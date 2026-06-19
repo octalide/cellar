@@ -1,12 +1,12 @@
 # cellar — an interactive cellular-automata editor and visualizer.
 #
 # a double-buffered weighted outer-totalistic grid is simulated on the CPU and
-# drawn as screen-space quads through blit, which also renders the control panel
-# over the same vertex stream. the keyboard and a blit panel drive the same
-# actions; the left mouse paints cells, the right mouse drags the view.
+# drawn as screen-space quads through blit, which also renders the control
+# windows over the same vertex stream. the left mouse paints cells (or erases
+# when the erase toggle is on), the right mouse drags the view.
 #
 #   space play/pause   S step   C clear   R randomize   M color mode
-#   LMB draw   RMB drag pan   scroll zoom   arrows pan
+#   LMB paint   RMB drag pan   scroll zoom   arrows pan
 #   Tab hide UI   F11 fullscreen   Esc quit
 
 use std.types.size.usize;
@@ -25,10 +25,12 @@ use bd: blit.draw;
 use bf: blit.font;
 use bi: blit.input;
 use bc: blit.context;
-use sim:     cellar.sim;
-use render:  cellar.render;
-use ui:      cellar.ui;
-use shaders: cellar.shaders;
+use sim:      cellar.sim;
+use render:   cellar.render;
+use ui:       cellar.ui;
+use app:      cellar.app;
+use worldwin: cellar.worldwin;
+use shaders:  cellar.shaders;
 
 # PAN_STEP: pixels the view pans per frame while an arrow key is held.
 val PAN_STEP: f32 = 12.0;
@@ -37,10 +39,12 @@ val ZOOM_STEP: f32 = 0.1;
 # ZOOM_MIN/ZOOM_MAX: clamp on the user zoom multiplier.
 val ZOOM_MIN: f32 = 0.25;
 val ZOOM_MAX: f32 = 16.0;
-# MAX_STEPS_PER_FRAME: caps catch-up stepping so a slow frame cannot spiral.
+# MAX_STEPS_PER_FRAME: caps capped-mode catch-up so a slow frame cannot spiral.
 val MAX_STEPS_PER_FRAME: i32 = 16;
-# COLOR_MODES: number of color modes M cycles through.
-val COLOR_MODES: u8 = 3;
+# UNCAPPED_BUDGET: seconds of wall-clock spent stepping per frame when uncapped.
+val UNCAPPED_BUDGET: f64 = 0.008;
+# UNCAPPED_MAX: hard ceiling on steps per uncapped frame, a runaway backstop.
+val UNCAPPED_MAX: i32 = 100000;
 # ICON: side length in pixels of the restore icon shown while the UI is hidden.
 val ICON: f32 = 26.0;
 
@@ -96,12 +100,16 @@ fun main(argc: i64, argv: **u8) i64 {
     page.make(?a);
     var pa: *allo.Allocator = ?a;
 
+    var app_state: app.App;
+    app.init(?app_state);
+
     var s: sim.Sim;
-    val ie: Option[str] = sim.init(?s, pa, sim.DEFAULT_W, sim.DEFAULT_H);
-    if (is_some[str](ie)) {
-        print.eprintf("sim init failed: %s\n", unwrap[str](ie));
+    if (is_some[str](sim.init(?s, pa, sim.DEFAULT_W, sim.DEFAULT_H))) {
+        print.eprintln("sim init failed");
         ret 1;
     }
+    # start at the default power-of-two bounds so the size dropdown matches reality
+    sim.resize(?s, app.bounds_size(app_state.bounds_idx), app.bounds_size(app_state.bounds_idx));
     sim.randomize(?s, sim.DEFAULT_DENSITY);
 
     glfw.set_error_callback(on_error);
@@ -129,9 +137,8 @@ fun main(argc: i64, argv: **u8) i64 {
 
     gl.load(glfw.get_proc_address);
 
-    val ae: Option[str] = bf.build_atlas(pa);
-    if (is_some[str](ae)) {
-        print.eprintf("atlas build failed: %s\n", unwrap[str](ae));
+    if (is_some[str](bf.build_atlas(pa))) {
+        print.eprintln("atlas build failed");
         glfw.terminate();
         sim.dnit(?s);
         ret 1;
@@ -176,15 +183,8 @@ fun main(argc: i64, argv: **u8) i64 {
     gl.enable(gl.BLEND);
     gl.blend_func(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 
-    var speed:      f32 = 12.0;
-    var zoom:       f32 = 1.0;
-    var pan_x:      f32 = 0.0;
-    var pan_y:      f32 = 0.0;
-    var acc:        f64 = 0.0;
-    var last_step:  f64 = glfw.get_time();
-    var ui_visible: u8  = 1;
-    var mode:       u8  = render.MODE_SOLID;
-    var gutter:     u8  = 0;
+    var acc:       f64 = 0.0;
+    var last_step: f64 = glfw.get_time();
 
     var is_fs: u8  = 0;
     var win_x: i32 = 0;
@@ -199,39 +199,50 @@ fun main(argc: i64, argv: **u8) i64 {
     for (!glfw.window_should_close(w)) {
         glfw.poll_events();
 
-        if (ui.g_quit       != 0) { glfw.set_window_should_close(w, true); ui.g_quit       = 0; }
-        if (ui.g_toggle     != 0) { sim.toggle_running(?s);                ui.g_toggle     = 0; }
-        if (ui.g_step       != 0) { sim.step(?s);                          ui.g_step       = 0; }
-        if (ui.g_clear      != 0) { sim.clear(?s);                         ui.g_clear      = 0; }
-        if (ui.g_random     != 0) { sim.randomize(?s, sim.DEFAULT_DENSITY); ui.g_random    = 0; }
-        if (ui.g_mode       != 0) { mode = (mode + 1) % COLOR_MODES;       ui.g_mode       = 0; }
-        if (ui.g_tab        != 0) { ui_visible = 1 - ui_visible;           ui.g_tab        = 0; }
+        if (ui.g_quit       != 0) { glfw.set_window_should_close(w, true);           ui.g_quit       = 0; }
+        if (ui.g_toggle     != 0) { sim.toggle_running(?s);                          ui.g_toggle     = 0; }
+        if (ui.g_step       != 0) { sim.step(?s);                                    ui.g_step       = 0; }
+        if (ui.g_clear      != 0) { sim.clear(?s);                                   ui.g_clear      = 0; }
+        if (ui.g_random     != 0) { sim.randomize(?s, sim.DEFAULT_DENSITY);          ui.g_random     = 0; }
+        if (ui.g_mode       != 0) { app_state.mode = (app_state.mode + 1) % app.MODE_COUNT; ui.g_mode = 0; }
+        if (ui.g_tab        != 0) { app_state.ui_visible = 1 - app_state.ui_visible; ui.g_tab        = 0; }
         if (ui.g_fullscreen != 0) { toggle_fullscreen(w, ?is_fs, ?win_x, ?win_y, ?win_w, ?win_h); ui.g_fullscreen = 0; }
 
         if (ui.g_scroll != 0.0) {
-            zoom = zoom + ui.g_scroll * ZOOM_STEP;
-            if (zoom < ZOOM_MIN) { zoom = ZOOM_MIN; }
-            if (zoom > ZOOM_MAX) { zoom = ZOOM_MAX; }
+            app_state.zoom = app_state.zoom + ui.g_scroll * ZOOM_STEP;
+            if (app_state.zoom < ZOOM_MIN) { app_state.zoom = ZOOM_MIN; }
+            if (app_state.zoom > ZOOM_MAX) { app_state.zoom = ZOOM_MAX; }
             ui.g_scroll = 0.0;
         }
 
-        if (glfw.get_key(w, glfw.KEY_LEFT)  == glfw.PRESS) { pan_x = pan_x + PAN_STEP; }
-        if (glfw.get_key(w, glfw.KEY_RIGHT) == glfw.PRESS) { pan_x = pan_x - PAN_STEP; }
-        if (glfw.get_key(w, glfw.KEY_UP)    == glfw.PRESS) { pan_y = pan_y + PAN_STEP; }
-        if (glfw.get_key(w, glfw.KEY_DOWN)  == glfw.PRESS) { pan_y = pan_y - PAN_STEP; }
+        if (glfw.get_key(w, glfw.KEY_LEFT)  == glfw.PRESS) { app_state.pan_x = app_state.pan_x + PAN_STEP; }
+        if (glfw.get_key(w, glfw.KEY_RIGHT) == glfw.PRESS) { app_state.pan_x = app_state.pan_x - PAN_STEP; }
+        if (glfw.get_key(w, glfw.KEY_UP)    == glfw.PRESS) { app_state.pan_y = app_state.pan_y + PAN_STEP; }
+        if (glfw.get_key(w, glfw.KEY_DOWN)  == glfw.PRESS) { app_state.pan_y = app_state.pan_y - PAN_STEP; }
 
         val now: f64 = glfw.get_time();
         val dt:  f64 = now - last_step;
         last_step = now;
         if (s.running != 0) {
-            acc = acc + dt;
-            val interval: f64 = 1.0 / speed::f64;
-            var budget: i32 = 0;
-            for (acc >= interval) {
-                sim.step(?s);
-                acc = acc - interval;
-                budget = budget + 1;
-                if (budget >= MAX_STEPS_PER_FRAME) { brk; }
+            if (app_state.uncapped != 0) {
+                val budget_end: f64 = now + UNCAPPED_BUDGET;
+                var n: i32 = 0;
+                for (glfw.get_time() < budget_end) {
+                    sim.step(?s);
+                    n = n + 1;
+                    if (n >= UNCAPPED_MAX) { brk; }
+                }
+                acc = 0.0;
+            } or {
+                acc = acc + dt;
+                val interval: f64 = 1.0 / app_state.speed::f64;
+                var budget: i32 = 0;
+                for (acc >= interval) {
+                    sim.step(?s);
+                    acc = acc - interval;
+                    budget = budget + 1;
+                    if (budget >= MAX_STEPS_PER_FRAME) { brk; }
+                }
             }
         } or {
             acc = 0.0;
@@ -261,8 +272,8 @@ fun main(argc: i64, argv: **u8) i64 {
         var rdown: u8 = 0;
         if (rb == glfw.PRESS) { rdown = 1; }
         if (rdown != 0 && rb_prev != 0) {
-            pan_x = pan_x + (mxd::f32 - rb_px);
-            pan_y = pan_y + (myd::f32 - rb_py);
+            app_state.pan_x = app_state.pan_x + (mxd::f32 - rb_px);
+            app_state.pan_y = app_state.pan_y + (myd::f32 - rb_py);
         }
         rb_px   = mxd::f32;
         rb_py   = myd::f32;
@@ -274,20 +285,17 @@ fun main(argc: i64, argv: **u8) i64 {
         in.down      = down;
         in.prev_down = 0;
 
-        val cam: render.Camera = render.fit(?s.grid, ww::f32, wh::f32, zoom, pan_x, pan_y);
+        val cam: render.Camera = render.fit(?s.grid, ww::f32, wh::f32, app_state.zoom, app_state.pan_x, app_state.pan_y);
 
         gl.clear_color(0.04, 0.05, 0.06, 1.0);
         gl.clear(gl.COLOR_BUFFER_BIT);
 
         bc.begin(?ctx, in, ww::f32, wh::f32);
-        render.draw_grid(?ctx, ?s, cam, mode, gutter);
+        render.draw_grid(?ctx, ?s, cam, app_state.mode::u8, app_state.gutter);
 
-        var px0: f32 = 0.0;
-        var py0: f32 = 0.0;
-        var px1: f32 = 0.0;
-        var py1: f32 = 0.0;
-        if (ui_visible != 0) {
-            ui.build_panel(?ctx, ?s, ?speed, ?px0, ?py0, ?px1, ?py1);
+        var consumed: u8 = 0;
+        if (app_state.ui_visible != 0) {
+            consumed = worldwin.draw(?ctx, ?app_state, ?s);
         } or {
             # translucent restore icon (a small three-bar glyph) in the top-left
             val ix0: f32 = 8.0;
@@ -299,25 +307,21 @@ fun main(argc: i64, argv: **u8) i64 {
             bc.quad(?ctx, ix0 + 6.0, iy0 + 8.0,  ix1 - 6.0, iy0 + 10.0, bar);
             bc.quad(?ctx, ix0 + 6.0, iy0 + 12.0, ix1 - 6.0, iy0 + 14.0, bar);
             bc.quad(?ctx, ix0 + 6.0, iy0 + 16.0, ix1 - 6.0, iy0 + 18.0, bar);
-            px0 = ix0;
-            py0 = iy0;
-            px1 = ix1;
-            py1 = iy1;
-            if (bi.in_rect(ctx.in, ix0, iy0, ix1, iy1) != 0 && bi.pressed(ctx.in) != 0) {
-                ui_visible = 1;
+            if (bi.in_rect(in, ix0, iy0, ix1, iy1) != 0) {
+                consumed = 1;
+                if (bi.pressed(ctx.in) != 0) { app_state.ui_visible = 1; }
             }
         }
         bc.end(?ctx);
 
-        # paint only when the cursor is off the panel/icon and not dragging a widget
-        val over_panel: u8 = bi.in_rect(in, px0, py0, px1, py1);
-        if (over_panel == 0 && ctx.active == 0) {
-            if (down != 0) {
-                var cx: usize = 0;
-                var cy: usize = 0;
-                if (render.cell_at(cam, ?s.grid, in.mx, in.my, ?cx, ?cy) != 0) {
-                    sim.paint(?s, cx, cy, 1);
-                }
+        # paint only when the cursor is off the windows and not dragging a widget
+        if (consumed == 0 && ctx.active == 0 && down != 0) {
+            var cx: usize = 0;
+            var cy: usize = 0;
+            if (render.cell_at(cam, ?s.grid, in.mx, in.my, ?cx, ?cy) != 0) {
+                var pv: u8 = 1;
+                if (app_state.erase != 0) { pv = 0; }
+                sim.paint(?s, cx, cy, pv);
             }
         }
 
