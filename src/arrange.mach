@@ -1,0 +1,180 @@
+# cellar.arrange: the arrangements window — a pattern palette, a custom-pattern
+# editor, and whole-world persistence.
+#
+# a dropdown selects one of the built-in patterns or the user-drawn custom one; a
+# preview shows it, a stamp-mode toggle arms click-to-stamp on the world, and a
+# small grid editor draws the custom pattern. buttons save and load the world and
+# save the custom pattern under arrangements/. like the other control windows it
+# reports whether the cursor lies over it so the caller can gate grid painting.
+
+use std.types.size.usize;
+use std.types.string.str;
+use bc: blit.context;
+use bw: blit.widget;
+use bi: blit.input;
+use bd: blit.draw;
+use sim:     cellar.sim;
+use app:     cellar.app;
+use pattern: cellar.pattern;
+use persist: cellar.persist;
+
+# PAD: spacing matching blit's widget padding.
+val PAD: f32 = 4.0;
+# TITLE_H: titlebar height for bounding a collapsed window.
+val TITLE_H: f32 = 16.0;
+# PREVIEW: side length in pixels of the square pattern preview.
+val PREVIEW: f32 = 120.0;
+# EDIT_CELL: side length in pixels of one cell in the custom editor.
+val EDIT_CELL: f32 = 11.0;
+# WORLD_PATH: fixed path for the saved/loaded world.
+val WORLD_PATH: str = "arrangements/world.cells";
+# CUSTOM_PATH: fixed path for the saved custom pattern.
+val CUSTOM_PATH: str = "arrangements/custom.cells";
+
+fun c_back()  bd.Color { ret bd.rgba(0.08, 0.09, 0.11, 1.0); }
+fun c_cell()  bd.Color { ret bd.rgba(0.40, 0.85, 0.55, 1.0); }
+fun c_lines() bd.Color { ret bd.rgba(0.18, 0.20, 0.26, 1.0); }
+
+# active: copy the selected pattern (built-in[pattern_sel], or the custom pattern
+# when pattern_sel == BUILTIN_COUNT) into out.
+fun active(a: *app.App, out: *pattern.Pattern) {
+    if (a.pattern_sel == pattern.BUILTIN_COUNT) {
+        @out = a.custom;
+    } or {
+        @out = pattern.builtin(a.pattern_sel);
+    }
+}
+
+# draw_preview: render a pattern scaled to fit a square box at the layout cursor,
+# then advance the cursor below it.
+fun draw_preview(ctx: *bc.Context, p: *pattern.Pattern) {
+    val x0: f32 = ctx.cx;
+    val y0: f32 = ctx.cy;
+    val surf: bc.Surface = bc.begin_surface(ctx, x0, y0, PREVIEW, PREVIEW, 0.0, 0.0);
+    bc.quad(ctx, 0.0, 0.0, PREVIEW, PREVIEW, c_back());
+
+    var span: usize = p.w;
+    if (p.h > span) { span = p.h; }
+    if (span == 0) { span = 1; }
+    val cs: f32 = PREVIEW / span::f32;
+    val px: f32 = (PREVIEW - p.w::f32 * cs) / 2.0;
+    val py: f32 = (PREVIEW - p.h::f32 * cs) / 2.0;
+
+    var y: usize = 0;
+    for (y < p.h) {
+        var x: usize = 0;
+        for (x < p.w) {
+            if (pattern.get(p, x, y) != 0) {
+                val qx: f32 = px + x::f32 * cs;
+                val qy: f32 = py + y::f32 * cs;
+                bc.quad(ctx, qx, qy, qx + cs, qy + cs, c_cell());
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+
+    bc.end_surface(ctx, surf);
+    ctx.cy = y0 + PREVIEW + PAD;
+    ctx.cx = ctx.ox;
+}
+
+# draw_editor: render the custom pattern as a clickable cell grid at the layout
+# cursor; a press inside toggles the cell under the cursor. advance below it.
+fun draw_editor(ctx: *bc.Context, p: *pattern.Pattern) {
+    val x0: f32 = ctx.cx;
+    val y0: f32 = ctx.cy;
+    val bw_px: f32 = p.w::f32 * EDIT_CELL;
+    val bh_px: f32 = p.h::f32 * EDIT_CELL;
+
+    val surf: bc.Surface = bc.begin_surface(ctx, x0, y0, bw_px, bh_px, 0.0, 0.0);
+    bc.quad(ctx, 0.0, 0.0, bw_px, bh_px, c_back());
+
+    var y: usize = 0;
+    for (y < p.h) {
+        var x: usize = 0;
+        for (x < p.w) {
+            val cx0: f32 = x::f32 * EDIT_CELL;
+            val cy0: f32 = y::f32 * EDIT_CELL;
+            var col: bd.Color = c_lines();
+            if (pattern.get(p, x, y) != 0) { col = c_cell(); }
+            bc.quad(ctx, cx0 + 1.0, cy0 + 1.0, cx0 + EDIT_CELL, cy0 + EDIT_CELL, col);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+
+    # toggle on the press edge so a single click flips exactly one cell
+    if (surf.inside != 0 && bi.pressed(ctx.in) != 0) {
+        val ux: usize = (surf.local_mx / EDIT_CELL)::usize;
+        val uy: usize = (surf.local_my / EDIT_CELL)::usize;
+        if (ux < p.w && uy < p.h) {
+            var v: u8 = 1;
+            if (pattern.get(p, ux, uy) != 0) { v = 0; }
+            pattern.set(p, ux, uy, v);
+        }
+    }
+
+    bc.end_surface(ctx, surf);
+    ctx.cy = y0 + bh_px + PAD;
+    ctx.cx = ctx.ox;
+}
+
+# stamp_active: stamp the active pattern onto the world centered on cell (cx, cy).
+# main calls this on the stamp-mode click edge.
+# ---
+# a:  application state (selects the pattern)
+# s:  simulation to stamp onto
+# cx: target column
+# cy: target row
+pub fun stamp_active(a: *app.App, s: *sim.Sim, cx: usize, cy: usize) {
+    if (a.pattern_sel == pattern.BUILTIN_COUNT) {
+        pattern.stamp(s, ?a.custom, cx, cy);
+    } or {
+        var p: pattern.Pattern = pattern.builtin(a.pattern_sel);
+        pattern.stamp(s, ?p, cx, cy);
+    }
+}
+
+# draw: lay out the arrangements window, apply its controls, and report whether
+# the cursor lies within the window this frame.
+# ---
+# ctx: blit context for this frame
+# a:   application state
+# s:   simulation the controls drive
+# ret: 1 if the cursor is over the window, else 0
+pub fun draw(ctx: *bc.Context, a: *app.App, s: *sim.Sim) u8 {
+    val handle: usize = bw.begin_window(ctx, ?a.arrange);
+
+    if (a.arrange.open != 0) {
+        var opts: [8]str;
+        var i: usize = 0;
+        for (i < pattern.BUILTIN_COUNT) {
+            opts[i] = pattern.builtin_name(i);
+            i = i + 1;
+        }
+        opts[pattern.BUILTIN_COUNT] = "custom";
+        bw.dropdown(ctx, "", ?a.pattern_sel, ?opts[0], pattern.BUILTIN_COUNT + 1);
+
+        var pv: pattern.Pattern;
+        active(a, ?pv);
+        draw_preview(ctx, ?pv);
+
+        bw.checkbox(ctx, "stamp mode", ?a.stamp_mode);
+
+        bw.text(ctx, "custom");
+        draw_editor(ctx, ?a.custom);
+        if (bw.button(ctx, "clear custom")) { pattern.clear(?a.custom); }
+        if (bw.button(ctx, "save custom"))  { persist.save_pattern(s.grid.a, ?a.custom, CUSTOM_PATH); }
+        if (bw.button(ctx, "load custom"))  { persist.load_pattern(s.grid.a, ?a.custom, CUSTOM_PATH); }
+
+        if (bw.button(ctx, "save world")) { persist.save_world(s.grid.a, s, WORLD_PATH); }
+        if (bw.button(ctx, "load world")) { persist.load_world(s.grid.a, s, WORLD_PATH); }
+    }
+
+    var y1: f32 = a.arrange.y + TITLE_H;
+    if (a.arrange.open != 0) { y1 = ctx.cy + PAD; }
+    bw.end_window(ctx, ?a.arrange, handle);
+
+    ret bi.in_rect(ctx.in, a.arrange.x, a.arrange.y, a.arrange.x + a.arrange.w, y1);
+}
