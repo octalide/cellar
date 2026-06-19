@@ -1,0 +1,118 @@
+# cellar.render: the world view — a camera that maps grid cells to screen
+# pixels, the grid-to-quad painter, and the inverse cursor-to-cell mapping the
+# editor uses for drawing.
+#
+# all geometry is emitted through blit as screen-space quads, so the cell grid
+# and the control panel share one vertex stream, one shader, and one texture.
+
+use std.types.size.usize;
+use bd: blit.draw;
+use bc: blit.context;
+use sim:  cellar.sim;
+use grid: cellar.grid;
+
+# MARGIN: minimum gap in pixels between the fitted grid and the window edge.
+val MARGIN: f32 = 16.0;
+# GUTTER_AT: cells at least this many pixels wide get a 1px gap drawn between them.
+val GUTTER_AT: f32 = 4.0;
+
+# Camera: places the grid as a square of `cell`-pixel cells with its top-left
+# corner at (ox, oy) in screen space.
+# ---
+# cell: side length of one cell in pixels
+# ox:   screen x of the grid's left edge
+# oy:   screen y of the grid's top edge
+pub rec Camera {
+    cell: f32;
+    ox:   f32;
+    oy:   f32;
+}
+
+# fit: a camera that scales the grid to fill the window (minus a margin),
+# centers it, then applies the user's zoom and pan.
+# ---
+# g:     the grid being viewed
+# sw:    window width in pixels
+# sh:    window height in pixels
+# zoom:  user zoom multiplier (1.0 = fit)
+# pan_x: horizontal pan offset in pixels
+# pan_y: vertical pan offset in pixels
+# ret:   the camera for this frame
+pub fun fit(g: *grid.Grid, sw: f32, sh: f32, zoom: f32, pan_x: f32, pan_y: f32) Camera {
+    val gw: f32 = g.w::f32;
+    val gh: f32 = g.h::f32;
+
+    var avail_w: f32 = sw - MARGIN * 2.0;
+    var avail_h: f32 = sh - MARGIN * 2.0;
+    if (avail_w < 1.0) { avail_w = 1.0; }
+    if (avail_h < 1.0) { avail_h = 1.0; }
+
+    var base: f32 = avail_w / gw;
+    if (avail_h / gh < base) { base = avail_h / gh; }
+
+    var cell: f32 = base * zoom;
+    if (cell < 1.0) { cell = 1.0; }
+
+    var cam: Camera;
+    cam.cell = cell;
+    cam.ox = (sw - gw * cell) / 2.0 + pan_x;
+    cam.oy = (sh - gh * cell) / 2.0 + pan_y;
+    ret cam;
+}
+
+# cell_at: the grid cell under screen pixel (px, py). writes (cx, cy) and returns
+# 1 when the pixel lands on a cell, else returns 0 and leaves the outputs alone.
+# ---
+# cam: the current camera
+# g:   the grid being viewed
+# px:  screen x in pixels
+# py:  screen y in pixels
+# cx:  out — column of the hit cell
+# cy:  out — row of the hit cell
+# ret: 1 if (px, py) is over a cell, else 0
+pub fun cell_at(cam: Camera, g: *grid.Grid, px: f32, py: f32, cx: *usize, cy: *usize) u8 {
+    if (cam.cell <= 0.0) { ret 0; }
+    val fx: f32 = (px - cam.ox) / cam.cell;
+    val fy: f32 = (py - cam.oy) / cam.cell;
+    if (fx < 0.0) { ret 0; }
+    if (fy < 0.0) { ret 0; }
+    val ix: usize = fx::usize;
+    val iy: usize = fy::usize;
+    if (ix >= g.w) { ret 0; }
+    if (iy >= g.h) { ret 0; }
+    @cx = ix;
+    @cy = iy;
+    ret 1;
+}
+
+# draw_grid: paint the dead-field backdrop and every live cell for this frame.
+# ---
+# ctx: blit context accumulating the frame's geometry
+# s:   simulation whose grid is drawn
+# cam: the camera mapping cells to pixels
+pub fun draw_grid(ctx: *bc.Context, s: *sim.Sim, cam: Camera) {
+    val g:  *grid.Grid = ?s.grid;
+    val gw: f32 = g.w::f32;
+    val gh: f32 = g.h::f32;
+
+    val bg: bd.Color = bd.rgba(0.08, 0.09, 0.11, 1.0);
+    bc.quad(ctx, cam.ox, cam.oy, cam.ox + gw * cam.cell, cam.oy + gh * cam.cell, bg);
+
+    var gutter: f32 = 0.0;
+    if (cam.cell >= GUTTER_AT) { gutter = 1.0; }
+
+    val live: bd.Color = bd.rgba(0.40, 0.85, 0.55, 1.0);
+    var y: usize = 0;
+    for (y < g.h) {
+        var x: usize = 0;
+        for (x < g.w) {
+            if (grid.get(g, x, y) != 0) {
+                val x0: f32 = cam.ox + x::f32 * cam.cell;
+                val y0: f32 = cam.oy + y::f32 * cam.cell;
+                bc.quad(ctx, x0, y0, x0 + cam.cell - gutter, y0 + cam.cell - gutter, live);
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}

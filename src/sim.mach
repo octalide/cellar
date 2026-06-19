@@ -1,0 +1,168 @@
+# cellar.sim: the simulation — a grid, the active rule, and the controls that
+# advance, edit, and reset it.
+#
+# stepping reads the front buffer and writes the back buffer cell by cell, then
+# swaps, so a generation is computed atomically. painting and randomize edit the
+# front buffer directly.
+
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.option.Option;
+use allo: std.allocator;
+use page: std.allocator.page;
+use rand: std.rand;
+use grid: cellar.grid;
+use rule: cellar.rule;
+
+# DEFAULT_W: default grid width in cells.
+pub val DEFAULT_W: usize = 120;
+# DEFAULT_H: default grid height in cells.
+pub val DEFAULT_H: usize = 120;
+
+# Sim: cellular-automaton simulation state.
+# ---
+# grid:       the double-buffered cell grid
+# rule:       the active Life-like rule
+# rng:        PRNG used by randomize
+# generation: number of completed steps since the last clear/randomize
+# running:    1 while auto-stepping, else 0
+# preset:     index of the active rule preset
+pub rec Sim {
+    grid:       grid.Grid;
+    rule:       rule.Rule;
+    rng:        rand.Rng;
+    generation: u64;
+    running:    u8;
+    preset:     usize;
+}
+
+# init: allocate the grid and seed the simulation with the default rule.
+# ---
+# s: simulation to initialize
+# a: allocator backing the grid
+# w: grid width in cells
+# h: grid height in cells
+# ret: none on success, some(message) on allocation failure
+pub fun init(s: *Sim, a: *allo.Allocator, w: usize, h: usize) Option[str] {
+    val e: Option[str] = grid.init(?s.grid, a, w, h);
+    if (e.has_value) { ret e; }
+    s.rule       = rule.preset(0);
+    s.preset     = 0;
+    s.rng        = rand.init();
+    s.generation = 0;
+    s.running    = 0;
+    ret e;
+}
+
+# free: release the simulation's grid.
+# ---
+# s: simulation to free
+pub fun free(s: *Sim) {
+    grid.free(?s.grid);
+}
+
+# step: advance one generation — apply the rule into the back buffer, then swap.
+# ---
+# s: simulation
+pub fun step(s: *Sim) {
+    val g: *grid.Grid = ?s.grid;
+    var y: usize = 0;
+    for (y < g.h) {
+        var x: usize = 0;
+        for (x < g.w) {
+            val alive: u8 = grid.get(g, x, y);
+            val n:     u8 = grid.count_neighbors(g, x, y);
+            grid.set_back(g, x, y, rule.next_state(s.rule, alive, n));
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    grid.swap(g);
+    s.generation = s.generation + 1;
+}
+
+# clear: empty the grid and reset the generation counter.
+# ---
+# s: simulation
+pub fun clear(s: *Sim) {
+    grid.clear(?s.grid);
+    s.generation = 0;
+}
+
+# randomize: fill the grid with live cells at the given density, reset the count.
+# ---
+# s:       simulation
+# density: live-cell probability in [0, 1]
+pub fun randomize(s: *Sim, density: f32) {
+    val g: *grid.Grid = ?s.grid;
+    var thresh: i64 = (density * 1000.0)::i64;
+    if (thresh < 0) { thresh = 0; }
+    if (thresh > 1000) { thresh = 1000; }
+    var y: usize = 0;
+    for (y < g.h) {
+        var x: usize = 0;
+        for (x < g.w) {
+            var v: u8 = 0;
+            if (rand.range(?s.rng, 0, 1000) < thresh) { v = 1; }
+            grid.set(g, x, y, v);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    s.generation = 0;
+}
+
+# paint: set the cell at (x, y) to v, ignoring out-of-bounds coordinates.
+# ---
+# s: simulation
+# x: column
+# y: row
+# v: value to write (0 or 1)
+pub fun paint(s: *Sim, x: usize, y: usize, v: u8) {
+    if (x >= s.grid.w) { ret; }
+    if (y >= s.grid.h) { ret; }
+    grid.set(?s.grid, x, y, v);
+}
+
+# toggle_running: flip between running and paused.
+# ---
+# s: simulation
+pub fun toggle_running(s: *Sim) {
+    s.running = 1 - s.running;
+}
+
+# cycle_rule: advance to the next built-in rule preset, wrapping around.
+# ---
+# s: simulation
+pub fun cycle_rule(s: *Sim) {
+    s.preset = (s.preset + 1) % rule.PRESET_COUNT;
+    s.rule   = rule.preset(s.preset);
+}
+
+test "sim: a blinker oscillates with period two" {
+    var a: allo.Allocator;
+    page.make(?a);
+
+    var s: Sim;
+    if (init(?s, ?a, 5, 5).has_value) { ret 1; }
+
+    # a horizontal three-cell row at the center
+    paint(?s, 1, 2, 1);
+    paint(?s, 2, 2, 1);
+    paint(?s, 3, 2, 1);
+
+    step(?s);
+    # now vertical
+    if (grid.get(?s.grid, 2, 1) != 1) { ret 1; }
+    if (grid.get(?s.grid, 2, 2) != 1) { ret 1; }
+    if (grid.get(?s.grid, 2, 3) != 1) { ret 1; }
+    if (grid.get(?s.grid, 1, 2) != 0) { ret 1; }
+
+    step(?s);
+    # back to horizontal
+    if (grid.get(?s.grid, 1, 2) != 1) { ret 1; }
+    if (grid.get(?s.grid, 3, 2) != 1) { ret 1; }
+
+    free(?s);
+    ret 0;
+}

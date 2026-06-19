@@ -1,0 +1,280 @@
+# cellar — an interactive cellular-automata editor and visualizer.
+#
+# a double-buffered Life-like grid is simulated on the CPU and drawn as
+# screen-space quads through blit, which also renders the control panel over the
+# same vertex stream. the keyboard and a blit panel drive the same actions;
+# the mouse paints cells directly onto the grid.
+#
+#   space play/pause   S step   C clear   R randomize   N next rule
+#   LMB draw   RMB erase   scroll zoom   arrows pan   Esc quit
+
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.option.Option;
+use std.types.option.is_some;
+use std.types.option.unwrap;
+use std.types.bool.true;
+use std.types.bool.false;
+use allo:    std.allocator;
+use page:    std.allocator.page;
+use print:   std.print;
+use glfw;
+use gl;
+use bd: blit.draw;
+use bf: blit.font;
+use bi: blit.input;
+use bc: blit.context;
+use sim:     cellar.sim;
+use render:  cellar.render;
+use ui:      cellar.ui;
+use shaders: cellar.shaders;
+
+# PAN_STEP: pixels the view pans per frame while an arrow key is held.
+val PAN_STEP: f32 = 12.0;
+# ZOOM_STEP: zoom multiplier change per scroll notch.
+val ZOOM_STEP: f32 = 0.1;
+# ZOOM_MIN/ZOOM_MAX: clamp on the user zoom multiplier.
+val ZOOM_MIN: f32 = 0.25;
+val ZOOM_MAX: f32 = 16.0;
+# MAX_STEPS_PER_FRAME: caps catch-up stepping so a slow frame cannot spiral.
+val MAX_STEPS_PER_FRAME: i32 = 16;
+
+fun on_error(code: i32, desc: *u8) {
+    print.eprintf("glfw error 0x%x: %s\n", code::u64, desc);
+}
+
+fun on_key(handle: ptr, key: i32, scancode: i32, action: i32, mods: i32) {
+    if (action != glfw.PRESS) { ret; }
+    if (key == glfw.KEY_ESCAPE) { ui.g_quit   = 1; }
+    if (key == glfw.KEY_SPACE)  { ui.g_toggle = 1; }
+    if (key == glfw.KEY_S)      { ui.g_step   = 1; }
+    if (key == glfw.KEY_C)      { ui.g_clear  = 1; }
+    if (key == glfw.KEY_R)      { ui.g_random = 1; }
+    if (key == glfw.KEY_N)      { ui.g_rule   = 1; }
+}
+
+fun on_scroll(handle: ptr, xoff: f64, yoff: f64) {
+    ui.g_scroll = ui.g_scroll + yoff::f32;
+}
+
+$main.symbol = "main";
+fun main(argc: i64, argv: **u8) i64 {
+    var a: allo.Allocator;
+    page.make(?a);
+    var pa: *allo.Allocator = ?a;
+
+    var s: sim.Sim;
+    val ie: Option[str] = sim.init(?s, pa, sim.DEFAULT_W, sim.DEFAULT_H);
+    if (is_some[str](ie)) {
+        print.eprintf("sim init failed: %s\n", unwrap[str](ie));
+        ret 1;
+    }
+    sim.randomize(?s, 0.30);
+
+    glfw.set_error_callback(on_error);
+    if (!glfw.init()) {
+        print.eprintln("failed to initialize GLFW");
+        sim.free(?s);
+        ret 1;
+    }
+    glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 3);
+    glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 3);
+    glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE);
+    glfw.window_hint(glfw.SAMPLES, 4);
+
+    val w: glfw.Window = glfw.open_window(900, 900, "cellar");
+    if (!glfw.window_is_valid(w)) {
+        print.eprintln("failed to create window");
+        glfw.terminate();
+        sim.free(?s);
+        ret 1;
+    }
+    glfw.make_context_current(w);
+    glfw.swap_interval(1);
+    glfw.set_key_callback(w, on_key);
+    glfw.set_scroll_callback(w, on_scroll);
+
+    val resolved: i64 = gl.load(glfw.get_proc_address);
+    print.printf("cellar: loaded %d GL commands\n", resolved);
+    print.println("space play/pause | S step | C clear | R randomize | N rule | LMB draw | RMB erase | scroll zoom | arrows pan | Esc quit");
+
+    val ae: Option[str] = bf.build_atlas(pa);
+    if (is_some[str](ae)) {
+        print.eprintf("atlas build failed: %s\n", unwrap[str](ae));
+        glfw.terminate();
+        sim.free(?s);
+        ret 1;
+    }
+    val prog: u32 = shaders.load_program(pa, "src/shaders/ui.vert", "src/shaders/ui.frag");
+    if (prog == 0) {
+        glfw.terminate();
+        sim.free(?s);
+        ret 1;
+    }
+    val u_screen: i32 = gl.get_uniform_location(prog, "uScreen");
+    val u_tex:    i32 = gl.get_uniform_location(prog, "uTex");
+
+    var tex: u32 = 0;
+    gl.gen_textures(1, ?tex);
+    gl.bind_texture(gl.TEXTURE_2D, tex);
+    gl.tex_parameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST::i32);
+    gl.tex_parameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST::i32);
+    gl.tex_image2d(gl.TEXTURE_2D, 0, gl.RGBA::i32, bf.ATLAS_W::i32, bf.ATLAS_H::i32, 0, gl.RGBA, gl.UNSIGNED_BYTE, (bf.atlas_pixels())::ptr);
+
+    var vbo: u32 = 0;
+    var vao: u32 = 0;
+    gl.gen_buffers(1, ?vbo);
+    gl.gen_vertex_arrays(1, ?vao);
+    gl.bind_vertex_array(vao);
+    gl.bind_buffer(gl.ARRAY_BUFFER, vbo);
+    gl.vertex_attrib_pointer(0, 2, gl.FLOAT, false, 32, nil);
+    gl.enable_vertex_attrib_array(0);
+    gl.vertex_attrib_pointer(1, 2, gl.FLOAT, false, 32, (8::usize):~ptr);
+    gl.enable_vertex_attrib_array(1);
+    gl.vertex_attrib_pointer(2, 4, gl.FLOAT, false, 32, (16::usize):~ptr);
+    gl.enable_vertex_attrib_array(2);
+
+    var ctx: bc.Context;
+    if (is_some[str](bc.init(?ctx, pa))) {
+        print.eprintln("blit context init failed");
+        glfw.terminate();
+        sim.free(?s);
+        ret 1;
+    }
+
+    gl.enable(gl.BLEND);
+    gl.blend_func(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+    var speed:     f32 = 12.0;
+    var density:   f32 = 0.30;
+    var zoom:      f32 = 1.0;
+    var pan_x:     f32 = 0.0;
+    var pan_y:     f32 = 0.0;
+    var acc:       f64 = 0.0;
+    var last_step: f64 = glfw.get_time();
+
+    for (!glfw.window_should_close(w)) {
+        glfw.poll_events();
+
+        if (ui.g_quit   != 0) { glfw.set_window_should_close(w, true); ui.g_quit   = 0; }
+        if (ui.g_toggle != 0) { sim.toggle_running(?s);                ui.g_toggle = 0; }
+        if (ui.g_step   != 0) { sim.step(?s);                          ui.g_step   = 0; }
+        if (ui.g_clear  != 0) { sim.clear(?s);                         ui.g_clear  = 0; }
+        if (ui.g_random != 0) { sim.randomize(?s, density);           ui.g_random = 0; }
+        if (ui.g_rule   != 0) { sim.cycle_rule(?s);                    ui.g_rule   = 0; }
+
+        if (ui.g_scroll != 0.0) {
+            zoom = zoom + ui.g_scroll * ZOOM_STEP;
+            if (zoom < ZOOM_MIN) { zoom = ZOOM_MIN; }
+            if (zoom > ZOOM_MAX) { zoom = ZOOM_MAX; }
+            ui.g_scroll = 0.0;
+        }
+
+        if (glfw.get_key(w, glfw.KEY_LEFT)  == glfw.PRESS) { pan_x = pan_x + PAN_STEP; }
+        if (glfw.get_key(w, glfw.KEY_RIGHT) == glfw.PRESS) { pan_x = pan_x - PAN_STEP; }
+        if (glfw.get_key(w, glfw.KEY_UP)    == glfw.PRESS) { pan_y = pan_y + PAN_STEP; }
+        if (glfw.get_key(w, glfw.KEY_DOWN)  == glfw.PRESS) { pan_y = pan_y - PAN_STEP; }
+
+        val now: f64 = glfw.get_time();
+        val dt:  f64 = now - last_step;
+        last_step = now;
+        if (s.running != 0) {
+            acc = acc + dt;
+            val interval: f64 = 1.0 / speed::f64;
+            var budget: i32 = 0;
+            for (acc >= interval) {
+                sim.step(?s);
+                acc = acc - interval;
+                budget = budget + 1;
+                if (budget >= MAX_STEPS_PER_FRAME) { brk; }
+            }
+        } or {
+            acc = 0.0;
+        }
+
+        var ww: i32 = 0;
+        var wh: i32 = 0;
+        glfw.get_window_size(w, ?ww, ?wh);
+        if (ww < 1) { ww = 1; }
+        if (wh < 1) { wh = 1; }
+        var fw: i32 = 0;
+        var fh: i32 = 0;
+        glfw.get_framebuffer_size(w, ?fw, ?fh);
+        if (fw < 1) { fw = 1; }
+        if (fh < 1) { fh = 1; }
+        gl.viewport(0, 0, fw, fh);
+
+        var mxd: f64 = 0.0;
+        var myd: f64 = 0.0;
+        glfw.get_cursor_pos(w, ?mxd, ?myd);
+        val lb: i32 = glfw.get_mouse_button(w, glfw.MOUSE_BUTTON_LEFT);
+        val rb: i32 = glfw.get_mouse_button(w, glfw.MOUSE_BUTTON_RIGHT);
+        var down: u8 = 0;
+        if (lb == glfw.PRESS) { down = 1; }
+
+        var in: bi.Input;
+        in.mx        = mxd::f32;
+        in.my        = myd::f32;
+        in.down      = down;
+        in.prev_down = 0;
+
+        val cam: render.Camera = render.fit(?s.grid, ww::f32, wh::f32, zoom, pan_x, pan_y);
+
+        gl.clear_color(0.04, 0.05, 0.06, 1.0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+
+        bc.begin(?ctx, in, ww::f32, wh::f32);
+        render.draw_grid(?ctx, ?s, cam);
+
+        var px0: f32 = 0.0;
+        var py0: f32 = 0.0;
+        var px1: f32 = 0.0;
+        var py1: f32 = 0.0;
+        ui.build_panel(?ctx, ?s, ?speed, ?density, ?px0, ?py0, ?px1, ?py1);
+        bc.end(?ctx);
+
+        # paint only when the cursor is off the panel and not dragging a widget
+        val over_panel: u8 = bi.in_rect(in, px0, py0, px1, py1);
+        if (over_panel == 0 && ctx.active == 0) {
+            if (down != 0) {
+                var cx: usize = 0;
+                var cy: usize = 0;
+                if (render.cell_at(cam, ?s.grid, in.mx, in.my, ?cx, ?cy) != 0) {
+                    sim.paint(?s, cx, cy, 1);
+                }
+            }
+            if (rb == glfw.PRESS) {
+                var ex: usize = 0;
+                var ey: usize = 0;
+                if (render.cell_at(cam, ?s.grid, in.mx, in.my, ?ex, ?ey) != 0) {
+                    sim.paint(?s, ex, ey, 0);
+                }
+            }
+        }
+
+        gl.use_program(prog);
+        gl.uniform2f(u_screen, ww::f32, wh::f32);
+        gl.active_texture(gl.TEXTURE0);
+        gl.bind_texture(gl.TEXTURE_2D, tex);
+        gl.uniform1i(u_tex, 0);
+        gl.bind_vertex_array(vao);
+        gl.bind_buffer(gl.ARRAY_BUFFER, vbo);
+        val vcount: usize = bc.draw_count(?ctx);
+        if (vcount > 0) {
+            gl.buffer_data(gl.ARRAY_BUFFER, (vcount * 32)::i64, (bc.draw_verts(?ctx))::ptr, gl.DYNAMIC_DRAW);
+            gl.draw_arrays(gl.TRIANGLES, 0, vcount::i32);
+        }
+
+        glfw.swap_buffers(w);
+    }
+
+    gl.delete_vertex_arrays(1, ?vao);
+    gl.delete_buffers(1, ?vbo);
+    gl.delete_textures(1, ?tex);
+    gl.delete_program(prog);
+    bc.free(?ctx);
+    sim.free(?s);
+    glfw.destroy_window(w);
+    glfw.terminate();
+    ret 0;
+}

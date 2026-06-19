@@ -1,0 +1,161 @@
+# cellar.grid: a double-buffered dense cell grid with toroidal wrapping.
+#
+# each cell holds 0 (dead) or 1 (alive). a back buffer receives the next
+# generation so a step never reads its own writes; swap() exchanges the front
+# and back pointers in O(1). neighbor counts wrap at the edges, so the world is
+# a torus.
+
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.option.Option;
+use std.types.option.some;
+use std.types.option.none;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use allo: std.allocator;
+use page: std.allocator.page;
+
+# Grid: a w x h grid of u8 cells with a parallel back buffer.
+# ---
+# cells: front buffer, row-major, length w*h
+# back:  back buffer for the next generation, same length
+# w:     width in cells
+# h:     height in cells
+# a:     allocator backing both buffers
+pub rec Grid {
+    cells: *u8;
+    back:  *u8;
+    w:     usize;
+    h:     usize;
+    a:     *allo.Allocator;
+}
+
+# init: allocate a zeroed w x h grid and its back buffer.
+# ---
+# g: grid to initialize
+# a: allocator backing both buffers
+# w: width in cells (must be > 0)
+# h: height in cells (must be > 0)
+# ret: none on success, some(message) on allocation failure
+pub fun init(g: *Grid, a: *allo.Allocator, w: usize, h: usize) Option[str] {
+    val n: usize = w * h;
+    val rc: Result[*u8, str] = allo.zallocate[u8](a, n);
+    if (is_err[*u8, str](rc)) { ret some[str]("cellar.grid.init: cell allocation failed"); }
+    val rb: Result[*u8, str] = allo.zallocate[u8](a, n);
+    if (is_err[*u8, str](rb)) {
+        allo.deallocate[u8](a, unwrap_ok[*u8, str](rc), n);
+        ret some[str]("cellar.grid.init: back allocation failed");
+    }
+    g.cells = unwrap_ok[*u8, str](rc);
+    g.back  = unwrap_ok[*u8, str](rb);
+    g.w = w;
+    g.h = h;
+    g.a = a;
+    ret none[str]();
+}
+
+# free: release both buffers and null the pointers.
+# ---
+# g: grid to free
+pub fun free(g: *Grid) {
+    val n: usize = g.w * g.h;
+    allo.deallocate[u8](g.a, g.cells, n);
+    allo.deallocate[u8](g.a, g.back, n);
+    g.cells = nil;
+    g.back = nil;
+}
+
+# get: the front-buffer cell at (x, y). caller guarantees x < w and y < h.
+# ---
+# g: grid
+# x: column in [0, w)
+# y: row in [0, h)
+# ret: 0 or 1
+pub fun get(g: *Grid, x: usize, y: usize) u8 {
+    ret g.cells[y * g.w + x];
+}
+
+# set: write v to the front-buffer cell at (x, y).
+# ---
+# g: grid
+# x: column in [0, w)
+# y: row in [0, h)
+# v: new value (0 or 1)
+pub fun set(g: *Grid, x: usize, y: usize, v: u8) {
+    g.cells[y * g.w + x] = v;
+}
+
+# set_back: write v to the back-buffer cell at (x, y).
+# ---
+# g: grid
+# x: column in [0, w)
+# y: row in [0, h)
+# v: new value (0 or 1)
+pub fun set_back(g: *Grid, x: usize, y: usize, v: u8) {
+    g.back[y * g.w + x] = v;
+}
+
+# count_neighbors: live cells among the 8 toroidal neighbors of (x, y).
+# ---
+# g: grid
+# x: column in [0, w)
+# y: row in [0, h)
+# ret: a count in [0, 8]
+pub fun count_neighbors(g: *Grid, x: usize, y: usize) u8 {
+    val w:  usize = g.w;
+    val h:  usize = g.h;
+    val xm: usize = (x + w - 1) % w;
+    val xp: usize = (x + 1) % w;
+    val ym: usize = (y + h - 1) % h;
+    val yp: usize = (y + 1) % h;
+    var n: u8 = 0;
+    n = n + g.cells[ym * w + xm];
+    n = n + g.cells[ym * w + x];
+    n = n + g.cells[ym * w + xp];
+    n = n + g.cells[y  * w + xm];
+    n = n + g.cells[y  * w + xp];
+    n = n + g.cells[yp * w + xm];
+    n = n + g.cells[yp * w + x];
+    n = n + g.cells[yp * w + xp];
+    ret n;
+}
+
+# swap: exchange the front and back buffers.
+# ---
+# g: grid
+pub fun swap(g: *Grid) {
+    val t: *u8 = g.cells;
+    g.cells = g.back;
+    g.back  = t;
+}
+
+# clear: set every front-buffer cell to 0.
+# ---
+# g: grid
+pub fun clear(g: *Grid) {
+    val n: usize = g.w * g.h;
+    var i: usize = 0;
+    for (i < n) {
+        g.cells[i] = 0;
+        i = i + 1;
+    }
+}
+
+test "grid: toroidal neighbor count wraps at the corners" {
+    var a: allo.Allocator;
+    page.make(?a);
+
+    var g: Grid;
+    if (init(?g, ?a, 4, 4).has_value) { ret 1; }
+
+    # a single live cell at the top-left corner contributes to the three
+    # diagonally/edge-opposite corner neighbors through wrapping.
+    set(?g, 0, 0, 1);
+    if (count_neighbors(?g, 3, 3) != 1) { ret 1; }
+    # (2, 2) is the one cell with no wrapped adjacency to the corner
+    if (count_neighbors(?g, 2, 2) != 0) { ret 1; }
+
+    free(?g);
+    ret 0;
+}

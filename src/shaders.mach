@@ -1,0 +1,90 @@
+# cellar.shaders: shader compilation and program loading for the blit overlay.
+
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use allo: std.allocator;
+use print: std.print;
+use fs: std.filesystem;
+use gl;
+
+# compile: build one shader stage from source; 0 on failure (logged to stderr).
+# ---
+# kind: gl.VERTEX_SHADER or gl.FRAGMENT_SHADER
+# src:  NUL-terminated GLSL source
+# ret:  the shader name, or 0 on failure
+pub fun compile(kind: u32, src: *u8) u32 {
+    val sh: u32 = gl.create_shader(kind);
+    var p: *u8 = src;
+    gl.shader_source(sh, 1, ?p, nil);
+    gl.compile_shader(sh);
+    var ok: i32 = 0;
+    gl.get_shaderiv(sh, gl.COMPILE_STATUS, ?ok);
+    if (ok == 0) {
+        var log: [1024]u8;
+        gl.get_shader_info_log(sh, 1024, nil, ?log[0]);
+        print.eprintf("shader compile failed: %s\n", ?log[0]);
+        gl.delete_shader(sh);
+        ret 0;
+    }
+    ret sh;
+}
+
+# free_str: release a NUL-terminated buffer returned by fs.read_all (size+1 bytes).
+# ---
+# a: allocator that produced the buffer
+# s: the string to release
+pub fun free_str(a: *allo.Allocator, s: str) {
+    allo.deallocate[u8](a, s::*u8, str_len(s) + 1);
+}
+
+# load_program: read, compile and link a vertex+fragment program; 0 on failure.
+# ---
+# a:     allocator for reading the source files
+# vpath: path to the vertex shader source
+# fpath: path to the fragment shader source
+# ret:   the linked program name, or 0 on failure
+pub fun load_program(a: *allo.Allocator, vpath: str, fpath: str) u32 {
+    val rv: Result[str, str] = fs.read_all(a, vpath);
+    if (is_err[str, str](rv)) {
+        print.eprintf("cannot read %s\n", vpath);
+        ret 0;
+    }
+    val vsrc: str = unwrap_ok[str, str](rv);
+    val rf: Result[str, str] = fs.read_all(a, fpath);
+    if (is_err[str, str](rf)) {
+        print.eprintf("cannot read %s\n", fpath);
+        free_str(a, vsrc);
+        ret 0;
+    }
+    val fsrc: str = unwrap_ok[str, str](rf);
+
+    val vs:  u32 = compile(gl.VERTEX_SHADER, vsrc::*u8);
+    val fsh: u32 = compile(gl.FRAGMENT_SHADER, fsrc::*u8);
+    free_str(a, vsrc);
+    free_str(a, fsrc);
+    if (vs == 0 || fsh == 0) {
+        if (vs != 0)  { gl.delete_shader(vs); }
+        if (fsh != 0) { gl.delete_shader(fsh); }
+        ret 0;
+    }
+
+    val prog: u32 = gl.create_program();
+    gl.attach_shader(prog, vs);
+    gl.attach_shader(prog, fsh);
+    gl.link_program(prog);
+    gl.delete_shader(vs);
+    gl.delete_shader(fsh);
+    var linked: i32 = 0;
+    gl.get_programiv(prog, gl.LINK_STATUS, ?linked);
+    if (linked == 0) {
+        var log: [1024]u8;
+        gl.get_program_info_log(prog, 1024, nil, ?log[0]);
+        print.eprintf("program link failed: %s\n", ?log[0]);
+        gl.delete_program(prog);
+        ret 0;
+    }
+    ret prog;
+}
