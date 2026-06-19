@@ -1,0 +1,295 @@
+# cellar.pattern: fixed-capacity cell patterns — the built-in library and the
+# user-drawn custom pattern — plus stamping them onto a simulation grid.
+#
+# a pattern is a small dense w x h grid of 0/1 cells held in a fixed [CAP] buffer,
+# so any pattern with w*h <= CAP fits regardless of its side lengths. the built-ins
+# are described as rows of '#'/'.' text and parsed once on demand; stamping places
+# a pattern's live cells onto the world, centered on a target cell and wrapping
+# toroidally to match the simulation's torus.
+
+use std.types.size.usize;
+use std.types.string.str;
+use allo: std.allocator;
+use page: std.allocator.page;
+use sim:  cellar.sim;
+use grid: cellar.grid;
+
+# CAP: cell-buffer capacity; a pattern is valid while w*h <= CAP.
+pub val CAP: usize = 1024;
+
+# BUILTIN_COUNT: number of patterns reachable through builtin()/builtin_name().
+pub val BUILTIN_COUNT: usize = 7;
+
+# Pattern: a small dense grid of 0/1 cells with a display name.
+# ---
+# cells: row-major 0/1 cells, length w*h, capacity CAP
+# w:     width in cells
+# h:     height in cells, with w*h <= CAP
+# name:  short display label
+pub rec Pattern {
+    cells: [1024]u8;
+    w:     usize;
+    h:     usize;
+    name:  str;
+}
+
+# init: set a pattern's dimensions and name and zero its cells.
+# ---
+# p:    pattern to initialize
+# w:    width in cells
+# h:    height in cells (w*h must not exceed CAP)
+# name: display label
+pub fun init(p: *Pattern, w: usize, h: usize, name: str) {
+    p.w    = w;
+    p.h    = h;
+    p.name = name;
+    clear(p);
+}
+
+# clear: zero every cell, preserving the pattern's dimensions and name.
+# ---
+# p: pattern to clear
+pub fun clear(p: *Pattern) {
+    val n: usize = p.w * p.h;
+    var i: usize = 0;
+    for (i < n) {
+        p.cells[i] = 0;
+        i = i + 1;
+    }
+}
+
+# get: the cell at (x, y). caller guarantees x < w and y < h.
+# ---
+# p: pattern
+# x: column in [0, w)
+# y: row in [0, h)
+# ret: 0 or 1
+pub fun get(p: *Pattern, x: usize, y: usize) u8 {
+    ret p.cells[y * p.w + x];
+}
+
+# set: write v to the cell at (x, y).
+# ---
+# p: pattern
+# x: column in [0, w)
+# y: row in [0, h)
+# v: new value (0 or 1)
+pub fun set(p: *Pattern, x: usize, y: usize, v: u8) {
+    p.cells[y * p.w + x] = v;
+}
+
+# from_rows: build a pattern from h row strings of w chars each, '#' live and any
+# other char dead.
+# ---
+# name: display label
+# w:    width in cells
+# h:    height in cells
+# rows: pointer to an array of h row strings (pass ?arr[0])
+# ret:  the parsed pattern
+fun from_rows(name: str, w: usize, h: usize, rows: *str) Pattern {
+    var p: Pattern;
+    p.w    = w;
+    p.h    = h;
+    p.name = name;
+    var y: usize = 0;
+    for (y < h) {
+        val row: str = rows[y];
+        var x: usize = 0;
+        for (x < w) {
+            var v: u8 = 0;
+            if (row[x] == '#') { v = 1; }
+            p.cells[y * w + x] = v;
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    ret p;
+}
+
+# glider: the classic 3x3 diagonal spaceship.
+fun glider() Pattern {
+    var r: [3]str;
+    r[0] = ".#.";
+    r[1] = "..#";
+    r[2] = "###";
+    ret from_rows("glider", 3, 3, ?r[0]);
+}
+
+# blinker: the period-two 3x1 oscillator.
+fun blinker() Pattern {
+    var r: [1]str;
+    r[0] = "###";
+    ret from_rows("blinker", 3, 1, ?r[0]);
+}
+
+# block: the 2x2 still life.
+fun block() Pattern {
+    var r: [2]str;
+    r[0] = "##";
+    r[1] = "##";
+    ret from_rows("block", 2, 2, ?r[0]);
+}
+
+# beehive: the 4x3 still life.
+fun beehive() Pattern {
+    var r: [3]str;
+    r[0] = ".##.";
+    r[1] = "#..#";
+    r[2] = ".##.";
+    ret from_rows("beehive", 4, 3, ?r[0]);
+}
+
+# lwss: the lightweight spaceship, a 5x4 orthogonal glider.
+fun lwss() Pattern {
+    var r: [4]str;
+    r[0] = ".#..#";
+    r[1] = "#....";
+    r[2] = "#...#";
+    r[3] = "####.";
+    ret from_rows("lwss", 5, 4, ?r[0]);
+}
+
+# pulsar: the 13x13 period-three oscillator.
+fun pulsar() Pattern {
+    var r: [13]str;
+    r[0]  = "..###...###..";
+    r[1]  = ".............";
+    r[2]  = "#....#.#....#";
+    r[3]  = "#....#.#....#";
+    r[4]  = "#....#.#....#";
+    r[5]  = "..###...###..";
+    r[6]  = ".............";
+    r[7]  = "..###...###..";
+    r[8]  = "#....#.#....#";
+    r[9]  = "#....#.#....#";
+    r[10] = "#....#.#....#";
+    r[11] = ".............";
+    r[12] = "..###...###..";
+    ret from_rows("pulsar", 13, 13, ?r[0]);
+}
+
+# gun: the Gosper glider gun, a 36x9 emitter of gliders.
+fun gun() Pattern {
+    var r: [9]str;
+    r[0] = "........................#...........";
+    r[1] = "......................#.#...........";
+    r[2] = "............##......##............##";
+    r[3] = "...........#...#....##............##";
+    r[4] = "##........#.....#...##..............";
+    r[5] = "##........#...#.##....#.#...........";
+    r[6] = "..........#.....#.......#...........";
+    r[7] = "...........#...#....................";
+    r[8] = "............##......................";
+    ret from_rows("gosper gun", 36, 9, ?r[0]);
+}
+
+# builtin: the i-th built-in pattern, for i in [0, BUILTIN_COUNT).
+# ---
+# i:   built-in index
+# ret: the pattern (the gun for any out-of-range index)
+pub fun builtin(i: usize) Pattern {
+    if (i == 0) { ret glider(); }
+    if (i == 1) { ret blinker(); }
+    if (i == 2) { ret block(); }
+    if (i == 3) { ret beehive(); }
+    if (i == 4) { ret lwss(); }
+    if (i == 5) { ret pulsar(); }
+    ret gun();
+}
+
+# builtin_name: the display label of the i-th built-in, for dropdown options.
+# ---
+# i:   built-in index
+# ret: the label
+pub fun builtin_name(i: usize) str {
+    if (i == 0) { ret "glider"; }
+    if (i == 1) { ret "blinker"; }
+    if (i == 2) { ret "block"; }
+    if (i == 3) { ret "beehive"; }
+    if (i == 4) { ret "lwss"; }
+    if (i == 5) { ret "pulsar"; }
+    ret "gosper gun";
+}
+
+# stamp: place a pattern's live cells onto the grid, centered on cell (cx, cy).
+#
+# the pattern's top-left lands at (cx - w/2, cy - h/2); out-of-range cells wrap
+# toroidally to match the simulation's torus. only live pattern cells are written
+# (via sim.paint, keeping age/heat consistent); dead pattern cells leave the grid
+# untouched, so a stamp overlays rather than erases.
+# ---
+# s:  simulation to stamp onto
+# p:  pattern to place
+# cx: target column the pattern is centered on
+# cy: target row the pattern is centered on
+pub fun stamp(s: *sim.Sim, p: *Pattern, cx: usize, cy: usize) {
+    val gw: i64 = s.grid.w::i64;
+    val gh: i64 = s.grid.h::i64;
+    if (gw <= 0 || gh <= 0) { ret; }
+    val ox: i64 = cx::i64 - (p.w / 2)::i64;
+    val oy: i64 = cy::i64 - (p.h / 2)::i64;
+    var y: usize = 0;
+    for (y < p.h) {
+        var x: usize = 0;
+        for (x < p.w) {
+            if (get(p, x, y) != 0) {
+                var gx: i64 = (ox + x::i64) % gw;
+                if (gx < 0) { gx = gx + gw; }
+                var gy: i64 = (oy + y::i64) % gh;
+                if (gy < 0) { gy = gy + gh; }
+                sim.paint(s, gx::usize, gy::usize, 1);
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+test "pattern: stamping a glider sets exactly its five cells, centered" {
+    var a: allo.Allocator;
+    page.make(?a);
+
+    var s: sim.Sim;
+    if (sim.init(?s, ?a, 9, 9).has_value) { ret 1; }
+
+    var g: Pattern = glider();
+    # centered on (4,4): top-left at (4 - 1, 4 - 1) = (3, 3)
+    stamp(?s, ?g, 4, 4);
+
+    # the glider's live offsets, shifted by (3,3)
+    if (grid.get(?s.grid, 4, 3) != 1) { ret 1; }
+    if (grid.get(?s.grid, 5, 4) != 1) { ret 1; }
+    if (grid.get(?s.grid, 3, 5) != 1) { ret 1; }
+    if (grid.get(?s.grid, 4, 5) != 1) { ret 1; }
+    if (grid.get(?s.grid, 5, 5) != 1) { ret 1; }
+
+    # a dead pattern cell leaves the grid clear, and the live count is exactly five
+    if (grid.get(?s.grid, 3, 3) != 0) { ret 1; }
+    var live: usize = 0;
+    var y: usize = 0;
+    for (y < 9) {
+        var x: usize = 0;
+        for (x < 9) {
+            if (grid.get(?s.grid, x, y) != 0) { live = live + 1; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    if (live != 5) { ret 1; }
+
+    sim.dnit(?s);
+    ret 0;
+}
+
+test "pattern: editing the custom pattern toggles cells in place" {
+    var p: Pattern;
+    init(?p, 16, 16, "custom");
+    if (get(?p, 3, 4) != 0) { ret 1; }
+    set(?p, 3, 4, 1);
+    if (get(?p, 3, 4) != 1) { ret 1; }
+    clear(?p);
+    if (get(?p, 3, 4) != 0) { ret 1; }
+    # dimensions survive a clear
+    if (p.w != 16 || p.h != 16) { ret 1; }
+    ret 0;
+}

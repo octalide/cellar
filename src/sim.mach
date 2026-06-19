@@ -1,9 +1,10 @@
-# cellar.sim: the simulation — a grid, the active rule, and the controls that
+# cellar.sim: the simulation — a grid, the active kernel, and the controls that
 # advance, edit, and reset it.
 #
-# stepping reads the front buffer and writes the back buffer cell by cell, then
-# swaps, so a generation is computed atomically. painting and randomize edit the
-# front buffer directly.
+# stepping convolves the kernel footprint over the front buffer (toroidal wrap),
+# applies next_state into the back buffer, updates the per-cell age and heat
+# fields, then swaps. painting, randomize, and clear edit the front buffer
+# directly and keep the aux fields consistent.
 
 use std.types.size.usize;
 use std.types.string.str;
@@ -11,32 +12,36 @@ use std.types.option.Option;
 use allo: std.allocator;
 use page: std.allocator.page;
 use rand: std.rand;
-use grid: cellar.grid;
-use rule: cellar.rule;
+use grid:   cellar.grid;
+use kernel: cellar.kernel;
 
 # DEFAULT_W: default grid width in cells.
 pub val DEFAULT_W: usize = 120;
 # DEFAULT_H: default grid height in cells.
 pub val DEFAULT_H: usize = 120;
+# DEFAULT_DENSITY: live-cell probability used by randomize when none is given.
+pub val DEFAULT_DENSITY: f32 = 0.30;
+# DECAY: heat lost per step by a dead cell, giving fading trails.
+pub val DECAY: u8 = 12;
 
 # Sim: cellular-automaton simulation state.
 # ---
-# grid:       the double-buffered cell grid
-# rule:       the active Life-like rule
+# grid:       the double-buffered cell grid with aux fields
+# kernel:     the active weighted outer-totalistic kernel
 # rng:        PRNG used by randomize
 # generation: number of completed steps since the last clear/randomize
 # running:    1 while auto-stepping, else 0
-# preset:     index of the active rule preset
+# preset:     index of the active kernel preset
 pub rec Sim {
     grid:       grid.Grid;
-    rule:       rule.Rule;
+    kernel:     kernel.Kernel;
     rng:        rand.Rng;
     generation: u64;
     running:    u8;
     preset:     usize;
 }
 
-# init: allocate the grid and seed the simulation with the default rule.
+# init: allocate the grid and seed the simulation with the default kernel.
 # ---
 # s: simulation to initialize
 # a: allocator backing the grid
@@ -46,7 +51,7 @@ pub rec Sim {
 pub fun init(s: *Sim, a: *allo.Allocator, w: usize, h: usize) Option[str] {
     val e: Option[str] = grid.init(?s.grid, a, w, h);
     if (e.has_value) { ret e; }
-    s.rule       = rule.preset(0);
+    s.kernel     = kernel.preset(0);
     s.preset     = 0;
     s.rng        = rand.init();
     s.generation = 0;
@@ -54,25 +59,69 @@ pub fun init(s: *Sim, a: *allo.Allocator, w: usize, h: usize) Option[str] {
     ret e;
 }
 
-# free: release the simulation's grid.
+# dnit: release the simulation's grid.
 # ---
-# s: simulation to free
-pub fun free(s: *Sim) {
-    grid.free(?s.grid);
+# s:   simulation to deinitialize
+# ret: 0 on success, or the first negative errno from deallocation
+pub fun dnit(s: *Sim) i64 {
+    ret grid.dnit(?s.grid);
 }
 
-# step: advance one generation — apply the rule into the back buffer, then swap.
+# update_aux: refresh the age and heat of (x, y) for its next state.
+# ---
+# g:  grid carrying the aux fields
+# x:  column
+# y:  row
+# ns: the cell's next state (0 or 1)
+fun update_aux(g: *grid.Grid, x: usize, y: usize, ns: u8) {
+    if (ns != 0) {
+        grid.set_age(g, x, y, grid.age_at(g, x, y) + 1);
+        grid.set_heat(g, x, y, 255);
+    } or {
+        grid.set_age(g, x, y, 0);
+        var nh: i32 = grid.heat_at(g, x, y)::i32 - DECAY::i32;
+        if (nh < 0) { nh = 0; }
+        grid.set_heat(g, x, y, nh::u8);
+    }
+}
+
+# step: advance one generation — convolve the kernel into the back buffer, update
+# the aux fields, then swap.
 # ---
 # s: simulation
 pub fun step(s: *Sim) {
-    val g: *grid.Grid = ?s.grid;
+    val g: *grid.Grid    = ?s.grid;
+    val k: *kernel.Kernel = ?s.kernel;
+    val r:     i64 = k.radius::i64;
+    val width: i64 = (2 * k.radius + 1)::i64;
+    val w:     i64 = g.w::i64;
+    val h:     i64 = g.h::i64;
     var y: usize = 0;
     for (y < g.h) {
         var x: usize = 0;
         for (x < g.w) {
+            var sum: i32 = 0;
+            var dy: i64 = 0 - r;
+            for (dy <= r) {
+                var ny: i64 = (y::i64 + dy) % h;
+                if (ny < 0) { ny = ny + h; }
+                var dx: i64 = 0 - r;
+                for (dx <= r) {
+                    val wt: i32 = k.weights[((dy + r) * width + (dx + r))::usize];
+                    if (wt != 0) {
+                        var nx: i64 = (x::i64 + dx) % w;
+                        if (nx < 0) { nx = nx + w; }
+                        val al: u8 = g.cells[(ny * w + nx)::usize];
+                        sum = sum + wt * al::i32;
+                    }
+                    dx = dx + 1;
+                }
+                dy = dy + 1;
+            }
             val alive: u8 = grid.get(g, x, y);
-            val n:     u8 = grid.count_neighbors(g, x, y);
-            grid.set_back(g, x, y, rule.next_state(s.rule, alive, n));
+            val ns:    u8 = kernel.next_state(k, alive, sum);
+            grid.set_back(g, x, y, ns);
+            update_aux(g, x, y, ns);
             x = x + 1;
         }
         y = y + 1;
@@ -89,6 +138,19 @@ pub fun clear(s: *Sim) {
     s.generation = 0;
 }
 
+# resize: reallocate the grid to a new size, clearing it and resetting the count.
+# ---
+# s: simulation
+# w: new width in cells
+# h: new height in cells
+# ret: none on success, some(message) on allocation failure
+pub fun resize(s: *Sim, w: usize, h: usize) Option[str] {
+    val e: Option[str] = grid.resize(?s.grid, w, h);
+    if (e.has_value) { ret e; }
+    s.generation = 0;
+    ret e;
+}
+
 # randomize: fill the grid with live cells at the given density, reset the count.
 # ---
 # s:       simulation
@@ -96,7 +158,7 @@ pub fun clear(s: *Sim) {
 pub fun randomize(s: *Sim, density: f32) {
     val g: *grid.Grid = ?s.grid;
     var thresh: i64 = (density * 1000.0)::i64;
-    if (thresh < 0) { thresh = 0; }
+    if (thresh < 0)    { thresh = 0; }
     if (thresh > 1000) { thresh = 1000; }
     var y: usize = 0;
     for (y < g.h) {
@@ -105,6 +167,13 @@ pub fun randomize(s: *Sim, density: f32) {
             var v: u8 = 0;
             if (rand.range(?s.rng, 0, 1000) < thresh) { v = 1; }
             grid.set(g, x, y, v);
+            if (v != 0) {
+                grid.set_age(g, x, y, 1);
+                grid.set_heat(g, x, y, 255);
+            } or {
+                grid.set_age(g, x, y, 0);
+                grid.set_heat(g, x, y, 0);
+            }
             x = x + 1;
         }
         y = y + 1;
@@ -112,7 +181,7 @@ pub fun randomize(s: *Sim, density: f32) {
     s.generation = 0;
 }
 
-# paint: set the cell at (x, y) to v, ignoring out-of-bounds coordinates.
+# paint: set the cell at (x, y) to v, keeping its aux fields consistent.
 # ---
 # s: simulation
 # x: column
@@ -121,7 +190,15 @@ pub fun randomize(s: *Sim, density: f32) {
 pub fun paint(s: *Sim, x: usize, y: usize, v: u8) {
     if (x >= s.grid.w) { ret; }
     if (y >= s.grid.h) { ret; }
-    grid.set(?s.grid, x, y, v);
+    val g: *grid.Grid = ?s.grid;
+    grid.set(g, x, y, v);
+    if (v != 0) {
+        grid.set_age(g, x, y, 1);
+        grid.set_heat(g, x, y, 255);
+    } or {
+        grid.set_age(g, x, y, 0);
+        grid.set_heat(g, x, y, 0);
+    }
 }
 
 # toggle_running: flip between running and paused.
@@ -129,14 +206,6 @@ pub fun paint(s: *Sim, x: usize, y: usize, v: u8) {
 # s: simulation
 pub fun toggle_running(s: *Sim) {
     s.running = 1 - s.running;
-}
-
-# cycle_rule: advance to the next built-in rule preset, wrapping around.
-# ---
-# s: simulation
-pub fun cycle_rule(s: *Sim) {
-    s.preset = (s.preset + 1) % rule.PRESET_COUNT;
-    s.rule   = rule.preset(s.preset);
 }
 
 test "sim: a blinker oscillates with period two" {
@@ -163,6 +232,36 @@ test "sim: a blinker oscillates with period two" {
     if (grid.get(?s.grid, 1, 2) != 1) { ret 1; }
     if (grid.get(?s.grid, 3, 2) != 1) { ret 1; }
 
-    free(?s);
+    dnit(?s);
+    ret 0;
+}
+
+test "sim: age accumulates while alive and heat decays after death" {
+    var a: allo.Allocator;
+    page.make(?a);
+
+    var s: Sim;
+    if (init(?s, ?a, 5, 5).has_value) { ret 1; }
+
+    # a block is still life under Life, so its cells stay alive every step
+    paint(?s, 1, 1, 1);
+    paint(?s, 2, 1, 1);
+    paint(?s, 1, 2, 1);
+    paint(?s, 2, 2, 1);
+
+    step(?s);
+    step(?s);
+    if (grid.age_at(?s.grid, 1, 1) != 3) { ret 1; }
+    if (grid.heat_at(?s.grid, 1, 1) != 255) { ret 1; }
+
+    # an isolated cell dies; its heat must decay rather than vanish
+    paint(?s, 4, 4, 1);
+    if (grid.heat_at(?s.grid, 4, 4) != 255) { ret 1; }
+    step(?s);
+    if (grid.get(?s.grid, 4, 4) != 0) { ret 1; }
+    if (grid.age_at(?s.grid, 4, 4) != 0) { ret 1; }
+    if (grid.heat_at(?s.grid, 4, 4) != 255 - DECAY) { ret 1; }
+
+    dnit(?s);
     ret 0;
 }

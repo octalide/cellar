@@ -1,9 +1,10 @@
-# cellar.render: the world view — a camera that maps grid cells to screen
-# pixels, the grid-to-quad painter, and the inverse cursor-to-cell mapping the
-# editor uses for drawing.
+# cellar.render: the world view — a camera that maps grid cells to screen pixels,
+# the grid-to-quad painter, and the inverse cursor-to-cell mapping the editor uses.
 #
-# all geometry is emitted through blit as screen-space quads, so the cell grid
-# and the control panel share one vertex stream, one shader, and one texture.
+# all geometry is emitted through blit as screen-space quads, so the cell grid and
+# the control panel share one vertex stream, one shader, and one texture. cells
+# default to solid fills; a color mode picks how each cell is tinted (flat live
+# color, a fading heat trail, or an age-driven sin palette).
 
 use std.types.size.usize;
 use bd: blit.draw;
@@ -13,8 +14,17 @@ use grid: cellar.grid;
 
 # MARGIN: minimum gap in pixels between the fitted grid and the window edge.
 val MARGIN: f32 = 16.0;
-# GUTTER_AT: cells at least this many pixels wide get a 1px gap drawn between them.
-val GUTTER_AT: f32 = 4.0;
+
+# PI/TAU: constants for the sin approximation driving the age palette.
+val PI:  f32 = 3.14159265;
+val TAU: f32 = 6.28318531;
+
+# MODE_SOLID: live cells in a flat color, dead cells unpainted.
+pub val MODE_SOLID: u8 = 0;
+# MODE_HEAT: every cell with nonzero heat tinted through a fire palette, so trails fade.
+pub val MODE_HEAT: u8 = 1;
+# MODE_AGE_SIN: live cells colored by a sin-wave palette over age.
+pub val MODE_AGE_SIN: u8 = 2;
 
 # Camera: places the grid as a square of `cell`-pixel cells with its top-left
 # corner at (ox, oy) in screen space.
@@ -26,6 +36,63 @@ pub rec Camera {
     cell: f32;
     ox:   f32;
     oy:   f32;
+}
+
+# fabs: absolute value of an f32.
+# ---
+# v:   value
+# ret: |v|
+fun fabs(v: f32) f32 {
+    if (v < 0.0) { ret 0.0 - v; }
+    ret v;
+}
+
+# clamp01: clamp an f32 into [0, 1].
+# ---
+# v:   value
+# ret: v clamped to [0, 1]
+fun clamp01(v: f32) f32 {
+    if (v < 0.0) { ret 0.0; }
+    if (v > 1.0) { ret 1.0; }
+    ret v;
+}
+
+# sin_approx: low-precision sine via the classic parabolic approximation.
+# defined for non-negative radians; the age palette only ever feeds it x >= 0.
+# ---
+# x:   angle in radians, x >= 0
+# ret: an approximation of sin(x) in [-1, 1]
+fun sin_approx(x: f32) f32 {
+    # range-reduce into [0, TAU) without a loop, then shift to [-PI, PI)
+    val k: f32 = (x / TAU)::i64::f32;
+    var t: f32 = x - k * TAU;
+    if (t > PI) { t = t - TAU; }
+    # y = (4/PI) t - (4/PI^2) t|t|
+    ret 1.27323954 * t - 0.405284735 * t * fabs(t);
+}
+
+# heat_color: map a heat value to a black-red-orange-yellow-white fire ramp.
+# ---
+# heat: trail value in [1, 255]
+# ret:  the fill color
+fun heat_color(heat: u8) bd.Color {
+    val t: f32 = heat::f32 / 255.0;
+    val r: f32 = clamp01(t * 3.0);
+    val g: f32 = clamp01(t * 3.0 - 1.0);
+    val b: f32 = clamp01(t * 3.0 - 2.0);
+    ret bd.rgba(r, g, b, 1.0);
+}
+
+# age_color: map a cell age to a smoothly cycling sin-wave palette.
+# ---
+# age: generations the cell has been continuously alive
+# ret: the fill color
+fun age_color(age: u32) bd.Color {
+    val p: f32 = age::f32 * 0.15;
+    val r: f32 = 0.5 + 0.5 * sin_approx(p);
+    val g: f32 = 0.5 + 0.5 * sin_approx(p + 2.094395);
+    val b: f32 = 0.5 + 0.5 * sin_approx(p + 4.188790);
+    ret bd.rgba(r, g, b, 1.0);
 }
 
 # fit: a camera that scales the grid to fill the window (minus a margin),
@@ -85,12 +152,17 @@ pub fun cell_at(cam: Camera, g: *grid.Grid, px: f32, py: f32, cx: *usize, cy: *u
     ret 1;
 }
 
-# draw_grid: paint the dead-field backdrop and every live cell for this frame.
+# draw_grid: paint the dead-field backdrop and the cells for this frame.
 # ---
-# ctx: blit context accumulating the frame's geometry
-# s:   simulation whose grid is drawn
-# cam: the camera mapping cells to pixels
-pub fun draw_grid(ctx: *bc.Context, s: *sim.Sim, cam: Camera) {
+# ctx:    blit context accumulating the frame's geometry
+# s:      simulation whose grid is drawn
+# cam:    the camera mapping cells to pixels
+# mode:   color mode (MODE_SOLID, MODE_HEAT, or MODE_AGE_SIN)
+# gutter: 1 to leave a 1px gap between cells, 0 for solid fills
+# sr:     solid-mode live-cell red in [0, 1]
+# sg:     solid-mode live-cell green in [0, 1]
+# sb:     solid-mode live-cell blue in [0, 1]
+pub fun draw_grid(ctx: *bc.Context, s: *sim.Sim, cam: Camera, mode: u8, gutter: u8, sr: f32, sg: f32, sb: f32) {
     val g:  *grid.Grid = ?s.grid;
     val gw: f32 = g.w::f32;
     val gh: f32 = g.h::f32;
@@ -98,18 +170,37 @@ pub fun draw_grid(ctx: *bc.Context, s: *sim.Sim, cam: Camera) {
     val bg: bd.Color = bd.rgba(0.08, 0.09, 0.11, 1.0);
     bc.quad(ctx, cam.ox, cam.oy, cam.ox + gw * cam.cell, cam.oy + gh * cam.cell, bg);
 
-    var gutter: f32 = 0.0;
-    if (cam.cell >= GUTTER_AT) { gutter = 1.0; }
+    var gap: f32 = 0.0;
+    if (gutter != 0) { gap = 1.0; }
 
-    val live: bd.Color = bd.rgba(0.40, 0.85, 0.55, 1.0);
+    val live: bd.Color = bd.rgba(sr, sg, sb, 1.0);
     var y: usize = 0;
     for (y < g.h) {
         var x: usize = 0;
         for (x < g.w) {
-            if (grid.get(g, x, y) != 0) {
+            val alive: u8 = grid.get(g, x, y);
+            var paint: u8 = 0;
+            var col: bd.Color;
+            if (mode == MODE_HEAT) {
+                val hv: u8 = grid.heat_at(g, x, y);
+                if (hv != 0) {
+                    paint = 1;
+                    col   = heat_color(hv);
+                }
+            } or {
+                if (alive != 0) {
+                    paint = 1;
+                    if (mode == MODE_AGE_SIN) {
+                        col = age_color(grid.age_at(g, x, y));
+                    } or {
+                        col = live;
+                    }
+                }
+            }
+            if (paint != 0) {
                 val x0: f32 = cam.ox + x::f32 * cam.cell;
                 val y0: f32 = cam.oy + y::f32 * cam.cell;
-                bc.quad(ctx, x0, y0, x0 + cam.cell - gutter, y0 + cam.cell - gutter, live);
+                bc.quad(ctx, x0, y0, x0 + cam.cell - gap, y0 + cam.cell - gap, col);
             }
             x = x + 1;
         }
