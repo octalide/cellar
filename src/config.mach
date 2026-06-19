@@ -1,0 +1,206 @@
+# cellar.config: persist UI settings, the active kernel, and window layout
+# between runs as a single fixed-order line of integers under arrangements/.
+#
+# every value is stored as a non-negative integer — fractional fields are scaled
+# (speed x10, colors x255) and floats truncated — so one integer formatter and
+# one whitespace tokenizer cover the whole file, with no float parsing. the world
+# contents are not part of settings; use the arrangements window to save a world.
+
+use std.types.bool.bool;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.option.Option;
+use std.types.option.some;
+use std.types.option.none;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+use allo: std.allocator;
+use page: std.allocator.page;
+use fs:   std.filesystem;
+use sim:     cellar.sim;
+use kernel:  cellar.kernel;
+use app:     cellar.app;
+use persist: cellar.persist;
+use ui:      cellar.ui;
+
+# PATH: settings file, under the (gitignored) arrangements/ data directory.
+pub val PATH: str = "arrangements/cellar.config";
+
+# VERSION: settings-format version; a file with a different version is ignored.
+val VERSION: u64 = 1;
+# CAP: buffer size for the serialized settings line, ample for ~105 integers.
+val CAP: usize = 4096;
+# DIR_MODE / FILE_MODE: permission bits for the data dir and the settings file.
+val DIR_MODE:  i32 = 0o755;
+val FILE_MODE: i32 = 0o644;
+
+# wr: append v's decimal digits and a separating space to buf at off; ret the new
+# offset.
+fun wr(buf: *u8, off: usize, v: u64) usize {
+    var o: usize = ui.buf_u64(buf, off, v);
+    buf[o] = ' ';
+    ret o + 1;
+}
+
+# read_uint: skip non-digits from pos, parse a run of digits, advance pos past
+# them, and return the value (0 at end of input).
+fun read_uint(s: str, pos: *usize) usize {
+    var o: usize = @pos;
+    for (s[o] != 0 && (s[o] < '0' || s[o] > '9')) { o = o + 1; }
+    var v: usize = 0;
+    for (s[o] >= '0' && s[o] <= '9') {
+        v = v * 10 + (s[o] - '0')::usize;
+        o = o + 1;
+    }
+    @pos = o;
+    ret v;
+}
+
+# save: write the current settings, kernel, and window layout to path.
+# ---
+# a:  allocator backing the transient buffer
+# ap: application state to serialize
+# s:  simulation whose kernel is serialized
+# ret: none on success, some(message) on failure
+pub fun save(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) Option[str] {
+    fs.create_dir_all(a, persist.DIR, DIR_MODE);
+
+    val rc: Result[*u8, str] = allo.allocate[u8](a, CAP);
+    if (is_err[*u8, str](rc)) { ret some[str]("cellar.config: buffer allocation failed"); }
+    val buf: *u8 = unwrap_ok[*u8, str](rc);
+
+    var o: usize = 0;
+    o = wr(buf, o, VERSION);
+    o = wr(buf, o, (ap.speed * 10.0)::u64);
+    o = wr(buf, o, ap.mode::u64);
+    o = wr(buf, o, ap.gutter::u64);
+    o = wr(buf, o, ap.uncapped::u64);
+    o = wr(buf, o, ap.erase::u64);
+    o = wr(buf, o, ap.bounds_idx::u64);
+    o = wr(buf, o, ap.stamp_mode::u64);
+    o = wr(buf, o, ap.pattern_sel::u64);
+    o = wr(buf, o, (ap.solid_r * 255.0)::u64);
+    o = wr(buf, o, (ap.solid_g * 255.0)::u64);
+    o = wr(buf, o, (ap.solid_b * 255.0)::u64);
+    o = wr(buf, o, s.kernel.radius::u64);
+    o = wr(buf, o, s.kernel.birth);
+    o = wr(buf, o, s.kernel.survive);
+    var i: usize = 0;
+    for (i < 81) {
+        o = wr(buf, o, s.kernel.weights[i]::u64);
+        i = i + 1;
+    }
+    o = wr(buf, o, ap.world.x::u64);   o = wr(buf, o, ap.world.y::u64);   o = wr(buf, o, ap.world.open::u64);
+    o = wr(buf, o, ap.kedit.x::u64);   o = wr(buf, o, ap.kedit.y::u64);   o = wr(buf, o, ap.kedit.open::u64);
+    o = wr(buf, o, ap.arrange.x::u64); o = wr(buf, o, ap.arrange.y::u64); o = wr(buf, o, ap.arrange.open::u64);
+    buf[o] = '\n';
+    o = o + 1;
+
+    val wrr: Result[bool, str] = fs.write_file(path, buf, o, FILE_MODE);
+    allo.deallocate[u8](a, buf, CAP);
+    if (is_err[bool, str](wrr)) { ret some[str](unwrap_err[bool, str](wrr)); }
+    ret none[str]();
+}
+
+# load: read settings from path into ap and s.kernel, if the file exists and its
+# version matches. a missing file leaves the defaults untouched.
+# ---
+# a:  allocator for the read buffer
+# ap: application state to populate
+# s:  simulation whose kernel is populated
+# ret: none on success or absence, some(message) on a version mismatch
+pub fun load(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) Option[str] {
+    if (!fs.exists(path)) { ret none[str](); }
+
+    val rr: Result[str, str] = fs.read_all(a, path);
+    if (is_err[str, str](rr)) { ret some[str](unwrap_err[str, str](rr)); }
+    val data: str = unwrap_ok[str, str](rr);
+    val total: usize = str_len(data) + 1;
+
+    var p: usize = 0;
+    if (read_uint(data, ?p) != VERSION::usize) {
+        allo.deallocate[u8](a, data::ptr::*u8, total);
+        ret some[str]("cellar.config: version mismatch, ignored");
+    }
+
+    ap.speed      = read_uint(data, ?p)::f32 / 10.0;
+    ap.mode       = read_uint(data, ?p);
+    ap.gutter     = read_uint(data, ?p)::u8;
+    ap.uncapped   = read_uint(data, ?p)::u8;
+    ap.erase      = read_uint(data, ?p)::u8;
+    ap.bounds_idx = read_uint(data, ?p);
+    ap.stamp_mode = read_uint(data, ?p)::u8;
+    ap.pattern_sel = read_uint(data, ?p);
+    ap.solid_r    = read_uint(data, ?p)::f32 / 255.0;
+    ap.solid_g    = read_uint(data, ?p)::f32 / 255.0;
+    ap.solid_b    = read_uint(data, ?p)::f32 / 255.0;
+
+    var r: usize = read_uint(data, ?p);
+    if (r < 1)                { r = 1; }
+    if (r > kernel.MAX_RADIUS) { r = kernel.MAX_RADIUS; }
+    s.kernel.radius  = r;
+    s.kernel.birth   = read_uint(data, ?p)::u64;
+    s.kernel.survive = read_uint(data, ?p)::u64;
+    var i: usize = 0;
+    for (i < 81) {
+        s.kernel.weights[i] = read_uint(data, ?p)::i32;
+        i = i + 1;
+    }
+    s.kernel.name = "custom";
+
+    ap.world.x    = read_uint(data, ?p)::f32;
+    ap.world.y    = read_uint(data, ?p)::f32;
+    ap.world.open = read_uint(data, ?p)::u8;
+    ap.kedit.x    = read_uint(data, ?p)::f32;
+    ap.kedit.y    = read_uint(data, ?p)::f32;
+    ap.kedit.open = read_uint(data, ?p)::u8;
+    ap.arrange.x    = read_uint(data, ?p)::f32;
+    ap.arrange.y    = read_uint(data, ?p)::f32;
+    ap.arrange.open = read_uint(data, ?p)::u8;
+
+    allo.deallocate[u8](a, data::ptr::*u8, total);
+    ret none[str]();
+}
+
+test "config: settings survive a save/load round trip" {
+    var a: allo.Allocator;
+    page.make(?a);
+
+    var s: sim.Sim;
+    if (sim.init(?s, ?a, 8, 8).has_value) { ret 1; }
+
+    var ap: app.App;
+    app.init(?ap);
+    ap.speed    = 30.0;
+    ap.mode     = 2;
+    ap.uncapped = 1;
+    ap.solid_r  = 1.0;
+    ap.solid_g  = 0.0;
+    ap.solid_b  = 0.5;
+    ap.kedit.open = 1;
+    s.kernel.birth = 42;
+
+    val path: str = "arrangements/test_config.cells";
+    if (save(?a, ?ap, ?s, path).has_value) { ret 1; }
+
+    var bp: app.App;
+    app.init(?bp);
+    var t: sim.Sim;
+    if (sim.init(?t, ?a, 2, 2).has_value) { ret 1; }
+    if (load(?a, ?bp, ?t, path).has_value) { ret 1; }
+
+    if (bp.mode != 2) { ret 1; }
+    if (bp.uncapped != 1) { ret 1; }
+    if (bp.kedit.open != 1) { ret 1; }
+    if (t.kernel.birth != 42) { ret 1; }
+    # speed x10 and color x255 round-trip within the quantization step
+    if (bp.speed < 29.0 || bp.speed > 31.0) { ret 1; }
+
+    fs.unlink(path);
+    sim.dnit(?s);
+    sim.dnit(?t);
+    ret 0;
+}

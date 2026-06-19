@@ -3,7 +3,8 @@
 # each cell holds 0 (dead) or 1 (alive). a back buffer receives the next
 # generation so a step never reads its own writes; swap() exchanges the front
 # and back pointers in O(1). neighbor counts wrap at the edges, so the world is
-# a torus.
+# a torus. two position-indexed auxiliary fields track per-cell history for the
+# renderer: age (generations continuously alive) and heat (a fading trail value).
 
 use std.types.size.usize;
 use std.types.string.str;
@@ -16,25 +17,29 @@ use std.types.result.unwrap_ok;
 use allo: std.allocator;
 use page: std.allocator.page;
 
-# Grid: a w x h grid of u8 cells with a parallel back buffer.
+# Grid: a w x h grid of u8 cells with a parallel back buffer and aux fields.
 # ---
 # cells: front buffer, row-major, length w*h
 # back:  back buffer for the next generation, same length
+# age:   per-cell generations continuously alive, 0 when dead, length w*h
+# heat:  per-cell trail value, 255 while alive and decaying after death, length w*h
 # w:     width in cells
 # h:     height in cells
-# a:     allocator backing both buffers
+# a:     allocator backing every buffer
 pub rec Grid {
     cells: *u8;
     back:  *u8;
+    age:   *u32;
+    heat:  *u8;
     w:     usize;
     h:     usize;
     a:     *allo.Allocator;
 }
 
-# init: allocate a zeroed w x h grid and its back buffer.
+# init: allocate a zeroed w x h grid, its back buffer, and the aux fields.
 # ---
 # g: grid to initialize
-# a: allocator backing both buffers
+# a: allocator backing every buffer
 # w: width in cells (must be > 0)
 # h: height in cells (must be > 0)
 # ret: none on success, some(message) on allocation failure
@@ -47,23 +52,72 @@ pub fun init(g: *Grid, a: *allo.Allocator, w: usize, h: usize) Option[str] {
         allo.deallocate[u8](a, unwrap_ok[*u8, str](rc), n);
         ret some[str]("cellar.grid.init: back allocation failed");
     }
+    val rg: Result[*u32, str] = allo.zallocate[u32](a, n);
+    if (is_err[*u32, str](rg)) {
+        allo.deallocate[u8](a, unwrap_ok[*u8, str](rc), n);
+        allo.deallocate[u8](a, unwrap_ok[*u8, str](rb), n);
+        ret some[str]("cellar.grid.init: age allocation failed");
+    }
+    val rh: Result[*u8, str] = allo.zallocate[u8](a, n);
+    if (is_err[*u8, str](rh)) {
+        allo.deallocate[u8](a, unwrap_ok[*u8, str](rc), n);
+        allo.deallocate[u8](a, unwrap_ok[*u8, str](rb), n);
+        allo.deallocate[u32](a, unwrap_ok[*u32, str](rg), n);
+        ret some[str]("cellar.grid.init: heat allocation failed");
+    }
     g.cells = unwrap_ok[*u8, str](rc);
     g.back  = unwrap_ok[*u8, str](rb);
+    g.age   = unwrap_ok[*u32, str](rg);
+    g.heat  = unwrap_ok[*u8, str](rh);
     g.w = w;
     g.h = h;
     g.a = a;
     ret none[str]();
 }
 
-# free: release both buffers and null the pointers.
+# dnit: release every buffer and null the pointers.
 # ---
-# g: grid to free
-pub fun free(g: *Grid) {
+# g:   grid to deinitialize
+# ret: 0 on success, or the first negative errno from deallocation
+pub fun dnit(g: *Grid) i64 {
     val n: usize = g.w * g.h;
-    allo.deallocate[u8](g.a, g.cells, n);
-    allo.deallocate[u8](g.a, g.back, n);
+    var rc: i64 = 0;
+    var e:  i64 = 0;
+    e = allo.deallocate[u8](g.a, g.cells, n);
+    if (e != 0 && rc == 0) { rc = e; }
+    e = allo.deallocate[u8](g.a, g.back, n);
+    if (e != 0 && rc == 0) { rc = e; }
+    e = allo.deallocate[u32](g.a, g.age, n);
+    if (e != 0 && rc == 0) { rc = e; }
+    e = allo.deallocate[u8](g.a, g.heat, n);
+    if (e != 0 && rc == 0) { rc = e; }
     g.cells = nil;
-    g.back = nil;
+    g.back  = nil;
+    g.age   = nil;
+    g.heat  = nil;
+    ret rc;
+}
+
+# resize: reallocate every buffer to a new w x h, clearing all state. the new
+# buffers are allocated before the old ones are freed, so a failed allocation
+# leaves the existing grid fully intact rather than nil.
+# ---
+# g: grid to resize
+# w: new width in cells (must be > 0)
+# h: new height in cells (must be > 0)
+# ret: none on success, some(message) on allocation failure
+pub fun resize(g: *Grid, w: usize, h: usize) Option[str] {
+    var ng: Grid;
+    val e: Option[str] = init(?ng, g.a, w, h);
+    if (e.has_value) { ret e; }
+    dnit(g);
+    g.cells = ng.cells;
+    g.back  = ng.back;
+    g.age   = ng.age;
+    g.heat  = ng.heat;
+    g.w     = ng.w;
+    g.h     = ng.h;
+    ret none[str]();
 }
 
 # get: the front-buffer cell at (x, y). caller guarantees x < w and y < h.
@@ -94,6 +148,46 @@ pub fun set(g: *Grid, x: usize, y: usize, v: u8) {
 # v: new value (0 or 1)
 pub fun set_back(g: *Grid, x: usize, y: usize, v: u8) {
     g.back[y * g.w + x] = v;
+}
+
+# age_at: the age of the cell at (x, y).
+# ---
+# g: grid
+# x: column in [0, w)
+# y: row in [0, h)
+# ret: generations the cell has been continuously alive, 0 when dead
+pub fun age_at(g: *Grid, x: usize, y: usize) u32 {
+    ret g.age[y * g.w + x];
+}
+
+# set_age: write the age of the cell at (x, y).
+# ---
+# g: grid
+# x: column in [0, w)
+# y: row in [0, h)
+# v: new age value
+pub fun set_age(g: *Grid, x: usize, y: usize, v: u32) {
+    g.age[y * g.w + x] = v;
+}
+
+# heat_at: the heat of the cell at (x, y).
+# ---
+# g: grid
+# x: column in [0, w)
+# y: row in [0, h)
+# ret: trail value in [0, 255]
+pub fun heat_at(g: *Grid, x: usize, y: usize) u8 {
+    ret g.heat[y * g.w + x];
+}
+
+# set_heat: write the heat of the cell at (x, y).
+# ---
+# g: grid
+# x: column in [0, w)
+# y: row in [0, h)
+# v: new heat value
+pub fun set_heat(g: *Grid, x: usize, y: usize, v: u8) {
+    g.heat[y * g.w + x] = v;
 }
 
 # count_neighbors: live cells among the 8 toroidal neighbors of (x, y).
@@ -130,7 +224,7 @@ pub fun swap(g: *Grid) {
     g.back  = t;
 }
 
-# clear: set every front-buffer cell to 0.
+# clear: zero every front-buffer cell and both aux fields.
 # ---
 # g: grid
 pub fun clear(g: *Grid) {
@@ -138,6 +232,8 @@ pub fun clear(g: *Grid) {
     var i: usize = 0;
     for (i < n) {
         g.cells[i] = 0;
+        g.age[i]   = 0;
+        g.heat[i]  = 0;
         i = i + 1;
     }
 }
@@ -156,6 +252,28 @@ test "grid: toroidal neighbor count wraps at the corners" {
     # (2, 2) is the one cell with no wrapped adjacency to the corner
     if (count_neighbors(?g, 2, 2) != 0) { ret 1; }
 
-    free(?g);
+    dnit(?g);
+    ret 0;
+}
+
+test "grid: aux fields are addressable and survive a resize" {
+    var a: allo.Allocator;
+    page.make(?a);
+
+    var g: Grid;
+    if (init(?g, ?a, 3, 3).has_value) { ret 1; }
+
+    set_age(?g, 1, 1, 7);
+    set_heat(?g, 1, 1, 200);
+    if (age_at(?g, 1, 1) != 7) { ret 1; }
+    if (heat_at(?g, 1, 1) != 200) { ret 1; }
+
+    if (resize(?g, 5, 2).has_value) { ret 1; }
+    if (g.w != 5 || g.h != 2) { ret 1; }
+    # resize clears, so the aux fields read back zero at the new dimensions
+    if (age_at(?g, 4, 1) != 0) { ret 1; }
+    if (heat_at(?g, 4, 1) != 0) { ret 1; }
+
+    dnit(?g);
     ret 0;
 }

@@ -1,0 +1,181 @@
+# cellar.kedit: the kernel-editor window.
+#
+# edits the simulation's live kernel in place: a preset quick-load, radius
+# controls, a clickable weight grid (each cell cycles its integer weight), and
+# birth/survive bit toggles over the reachable weighted sums. any edit relabels
+# the kernel "custom".
+
+use std.types.size.usize;
+use std.types.string.str;
+use bc: blit.context;
+use bw: blit.widget;
+use bi: blit.input;
+use bd: blit.draw;
+use sim:    cellar.sim;
+use kernel: cellar.kernel;
+use app:    cellar.app;
+use ui:     cellar.ui;
+
+# CELL: weight-grid cell size in pixels.
+val CELL: f32 = 18.0;
+# TOG: birth/survive toggle square size in pixels.
+val TOG: f32 = 16.0;
+# PAD: spacing matching blit's widget padding.
+val PAD: f32 = 4.0;
+# MAXW: weights cycle through 0..MAXW on click.
+val MAXW: i32 = 4;
+# TOGS_PER_ROW: birth/survive toggles before wrapping to a new row.
+val TOGS_PER_ROW: usize = 9;
+# TITLE_H: titlebar height for bounding a collapsed window.
+val TITLE_H: f32 = 16.0;
+
+# clear_weights: zero every footprint weight.
+fun clear_weights(k: *kernel.Kernel) {
+    var i: usize = 0;
+    for (i < 81) { k.weights[i] = 0; i = i + 1; }
+    k.name = "custom";
+}
+
+# moore_ones: set every non-center footprint cell to weight 1.
+fun moore_ones(k: *kernel.Kernel) {
+    clear_weights(k);
+    val r: i64 = k.radius::i64;
+    var dy: i64 = 0 - r;
+    for (dy <= r) {
+        var dx: i64 = 0 - r;
+        for (dx <= r) {
+            if (dx != 0 || dy != 0) { kernel.set_weight(k, dx, dy, 1); }
+            dx = dx + 1;
+        }
+        dy = dy + 1;
+    }
+    k.name = "custom";
+}
+
+# draw_weights: render the clickable weight grid at the layout cursor, then
+# advance the cursor below it. each cell cycles its weight 0..MAXW on click.
+fun draw_weights(ctx: *bc.Context, k: *kernel.Kernel) {
+    val r:  i64 = k.radius::i64;
+    val n:  i64 = 2 * r + 1;
+    val x0: f32 = ctx.cx;
+    val y0: f32 = ctx.cy;
+
+    var dy: i64 = 0 - r;
+    for (dy <= r) {
+        var dx: i64 = 0 - r;
+        for (dx <= r) {
+            val cx0: f32 = x0 + (dx + r)::f32 * CELL;
+            val cy0: f32 = y0 + (dy + r)::f32 * CELL;
+            val cx1: f32 = cx0 + CELL - 1.0;
+            val cy1: f32 = cy0 + CELL - 1.0;
+
+            val wv: i32 = kernel.weight_at(k, dx, dy);
+            var t:  f32 = wv::f32 / MAXW::f32;
+            if (t > 1.0) { t = 1.0; }
+            bc.quad(ctx, cx0, cy0, cx1, cy1, bd.rgba(0.12 + 0.45 * t, 0.16 + 0.55 * t, 0.20 + 0.20 * t, 1.0));
+            bc.glyph(ctx, '0' + wv::u8, cx0 + (CELL - 8.0) / 2.0, cy0 + (CELL - 8.0) / 2.0, bd.rgba(0.95, 0.95, 1.0, 1.0));
+
+            if (bw.region_clicked(ctx, cx0, cy0, cx1, cy1) != 0) {
+                var nv: i32 = wv + 1;
+                if (nv > MAXW) { nv = 0; }
+                kernel.set_weight(k, dx, dy, nv);
+                k.name = "custom";
+            }
+            dx = dx + 1;
+        }
+        dy = dy + 1;
+    }
+
+    ctx.cy = y0 + n::f32 * CELL + PAD;
+    ctx.cx = ctx.ox;
+}
+
+# draw_toggle_row: render one wrapped row of sum bits (birth or survive) at the
+# layout cursor and advance below it. clicking a square flips that sum's bit.
+fun draw_toggle_row(ctx: *bc.Context, ch: u8, k: *kernel.Kernel, is_birth: u8, ms: i32) {
+    val x0: f32 = ctx.cx;
+    val y0: f32 = ctx.cy;
+    val rowstart: f32 = x0 + 14.0;
+
+    bc.glyph(ctx, ch, x0, y0 + (TOG - 8.0) / 2.0, bd.rgba(0.92, 0.92, 0.95, 1.0));
+
+    val count:  usize = (ms + 1)::usize;
+    var maxrow: usize = 0;
+    var i: usize = 0;
+    for (i < count) {
+        val rr: usize = i / TOGS_PER_ROW;
+        val cc: usize = i % TOGS_PER_ROW;
+        val bx0: f32 = rowstart + cc::f32 * TOG;
+        val by0: f32 = y0 + rr::f32 * TOG;
+        val bx1: f32 = bx0 + TOG - 2.0;
+        val by1: f32 = by0 + TOG - 2.0;
+
+        var set: u8 = kernel.has_bit(k.survive, i);
+        if (is_birth != 0) { set = kernel.has_bit(k.birth, i); }
+        var col: bd.Color = bd.rgba(0.15, 0.16, 0.20, 1.0);
+        if (set != 0) { col = bd.rgba(0.45, 0.80, 0.55, 1.0); }
+        bc.quad(ctx, bx0, by0, bx1, by1, col);
+        if (i < 10) {
+            bc.glyph(ctx, '0' + i::u8, bx0 + (TOG - 2.0 - 8.0) / 2.0, by0 + (TOG - 2.0 - 8.0) / 2.0, bd.rgba(0.92, 0.92, 0.95, 1.0));
+        }
+
+        if (bw.region_clicked(ctx, bx0, by0, bx1, by1) != 0) {
+            if (is_birth != 0) { k.birth = kernel.toggle_bit(k.birth, i); }
+            or { k.survive = kernel.toggle_bit(k.survive, i); }
+            k.name = "custom";
+        }
+
+        if (rr > maxrow) { maxrow = rr; }
+        i = i + 1;
+    }
+
+    ctx.cy = y0 + (maxrow + 1)::f32 * TOG + PAD;
+    ctx.cx = ctx.ox;
+}
+
+# draw: lay out the kernel-editor window, apply edits to the sim's kernel, and
+# report whether the cursor lies within the window this frame.
+# ---
+# ctx: blit context for this frame
+# a:   application state
+# s:   simulation whose kernel is edited
+# ret: 1 if the cursor is over the window, else 0
+pub fun draw(ctx: *bc.Context, a: *app.App, s: *sim.Sim) u8 {
+    val handle: usize = bw.begin_window(ctx, ?a.kedit);
+
+    if (a.kedit.open != 0) {
+        val k: *kernel.Kernel = ?s.kernel;
+
+        var presets: [4]str;
+        presets[0] = "life";
+        presets[1] = "highlife";
+        presets[2] = "seeds";
+        presets[3] = "day&night";
+        if (bw.dropdown(ctx, "preset", ?a.preset_sel, ?presets[0], 4) != 0) {
+            s.kernel = kernel.preset(a.preset_sel);
+        }
+
+        var rl: [16]u8;
+        var ro: usize = ui.buf_str(?rl[0], 0, "radius ");
+        ro = ui.buf_u64(?rl[0], ro, k.radius::u64);
+        rl[ro] = 0;
+        bw.text(ctx, (?rl[0])::*u8::str);
+        if (bw.button(ctx, "radius -")) { if (k.radius > 1)                { kernel.set_radius(k, k.radius - 1); } }
+        if (bw.button(ctx, "radius +")) { if (k.radius < kernel.MAX_RADIUS) { kernel.set_radius(k, k.radius + 1); } }
+
+        draw_weights(ctx, k);
+
+        if (bw.button(ctx, "clear weights")) { clear_weights(k); }
+        if (bw.button(ctx, "moore 1s"))      { moore_ones(k); }
+
+        val ms: i32 = kernel.max_sum(k);
+        draw_toggle_row(ctx, 'B', k, 1, ms);
+        draw_toggle_row(ctx, 'S', k, 0, ms);
+    }
+
+    var y1: f32 = a.kedit.y + TITLE_H;
+    if (a.kedit.open != 0) { y1 = ctx.cy + PAD; }
+    bw.end_window(ctx, ?a.kedit, handle);
+
+    ret bi.in_rect(ctx.in, a.kedit.x, a.kedit.y, a.kedit.x + a.kedit.w, y1);
+}

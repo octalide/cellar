@@ -1,12 +1,13 @@
 # cellar — an interactive cellular-automata editor and visualizer.
 #
-# a double-buffered Life-like grid is simulated on the CPU and drawn as
-# screen-space quads through blit, which also renders the control panel over the
-# same vertex stream. the keyboard and a blit panel drive the same actions;
-# the mouse paints cells directly onto the grid.
+# a double-buffered weighted outer-totalistic grid is simulated on the CPU and
+# drawn as screen-space quads through blit, which also renders the control
+# windows over the same vertex stream. the left mouse paints cells (or erases
+# when the erase toggle is on), the right mouse drags the view.
 #
-#   space play/pause   S step   C clear   R randomize   N next rule
-#   LMB draw   RMB erase   scroll zoom   arrows pan   Esc quit
+#   space play/pause   S step   C clear   R randomize   M color mode
+#   LMB paint   RMB drag pan   scroll zoom   arrows pan
+#   Tab hide UI   F11 fullscreen   Esc quit
 
 use std.types.size.usize;
 use std.types.string.str;
@@ -24,10 +25,15 @@ use bd: blit.draw;
 use bf: blit.font;
 use bi: blit.input;
 use bc: blit.context;
-use sim:     cellar.sim;
-use render:  cellar.render;
-use ui:      cellar.ui;
-use shaders: cellar.shaders;
+use sim:      cellar.sim;
+use render:   cellar.render;
+use ui:       cellar.ui;
+use app:      cellar.app;
+use worldwin: cellar.worldwin;
+use kedit:    cellar.kedit;
+use arrange:  cellar.arrange;
+use config:   cellar.config;
+use shaders:  cellar.shaders;
 
 # PAN_STEP: pixels the view pans per frame while an arrow key is held.
 val PAN_STEP: f32 = 12.0;
@@ -36,8 +42,15 @@ val ZOOM_STEP: f32 = 0.1;
 # ZOOM_MIN/ZOOM_MAX: clamp on the user zoom multiplier.
 val ZOOM_MIN: f32 = 0.25;
 val ZOOM_MAX: f32 = 16.0;
-# MAX_STEPS_PER_FRAME: caps catch-up stepping so a slow frame cannot spiral.
+# MAX_STEPS_PER_FRAME: caps capped-mode catch-up so a slow frame cannot spiral.
 val MAX_STEPS_PER_FRAME: i32 = 16;
+# UNCAPPED_BUDGET: seconds of wall-clock spent stepping per frame when uncapped.
+# sized to keep a core busy between vsync waits without starving render/input.
+val UNCAPPED_BUDGET: f64 = 0.012;
+# UNCAPPED_MAX: hard ceiling on steps per uncapped frame, a runaway backstop.
+val UNCAPPED_MAX: i32 = 100000;
+# ICON: side length in pixels of the restore icon shown while the UI is hidden.
+val ICON: f32 = 26.0;
 
 fun on_error(code: i32, desc: *u8) {
     print.eprintf("glfw error 0x%x: %s\n", code::u64, desc);
@@ -45,16 +58,44 @@ fun on_error(code: i32, desc: *u8) {
 
 fun on_key(handle: ptr, key: i32, scancode: i32, action: i32, mods: i32) {
     if (action != glfw.PRESS) { ret; }
-    if (key == glfw.KEY_ESCAPE) { ui.g_quit   = 1; }
-    if (key == glfw.KEY_SPACE)  { ui.g_toggle = 1; }
-    if (key == glfw.KEY_S)      { ui.g_step   = 1; }
-    if (key == glfw.KEY_C)      { ui.g_clear  = 1; }
-    if (key == glfw.KEY_R)      { ui.g_random = 1; }
-    if (key == glfw.KEY_N)      { ui.g_rule   = 1; }
+    if (key == glfw.KEY_ESCAPE) { ui.g_quit       = 1; }
+    if (key == glfw.KEY_SPACE)  { ui.g_toggle     = 1; }
+    if (key == glfw.KEY_S)      { ui.g_step       = 1; }
+    if (key == glfw.KEY_C)      { ui.g_clear      = 1; }
+    if (key == glfw.KEY_R)      { ui.g_random     = 1; }
+    if (key == glfw.KEY_M)      { ui.g_mode       = 1; }
+    if (key == glfw.KEY_TAB)    { ui.g_tab        = 1; }
+    if (key == glfw.KEY_F11)    { ui.g_fullscreen = 1; }
 }
 
 fun on_scroll(handle: ptr, xoff: f64, yoff: f64) {
     ui.g_scroll = ui.g_scroll + yoff::f32;
+}
+
+# toggle_fullscreen: switch between windowed and borderless monitor fullscreen.
+# windowed placement is saved on the way out and restored on the way back. a
+# missing primary monitor or video mode leaves the window untouched.
+# ---
+# w:     the window
+# is_fs: in/out — 1 while fullscreen, 0 while windowed
+# wx:    in/out — saved windowed x position
+# wy:    in/out — saved windowed y position
+# ww:    in/out — saved windowed width
+# wh:    in/out — saved windowed height
+fun toggle_fullscreen(w: glfw.Window, is_fs: *u8, wx: *i32, wy: *i32, ww: *i32, wh: *i32) {
+    if (@is_fs == 0) {
+        val m: glfw.Monitor = glfw.get_primary_monitor();
+        if (!glfw.monitor_is_valid(m)) { ret; }
+        val vm: *glfw.Vidmode = glfw.get_video_mode(m);
+        if (vm == nil) { ret; }
+        glfw.get_window_pos(w, wx, wy);
+        glfw.get_window_size(w, ww, wh);
+        glfw.set_window_monitor(w, m, 0, 0, vm.width, vm.height, vm.refreshRate);
+        @is_fs = 1;
+    } or {
+        glfw.set_window_monitor(w, glfw.no_monitor(), @wx, @wy, @ww, @wh, 0);
+        @is_fs = 0;
+    }
 }
 
 $main.symbol = "main";
@@ -63,18 +104,24 @@ fun main(argc: i64, argv: **u8) i64 {
     page.make(?a);
     var pa: *allo.Allocator = ?a;
 
+    var app_state: app.App;
+    app.init(?app_state);
+
     var s: sim.Sim;
-    val ie: Option[str] = sim.init(?s, pa, sim.DEFAULT_W, sim.DEFAULT_H);
-    if (is_some[str](ie)) {
-        print.eprintf("sim init failed: %s\n", unwrap[str](ie));
+    if (is_some[str](sim.init(?s, pa, sim.DEFAULT_W, sim.DEFAULT_H))) {
+        print.eprintln("sim init failed");
         ret 1;
     }
-    sim.randomize(?s, 0.30);
+    # restore saved settings, kernel, and window layout before sizing the world
+    config.load(pa, ?app_state, ?s, config.PATH);
+    val side: usize = app.bounds_size(app_state.bounds_idx);
+    sim.resize(?s, side, side);
+    sim.randomize(?s, sim.DEFAULT_DENSITY);
 
     glfw.set_error_callback(on_error);
     if (!glfw.init()) {
         print.eprintln("failed to initialize GLFW");
-        sim.free(?s);
+        sim.dnit(?s);
         ret 1;
     }
     glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 3);
@@ -86,7 +133,7 @@ fun main(argc: i64, argv: **u8) i64 {
     if (!glfw.window_is_valid(w)) {
         print.eprintln("failed to create window");
         glfw.terminate();
-        sim.free(?s);
+        sim.dnit(?s);
         ret 1;
     }
     glfw.make_context_current(w);
@@ -94,21 +141,18 @@ fun main(argc: i64, argv: **u8) i64 {
     glfw.set_key_callback(w, on_key);
     glfw.set_scroll_callback(w, on_scroll);
 
-    val resolved: i64 = gl.load(glfw.get_proc_address);
-    print.printf("cellar: loaded %d GL commands\n", resolved);
-    print.println("space play/pause | S step | C clear | R randomize | N rule | LMB draw | RMB erase | scroll zoom | arrows pan | Esc quit");
+    gl.load(glfw.get_proc_address);
 
-    val ae: Option[str] = bf.build_atlas(pa);
-    if (is_some[str](ae)) {
-        print.eprintf("atlas build failed: %s\n", unwrap[str](ae));
+    if (is_some[str](bf.build_atlas(pa))) {
+        print.eprintln("atlas build failed");
         glfw.terminate();
-        sim.free(?s);
+        sim.dnit(?s);
         ret 1;
     }
     val prog: u32 = shaders.load_program(pa, "src/shaders/ui.vert", "src/shaders/ui.frag");
     if (prog == 0) {
         glfw.terminate();
-        sim.free(?s);
+        sim.dnit(?s);
         ret 1;
     }
     val u_screen: i32 = gl.get_uniform_location(prog, "uScreen");
@@ -138,55 +182,73 @@ fun main(argc: i64, argv: **u8) i64 {
     if (is_some[str](bc.init(?ctx, pa))) {
         print.eprintln("blit context init failed");
         glfw.terminate();
-        sim.free(?s);
+        sim.dnit(?s);
         ret 1;
     }
 
     gl.enable(gl.BLEND);
     gl.blend_func(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 
-    var speed:     f32 = 12.0;
-    var density:   f32 = 0.30;
-    var zoom:      f32 = 1.0;
-    var pan_x:     f32 = 0.0;
-    var pan_y:     f32 = 0.0;
     var acc:       f64 = 0.0;
     var last_step: f64 = glfw.get_time();
+
+    var is_fs: u8  = 0;
+    var win_x: i32 = 0;
+    var win_y: i32 = 0;
+    var win_w: i32 = 0;
+    var win_h: i32 = 0;
+
+    var rb_prev: u8  = 0;
+    var rb_px:   f32 = 0.0;
+    var rb_py:   f32 = 0.0;
 
     for (!glfw.window_should_close(w)) {
         glfw.poll_events();
 
-        if (ui.g_quit   != 0) { glfw.set_window_should_close(w, true); ui.g_quit   = 0; }
-        if (ui.g_toggle != 0) { sim.toggle_running(?s);                ui.g_toggle = 0; }
-        if (ui.g_step   != 0) { sim.step(?s);                          ui.g_step   = 0; }
-        if (ui.g_clear  != 0) { sim.clear(?s);                         ui.g_clear  = 0; }
-        if (ui.g_random != 0) { sim.randomize(?s, density);           ui.g_random = 0; }
-        if (ui.g_rule   != 0) { sim.cycle_rule(?s);                    ui.g_rule   = 0; }
+        if (ui.g_quit       != 0) { glfw.set_window_should_close(w, true);           ui.g_quit       = 0; }
+        if (ui.g_toggle     != 0) { sim.toggle_running(?s);                          ui.g_toggle     = 0; }
+        if (ui.g_step       != 0) { sim.step(?s);                                    ui.g_step       = 0; }
+        if (ui.g_clear      != 0) { sim.clear(?s);                                   ui.g_clear      = 0; }
+        if (ui.g_random     != 0) { sim.randomize(?s, sim.DEFAULT_DENSITY);          ui.g_random     = 0; }
+        if (ui.g_mode       != 0) { app_state.mode = (app_state.mode + 1) % app.MODE_COUNT; ui.g_mode = 0; }
+        if (ui.g_tab        != 0) { app_state.ui_visible = 1 - app_state.ui_visible; ui.g_tab        = 0; }
+        if (ui.g_fullscreen != 0) { toggle_fullscreen(w, ?is_fs, ?win_x, ?win_y, ?win_w, ?win_h); ui.g_fullscreen = 0; }
 
         if (ui.g_scroll != 0.0) {
-            zoom = zoom + ui.g_scroll * ZOOM_STEP;
-            if (zoom < ZOOM_MIN) { zoom = ZOOM_MIN; }
-            if (zoom > ZOOM_MAX) { zoom = ZOOM_MAX; }
+            app_state.zoom = app_state.zoom + ui.g_scroll * ZOOM_STEP;
+            if (app_state.zoom < ZOOM_MIN) { app_state.zoom = ZOOM_MIN; }
+            if (app_state.zoom > ZOOM_MAX) { app_state.zoom = ZOOM_MAX; }
             ui.g_scroll = 0.0;
         }
 
-        if (glfw.get_key(w, glfw.KEY_LEFT)  == glfw.PRESS) { pan_x = pan_x + PAN_STEP; }
-        if (glfw.get_key(w, glfw.KEY_RIGHT) == glfw.PRESS) { pan_x = pan_x - PAN_STEP; }
-        if (glfw.get_key(w, glfw.KEY_UP)    == glfw.PRESS) { pan_y = pan_y + PAN_STEP; }
-        if (glfw.get_key(w, glfw.KEY_DOWN)  == glfw.PRESS) { pan_y = pan_y - PAN_STEP; }
+        if (glfw.get_key(w, glfw.KEY_LEFT)  == glfw.PRESS) { app_state.pan_x = app_state.pan_x + PAN_STEP; }
+        if (glfw.get_key(w, glfw.KEY_RIGHT) == glfw.PRESS) { app_state.pan_x = app_state.pan_x - PAN_STEP; }
+        if (glfw.get_key(w, glfw.KEY_UP)    == glfw.PRESS) { app_state.pan_y = app_state.pan_y + PAN_STEP; }
+        if (glfw.get_key(w, glfw.KEY_DOWN)  == glfw.PRESS) { app_state.pan_y = app_state.pan_y - PAN_STEP; }
 
         val now: f64 = glfw.get_time();
         val dt:  f64 = now - last_step;
         last_step = now;
         if (s.running != 0) {
-            acc = acc + dt;
-            val interval: f64 = 1.0 / speed::f64;
-            var budget: i32 = 0;
-            for (acc >= interval) {
-                sim.step(?s);
-                acc = acc - interval;
-                budget = budget + 1;
-                if (budget >= MAX_STEPS_PER_FRAME) { brk; }
+            if (app_state.uncapped != 0) {
+                val budget_end: f64 = now + UNCAPPED_BUDGET;
+                var n: i32 = 0;
+                for (glfw.get_time() < budget_end) {
+                    sim.step(?s);
+                    n = n + 1;
+                    if (n >= UNCAPPED_MAX) { brk; }
+                }
+                acc = 0.0;
+            } or {
+                acc = acc + dt;
+                val interval: f64 = 1.0 / app_state.speed::f64;
+                var budget: i32 = 0;
+                for (acc >= interval) {
+                    sim.step(?s);
+                    acc = acc - interval;
+                    budget = budget + 1;
+                    if (budget >= MAX_STEPS_PER_FRAME) { brk; }
+                }
             }
         } or {
             acc = 0.0;
@@ -212,42 +274,68 @@ fun main(argc: i64, argv: **u8) i64 {
         var down: u8 = 0;
         if (lb == glfw.PRESS) { down = 1; }
 
+        # right-mouse drag pans the view; the first drag frame only anchors
+        var rdown: u8 = 0;
+        if (rb == glfw.PRESS) { rdown = 1; }
+        if (rdown != 0 && rb_prev != 0) {
+            app_state.pan_x = app_state.pan_x + (mxd::f32 - rb_px);
+            app_state.pan_y = app_state.pan_y + (myd::f32 - rb_py);
+        }
+        rb_px   = mxd::f32;
+        rb_py   = myd::f32;
+        rb_prev = rdown;
+
         var in: bi.Input;
         in.mx        = mxd::f32;
         in.my        = myd::f32;
         in.down      = down;
         in.prev_down = 0;
 
-        val cam: render.Camera = render.fit(?s.grid, ww::f32, wh::f32, zoom, pan_x, pan_y);
+        val cam: render.Camera = render.fit(?s.grid, ww::f32, wh::f32, app_state.zoom, app_state.pan_x, app_state.pan_y);
 
         gl.clear_color(0.04, 0.05, 0.06, 1.0);
         gl.clear(gl.COLOR_BUFFER_BIT);
 
         bc.begin(?ctx, in, ww::f32, wh::f32);
-        render.draw_grid(?ctx, ?s, cam);
+        render.draw_grid(?ctx, ?s, cam, app_state.mode::u8, app_state.gutter, app_state.solid_r, app_state.solid_g, app_state.solid_b);
 
-        var px0: f32 = 0.0;
-        var py0: f32 = 0.0;
-        var px1: f32 = 0.0;
-        var py1: f32 = 0.0;
-        ui.build_panel(?ctx, ?s, ?speed, ?density, ?px0, ?py0, ?px1, ?py1);
+        var consumed: u8 = 0;
+        if (app_state.ui_visible != 0) {
+            consumed = worldwin.draw(?ctx, ?app_state, ?s);
+            if (kedit.draw(?ctx, ?app_state, ?s) != 0) { consumed = 1; }
+            if (arrange.draw(?ctx, ?app_state, ?s) != 0) { consumed = 1; }
+        } or {
+            # translucent restore icon (a small three-bar glyph) in the top-left
+            val ix0: f32 = 8.0;
+            val iy0: f32 = 8.0;
+            val ix1: f32 = ix0 + ICON;
+            val iy1: f32 = iy0 + ICON;
+            bc.quad(?ctx, ix0, iy0, ix1, iy1, bd.rgba(0.10, 0.11, 0.14, 0.70));
+            val bar: bd.Color = bd.rgba(0.75, 0.80, 0.90, 0.90);
+            bc.quad(?ctx, ix0 + 6.0, iy0 + 8.0,  ix1 - 6.0, iy0 + 10.0, bar);
+            bc.quad(?ctx, ix0 + 6.0, iy0 + 12.0, ix1 - 6.0, iy0 + 14.0, bar);
+            bc.quad(?ctx, ix0 + 6.0, iy0 + 16.0, ix1 - 6.0, iy0 + 18.0, bar);
+            if (bi.in_rect(in, ix0, iy0, ix1, iy1) != 0) {
+                consumed = 1;
+                if (bi.pressed(ctx.in) != 0) { app_state.ui_visible = 1; }
+            }
+        }
         bc.end(?ctx);
 
-        # paint only when the cursor is off the panel and not dragging a widget
-        val over_panel: u8 = bi.in_rect(in, px0, py0, px1, py1);
-        if (over_panel == 0 && ctx.active == 0) {
-            if (down != 0) {
-                var cx: usize = 0;
-                var cy: usize = 0;
-                if (render.cell_at(cam, ?s.grid, in.mx, in.my, ?cx, ?cy) != 0) {
-                    sim.paint(?s, cx, cy, 1);
+        # paint only when the cursor is off the windows and not dragging a widget;
+        # stamp mode places the active pattern on the press edge instead
+        if (consumed == 0 && ctx.active == 0) {
+            var cx: usize = 0;
+            var cy: usize = 0;
+            if (app_state.stamp_mode != 0 && app_state.erase == 0) {
+                if (bi.pressed(ctx.in) != 0 && render.cell_at(cam, ?s.grid, in.mx, in.my, ?cx, ?cy) != 0) {
+                    arrange.stamp_active(?app_state, ?s, cx, cy);
                 }
-            }
-            if (rb == glfw.PRESS) {
-                var ex: usize = 0;
-                var ey: usize = 0;
-                if (render.cell_at(cam, ?s.grid, in.mx, in.my, ?ex, ?ey) != 0) {
-                    sim.paint(?s, ex, ey, 0);
+            } or {
+                if (down != 0 && render.cell_at(cam, ?s.grid, in.mx, in.my, ?cx, ?cy) != 0) {
+                    var pv: u8 = 1;
+                    if (app_state.erase != 0) { pv = 0; }
+                    sim.paint(?s, cx, cy, pv);
                 }
             }
         }
@@ -268,12 +356,14 @@ fun main(argc: i64, argv: **u8) i64 {
         glfw.swap_buffers(w);
     }
 
+    config.save(pa, ?app_state, ?s, config.PATH);
+
     gl.delete_vertex_arrays(1, ?vao);
     gl.delete_buffers(1, ?vbo);
     gl.delete_textures(1, ?tex);
     gl.delete_program(prog);
     bc.free(?ctx);
-    sim.free(?s);
+    sim.dnit(?s);
     glfw.destroy_window(w);
     glfw.terminate();
     ret 0;

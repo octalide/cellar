@@ -1,0 +1,101 @@
+# cellar.worldwin: the world-controls window — run state, speed, randomize,
+# color mode, grid lines, and world size. it both displays and drives the sim,
+# and reports whether the cursor is over it so the caller can gate grid painting.
+
+use std.types.size.usize;
+use std.types.string.str;
+use bc: blit.context;
+use bw: blit.widget;
+use bi: blit.input;
+use bd: blit.draw;
+use sim: cellar.sim;
+use app: cellar.app;
+use ui:  cellar.ui;
+
+# TITLE_H: titlebar height used to bound a collapsed window for input gating.
+val TITLE_H: f32 = 16.0;
+
+# hex_digit: the lowercase ascii hex digit for a nibble in [0, 15].
+fun hex_digit(n: u8) u8 {
+    if (n < 10) { ret '0' + n; }
+    ret 'a' + (n - 10);
+}
+
+# hex_byte: write the two hex digits of v into buf at off; ret the new offset.
+fun hex_byte(buf: *u8, off: usize, v: u8) usize {
+    buf[off]     = hex_digit(v / 16);
+    buf[off + 1] = hex_digit(v % 16);
+    ret off + 2;
+}
+
+# color_picker: RGB sliders, a #rrggbb readout, and a swatch for the solid color.
+fun color_picker(ctx: *bc.Context, a: *app.App) {
+    bw.slider_f(ctx, "R", ?a.solid_r, 0.0, 1.0);
+    bw.slider_f(ctx, "G", ?a.solid_g, 0.0, 1.0);
+    bw.slider_f(ctx, "B", ?a.solid_b, 0.0, 1.0);
+
+    var hx: [10]u8;
+    var o: usize = ui.buf_str(?hx[0], 0, "#");
+    o = hex_byte(?hx[0], o, (a.solid_r * 255.0)::u8);
+    o = hex_byte(?hx[0], o, (a.solid_g * 255.0)::u8);
+    o = hex_byte(?hx[0], o, (a.solid_b * 255.0)::u8);
+    hx[o] = 0;
+    bw.text(ctx, (?hx[0])::*u8::str);
+
+    val sy: f32 = ctx.cy;
+    bc.quad(ctx, ctx.cx, sy, ctx.cx + ctx.pw, sy + 12.0, bd.rgba(a.solid_r, a.solid_g, a.solid_b, 1.0));
+    ctx.cy = sy + 16.0;
+    ctx.cx = ctx.ox;
+}
+
+# draw: lay out the world window, apply its controls to the sim/app state, and
+# report whether the cursor lies within the window this frame.
+# ---
+# ctx: blit context for this frame
+# a:   application state
+# s:   simulation the controls drive
+# ret: 1 if the cursor is over the window, else 0
+pub fun draw(ctx: *bc.Context, a: *app.App, s: *sim.Sim) u8 {
+    val handle: usize = bw.begin_window(ctx, ?a.world);
+
+    if (a.world.open != 0) {
+        var play: str = "play";
+        if (s.running != 0) { play = "pause"; }
+        if (bw.button(ctx, play))   { sim.toggle_running(s); }
+        if (bw.button(ctx, "step")) { sim.step(s); }
+
+        bw.slider_f(ctx, "speed", ?a.speed, 1.0, 120.0);
+        bw.checkbox(ctx, "uncapped", ?a.uncapped);
+
+        if (bw.button(ctx, "clear"))     { sim.clear(s); }
+        if (bw.button(ctx, "randomize")) { sim.randomize(s, sim.DEFAULT_DENSITY); }
+
+        bw.checkbox(ctx, "erase", ?a.erase);
+        bw.checkbox(ctx, "grid lines", ?a.gutter);
+
+        var modes: [3]str;
+        modes[0] = "color solid";
+        modes[1] = "color heat";
+        modes[2] = "color age";
+        bw.dropdown(ctx, "", ?a.mode, ?modes[0], app.MODE_COUNT);
+        # mode 0 is render.MODE_SOLID: expose its color
+        if (a.mode == 0) { color_picker(ctx, a); }
+
+        var sizes: [5]str;
+        sizes[0] = "size 32";
+        sizes[1] = "size 64";
+        sizes[2] = "size 128";
+        sizes[3] = "size 256";
+        sizes[4] = "size 512";
+        if (bw.dropdown(ctx, "", ?a.bounds_idx, ?sizes[0], app.BOUNDS_COUNT) != 0) {
+            val n: usize = app.bounds_size(a.bounds_idx);
+            sim.resize(s, n, n);
+        }
+    }
+
+    var y1: f32 = a.world.y + TITLE_H;
+    if (a.world.open != 0) { y1 = ctx.cy + 4.0; }
+    bw.end_window(ctx, ?a.world, handle);
+
+    ret bi.in_rect(ctx.in, a.world.x, a.world.y, a.world.x + a.world.w, y1);
+}
