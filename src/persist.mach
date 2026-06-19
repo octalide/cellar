@@ -1,0 +1,301 @@
+# cellar.persist: text serialization of a world or a pattern to disk.
+#
+# the on-disk format is a header line "<w> <h>\n" followed by h lines of w
+# characters, '1' for a live cell and '0' for a dead one. it is deliberately
+# trivial to read and write. saves create the arrangements/ directory first; the
+# world allocator (sim.grid.a) backs the transient buffers. both a grid and a
+# pattern store cells row-major as bytes, so one formatter serializes either.
+
+use std.types.bool.bool;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.option.Option;
+use std.types.option.some;
+use std.types.option.none;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+use allo: std.allocator;
+use page: std.allocator.page;
+use fs:   std.filesystem;
+use sim:     cellar.sim;
+use grid:    cellar.grid;
+use pattern: cellar.pattern;
+use ui:      cellar.ui;
+
+# DIR: directory holding saved worlds and patterns (user data, not source).
+pub val DIR: str = "arrangements";
+
+# DIR_MODE: permission bits for the arrangements directory.
+val DIR_MODE: i32 = 0o755;
+# FILE_MODE: permission bits for saved files.
+val FILE_MODE: i32 = 0o644;
+# HEADER_MAX: bytes reserved for the "<w> <h>\n" header when sizing a buffer.
+val HEADER_MAX: usize = 32;
+
+# write_cells: format a w x h field of row-major cells into buf as the header plus
+# '0'/'1' rows, each row newline-terminated. ret the byte count written.
+fun write_cells(buf: *u8, cells: *u8, w: usize, h: usize) usize {
+    var off: usize = 0;
+    off = ui.buf_u64(buf, off, w::u64);
+    buf[off] = ' ';
+    off = off + 1;
+    off = ui.buf_u64(buf, off, h::u64);
+    buf[off] = '\n';
+    off = off + 1;
+    var y: usize = 0;
+    for (y < h) {
+        var x: usize = 0;
+        for (x < w) {
+            var ch: u8 = '0';
+            if (cells[y * w + x] != 0) { ch = '1'; }
+            buf[off] = ch;
+            off = off + 1;
+            x = x + 1;
+        }
+        buf[off] = '\n';
+        off = off + 1;
+        y = y + 1;
+    }
+    ret off;
+}
+
+# save_buffer: allocate, format, and write a w x h field of row-major cells to
+# path, ensuring the arrangements/ directory exists first.
+# ---
+# a:     allocator backing the transient buffer
+# cells: row-major 0/1 cells, length w*h
+# w:     field width
+# h:     field height
+# path:  destination file path
+# ret:   none on success, some(message) on failure
+fun save_buffer(a: *allo.Allocator, cells: *u8, w: usize, h: usize, path: str) Option[str] {
+    fs.create_dir_all(a, DIR, DIR_MODE);
+
+    val cap: usize = HEADER_MAX + h * (w + 1);
+    val rc: Result[*u8, str] = allo.allocate[u8](a, cap);
+    if (is_err[*u8, str](rc)) { ret some[str]("cellar.persist: buffer allocation failed"); }
+    val buf: *u8 = unwrap_ok[*u8, str](rc);
+
+    val len: usize = write_cells(buf, cells, w, h);
+    val wr: Result[bool, str] = fs.write_file(path, buf, len, FILE_MODE);
+    allo.deallocate[u8](a, buf, cap);
+
+    if (is_err[bool, str](wr)) { ret some[str](unwrap_err[bool, str](wr)); }
+    ret none[str]();
+}
+
+# parse_uint: read a run of decimal digits from s at off into out; ret the offset
+# just past the digits.
+fun parse_uint(s: str, off: usize, out: *usize) usize {
+    var o: usize = off;
+    var v: usize = 0;
+    for (s[o] >= '0' && s[o] <= '9') {
+        v = v * 10 + (s[o] - '0')::usize;
+        o = o + 1;
+    }
+    @out = v;
+    ret o;
+}
+
+# next_cell: advance past any non-cell chars (newlines, header) to the next '0' or
+# '1'; ret the offset of that char, or of the terminating NUL if none remains.
+fun next_cell(s: str, p: usize) usize {
+    var o: usize = p;
+    for (s[o] != 0 && s[o] != '0' && s[o] != '1') { o = o + 1; }
+    ret o;
+}
+
+# parse_header: read "<w> <h>" from data into w and h; ret the offset past them.
+fun parse_header(data: str, w: *usize, h: *usize) usize {
+    var i: usize = 0;
+    i = parse_uint(data, i, w);
+    for (data[i] == ' ') { i = i + 1; }
+    i = parse_uint(data, i, h);
+    ret i;
+}
+
+# save_world: serialize the simulation grid to path.
+# ---
+# a:    allocator backing the transient buffer
+# s:    simulation whose grid is saved
+# path: destination file path
+# ret:  none on success, some(message) on failure
+pub fun save_world(a: *allo.Allocator, s: *sim.Sim, path: str) Option[str] {
+    ret save_buffer(a, s.grid.cells, s.grid.w, s.grid.h, path);
+}
+
+# load_world: read path, resize the simulation to its dimensions, and set cells.
+# ---
+# a:    allocator for the read buffer
+# s:    simulation to populate
+# path: source file path
+# ret:  none on success, some(message) on failure
+pub fun load_world(a: *allo.Allocator, s: *sim.Sim, path: str) Option[str] {
+    val rr: Result[str, str] = fs.read_all(a, path);
+    if (is_err[str, str](rr)) { ret some[str](unwrap_err[str, str](rr)); }
+    val data: str = unwrap_ok[str, str](rr);
+    val total: usize = str_len(data) + 1;
+
+    var w: usize = 0;
+    var h: usize = 0;
+    val start: usize = parse_header(data, ?w, ?h);
+
+    if (w == 0 || h == 0) {
+        allo.deallocate[u8](a, data::ptr::*u8, total);
+        ret some[str]("cellar.persist.load_world: bad dimensions");
+    }
+
+    val e: Option[str] = sim.resize(s, w, h);
+    if (e.has_value) {
+        allo.deallocate[u8](a, data::ptr::*u8, total);
+        ret e;
+    }
+    grid.clear(?s.grid);
+
+    var p: usize = start;
+    var y: usize = 0;
+    for (y < h) {
+        var x: usize = 0;
+        for (x < w) {
+            p = next_cell(data, p);
+            if (data[p] == 0) {
+                allo.deallocate[u8](a, data::ptr::*u8, total);
+                ret some[str]("cellar.persist.load_world: truncated body");
+            }
+            var v: u8 = 0;
+            if (data[p] == '1') { v = 1; }
+            sim.paint(s, x, y, v);
+            p = p + 1;
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+
+    allo.deallocate[u8](a, data::ptr::*u8, total);
+    ret none[str]();
+}
+
+# save_pattern: serialize a pattern to path.
+# ---
+# a:    allocator backing the transient buffer
+# p:    pattern to save
+# path: destination file path
+# ret:  none on success, some(message) on failure
+pub fun save_pattern(a: *allo.Allocator, p: *pattern.Pattern, path: str) Option[str] {
+    ret save_buffer(a, ?p.cells[0], p.w, p.h, path);
+}
+
+# load_pattern: read path into a pattern, resizing it to the stored dimensions.
+# ---
+# a:    allocator for the read buffer
+# p:    pattern to populate
+# path: source file path
+# ret:  none on success, some(message) on failure
+pub fun load_pattern(a: *allo.Allocator, p: *pattern.Pattern, path: str) Option[str] {
+    val rr: Result[str, str] = fs.read_all(a, path);
+    if (is_err[str, str](rr)) { ret some[str](unwrap_err[str, str](rr)); }
+    val data: str = unwrap_ok[str, str](rr);
+    val total: usize = str_len(data) + 1;
+
+    var w: usize = 0;
+    var h: usize = 0;
+    val start: usize = parse_header(data, ?w, ?h);
+
+    if (w == 0 || h == 0 || w * h > pattern.CAP) {
+        allo.deallocate[u8](a, data::ptr::*u8, total);
+        ret some[str]("cellar.persist.load_pattern: bad dimensions");
+    }
+
+    pattern.init(p, w, h, p.name);
+
+    var pos: usize = start;
+    var y: usize = 0;
+    for (y < h) {
+        var x: usize = 0;
+        for (x < w) {
+            pos = next_cell(data, pos);
+            if (data[pos] == 0) {
+                allo.deallocate[u8](a, data::ptr::*u8, total);
+                ret some[str]("cellar.persist.load_pattern: truncated body");
+            }
+            var v: u8 = 0;
+            if (data[pos] == '1') { v = 1; }
+            pattern.set(p, x, y, v);
+            pos = pos + 1;
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+
+    allo.deallocate[u8](a, data::ptr::*u8, total);
+    ret none[str]();
+}
+
+test "persist: a world survives a save/load round trip" {
+    var a: allo.Allocator;
+    page.make(?a);
+
+    var s: sim.Sim;
+    if (sim.init(?s, ?a, 6, 4).has_value) { ret 1; }
+    sim.paint(?s, 0, 0, 1);
+    sim.paint(?s, 5, 3, 1);
+    sim.paint(?s, 2, 1, 1);
+
+    val path: str = "arrangements/test_roundtrip.cells";
+    if (save_world(?a, ?s, path).has_value) { ret 1; }
+
+    var t: sim.Sim;
+    if (sim.init(?t, ?a, 2, 2).has_value) { ret 1; }
+    if (load_world(?a, ?t, path).has_value) { ret 1; }
+
+    if (t.grid.w != 6 || t.grid.h != 4) { ret 1; }
+    var y: usize = 0;
+    for (y < 4) {
+        var x: usize = 0;
+        for (x < 6) {
+            if (grid.get(?t.grid, x, y) != grid.get(?s.grid, x, y)) { ret 1; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+
+    fs.unlink(path);
+    sim.dnit(?s);
+    sim.dnit(?t);
+    ret 0;
+}
+
+test "persist: a pattern survives a save/load round trip" {
+    var a: allo.Allocator;
+    page.make(?a);
+
+    var p: pattern.Pattern;
+    pattern.init(?p, 5, 3, "custom");
+    pattern.set(?p, 0, 0, 1);
+    pattern.set(?p, 4, 2, 1);
+    pattern.set(?p, 2, 1, 1);
+
+    val path: str = "arrangements/test_pattern.cells";
+    if (save_pattern(?a, ?p, path).has_value) { ret 1; }
+
+    var q: pattern.Pattern;
+    pattern.init(?q, 1, 1, "custom");
+    if (load_pattern(?a, ?q, path).has_value) { ret 1; }
+
+    if (q.w != 5 || q.h != 3) { ret 1; }
+    var y: usize = 0;
+    for (y < 3) {
+        var x: usize = 0;
+        for (x < 5) {
+            if (pattern.get(?q, x, y) != pattern.get(?p, x, y)) { ret 1; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+
+    fs.unlink(path);
+    ret 0;
+}
