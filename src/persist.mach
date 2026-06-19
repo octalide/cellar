@@ -34,6 +34,9 @@ val DIR_MODE: i32 = 0o755;
 val FILE_MODE: i32 = 0o644;
 # HEADER_MAX: bytes reserved for the "<w> <h>\n" header when sizing a buffer.
 val HEADER_MAX: usize = 32;
+# MAX_DIM: largest world side length a loaded file may declare, bounding the
+# allocation a corrupt or hand-edited header can request.
+val MAX_DIM: usize = 4096;
 
 # write_cells: format a w x h field of row-major cells into buf as the header plus
 # '0'/'1' rows, each row newline-terminated. ret the byte count written.
@@ -143,7 +146,7 @@ pub fun load_world(a: *allo.Allocator, s: *sim.Sim, path: str) Option[str] {
     var h: usize = 0;
     val start: usize = parse_header(data, ?w, ?h);
 
-    if (w == 0 || h == 0) {
+    if (w == 0 || h == 0 || w > MAX_DIM || h > MAX_DIM) {
         allo.deallocate[u8](a, data::ptr::*u8, total);
         ret some[str]("cellar.persist.load_world: bad dimensions");
     }
@@ -232,6 +235,37 @@ pub fun load_pattern(a: *allo.Allocator, p: *pattern.Pattern, path: str) Option[
 
     allo.deallocate[u8](a, data::ptr::*u8, total);
     ret none[str]();
+}
+
+test "persist: a 16x16 custom pattern and a 128x128 world save and reload" {
+    var a: allo.Allocator;
+    page.make(?a);
+
+    var p: pattern.Pattern;
+    pattern.init(?p, 16, 16, "custom");
+    pattern.set(?p, 0, 0, 1);
+    pattern.set(?p, 15, 15, 1);
+    pattern.set(?p, 8, 3, 1);
+    val ppath: str = "arrangements/test_custom16.cells";
+    if (save_pattern(?a, ?p, ppath).has_value) { ret 1; }
+    var q: pattern.Pattern;
+    pattern.init(?q, 1, 1, "custom");
+    if (load_pattern(?a, ?q, ppath).has_value) { ret 1; }
+    if (q.w != 16 || q.h != 16) { ret 1; }
+    if (pattern.get(?q, 15, 15) != 1) { ret 1; }
+    fs.unlink(ppath);
+
+    var s2: sim.Sim;
+    if (sim.init(?s2, ?a, 128, 128).has_value) { ret 1; }
+    sim.paint(?s2, 1, 1, 1);
+    sim.paint(?s2, 127, 127, 1);
+    val wpath: str = "arrangements/test_world128.cells";
+    if (save_world(?a, ?s2, wpath).has_value) { ret 1; }
+    if (load_world(?a, ?s2, wpath).has_value) { ret 1; }
+    if (grid.get(?s2.grid, 127, 127) != 1) { ret 1; }
+    fs.unlink(wpath);
+    sim.dnit(?s2);
+    ret 0;
 }
 
 test "persist: a world survives a save/load round trip" {
