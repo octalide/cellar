@@ -1,0 +1,182 @@
+# cellar.kernel: a weighted outer-totalistic cellular-automaton rule.
+#
+# a kernel generalizes the Life family. its footprint is a (2r+1)x(2r+1) square
+# of integer weights centered on the cell; the weighted neighbor-sum S is the dot
+# product of those weights with the live/dead state of each footprint cell. birth
+# and survive are bitmasks over S — bit n set means "accept when S == n". with
+# unit Moore weights and a zero center, S is the classic live-neighbor count, so
+# B/S rules like Conway's Life are expressed exactly.
+
+use std.types.size.usize;
+use std.types.string.str;
+
+# MAX_RADIUS: largest supported footprint radius; the 9x9 footprint fills [81].
+pub val MAX_RADIUS: usize = 4;
+# SUM_MAX: weighted sum is saturated to this bound before the mask test, so the
+# birth/survive bitmasks only ever need 64 bits.
+pub val SUM_MAX: i32 = 63;
+
+# Kernel: a weighted outer-totalistic rule.
+# ---
+# weights: (2r+1)x(2r+1) footprint, row-major into a fixed [81] array; the weight
+#          at offset (dx, dy) lives at weights[(dy+r)*(2r+1) + (dx+r)]
+# radius:  footprint radius r in [1, 4]
+# birth:   bitmask over the weighted sum S; bit n set => a dead cell with S == n is born
+# survive: bitmask over the weighted sum S; bit n set => a live cell with S == n survives
+# name:    short display label, e.g. "life B3/S23"
+pub rec Kernel {
+    weights: [81]i32;
+    radius:  usize;
+    birth:   u64;
+    survive: u64;
+    name:    str;
+}
+
+# PRESET_COUNT: number of built-in kernels reachable through preset().
+pub val PRESET_COUNT: usize = 4;
+
+# set_bit: return mask with bit n set.
+# ---
+# mask: source bitmask
+# n:    bit index to set
+# ret:  mask with bit n set
+pub fun set_bit(mask: u64, n: usize) u64 {
+    ret mask | ((1::u64) << (n::u64));
+}
+
+# bs_mask: build a count bitmask from a digit string, e.g. "23" sets bits 2 and 3.
+# ---
+# digits: NUL-terminated string of decimal digits
+# ret:    the bitmask
+fun bs_mask(digits: str) u64 {
+    var m: u64 = 0;
+    var i: usize = 0;
+    for (digits[i] != 0) {
+        m = set_bit(m, (digits[i] - '0')::usize);
+        i = i + 1;
+    }
+    ret m;
+}
+
+# moore: a radius-1 unit-weight Moore kernel (center weight 0) with the given masks.
+# ---
+# birth:   weighted-sum birth bitmask
+# survive: weighted-sum survival bitmask
+# name:    display label
+# ret:     the kernel
+fun moore(birth: u64, survive: u64, name: str) Kernel {
+    var k: Kernel;
+    var i: usize = 0;
+    for (i < 81) {
+        k.weights[i] = 0;
+        i = i + 1;
+    }
+    k.radius = 1;
+    var dy: usize = 0;
+    for (dy < 3) {
+        var dx: usize = 0;
+        for (dx < 3) {
+            var center: u8 = 0;
+            if (dx == 1 && dy == 1) { center = 1; }
+            if (center == 0) { k.weights[dy * 3 + dx] = 1; }
+            dx = dx + 1;
+        }
+        dy = dy + 1;
+    }
+    k.birth   = birth;
+    k.survive = survive;
+    k.name    = name;
+    ret k;
+}
+
+# life: Conway's Life, B3/S23.
+# ---
+# ret: the kernel
+pub fun life() Kernel {
+    ret moore(bs_mask("3"), bs_mask("23"), "life B3/S23");
+}
+
+# highlife: HighLife, B36/S23.
+# ---
+# ret: the kernel
+pub fun highlife() Kernel {
+    ret moore(bs_mask("36"), bs_mask("23"), "highlife B36/S23");
+}
+
+# seeds: Seeds, B2/S (nothing survives).
+# ---
+# ret: the kernel
+pub fun seeds() Kernel {
+    ret moore(bs_mask("2"), bs_mask(""), "seeds B2/S");
+}
+
+# daynight: Day & Night, B3678/S34678.
+# ---
+# ret: the kernel
+pub fun daynight() Kernel {
+    ret moore(bs_mask("3678"), bs_mask("34678"), "day&night B3678/S34678");
+}
+
+# preset: a built-in kernel by index; index 0 (life) for any out-of-range value.
+# ---
+# i:   preset index in [0, PRESET_COUNT)
+# ret: the kernel
+pub fun preset(i: usize) Kernel {
+    if (i == 1) { ret highlife(); }
+    if (i == 2) { ret seeds(); }
+    if (i == 3) { ret daynight(); }
+    ret life();
+}
+
+# next_state: the cell's next value given its state and weighted neighbor-sum.
+# the sum is saturated to [0, SUM_MAX] before the mask test.
+# ---
+# k:     the active kernel
+# alive: current cell state (0 or 1)
+# sum:   weighted neighbor-sum S over the footprint
+# ret:   next cell state (0 or 1)
+pub fun next_state(k: *Kernel, alive: u8, sum: i32) u8 {
+    var s: i32 = sum;
+    if (s < 0)       { s = 0; }
+    if (s > SUM_MAX) { s = SUM_MAX; }
+    val mask: u64 = (1::u64) << (s::u64);
+    if (alive != 0) {
+        if ((k.survive & mask) != 0) { ret 1; }
+        ret 0;
+    }
+    if ((k.birth & mask) != 0) { ret 1; }
+    ret 0;
+}
+
+test "kernel: life births on 3 and survives on 2 or 3" {
+    var k: Kernel = life();
+    if (next_state(?k, 0, 3) != 1) { ret 1; }
+    if (next_state(?k, 0, 2) != 0) { ret 1; }
+    if (next_state(?k, 1, 2) != 1) { ret 1; }
+    if (next_state(?k, 1, 3) != 1) { ret 1; }
+    if (next_state(?k, 1, 1) != 0) { ret 1; }
+    if (next_state(?k, 1, 4) != 0) { ret 1; }
+    ret 0;
+}
+
+test "kernel: unit Moore footprint has weight 8 and a zero center" {
+    var k: Kernel = life();
+    if (k.radius != 1) { ret 1; }
+    if (k.weights[4] != 0) { ret 1; }
+    var total: i32 = 0;
+    var i: usize = 0;
+    for (i < 9) {
+        total = total + k.weights[i];
+        i = i + 1;
+    }
+    if (total != 8) { ret 1; }
+    ret 0;
+}
+
+test "kernel: sum saturates so high weighted sums still test a valid bit" {
+    var k: Kernel = seeds();
+    # seeds never survives; an absurd sum must not panic or wrap into a set bit
+    if (next_state(?k, 1, 9999) != 0) { ret 1; }
+    if (next_state(?k, 0, 0 - 5) != 0) { ret 1; }
+    ret 0;
+}
