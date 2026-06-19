@@ -39,27 +39,13 @@ and Day & Night (`B3678/S34678`).
 
 ## Build & run
 
+Requires the [Mach toolchain][mach].
+
 ```
+git clone https://github.com/octalide/cellar
+cd cellar
+mach dep pull   # vendor mach-std, mach-glfw, mach-gl, and blit into dep/
 mach build      # compile
-mach run        # build and launch (run from the project root: shaders load by relative path)
-mach test       # grid / kernel / sim unit tests
+mach run        # launch from the project root (shaders load by relative path)
+mach test       # grid / kernel / sim / persist / config unit tests
 ```
-
-## Layout
-
-```
-src/
-  main.mach      window, GL setup, the frame loop, input wiring
-  grid.mach      double-buffered toroidal cell grid with age/heat aux fields
-  kernel.mach    weighted outer-totalistic kernels and presets
-  sim.mach       simulation state: convolution step, paint, clear, randomize, resize
-  render.mach    camera (fit/zoom/pan), color modes, and grid -> blit quads
-  ui.mach        control-event globals, text helpers, control panel
-  shaders.mach   shader compile + program link
-  shaders/       ui.vert / ui.frag — the blit overlay shader
-```
-
-[mach]:       https://github.com/octalide/mach
-[mach-gl]:    https://github.com/octalide/mach-gl
-[mach-glfw]:  https://github.com/octalide/mach-glfw
-[blit]:       https://github.com/octalide/blit
