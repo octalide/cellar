@@ -1,0 +1,817 @@
+# the pool on the GPU: stepped by a compute stage and drawn from where it lies
+#
+# the cells live in two storage buffers stepped back and forth, and the page
+# table and the rule in a third, laid out as cellar.space keeps them, so the
+# host's pool is mirrored rather than translated. the host's cells are a
+# staging copy: whole chunks it filled or allocated, and single cells it
+# painted, are uploaded at the start of the next frame's recording, and
+# everything else about them is only on the GPU. pull brings the GPU's cells
+# back when the host needs to read them, for a save or a test.
+#
+# each frame records its generations, then a census stage that counts every
+# chunk, then a readback of the census. the readback lands a couple of frames
+# later, and collect settles the host's pool from it: chunks that came alive
+# get their neighbours and dead ones are freed. that lag is why the generations
+# a frame may record are budgeted. a pattern spreads at most the rule's radius
+# a generation, and a census that saw every live chunk surrounded by chunks
+# leaves room for 64 cells of spread before anything can reach past them, so
+# no generation is recorded that could outrun the last census the pool was
+# settled from.
+#
+# a chunk allocated empty is cleared on the GPU by a stage of its own rather
+# than uploaded, and each step stamps which chunks it left alive or warm, so the
+# next can skip the chunks with nothing alive nearby. whatever the host uploads
+# is stamped alive and warm, so it is stepped in full at least once.
+#
+# where the compute stages cannot be built, the CPU steps and this only draws,
+# uploading the chunks in view every frame.
+
+use gfx: boom.graphics;
+use gm:  boom.math;
+use cellar.kernel;
+use cellar.space;
+use allo: std.allocator;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use mem: std.memory;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+
+#[embed("{artifact.stage-step_comp.out}")]
+val STEP_SPV:   [_]u8;
+#[embed("{artifact.stage-clear_comp.out}")]
+val CLEAR_SPV:  [_]u8;
+#[embed("{artifact.stage-grow_comp.out}")]
+val GROW_SPV:   [_]u8;
+#[embed("{artifact.stage-census_comp.out}")]
+val CENSUS_SPV: [_]u8;
+#[embed("{artifact.stage-cells_vert.out}")]
+val VERT_SPV:   [_]u8;
+#[embed("{artifact.stage-cells_frag.out}")]
+val FRAG_SPV:   [_]u8;
+
+# words of the meta buffer ahead of the page table: the rule
+pub val HEAD: usize = 96;
+# words of the view buffer ahead of the palettes
+pub val LOOK: usize = 20;
+# entries in each palette
+pub val SHADES: usize = 256;
+# generations one frame may record, leaving storage binding sets for the
+# census and the draw
+pub val MAX_STEPS: usize = 240;
+# cells a census that saw every live chunk surrounded leaves room to spread
+val REACH: u64 = 64;
+# censuses in flight a frame can look back over
+val RING: usize = 8;
+# dirty entries or chunks past which one stalled upload beats many recorded ones
+val BULK: usize = 32;
+# chunks in view uploaded per frame while the CPU steps
+val MAX_VIEW: usize = 4096;
+
+# the camera and colours the draw reads, uploaded each frame
+# ---
+# base_cx: the chunk column holding the view centre, biased by space.BIAS
+# base_cy: the chunk row holding the view centre, biased
+# mode:    colour mode: 0 solid, 1 heat, 2 age
+# gutter:  1 to show grid lines
+# frac_x:  the centre's column inside its chunk, in cells
+# frac_y:  the centre's row inside its chunk, in cells
+# ppc:     pixels per cell
+# half_w:  half the viewport width in pixels
+# half_h:  half the viewport height in pixels
+# pad0:    alignment
+# pad1:    alignment
+# pad2:    alignment
+# solid:   the solid live colour, in the target's space
+# back:    the backdrop, in the target's space
+pub rec Look {
+    base_cx: u32;
+    base_cy: u32;
+    mode:    u32;
+    gutter:  u32;
+    frac_x:  f32;
+    frac_y:  f32;
+    ppc:     f32;
+    half_w:  f32;
+    half_h:  f32;
+    pad0:    u32;
+    pad1:    u32;
+    pad2:    u32;
+    solid:   [4]f32;
+    back:    [4]f32;
+}
+
+# what the pool was when a census was recorded
+# ---
+# id:     the census id
+# spread: cells of spread recorded up to it
+# bulk:   the bulk-edit count then
+# edits:  the edit count then
+# cap:    slots the readback covers
+# hi:     slots the census counted
+rec Snap {
+    id:     u32;
+    spread: u64;
+    bulk:   u64;
+    edits:  u64;
+    cap:    usize;
+    hi:     usize;
+}
+
+# a painted cell waiting to be uploaded
+# ---
+# at: slot * space.CELLS + cell
+# v:  its value
+rec Write {
+    at: u32;
+    v:  u32;
+}
+
+# the buffers sized to the pool's capacity
+# ---
+# cells:  the two cell pools stepped between
+# meta:   the rule and the page table
+# flags:  per slot the serials of the last step that left it alive and warm
+# list:   the slots the clear stage empties
+# status: the census stage's output
+# rb:     the census readback
+# got:    where a landed census is copied
+# landed: the landed census unpacked to space.CENSUS words per slot
+# cap:    slots the buffers hold
+rec Pool {
+    cells:  [2]gfx.StorageBuffer;
+    meta:   gfx.StorageBuffer;
+    flags:  gfx.StorageBuffer;
+    list:   gfx.StorageBuffer;
+    status: gfx.StorageBuffer;
+    rb:     gfx.Readback;
+    got:    *u32;
+    landed: *u32;
+    cap:    usize;
+}
+
+# the GPU's side of the world
+# ---
+# a:        allocator for host buffers
+# r:        the renderer
+# d:        its device
+# p:        the buffers sized to the pool
+# old:      the buffers a growth replaced, kept until the frame copying out of
+#           them has run
+# retired:  old holds buffers
+# view:     the look and the palettes
+# step:     the step stage
+# clear:    the clear stage
+# grow:     the stage that carries the world into larger buffers
+# census:   the census stage
+# draw:     the cell shader
+# mat:      the draw's material
+# xf:       the draw's transform
+# hi:       slots the GPU's page table covers
+# front:    which of cells holds the world
+# stepping: the compute stages built, so the GPU steps
+# serial:   the serial of the last step recorded; stamps equal to it are current
+# ring:     recent censuses
+# id:       the last census id
+# spread:   cells of spread recorded since the world was made
+# limit:    the spread the last settled census allows
+# bulk:     bulk edits: clears, fills
+# edits:    every edit, bulk or painted
+# writes:   painted cells to upload
+# zeros:    slots to clear this frame
+# stamped:  slots whose stamps to set current this frame
+# head:     the meta header staged for upload
+pub rec Gpu {
+    a:        *allo.Allocator;
+    r:        *gfx.Renderer;
+    d:        *gfx.Device;
+    p:        Pool;
+    old:      Pool;
+    retired:  bool;
+    view:     gfx.StorageBuffer;
+    step:     gfx.Compute;
+    clear:    gfx.Compute;
+    grow:     gfx.Compute;
+    census:   gfx.Compute;
+    draw:     gfx.Shader;
+    mat:      gfx.Material;
+    xf:       gm.Transform;
+    hi:       usize;
+    front:    usize;
+    stepping: bool;
+    serial:   u32;
+    ring:     [8]Snap;
+    id:       u32;
+    spread:   u64;
+    limit:    u64;
+    bulk:     u64;
+    edits:    u64;
+    writes:   Vector[Write];
+    zeros:    Vector[u32];
+    stamped:  Vector[u32];
+    head:     [96]u32;
+}
+
+# the census id's four words, then one packed word per slot
+fun status_bytes(cap: usize) usize {
+    ret 16 + cap * 4;
+}
+
+# a packed census word's incarnation bits
+val TAG: u32 = 0x3ffff;
+
+fun make(d: *gfx.Device, size: usize, out: *gfx.StorageBuffer) err[gfx.Error] {
+    val made: res[gfx.StorageBuffer, gfx.Error] = gfx.storage_buffer(d, size);
+    if (sel made.err) { ret err[gfx.Error].err{made.err}; }
+    @out = made.ok;
+    ret err[gfx.Error].ok{};
+}
+
+# the buffers sized for cap slots
+fun make_pool(g: *Gpu, cap: usize) err[gfx.Error] {
+    val e1: err[gfx.Error] = make(g.d, cap * space.CELLS * 4, ?g.p.cells[0]);
+    if (sel e1.err) { ret e1; }
+    val e2: err[gfx.Error] = make(g.d, cap * space.CELLS * 4, ?g.p.cells[1]);
+    if (sel e2.err) {
+        gfx.storage_buffer_delete(g.d, ?g.p.cells[0]);
+        ret e2;
+    }
+    val e3: err[gfx.Error] = make(g.d, (HEAD + cap * space.ENTRY) * 4, ?g.p.meta);
+    if (sel e3.err) {
+        gfx.storage_buffer_delete(g.d, ?g.p.cells[0]);
+        gfx.storage_buffer_delete(g.d, ?g.p.cells[1]);
+        ret e3;
+    }
+    val e4: err[gfx.Error] = make(g.d, status_bytes(cap), ?g.p.status);
+    if (sel e4.err) {
+        gfx.storage_buffer_delete(g.d, ?g.p.cells[0]);
+        gfx.storage_buffer_delete(g.d, ?g.p.cells[1]);
+        gfx.storage_buffer_delete(g.d, ?g.p.meta);
+        ret e4;
+    }
+    val e5: err[gfx.Error] = gfx.readback(?g.p.rb, g.d, status_bytes(cap));
+    if (sel e5.err) {
+        gfx.storage_buffer_delete(g.d, ?g.p.cells[0]);
+        gfx.storage_buffer_delete(g.d, ?g.p.cells[1]);
+        gfx.storage_buffer_delete(g.d, ?g.p.meta);
+        gfx.storage_buffer_delete(g.d, ?g.p.status);
+        ret e5;
+    }
+    val e5f: err[gfx.Error] = make(g.d, cap * 8, ?g.p.flags);
+    if (sel e5f.err) {
+        gfx.readback_delete(?g.p.rb, g.d);
+        gfx.storage_buffer_delete(g.d, ?g.p.cells[0]);
+        gfx.storage_buffer_delete(g.d, ?g.p.cells[1]);
+        gfx.storage_buffer_delete(g.d, ?g.p.meta);
+        gfx.storage_buffer_delete(g.d, ?g.p.status);
+        ret e5f;
+    }
+    val e5l: err[gfx.Error] = make(g.d, cap * 4, ?g.p.list);
+    if (sel e5l.err) {
+        gfx.storage_buffer_delete(g.d, ?g.p.flags);
+        gfx.readback_delete(?g.p.rb, g.d);
+        gfx.storage_buffer_delete(g.d, ?g.p.cells[0]);
+        gfx.storage_buffer_delete(g.d, ?g.p.cells[1]);
+        gfx.storage_buffer_delete(g.d, ?g.p.meta);
+        gfx.storage_buffer_delete(g.d, ?g.p.status);
+        ret e5l;
+    }
+    val rg: res[*u32, allo.Error] = allo.allocate[u32](g.a, status_bytes(cap) / 4);
+    if (sel rg.err) {
+        drop_pool(g, ?g.p);
+        ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.empty{}}};
+    }
+    g.p.got = rg.ok;
+    val ru: res[*u32, allo.Error] = allo.allocate[u32](g.a, cap * space.CENSUS);
+    if (sel ru.err) {
+        drop_pool(g, ?g.p);
+        ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.empty{}}};
+    }
+    g.p.landed = ru.ok;
+    g.p.cap    = cap;
+    # a readback of the old size may still land; nothing recorded before is wanted
+    var i: usize = 0;
+    for (i < RING) {
+        g.ring[i].id = 0;
+        i            = i + 1;
+    }
+    ret err[gfx.Error].ok{};
+}
+
+fun drop_pool(g: *Gpu, p: *Pool) {
+    gfx.storage_buffer_delete(g.d, ?p.list);
+    gfx.storage_buffer_delete(g.d, ?p.flags);
+    gfx.readback_delete(?p.rb, g.d);
+    gfx.storage_buffer_delete(g.d, ?p.status);
+    gfx.storage_buffer_delete(g.d, ?p.meta);
+    gfx.storage_buffer_delete(g.d, ?p.cells[1]);
+    gfx.storage_buffer_delete(g.d, ?p.cells[0]);
+    if (p.got != nil)    { allo.deallocate[u32](g.a, p.got, status_bytes(p.cap) / 4); }
+    if (p.landed != nil) { allo.deallocate[u32](g.a, p.landed, p.cap * space.CENSUS); }
+    p.got    = nil;
+    p.landed = nil;
+    p.cap    = 0;
+}
+
+# build the stages and buffers on a renderer
+#
+# stepping is false afterwards when the compute stages were refused, and the
+# CPU must step; the draw still works.
+# ---
+# g:    the GPU side to build
+# a:    allocator for host buffers
+# r:    the renderer, initialized
+# cap:  slots to size the pool for, at least the host pool's capacity
+# heat: SHADES entries of four floats, the heat palette
+# age:  SHADES entries of four floats, the age palette
+# ret:  ok, or why the pool or the draw could not be made
+pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f32, age: *f32) err[gfx.Error] {
+    g.a        = a;
+    g.r        = r;
+    g.d        = gfx.renderer_device(r);
+    g.p.got    = nil;
+    g.p.landed = nil;
+    g.p.cap    = 0;
+    g.retired  = false;
+    g.hi       = 0;
+    g.front    = 0;
+    g.id       = 0;
+    g.spread   = 0;
+    g.limit    = REACH;
+    g.bulk     = 0;
+    g.edits    = 0;
+    g.mat      = gfx.material();
+    g.xf       = gm.transform_identity();
+    g.writes   = vector.init[Write](a);
+    g.zeros    = vector.init[u32](a);
+    g.stamped  = vector.init[u32](a);
+    # stamps start at zero, which neither of the first two serials matches
+    g.serial = 2;
+
+    val e6: err[gfx.Error] = gfx.shader(?g.draw, ?VERT_SPV[0], $length_of(VERT_SPV), ?FRAG_SPV[0], $length_of(FRAG_SPV));
+    if (sel e6.err) { ret e6; }
+    gfx.shader_set_state(?g.draw, gfx.pipeline_desc_2d());
+
+    g.stepping = false;
+    val sc: err[gfx.Error] = gfx.compute(?g.step, g.d, ?STEP_SPV[0], $length_of(STEP_SPV));
+    if (sel sc.ok) {
+        val zc: err[gfx.Error] = gfx.compute(?g.clear, g.d, ?CLEAR_SPV[0], $length_of(CLEAR_SPV));
+        if (sel zc.ok) {
+            val gc: err[gfx.Error] = gfx.compute(?g.grow, g.d, ?GROW_SPV[0], $length_of(GROW_SPV));
+            if (sel gc.ok) {
+                val cc: err[gfx.Error] = gfx.compute(?g.census, g.d, ?CENSUS_SPV[0], $length_of(CENSUS_SPV));
+                if (sel cc.ok) { g.stepping = true; }
+                or             { gfx.compute_delete(?g.grow, g.d); }
+            }
+            if (!g.stepping) { gfx.compute_delete(?g.clear, g.d); }
+        }
+        if (!g.stepping) { gfx.compute_delete(?g.step, g.d); }
+    }
+
+    val e7: err[gfx.Error] = make(g.d, (LOOK + SHADES * 8) * 4, ?g.view);
+    if (sel e7.err) { ret e7; }
+    val e8: err[gfx.Error] = gfx.storage_buffer_upload(g.d, ?g.view, LOOK * 4, heat::*u8, SHADES * 16);
+    if (sel e8.err) { ret e8; }
+    val e9: err[gfx.Error] = gfx.storage_buffer_upload(g.d, ?g.view, (LOOK + SHADES * 4) * 4, age::*u8, SHADES * 16);
+    if (sel e9.err) { ret e9; }
+    ret make_pool(g, cap);
+}
+
+# leave stepping to the CPU even though the compute stages were built, to
+# measure the CPU engine against the GPU's
+pub fun forgo_compute(g: *Gpu) {
+    if (!g.stepping) { ret; }
+    gfx.compute_delete(?g.step, g.d);
+    gfx.compute_delete(?g.clear, g.d);
+    gfx.compute_delete(?g.grow, g.d);
+    gfx.compute_delete(?g.census, g.d);
+    g.stepping = false;
+}
+
+# release everything, waiting for the device first
+pub fun dnit(g: *Gpu) {
+    gfx.renderer_wait_idle(g.r);
+    if (g.retired) { drop_pool(g, ?g.old); }
+    drop_pool(g, ?g.p);
+    gfx.storage_buffer_delete(g.d, ?g.view);
+    gfx.shader_delete(?g.draw, g.d);
+    if (g.stepping) {
+        gfx.compute_delete(?g.step, g.d);
+        gfx.compute_delete(?g.clear, g.d);
+        gfx.compute_delete(?g.grow, g.d);
+        gfx.compute_delete(?g.census, g.d);
+    }
+    vector.dnit[Write](?g.writes);
+    vector.dnit[u32](?g.zeros);
+    vector.dnit[u32](?g.stamped);
+}
+
+# note an edit, which a census recorded before it cannot free chunks around
+pub fun note_edit(g: *Gpu) {
+    g.edits = g.edits + 1;
+}
+
+# note a clear or fill: the pool was rebuilt whole and settled on the host,
+# so every census recorded before it is stale and the full reach is free again
+pub fun note_bulk(g: *Gpu) {
+    g.bulk  = g.bulk + 1;
+    g.edits = g.edits + 1;
+    g.limit = g.spread + REACH;
+    vector.clear[Write](?g.writes);
+    vector.clear[u32](?g.stamped);
+}
+
+# queue a painted cell, already written to the host's staging cells
+pub fun note_write(g: *Gpu, sp: *space.Space, s: usize, i: usize) {
+    if ((sp.dirty[s] & space.DIRTY_CELLS) != 0) { ret; }
+    val at: usize = s * space.CELLS + i;
+    vector.push[Write](?g.writes, Write{at: at::u32, v: sp.cells[at]});
+    vector.push[u32](?g.stamped, s::u32);
+}
+
+# how many generations may be recorded before the next census lands
+# ---
+# g:      the GPU side
+# radius: the rule's radius, the spread of one generation
+pub fun budget(g: *Gpu, radius: usize) usize {
+    val r: u64 = radius::u64;
+    if (r == 0 || g.spread + r > g.limit) { ret 0; }
+    val n: u64 = (g.limit - g.spread) / r;
+    if (n > MAX_STEPS::u64) { ret MAX_STEPS; }
+    ret n::usize;
+}
+
+# settle the host's pool from the newest census that has landed
+#
+# call once a frame after the frame begins and before anything is recorded, so
+# a finished copy is taken before the frame's own readback reuses its slot.
+# ---
+# g:   the GPU side
+# sp:  the host's pool
+# ret: false when the pool could not hold a chunk the world grew into
+pub fun collect(g: *Gpu, sp: *space.Space) bool {
+    if (!g.stepping || g.p.cap == 0) { ret true; }
+    val len: usize = status_bytes(g.p.cap);
+    if (!gfx.renderer_readback_take(g.r, ?g.p.rb, g.p.got::*u8, len)) { ret true; }
+    val id:   u32   = g.p.got[0];
+    val snap: *Snap = ?g.ring[id::usize % RING];
+    if (snap.id != id || id == 0 || snap.cap != g.p.cap || snap.bulk != g.bulk) { ret true; }
+    var n: usize = sp.hi;
+    if (n > snap.hi) { n = snap.hi; }
+    # a slot matches its report when the incarnation bits agree. fewer than
+    # 2^18 allocations happen between a census and its landing, since no frame
+    # makes more than the pool holds, so bits that agree name the same chunk
+    var s: usize = 0;
+    for (s < n) {
+        val w:   u32  = g.p.got[4 + s];
+        val c:   *u32 = ?g.p.landed[s * space.CENSUS];
+        val inc: u32  = space.incarnation(sp, s);
+        c[0] = w & 0x1fff;
+        c[1] = (w >> 13) & 1;
+        c[2] = 0;
+        if (inc != 0 && (w >> 14) == (inc & TAG)) { c[2] = inc; }
+        c[3] = 0;
+        s    = s + 1;
+    }
+    val ok: bool = space.settle(sp, g.p.landed, n, snap.edits == g.edits);
+    # a census the pool could not be settled from leaves the limit where it was
+    if (ok && snap.spread + REACH > g.limit) { g.limit = snap.spread + REACH; }
+    ret ok;
+}
+
+# read the GPU's cells into the host's staging cells
+#
+# a stall. chunks whose staging is newer than the GPU's, filled or painted and
+# not yet uploaded, keep their staging. call outside a frame, or in one before
+# frame has recorded anything.
+# ---
+# g:   the GPU side
+# sp:  the host's pool
+# ret: ok, or why the read failed
+pub fun pull(g: *Gpu, sp: *space.Space) err[gfx.Error] {
+    if (!g.stepping) { ret err[gfx.Error].ok{}; }
+    # one read per run of slots whose staging is not newer; a free slot's
+    # staging is unused, so it may ride along in a run
+    var top: usize = g.hi;
+    if (sp.hi < top) { top = sp.hi; }
+    val newer: u8    = space.DIRTY_CELLS | space.DIRTY_ZERO;
+    var s:     usize = 0;
+    for (s < top) {
+        if ((sp.dirty[s] & newer) != 0) {
+            s = s + 1;
+            cnt;
+        }
+        var run: usize = 1;
+        for (s + run < top && (sp.dirty[s + run] & newer) == 0) { run = run + 1; }
+        val e: err[gfx.Error] = gfx.storage_buffer_read(g.d, ?g.p.cells[g.front], s * space.CELLS * 4,
+            (?sp.cells[s * space.CELLS])::*u8, run * space.CELLS * 4);
+        if (sel e.err) { ret e; }
+        s = s + run;
+    }
+    # a painted cell not yet uploaded is newer than what was just read
+    var i: usize = 0;
+    for (i < g.writes.len) {
+        val w: Write = g.writes.data[i];
+        sp.cells[w.at::usize] = w.v;
+        i                     = i + 1;
+    }
+    ret err[gfx.Error].ok{};
+}
+
+# upload a run of whole chunks, stalled or recorded
+fun upload_cells(g: *Gpu, sp: *space.Space, s: usize, n: usize, stall: bool) err[gfx.Error] {
+    val at:  usize = s * space.CELLS * 4;
+    val len: usize = n * space.CELLS * 4;
+    val src: *u8   = (?sp.cells[s * space.CELLS])::*u8;
+    if (stall) { ret gfx.storage_buffer_upload(g.d, ?g.p.cells[g.front], at, src, len); }
+    ret gfx.renderer_buffer_update(g.r, ?g.p.cells[g.front], at, src, len);
+}
+
+# bring the GPU's pool level with the host's: grow it, then upload changed
+# page-table entries, whole chunks and painted cells
+fun flush(g: *Gpu, sp: *space.Space) err[gfx.Error] {
+    # buffers a growth replaced are freed once the frame that copied out of
+    # them has run, which deleting waits for
+    if (g.retired) {
+        drop_pool(g, ?g.old);
+        g.retired = false;
+    }
+    val grew: bool = sp.cap > g.p.cap;
+    if (grew) {
+        # the world moves into larger buffers on the GPU, and only the page
+        # table goes up again
+        g.old     = g.p;
+        g.retired = true;
+        val grown: err[gfx.Error] = make_pool(g, sp.cap);
+        if (sel grown.err) { ret grown; }
+        if (g.hi != 0 && g.stepping) {
+            var gb: [4]*gfx.StorageBuffer;
+            gb[0] = ?g.old.cells[g.front];
+            gb[1] = ?g.p.cells[g.front];
+            gb[2] = ?g.old.flags;
+            gb[3] = ?g.p.flags;
+            val eg: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.grow, ?gb[0], 4, 64, g.hi::u32, 1);
+            if (sel eg.err) { ret eg; }
+        }
+        var t: usize = 0;
+        for (t < sp.hi) {
+            sp.dirty[t] = sp.dirty[t] | space.DIRTY_ENTRY;
+            t           = t + 1;
+        }
+    }
+
+    var top: usize = sp.hi;
+    if (g.hi > top) { top = g.hi; }
+    var entries: usize = 0;
+    var chunks:  usize = 0;
+    var s:       usize = 0;
+    for (s < top) {
+        if ((sp.dirty[s] & space.DIRTY_ENTRY) != 0) { entries = entries + 1; }
+        if ((sp.dirty[s] & space.DIRTY_CELLS) != 0) { chunks = chunks + 1; }
+        s = s + 1;
+    }
+
+    if (entries > BULK) {
+        # one recorded write of the span the dirty entries lie in, which never
+        # waits on the GPU the way a stalled upload would every frame
+        var lo: usize = top;
+        var hi: usize = 0;
+        s = 0;
+        for (s < top) {
+            if ((sp.dirty[s] & space.DIRTY_ENTRY) != 0) {
+                if (s < lo) { lo = s; }
+                hi = s + 1;
+            }
+            s = s + 1;
+        }
+        val e10: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.meta, (HEAD + lo * space.ENTRY) * 4,
+            (?sp.table[lo * space.ENTRY])::*u8, (hi - lo) * space.ENTRY * 4);
+        if (sel e10.err) { ret e10; }
+    }
+    or (entries != 0) {
+        s = 0;
+        for (s < top) {
+            if ((sp.dirty[s] & space.DIRTY_ENTRY) != 0) {
+                val e11: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.meta, (HEAD + s * space.ENTRY) * 4,
+                    (?sp.table[s * space.ENTRY])::*u8, space.ENTRY * 4);
+                if (sel e11.err) { ret e11; }
+            }
+            s = s + 1;
+        }
+    }
+
+    if (g.stepping) {
+        # chunks allocated empty are cleared on the GPU, in both pools
+        vector.clear[u32](?g.zeros);
+        s = 0;
+        for (s < top) {
+            if ((sp.dirty[s] & (space.DIRTY_ZERO | space.DIRTY_CELLS)) == space.DIRTY_ZERO && space.used(sp, s)) {
+                vector.push[u32](?g.zeros, s::u32);
+            }
+            s = s + 1;
+        }
+        if (g.zeros.len != 0) {
+            val el: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.list, 0, g.zeros.data::*u8, g.zeros.len * 4);
+            if (sel el.err) { ret el; }
+            var zb: [4]*gfx.StorageBuffer;
+            zb[0] = ?g.p.cells[0];
+            zb[1] = ?g.p.cells[1];
+            zb[2] = ?g.p.list;
+            zb[3] = ?g.p.flags;
+            val ez: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.clear, ?zb[0], 4, 64, g.zeros.len::u32, 1);
+            if (sel ez.err) { ret ez; }
+        }
+
+        # chunks the host filled are uploaded, and stamped so they step in full.
+        # a stalled upload would land before this frame's growth copy, which
+        # would then overwrite it, so a growing frame records its uploads
+        val stall: bool = chunks > BULK && !grew;
+        s = 0;
+        for (chunks != 0 && s < top) {
+            if ((sp.dirty[s] & space.DIRTY_CELLS) != 0 && space.used(sp, s)) {
+                # a stalled upload runs on over free slots, whose cells nothing reads,
+                # so a fragmented pool still goes up in a few copies
+                var run: usize = 1;
+                for (stall && s + run < top
+                    && ((sp.dirty[s + run] & space.DIRTY_CELLS) != 0 || !space.used(sp, s + run))) {
+                    run = run + 1;
+                }
+                val e12: err[gfx.Error] = upload_cells(g, sp, s, run, stall);
+                if (sel e12.err) { ret e12; }
+                if (!stall)      { vector.push[u32](?g.stamped, s::u32); }
+                s = s + run;
+                cnt;
+            }
+            s = s + 1;
+        }
+        if (stall) {
+            # many at once: every slot is stamped, which only costs one full step
+            val rs: res[*u32, allo.Error] = allo.allocate[u32](g.a, top * 2);
+            if (sel rs.err) { ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.empty{}}}; }
+            mem.fill[u32](rs.ok, g.serial, top * 2);
+            val ef: err[gfx.Error] = gfx.storage_buffer_upload(g.d, ?g.p.flags, 0, rs.ok::*u8, top * 8);
+            allo.deallocate[u32](g.a, rs.ok, top * 2);
+            if (sel ef.err) { ret ef; }
+        }
+    }
+
+    var i: usize = 0;
+    for (i < g.writes.len) {
+        val w:   *Write         = ?g.writes.data[i];
+        val e13: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.cells[g.front], w.at::usize * 4, (?w.v)::*u8, 4);
+        if (sel e13.err) { ret e13; }
+        i = i + 1;
+    }
+    vector.clear[Write](?g.writes);
+    var now: [2]u32;
+    now[0] = g.serial;
+    now[1] = g.serial;
+    i      = 0;
+    for (i < g.stamped.len && g.stepping) {
+        val es: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.flags, g.stamped.data[i]::usize * 8, (?now[0])::*u8, 8);
+        if (sel es.err) { ret es; }
+        i = i + 1;
+    }
+    vector.clear[u32](?g.stamped);
+
+    s = 0;
+    for (s < top) {
+        sp.dirty[s] = 0;
+        s           = s + 1;
+    }
+    g.hi = sp.hi;
+    ret err[gfx.Error].ok{};
+}
+
+# while the CPU steps, upload the chunks the view can see
+fun upload_view(g: *Gpu, sp: *space.Space, look: *Look) err[gfx.Error] {
+    if (look.ppc <= 0.0) { ret err[gfx.Error].ok{}; }
+    val bx:   i64   = look.base_cx::i64 - space.BIAS;
+    val by:   i64   = look.base_cy::i64 - space.BIAS;
+    val cx:   f32   = look.frac_x;
+    val cy:   f32   = look.frac_y;
+    val hw:   f32   = look.half_w / look.ppc;
+    val hh:   f32   = look.half_h / look.ppc;
+    val x0:   i64   = bx + ((cx - hw) / 64.0 - 1.0)::i64;
+    val x1:   i64   = bx + ((cx + hw) / 64.0 + 1.0)::i64;
+    val y0:   i64   = by + ((cy - hh) / 64.0 - 1.0)::i64;
+    val y1:   i64   = by + ((cy + hh) / 64.0 + 1.0)::i64;
+    var sent: usize = 0;
+    var s:    usize = 0;
+    for (s < sp.hi && sent < MAX_VIEW) {
+        if (space.used(sp, s)) {
+            val x: i64 = space.slot_x(sp, s);
+            val y: i64 = space.slot_y(sp, s);
+            if (x >= x0 && x <= x1 && y >= y0 && y <= y1) {
+                val e: err[gfx.Error] = upload_cells(g, sp, s, 1, false);
+                if (sel e.err) { ret e; }
+                sent = sent + 1;
+            }
+        }
+        s = s + 1;
+    }
+    ret err[gfx.Error].ok{};
+}
+
+fun write_head(g: *Gpu, k: *kernel.Kernel) {
+    g.head[0] = k.radius::u32;
+    g.head[1] = (k.birth & 0xffffffff)::u32;
+    g.head[2] = (k.birth >> 32)::u32;
+    g.head[3] = (k.survive & 0xffffffff)::u32;
+    g.head[4] = (k.survive >> 32)::u32;
+    g.head[5] = g.id;
+    g.head[6] = g.hi::u32;
+    g.head[7] = g.serial;
+    var i: usize = 0;
+    for (i < 88) {
+        var w: u32 = 1024;
+        if (i < 81) { w = (k.weights[i] + 1024)::u32; }
+        g.head[8 + i] = w;
+        i             = i + 1;
+    }
+}
+
+# record a frame's work: bring the pool level, step, count, and set the view
+#
+# call once a frame between renderer_begin_frame and the first pass, after
+# collect and after anything that reads the GPU's cells with a stall.
+# ---
+# g:     the GPU side
+# sp:    the host's pool
+# k:     the rule
+# steps: generations wanted; fewer are recorded when the budget is short
+# look:  the camera and colours for the draw
+# ret:   the generations recorded, or why recording failed
+pub fun frame(g: *Gpu, sp: *space.Space, k: *kernel.Kernel, steps: usize, look: *Look) res[usize, gfx.Error] {
+    val e14: err[gfx.Error] = flush(g, sp);
+    if (sel e14.err) { ret res[usize, gfx.Error].err{e14.err}; }
+    val e15: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.view, 0, look::*u8, LOOK * 4);
+    if (sel e15.err) { ret res[usize, gfx.Error].err{e15.err}; }
+    if (!g.stepping) {
+        val e16: err[gfx.Error] = upload_view(g, sp, look);
+        if (sel e16.err) { ret res[usize, gfx.Error].err{e16.err}; }
+        ret res[usize, gfx.Error].ok{0};
+    }
+
+    var n: usize = steps;
+    val b: usize = budget(g, k.radius);
+    if (n > b) { n = b; }
+    g.id = g.id + 1;
+    if (g.id == 0) { g.id = 1; }
+    write_head(g, k);
+    val e17: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.meta, 0, (?g.head[0])::*u8, HEAD * 4);
+    if (sel e17.err) { ret res[usize, gfx.Error].err{e17.err}; }
+
+    var i: usize = 0;
+    for (i < n) {
+        if (g.hi != 0) {
+            g.serial = g.serial + 1;
+            val es: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.meta, 7 * 4, (?g.serial)::*u8, 4);
+            if (sel es.err) { ret res[usize, gfx.Error].err{es.err}; }
+            var bufs: [4]*gfx.StorageBuffer;
+            bufs[0] = ?g.p.cells[g.front];
+            bufs[1] = ?g.p.cells[1 - g.front];
+            bufs[2] = ?g.p.meta;
+            bufs[3] = ?g.p.flags;
+            val e18: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.step, ?bufs[0], 4, 8, g.hi::u32, 1);
+            if (sel e18.err) { ret res[usize, gfx.Error].err{e18.err}; }
+            g.front = 1 - g.front;
+        }
+        g.spread = g.spread + k.radius::u64;
+        i        = i + 1;
+    }
+
+    var groups: u32 = ((g.hi + 63) / 64)::u32;
+    if (groups == 0) { groups = 1; }
+    var cb: [4]*gfx.StorageBuffer;
+    cb[0] = ?g.p.cells[g.front];
+    cb[1] = ?g.p.meta;
+    cb[2] = ?g.p.status;
+    cb[3] = ?g.p.flags;
+    val e19: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.census, ?cb[0], 4, groups, 1, 1);
+    if (sel e19.err) { ret res[usize, gfx.Error].err{e19.err}; }
+    val e20: err[gfx.Error] = gfx.renderer_readback(g.r, ?g.p.rb, ?g.p.status, 0);
+    if (sel e20.err) { ret res[usize, gfx.Error].err{e20.err}; }
+    val snap: *Snap = ?g.ring[g.id::usize % RING];
+    snap.id     = g.id;
+    snap.spread = g.spread;
+    snap.bulk   = g.bulk;
+    snap.edits  = g.edits;
+    snap.cap    = g.p.cap;
+    snap.hi     = g.hi;
+    ret res[usize, gfx.Error].ok{n};
+}
+
+# draw every chunk into an open pass
+pub fun draw(g: *Gpu, p: *gfx.Pass) {
+    if (g.hi == 0) { ret; }
+    var bufs: [3]*gfx.StorageBuffer;
+    bufs[0] = ?g.p.cells[g.front];
+    bufs[1] = ?g.p.meta;
+    bufs[2] = ?g.view;
+    gfx.pass_draw_storage(p, ?bufs[0], 3, 6, g.hi::u32, ?g.mat, ?g.xf, ?g.draw);
+}
