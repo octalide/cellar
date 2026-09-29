@@ -1,15 +1,17 @@
 # text serialization of a world or a pattern to disk
 #
-# the on-disk format is a header line "<w> <h>\n" followed by h lines of w
-# characters, '1' for a live cell and '0' for a dead one. it is deliberately
-# trivial to read and write. saves create the arrangements directory first,
-# and the world allocator (sim.grid.a) backs the transient buffers. a grid and
-# a pattern both store cells row-major as bytes, so one formatter serializes
-# either.
+# a pattern is a header line "<w> <h>\n" followed by h lines of w characters,
+# '1' for a live cell and '0' for a dead one. a world is sparse: a first line
+# "cellar 2", then for every chunk holding a live cell a line "<cx> <cy>" with
+# its signed chunk coordinates and 64 lines of 64 cells. a world file in the
+# pattern format, what every world was saved as before the world became
+# unbounded, still loads, centred on the origin. both are deliberately trivial
+# to read and write. saves create the arrangements directory first.
 
-use cellar.grid;
+use gfx: boom.graphics;
 use cellar.pattern;
 use cellar.sim;
+use cellar.space;
 use cellar.text;
 use allo: std.allocator;
 use std.allocator.page;
@@ -18,6 +20,9 @@ use std.collections.vector;
 use std.collections.vector.Vector;
 use fs:       std.filesystem;
 use io_error: std.io.error;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
 use std.types.error.err;
 use std.types.result.res;
 use std.types.size.usize;
@@ -32,9 +37,13 @@ pub val DIR_MODE: i32 = 0o755;
 pub val FILE_MODE: i32 = 0o644;
 # bytes reserved for the "<w> <h>\n" header when sizing a buffer
 val HEADER_MAX: usize = 32;
-# largest world side a loaded file may declare, bounding the allocation a
+# largest world side an old dense file may declare, bounding the allocation a
 # corrupt or hand-edited header can request
 val MAX_DIM: usize = 4096;
+# the first line of a sparse world file
+val MAGIC: str = "cellar 2";
+# bytes of one chunk record past its coordinate line
+val CHUNK_TEXT: usize = 64 * 65;
 
 # why a save or load did not complete
 # ---
@@ -43,12 +52,14 @@ val MAX_DIM: usize = 4096;
 # dimensions: the header declares a size of zero or beyond the limit
 # truncated:  the body holds fewer cells than the header declares
 # version:    a settings file written by another format version
+# gpu:        the GPU's cells could not be read back
 pub tag Error: u8 {
     alloc: allo.Error;
     fs:    fs.FsError;
     dimensions;
     truncated;
     version;
+    gpu;
 }
 
 # a one-line description of a persistence failure
@@ -60,6 +71,7 @@ pub fun error_message(e: Error) str {
     if (sel e.dimensions) { ret "bad dimensions"; }
     if (sel e.truncated)  { ret "truncated body"; }
     if (sel e.version)    { ret "version mismatch"; }
+    if (sel e.gpu)        { ret "GPU read failed"; }
     if (sel e.fs) {
         if (sel e.fs.io) { ret io_error.kind_name(e.fs.io.kind); }
     }
@@ -159,16 +171,6 @@ fun parse_header(b: *Vector[u8], w: *usize, h: *usize) usize {
     ret parse_uint(b, i, h);
 }
 
-# serialize the simulation grid to path
-# ---
-# a:    allocator backing the transient buffer
-# s:    simulation whose grid is saved
-# path: destination file path
-# ret:  ok, or why the file was not written
-pub fun save_world(a: *allo.Allocator, s: *sim.Sim, path: str) err[Error] {
-    ret save_buffer(a, s.grid.cells, s.grid.w, s.grid.h, path);
-}
-
 # parse the w x h cells after the header into out, row-major as 0 or 1
 #
 # every cell is read before the caller changes anything, so a short body is
@@ -194,10 +196,151 @@ fun parse_body(b: *Vector[u8], start: usize, w: usize, h: usize, out: *u8) err[E
     ret err[Error].ok{};
 }
 
-# read path, resize the simulation to its dimensions, and set its cells
+# append a signed decimal to buf at off
+fun buf_i64(buf: *u8, off: usize, v: i64) usize {
+    if (v < 0) {
+        buf[off] = '-';
+        ret text.buf_u64(buf, off + 1, (0 - v)::u64);
+    }
+    ret text.buf_u64(buf, off, v::u64);
+}
+
+# serialize the world's live chunks to path
 #
-# the whole file is validated before the world changes, so a refusal leaves
-# the world as it was.
+# on the GPU the cells are read back first, a stall.
+# ---
+# a:    allocator backing the transient buffer
+# s:    simulation whose world is saved
+# path: destination file path
+# ret:  ok, or why the file was not written
+pub fun save_world(a: *allo.Allocator, s: *sim.Sim, path: str) err[Error] {
+    val synced: err[gfx.Error] = sim.sync(s);
+    if (sel synced.err) { ret err[Error].err{Error.gpu{}}; }
+    val made: err[fs.FsError] = fs.create_dir_all(a, DIR, DIR_MODE);
+    if (sel made.err) { ret err[Error].err{Error.fs{made.err}}; }
+
+    val sp:   *space.Space = ?s.space;
+    var live: usize        = 0;
+    var sl:   usize        = 0;
+    for (sl < sp.hi) {
+        if (space.used(sp, sl)) {
+            space.recount(sp, sl);
+            if (sp.census[sl * space.CENSUS] != 0) { live = live + 1; }
+        }
+        sl = sl + 1;
+    }
+    val cap: usize                = HEADER_MAX + live * (HEADER_MAX + CHUNK_TEXT);
+    val rb:  res[*u8, allo.Error] = allo.allocate[u8](a, cap);
+    if (sel rb.err) { ret err[Error].err{Error.alloc{rb.err}}; }
+    val buf: *u8   = rb.ok;
+    var off: usize = text.buf_str(buf, 0, MAGIC);
+    buf[off] = '\n';
+    off      = off + 1;
+    sl       = 0;
+    for (sl < sp.hi) {
+        if (space.used(sp, sl) && sp.census[sl * space.CENSUS] != 0) {
+            off      = buf_i64(buf, off, space.slot_x(sp, sl));
+            buf[off] = ' ';
+            off      = buf_i64(buf, off + 1, space.slot_y(sp, sl));
+            buf[off] = '\n';
+            off      = off + 1;
+            val c: *u32  = ?sp.cells[sl * space.CELLS];
+            var i: usize = 0;
+            for (i < space.CELLS) {
+                var ch: u8 = '0';
+                if (c[i] >= 256) { ch = '1'; }
+                buf[off] = ch;
+                off      = off + 1;
+                if (i % 64 == 63) {
+                    buf[off] = '\n';
+                    off      = off + 1;
+                }
+                i = i + 1;
+            }
+        }
+        sl = sl + 1;
+    }
+    val wrote: err[fs.FsError] = fs.write_bytes(path, buf, off, FILE_MODE);
+    allo.deallocate[u8](a, buf, cap);
+    if (sel wrote.err) { ret err[Error].err{Error.fs{wrote.err}}; }
+    ret err[Error].ok{};
+}
+
+# read a signed decimal at off, skipping spaces before it
+# ---
+# b:   the file contents
+# off: where to start
+# out: receives the value
+# ret: the offset past the digits, or the length when none were found
+fun parse_i64(b: *Vector[u8], off: usize, out: *i64) usize {
+    var o: usize = off;
+    for (text.byte_at(b.data, b.len, o) == ' ') { o = o + 1; }
+    var neg: bool = false;
+    if (text.byte_at(b.data, b.len, o) == '-') {
+        neg = true;
+        o   = o + 1;
+    }
+    val c: u8 = text.byte_at(b.data, b.len, o);
+    if (c < '0' || c > '9') { ret b.len; }
+    var v: usize = 0;
+    o    = parse_uint(b, o, ?v);
+    @out = v::i64;
+    if (neg) { @out = 0 - v::i64; }
+    ret o;
+}
+
+# whether the file starts with the sparse world's first line
+fun is_sparse(b: *Vector[u8]) bool {
+    var i: usize = 0;
+    for (MAGIC[i] != 0) {
+        if (text.byte_at(b.data, b.len, i) != MAGIC[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the chunk records of a sparse world, as coordinates and 0/1 cells
+# ---
+# b:     the file contents
+# at:    receives each chunk's coordinates, two per chunk
+# cells: receives each chunk's space.CELLS cells
+# ret:   ok, or why the file was refused
+fun parse_sparse(b: *Vector[u8], at: *Vector[i64], cells: *Vector[u8]) err[Error] {
+    var p: usize = 0;
+    for (p < b.len && b.data[p] != '\n') { p = p + 1; }
+    for (true) {
+        for (p < b.len && (b.data[p] == '\n' || b.data[p] == '\r' || b.data[p] == ' ')) { p = p + 1; }
+        if (p >= b.len) { brk; }
+        var cx: i64 = 0;
+        var cy: i64 = 0;
+        p = parse_i64(b, p, ?cx);
+        if (p >= b.len) { ret err[Error].err{Error.truncated{}}; }
+        p = parse_i64(b, p, ?cy);
+        if (p >= b.len) { ret err[Error].err{Error.truncated{}}; }
+        if (at.len / 2 >= space.MAX_SLOTS || cx < 0 - space.BIAS || cx >= space.BIAS
+            || cy < 0 - space.BIAS || cy >= space.BIAS) { ret err[Error].err{Error.dimensions{}}; }
+        vector.push[i64](at, cx);
+        vector.push[i64](at, cy);
+        val base: usize                  = cells.len;
+        val grow: res[usize, allo.Error] = vector.reserve[u8](cells, space.CELLS);
+        if (sel grow.err) { ret err[Error].err{Error.alloc{grow.err}}; }
+        cells.len = base + space.CELLS;
+        val parsed: err[Error] = parse_body(b, p, 64, 64, ?cells.data[base]);
+        if (sel parsed.err) { ret parsed; }
+        # step past the cells just read
+        var n: usize = 0;
+        for (n < space.CELLS) {
+            p = next_cell(b, p) + 1;
+            n = n + 1;
+        }
+    }
+    ret err[Error].ok{};
+}
+
+# read path and replace the world with what it holds
+#
+# the whole file is parsed before the world changes, so a refusal leaves the
+# world as it was.
 # ---
 # a:    allocator for the read and parse buffers
 # s:    simulation to populate
@@ -208,6 +351,32 @@ pub fun load_world(a: *allo.Allocator, s: *sim.Sim, path: str) err[Error] {
     if (sel rr.err) { ret err[Error].err{Error.fs{rr.err}}; }
     var data: Vector[u8] = rr.ok;
 
+    if (is_sparse(?data)) {
+        var at:     Vector[i64] = vector.init[i64](a);
+        var cells:  Vector[u8]  = vector.init[u8](a);
+        val parsed: err[Error]  = parse_sparse(?data, ?at, ?cells);
+        vector.dnit[u8](?data);
+        if (sel parsed.ok) {
+            sim.fill_begin(s);
+            var k: usize = 0;
+            for (k < at.len / 2) {
+                val ox: i64   = at.data[k * 2] * space.SIDE;
+                val oy: i64   = at.data[k * 2 + 1] * space.SIDE;
+                var i:  usize = 0;
+                for (i < space.CELLS) {
+                    if (cells.data[k * space.CELLS + i] != 0) { sim.fill_cell(s, ox + (i % 64)::i64, oy + (i / 64)::i64); }
+                    i = i + 1;
+                }
+                k = k + 1;
+            }
+            sim.fill_end(s);
+        }
+        vector.dnit[i64](?at);
+        vector.dnit[u8](?cells);
+        ret parsed;
+    }
+
+    # an old dense world, centred on the origin
     var w:     usize = 0;
     var h:     usize = 0;
     val start: usize = parse_header(?data, ?w, ?h);
@@ -215,7 +384,6 @@ pub fun load_world(a: *allo.Allocator, s: *sim.Sim, path: str) err[Error] {
         vector.dnit[u8](?data);
         ret err[Error].err{Error.dimensions{}};
     }
-
     val rc: res[*u8, allo.Error] = allo.allocate[u8](a, w * h);
     if (sel rc.err) {
         vector.dnit[u8](?data);
@@ -228,22 +396,19 @@ pub fun load_world(a: *allo.Allocator, s: *sim.Sim, path: str) err[Error] {
         allo.deallocate[u8](a, cells, w * h);
         ret parsed;
     }
-
-    # resize allocates before it frees, so a refusal here keeps the old world
-    val e: err[allo.Error] = sim.resize(s, w, h);
-    if (sel e.err) {
-        allo.deallocate[u8](a, cells, w * h);
-        ret err[Error].err{Error.alloc{e.err}};
-    }
+    val ox: i64 = 0 - (w / 2)::i64;
+    val oy: i64 = 0 - (h / 2)::i64;
+    sim.fill_begin(s);
     var y: usize = 0;
     for (y < h) {
         var x: usize = 0;
         for (x < w) {
-            sim.paint(s, x, y, cells[y * w + x]);
+            if (cells[y * w + x] != 0) { sim.fill_cell(s, ox + x::i64, oy + y::i64); }
             x = x + 1;
         }
         y = y + 1;
     }
+    sim.fill_end(s);
     allo.deallocate[u8](a, cells, w * h);
     ret err[Error].ok{};
 }
@@ -288,41 +453,59 @@ pub fun load_pattern(a: *allo.Allocator, p: *pattern.Pattern, path: str) err[Err
     ret err[Error].ok{};
 }
 
-test load_world__round_trips {
+test load_world__round_trips_a_sparse_world {
     var a: allo.Allocator;
     page.make(?a);
 
-    var s:     sim.Sim;
-    val made2: err[allo.Error] = sim.init(?s, ?a, 6, 4);
-    if (sel made2.err) { ret 1; }
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
     sim.paint(?s, 0, 0, 1);
-    sim.paint(?s, 5, 3, 1);
-    sim.paint(?s, 2, 1, 1);
+    sim.paint(?s, -5, 3, 1);
+    sim.paint(?s, 100000, -70000, 1);
 
-    val path:   str        = "arrangements/test_world.cells";
-    val saved3: err[Error] = save_world(?a, ?s, path);
-    if (sel saved3.err) { ret 2; }
+    val path:  str        = "arrangements/test_world.cells";
+    val saved: err[Error] = save_world(?a, ?s, path);
+    if (sel saved.err) { ret 2; }
 
     var t:     sim.Sim;
-    val made3: err[allo.Error] = sim.init(?t, ?a, 2, 2);
-    if (sel made3.err) { ret 3; }
-    val loaded3: err[Error] = load_world(?a, ?t, path);
-    if (sel loaded3.err) { ret 4; }
+    val made2: err[allo.Error] = sim.init(?t, ?a);
+    if (sel made2.err) { ret 3; }
+    sim.paint(?t, 7, 7, 1);
+    val loaded: err[Error] = load_world(?a, ?t, path);
+    if (sel loaded.err) { ret 4; }
 
-    if (t.grid.w != 6 || t.grid.h != 4) { ret 5; }
-    var y: usize = 0;
-    for (y < 4) {
-        var x: usize = 0;
-        for (x < 6) {
-            if (grid.get(?t.grid, x, y) != grid.get(?s.grid, x, y)) { ret 6; }
-            x = x + 1;
-        }
-        y = y + 1;
-    }
+    if (sim.population(?t) != 3)                               { ret 5; }
+    if (!sim.alive(?t, 0, 0) || !sim.alive(?t, -5, 3))         { ret 6; }
+    if (!sim.alive(?t, 100000, -70000) || sim.alive(?t, 7, 7)) { ret 7; }
 
     fs.remove_file(path);
     sim.dnit(?s);
     sim.dnit(?t);
+    ret 0;
+}
+
+test load_world__loads_an_old_dense_file_centred {
+    var a: allo.Allocator;
+    page.make(?a);
+
+    # a 4 x 2 world from before the world was unbounded
+    var body: [14]u8          = [14]u8{'4', ' ', '2', '\n', '1', '0', '0', '0', '\n', '0', '0', '0', '1', '\n'};
+    val path: str             = "arrangements/test_old.cells";
+    val dir:  err[fs.FsError] = fs.create_dir_all(?a, DIR, DIR_MODE);
+    if (sel dir.err) { ret 1; }
+    val wrote: err[fs.FsError] = fs.write_bytes(path, ?body[0], 14, FILE_MODE);
+    if (sel wrote.err) { ret 2; }
+
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 3; }
+    val loaded: err[Error] = load_world(?a, ?s, path);
+    fs.remove_file(path);
+    if (sel loaded.err)                                 { ret 4; }
+    if (sim.population(?s) != 2)                        { ret 5; }
+    if (!sim.alive(?s, -2, -1) || !sim.alive(?s, 1, 0)) { ret 6; }
+    sim.dnit(?s);
     ret 0;
 }
 
@@ -390,7 +573,7 @@ test load_world__short_body_leaves_the_world_intact {
     page.make(?a);
 
     var s:    sim.Sim;
-    val made: err[allo.Error] = sim.init(?s, ?a, 4, 4);
+    val made: err[allo.Error] = sim.init(?s, ?a);
     if (sel made.err) { ret 1; }
     sim.paint(?s, 2, 2, 1);
 
@@ -404,10 +587,10 @@ test load_world__short_body_leaves_the_world_intact {
 
     val loaded: err[Error] = load_world(?a, ?s, path);
     fs.remove_file(path);
-    if (!sel loaded.err)                { ret 4; }
-    if (!sel loaded.err.truncated)      { ret 5; }
-    if (s.grid.w != 4 || s.grid.h != 4) { ret 6; }
-    if (grid.get(?s.grid, 2, 2) != 1)   { ret 7; }
+    if (!sel loaded.err)           { ret 4; }
+    if (!sel loaded.err.truncated) { ret 5; }
+    if (sim.population(?s) != 1)   { ret 6; }
+    if (!sim.alive(?s, 2, 2))      { ret 7; }
     sim.dnit(?s);
     ret 0;
 }
