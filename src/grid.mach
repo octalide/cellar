@@ -5,9 +5,16 @@
 # back pointers in O(1). neighbor counts wrap at the edges, so the world is a
 # torus. two position-indexed auxiliary fields track per-cell history for the
 # renderer: age (generations continuously alive) and heat (a fading trail).
+#
+# the renderer draws only cells that are alive or still warm, so the grid keeps
+# a list of their indices. a step rebuilds it while it visits every cell anyway,
+# and an edit appends to it or marks it stale, which the next draw rebuilds.
 
 use allo: std.allocator;
 use std.allocator.page;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
 use std.types.error.err;
 use std.types.result.res;
 use std.types.size.usize;
@@ -18,6 +25,9 @@ use std.types.size.usize;
 # back:  back buffer for the next generation, same length
 # age:   per-cell generations continuously alive, 0 when dead, length w*h
 # heat:  per-cell trail value, 255 while alive and decaying after death, length w*h
+# live:  indices of cells that are alive or warm, capacity w*h
+# count: how many indices live holds
+# stale: live may miss a drawable cell or hold one twice, and needs a rebuild
 # w:     width in cells
 # h:     height in cells
 # a:     allocator backing every buffer
@@ -26,6 +36,9 @@ pub rec Grid {
     back:  *u8;
     age:   *u32;
     heat:  *u8;
+    live:  *u32;
+    count: usize;
+    stale: bool;
     w:     usize;
     h:     usize;
     a:     *allo.Allocator;
@@ -62,10 +75,21 @@ pub fun init(g: *Grid, a: *allo.Allocator, w: usize, h: usize) err[allo.Error] {
         allo.deallocate[u32](a, rg.ok, n);
         ret err[allo.Error].err{rh.err};
     }
+    val rl: res[*u32, allo.Error] = allo.allocate[u32](a, n);
+    if (sel rl.err) {
+        allo.deallocate[u8](a, rc.ok, n);
+        allo.deallocate[u8](a, rb.ok, n);
+        allo.deallocate[u32](a, rg.ok, n);
+        allo.deallocate[u8](a, rh.ok, n);
+        ret err[allo.Error].err{rl.err};
+    }
     g.cells = rc.ok;
     g.back  = rb.ok;
     g.age   = rg.ok;
     g.heat  = rh.ok;
+    g.live  = rl.ok;
+    g.count = 0;
+    g.stale = false;
     g.w     = w;
     g.h     = h;
     g.a     = a;
@@ -82,14 +106,18 @@ pub fun dnit(g: *Grid) err[allo.Error] {
     val e1: err[allo.Error] = allo.deallocate[u8](g.a, g.back, n);
     val e2: err[allo.Error] = allo.deallocate[u32](g.a, g.age, n);
     val e3: err[allo.Error] = allo.deallocate[u8](g.a, g.heat, n);
+    val e4: err[allo.Error] = allo.deallocate[u32](g.a, g.live, n);
     g.cells = nil;
     g.back  = nil;
     g.age   = nil;
     g.heat  = nil;
+    g.live  = nil;
+    g.count = 0;
     if (sel e0.err) { ret e0; }
     if (sel e1.err) { ret e1; }
     if (sel e2.err) { ret e2; }
-    ret e3;
+    if (sel e3.err) { ret e3; }
+    ret e4;
 }
 
 # reallocate every buffer to a new w x h, clearing all state
@@ -180,6 +208,52 @@ pub fun set_heat(g: *Grid, x: usize, y: usize, v: u8) {
     g.heat[y * g.w + x] = v;
 }
 
+# whether the cell at index i is alive or still warm, so a draw may paint it
+# ---
+# g:   grid
+# i:   row-major index in [0, w*h)
+# ret: true when the cell is alive or its heat is nonzero
+pub fun drawable(g: *Grid, i: usize) bool {
+    ret g.cells[i] != 0 || g.heat[i] != 0;
+}
+
+# append index i to the live list
+#
+# the caller appends a cell only as it becomes drawable, so an index never
+# appears twice while the list is fresh.
+# ---
+# g: grid
+# i: row-major index in [0, w*h)
+pub fun live_push(g: *Grid, i: usize) {
+    if (g.count >= g.w * g.h) {
+        g.stale = true;
+        ret;
+    }
+    g.live[g.count] = i::u32;
+    g.count         = g.count + 1;
+}
+
+# empty the live list ahead of a pass that refills it
+# ---
+# g: grid
+pub fun live_reset(g: *Grid) {
+    g.count = 0;
+    g.stale = false;
+}
+
+# rebuild the live list from every cell
+# ---
+# g: grid
+pub fun live_rebuild(g: *Grid) {
+    live_reset(g);
+    val n: usize = g.w * g.h;
+    var i: usize = 0;
+    for (i < n) {
+        if (drawable(g, i)) { live_push(g, i); }
+        i = i + 1;
+    }
+}
+
 # live cells among the 8 toroidal neighbors of (x, y)
 # ---
 # g:   grid
@@ -226,6 +300,7 @@ pub fun clear(g: *Grid) {
         g.heat[i]  = 0;
         i          = i + 1;
     }
+    live_reset(g);
 }
 
 test count_neighbors__wraps_at_the_corners {

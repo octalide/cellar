@@ -11,6 +11,8 @@ use cellar.kernel;
 use allo: std.allocator;
 use std.allocator.page;
 use std.rand;
+use std.types.bool.bool;
+use std.types.bool.true;
 use std.types.error.err;
 use std.types.size.usize;
 
@@ -97,6 +99,7 @@ pub fun step(s: *Sim) {
     val w:     i64            = g.w::i64;
     val h:     i64            = g.h::i64;
     var y:     usize          = 0;
+    grid.live_reset(g);
     for (y < g.h) {
         var x: usize = 0;
         for (x < g.w) {
@@ -122,6 +125,7 @@ pub fun step(s: *Sim) {
             val ns:    u8 = kernel.next_state(k, alive, sum);
             grid.set_back(g, x, y, ns);
             update_aux(g, x, y, ns);
+            if (ns != 0 || grid.heat_at(g, x, y) != 0) { grid.live_push(g, y * g.w + x); }
             x = x + 1;
         }
         y = y + 1;
@@ -184,15 +188,20 @@ pub fun randomize(s: *Sim, density: f32) {
 # v: value to write, 0 or 1
 pub fun paint(s: *Sim, x: usize, y: usize, v: u8) {
     if (x >= s.grid.w || y >= s.grid.h) { ret; }
-    val g: *grid.Grid = ?s.grid;
+    val g:   *grid.Grid = ?s.grid;
+    val i:   usize      = y * g.w + x;
+    val was: bool       = grid.drawable(g, i);
     grid.set(g, x, y, v);
     if (v != 0) {
         grid.set_age(g, x, y, 1);
         grid.set_heat(g, x, y, 255);
+        if (!was) { grid.live_push(g, i); }
         ret;
     }
     grid.set_age(g, x, y, 0);
     grid.set_heat(g, x, y, 0);
+    # the index stays listed, and painting it again would list it twice
+    if (was) { g.stale = true; }
 }
 
 # flip between running and paused
@@ -254,6 +263,37 @@ test step__age_accumulates_and_heat_decays {
     if (grid.get(?s.grid, 4, 4) != 0)               { ret 4; }
     if (grid.age_at(?s.grid, 4, 4) != 0)            { ret 5; }
     if (grid.heat_at(?s.grid, 4, 4) != 255 - DECAY) { ret 6; }
+
+    dnit(?s);
+    ret 0;
+}
+
+test step__live_list_holds_exactly_the_drawable_cells {
+    var a: allo.Allocator;
+    page.make(?a);
+
+    var s:    Sim;
+    val made: err[allo.Error] = init(?s, ?a, 6, 6);
+    if (sel made.err) { ret 1; }
+    paint(?s, 1, 2, 1);
+    paint(?s, 2, 2, 1);
+    paint(?s, 3, 2, 1);
+    if (s.grid.count != 3 || s.grid.stale) { ret 2; }
+
+    # the blinker turns vertical and its two dead ends stay warm
+    step(?s);
+    if (s.grid.count != 5 || s.grid.stale) { ret 3; }
+    var i: usize = 0;
+    for (i < s.grid.count) {
+        if (!grid.drawable(?s.grid, s.grid.live[i]::usize)) { ret 4; }
+        i = i + 1;
+    }
+
+    # erasing a listed cell leaves it listed, so the list is marked for a rebuild
+    paint(?s, 2, 2, 0);
+    if (!s.grid.stale) { ret 5; }
+    grid.live_rebuild(?s.grid);
+    if (s.grid.count != 4 || s.grid.stale) { ret 6; }
 
     dnit(?s);
     ret 0;
