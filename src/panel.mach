@@ -1,0 +1,270 @@
+# the side panel: every control, grouped by task into collapsible sections
+#
+# run for stepping and speed, draw for the tool and the patterns, rule for the
+# kernel, view for colour and the camera, and files for saving and loading.
+# the panel is docked to the right edge and scrolls when its sections are
+# taller than the window. on a narrow window it floats over the world rather
+# than squeezing it.
+
+use gfx: boom.graphics;
+use cellar.app;
+use cellar.arrange;
+use cellar.kedit;
+use cellar.paths;
+use cellar.pattern;
+use cellar.persist;
+use cellar.render;
+use cellar.sim;
+use cellar.text;
+use cellar.theme;
+use cellar.ui;
+use cellar.world;
+use allo: std.allocator;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.size.usize;
+use std.types.string.str;
+
+# unscaled panel width and header height
+val WIDTH:  f32 = 300.0;
+val HEADER: f32 = 48.0;
+# below this many unscaled pixels of window, the panel floats over the world
+val DOCK_MIN: f32 = 760.0;
+# the version shown in the header
+val VERSION: str = $mach.project.version;
+
+# what the panel needs from the frame, and asks of it
+# ---
+# a:    allocator for file buffers
+# p:    the data directory
+# shot: set when a screenshot was asked for
+pub rec Deps {
+    a:    *allo.Allocator;
+    p:    *paths.Paths;
+    shot: bool;
+}
+
+# the panel's width in pixels for a window sw wide
+fun width(u: *ui.Ui, sw: f32) f32 {
+    var w: f32 = ui.px(u, WIDTH);
+    if (w > sw * 0.85) { w = sw * 0.85; }
+    ret w;
+}
+
+# the panel's left edge, or sw when it is hidden
+pub fun left(u: *ui.Ui, a: *app.App, sw: f32) f32 {
+    if (a.panel == 0) { ret sw; }
+    ret sw - width(u, sw);
+}
+
+# the part of the window the world shows through
+pub fun port(u: *ui.Ui, a: *app.App, sw: f32, sh: f32) render.Port {
+    var w: f32 = left(u, a, sw);
+    if (sw < ui.px(u, DOCK_MIN)) { w = sw; }
+    ret render.Port{w: w, h: sh};
+}
+
+# the areas randomize can fill, in two rows of four
+fun areas(u: *ui.Ui, a: *app.App) {
+    var names: [8]str;
+    names[0] = "32";
+    names[1] = "64";
+    names[2] = "128";
+    names[3] = "256";
+    names[4] = "512";
+    names[5] = "1k";
+    names[6] = "2k";
+    names[7] = "4k";
+    val h: f32   = ui.px(u, ui.ROW);
+    var i: usize = 0;
+    for (i < app.BOUNDS_COUNT) {
+        val c: usize = i % 4;
+        if (ui.button_at(u, names[i], ui.cell_x0(u, c, 4), u.y, ui.cell_x1(u, c, 4), u.y + h, a.bounds_idx == i)) {
+            a.bounds_idx = i;
+        }
+        if (c == 3) { ui.advance(u, h); }
+        i = i + 1;
+    }
+}
+
+# save or load with the outcome flashed
+fun report(a: *app.App, ok: str, e: err[persist.Error]) {
+    if (sel e.err) {
+        app.say(a, persist.error_message(e.err));
+        ret;
+    }
+    app.say(a, ok);
+}
+
+fun run(u: *ui.Ui, a: *app.App, s: *sim.Sim) {
+    if (!ui.heading(u, "RUN", ?a.open_run)) { ret; }
+    val h:  f32 = ui.px(u, ui.ROW);
+    var go: str = "Play";
+    if (world.running(s))                                                                              { go = "Pause"; }
+    if (ui.button_at(u, go, ui.cell_x0(u, 0, 2), u.y, ui.cell_x1(u, 0, 2), u.y + h, world.running(s))) { world.toggle(s); }
+    if (ui.button_at(u, "Step", ui.cell_x0(u, 1, 2), u.y, ui.cell_x1(u, 1, 2), u.y + h, false))        { world.step(s); }
+    ui.advance(u, h);
+
+    var rd: [32]u8;
+    var o:  usize = 0;
+    if (a.uncapped != 0) { o = text.buf_str(?rd[0], 0, "as fast as it goes"); }
+    or {
+        o = text.buf_u64(?rd[0], 0, (a.speed + 0.5)::u64);
+        o = text.buf_str(?rd[0], o, " gen/s");
+    }
+    rd[o] = 0;
+    ui.slider(u, "Speed", ?rd[0], ?a.speed, 1.0, 120.0);
+    ui.toggle(u, "Uncapped", ?a.uncapped);
+
+    var acts: [2]str;
+    acts[0] = "Randomize";
+    acts[1] = "Clear";
+    val hit: usize = ui.buttons(u, ?acts[0], 2);
+    if (hit == 0) { world.randomize(s, app.bounds_size(a.bounds_idx)); }
+    if (hit == 1) { world.clear(s); }
+    ui.note(u, "Randomize fills a square this wide");
+    areas(u, a);
+}
+
+fun look(u: *ui.Ui, a: *app.App) {
+    if (!ui.heading(u, "VIEW", ?a.open_view)) { ret; }
+    var modes: [3]str;
+    modes[0] = "Solid";
+    modes[1] = "Trails";
+    modes[2] = "Age";
+    ui.segmented(u, ?modes[0], app.MODE_COUNT, ?a.mode);
+
+    if (a.mode == render.MODE_SOLID::usize) {
+        val n:  usize = theme.SWATCH_COUNT;
+        val g:  f32   = ui.px(u, 4.0);
+        val sz: f32   = (u.w - g * (n - 1)::f32) / n::f32;
+        var i:  usize = 0;
+        for (i < n) {
+            val x0: f32    = u.x + i::f32 * (sz + g);
+            val hh: ui.Hit = ui.region(u, x0, u.y, x0 + sz, u.y + sz);
+            val c:  u32    = theme.swatch(i);
+            if (c == a.solid) { ui.frame(u, x0, u.y, x0 + sz, u.y + sz, ui.px(u, 2.0), theme.TEXT, 1.0); }
+            or (hh.hot)       { ui.frame(u, x0, u.y, x0 + sz, u.y + sz, ui.px(u, 2.0), theme.TEXT_DIM, 1.0); }
+            val inset: f32 = ui.px(u, 4.0);
+            ui.rect(u, x0 + inset, u.y + inset, x0 + sz - inset, u.y + sz - inset, c, 1.0);
+            if (hh.clicked) { a.solid = c; }
+            i = i + 1;
+        }
+        ui.advance(u, sz);
+    }
+    ui.toggle(u, "Grid lines", ?a.gutter);
+
+    ui.note(u, "Interface size");
+    var scales: [4]str;
+    scales[0] = "100%";
+    scales[1] = "125%";
+    scales[2] = "150%";
+    scales[3] = "200%";
+    ui.segmented(u, ?scales[0], app.SCALE_COUNT, ?a.scale_idx);
+
+    if (ui.button(u, "Frame the randomize area", false)) { a.refit = true; }
+}
+
+# show as much of the end of a long string as fits in w pixels
+fun tail(f: *gfx.Font, s: str, w: f32) str {
+    var t: str = s;
+    for (t[0] != 0 && ui.measure(f, t) > w) { t = ?t[1]; }
+    ret t;
+}
+
+fun files(u: *ui.Ui, a: *app.App, s: *sim.Sim, d: *Deps) {
+    if (!ui.heading(u, "FILES", ?a.open_files)) { ret; }
+    if (!d.p.ok) {
+        ui.note(u, "no user data directory is known");
+        ret;
+    }
+    var world_path:  [1088]u8;
+    var custom_path: [1088]u8;
+    paths.file(d.p, paths.WORLD, ?world_path[0]);
+    paths.file(d.p, paths.CUSTOM, ?custom_path[0]);
+
+    var wl: [2]str;
+    wl[0] = "Save world";
+    wl[1] = "Load world";
+    val w: usize = ui.buttons(u, ?wl[0], 2);
+    if (w == 0) { report(a, "world saved", persist.save_world(d.a, s, ?world_path[0])); }
+    if (w == 1) { report(a, "world loaded", persist.load_world(d.a, s, ?world_path[0])); }
+
+    var pl: [2]str;
+    pl[0] = "Save pattern";
+    pl[1] = "Load pattern";
+    val q: usize = ui.buttons(u, ?pl[0], 2);
+    if (q == 0) { report(a, "custom pattern saved", persist.save_pattern(d.a, ?a.custom, ?custom_path[0])); }
+    if (q == 1) {
+        report(a, "custom pattern loaded", persist.load_pattern(d.a, ?a.custom, ?custom_path[0]));
+        a.pattern_sel = pattern.BUILTIN_COUNT;
+    }
+    if (ui.button(u, "Screenshot", false)) { d.shot = true; }
+    ui.note(u, tail(u.small, paths.dir(d.p), u.w));
+}
+
+# the header: name, version, and the help and hide buttons
+fun header(u: *ui.Ui, a: *app.App, x0: f32, x1: f32) {
+    val h: f32 = ui.px(u, HEADER);
+    ui.rect(u, x0, 0.0, x1, h, theme.HEADER, 1.0);
+    ui.rect(u, x0, h - 1.0, x1, h, theme.PANEL_EDGE, 1.0);
+    val pad: f32 = ui.px(u, ui.PAD);
+    val pen: f32 = ui.text_mid(u, u.body, "cellar", x0 + pad, 0.0, h, theme.TEXT, 1.0);
+    ui.text_mid(u, u.small, VERSION, pen + ui.px(u, 8.0), 0.0, h, theme.TEXT_FAINT, 1.0);
+
+    val b:  f32 = ui.px(u, 28.0);
+    val by: f32 = (h - b) / 2.0;
+    val hx: f32 = x1 - pad - b;
+    if (ui.button_at(u, "»", hx, by, hx + b, by + b, false))                                       { a.panel = 0; }
+    if (ui.button_at(u, "?", hx - b - ui.px(u, 6.0), by, hx - ui.px(u, 6.0), by + b, a.help != 0)) { a.help = 1 - a.help; }
+}
+
+# the tab that brings a hidden panel back
+fun restore(u: *ui.Ui, a: *app.App, sw: f32) {
+    val b: f32 = ui.px(u, 28.0);
+    val m: f32 = ui.px(u, 10.0);
+    ui.block(u, sw - m - b, m, sw - m, m + b);
+    if (ui.button_at(u, "«", sw - m - b, m, sw - m, m + b, false)) { a.panel = 1; }
+}
+
+# draw the panel and apply its controls
+# ---
+# u:  the interface
+# a:  application state
+# s:  the simulation, locked by the caller
+# d:  what the panel needs from the frame
+# sw: window width in pixels
+# sh: window height in pixels
+pub fun draw(u: *ui.Ui, a: *app.App, s: *sim.Sim, d: *Deps, sw: f32, sh: f32) {
+    if (a.panel == 0) {
+        a.side_x0 = sw;
+        restore(u, a, sw);
+        ret;
+    }
+    val x0: f32 = left(u, a, sw);
+    a.side_x0 = x0;
+    ui.block(u, x0, 0.0, sw, sh);
+    ui.rect(u, x0, 0.0, sw, sh, theme.PANEL, 1.0);
+    ui.rect(u, x0, 0.0, x0 + 1.0, sh, theme.PANEL_EDGE, 1.0);
+
+    val top:  f32 = ui.px(u, HEADER);
+    var most: f32 = a.content - (sh - top);
+    if (most < 0.0)      { most = 0.0; }
+    if (a.scroll > most) { a.scroll = most; }
+    if (a.scroll < 0.0)  { a.scroll = 0.0; }
+
+    val pad: f32 = ui.px(u, ui.PAD);
+    val y0:  f32 = top + ui.px(u, 8.0) - a.scroll;
+    ui.column(u, x0 + pad, y0, sw - x0 - pad * 2.0);
+    run(u, a, s);
+    arrange.section(u, a);
+    kedit.section(u, s, ?a.open_rule);
+    look(u, a);
+    files(u, a, s, d);
+    a.content = u.y - y0 + ui.px(u, 12.0);
+
+    # drawn last, so content scrolled up passes under it
+    header(u, a, x0, sw);
+}

@@ -1,66 +1,100 @@
-# application state and the constants the control windows read
+# everything about how the user is viewing and editing the world
 #
-# the simulation owns the grid and kernel. this owns everything about how the
-# user is currently viewing and editing them.
+# the simulation owns the cells and the rule. this owns the camera, the tool,
+# the colours, the panel and what it shows, and the messages it flashes.
 
-use bw: blit.widget;
 use cellar.pattern;
 use cellar.render;
+use cellar.theme;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
 
-# number of color modes (kept in step with render.MODE_*)
+# number of colour modes (kept in step with render.MODE_*)
 pub val MODE_COUNT: usize = 3;
 # number of selectable power-of-two randomize areas
 pub val BOUNDS_COUNT: usize = 8;
 # bounds-table index used at startup (128)
 pub val DEFAULT_BOUNDS: usize = 2;
 
-# all interactive state not owned by the simulation itself
+# paint live cells
+pub val TOOL_DRAW: usize = 0;
+# paint dead cells
+pub val TOOL_ERASE: usize = 1;
+# stamp the selected pattern
+pub val TOOL_STAMP: usize = 2;
+
+# number of interface scales offered
+pub val SCALE_COUNT: usize = 4;
+
+# ticks a message stays up
+pub val TOAST_TICKS: i32 = 150;
+
+# all interactive state not owned by the simulation
 # ---
-# speed:       steps per second when not uncapped
-# zoom:        camera zoom multiplier (1.0 = render.BASE_PPC pixels per cell)
-# pan_x:       world column at the view's centre, in cells
-# pan_y:       world row at the view's centre, in cells
-# mode:        color mode index (render.MODE_*)
-# gutter:      1 to draw 1px grid lines between cells
-# uncapped:    1 to step as fast as the frame budget allows
-# erase:       1 to paint dead cells, 0 to paint live cells
+# speed:       generations per second when not uncapped
+# mode:        colour mode (render.MODE_*)
+# gutter:      1 to draw grid lines when zoomed in
+# uncapped:    1 to step as fast as the machine allows
+# tool:        what a left press does to the world (TOOL_*)
 # bounds_idx:  index into the power-of-two randomize-area table
-# ui_visible:  1 to show the windows, 0 to hide them behind the restore icon
-# world:       the world-controls window
-# kedit:       the kernel-editor window
-# preset_sel:  kernel-preset dropdown selection
-# arrange:     the arrangement (pattern/persistence) window
-# pattern_sel: arrangement dropdown selection; BUILTIN_COUNT selects the custom pattern
-# stamp_mode:  1 to stamp the active pattern on click, 0 to paint single cells
+# pattern_sel: selected pattern; pattern.BUILTIN_COUNT selects the custom one
 # custom:      the user-drawn custom pattern
-# solid_r:     solid-mode live-cell red in [0, 1]
-# solid_g:     solid-mode live-cell green in [0, 1]
-# solid_b:     solid-mode live-cell blue in [0, 1]
-# status:      last persistence message, shown in the arrangements window
+# solid:       live-cell colour in solid mode, sRGB hex
+# zoom:        zoom multiplier, render.BASE_PPC pixels per cell at 1
+# pan_x:       world column at the view's centre
+# pan_y:       world row at the view's centre
+# refit:       frame the randomize area on the next frame
+# panel:       1 while the side panel is shown
+# open_run:    the run section is expanded
+# open_draw:   the draw section is expanded
+# open_rule:   the rule section is expanded
+# open_view:   the view section is expanded
+# open_files:  the files section is expanded
+# scale_idx:   index into the interface scales
+# scroll:      how far the panel's content is scrolled up, in pixels
+# content:     the panel content's height last frame
+# side_x0:     the panel's left edge last frame, or the window width when hidden
+# help:        1 while the key reference is shown
+# toast:       the message being flashed
+# toast_t:     ticks it has left
+# stroke:      a paint stroke is under way
+# last_x:      the cell the stroke last painted
+# last_y:      the cell the stroke last painted
+# shot:        a screenshot of the next frame is wanted
 pub rec App {
     speed:       f32;
-    zoom:        f32;
-    pan_x:       f32;
-    pan_y:       f32;
     mode:        usize;
     gutter:      u8;
     uncapped:    u8;
-    erase:       u8;
+    tool:        usize;
     bounds_idx:  usize;
-    ui_visible:  u8;
-    world:       bw.Window;
-    kedit:       bw.Window;
-    preset_sel:  usize;
-    arrange:     bw.Window;
     pattern_sel: usize;
-    stamp_mode:  u8;
     custom:      pattern.Pattern;
-    solid_r:     f32;
-    solid_g:     f32;
-    solid_b:     f32;
-    status:      str;
+    solid:       u32;
+    zoom:        f32;
+    pan_x:       f32;
+    pan_y:       f32;
+    refit:       bool;
+    panel:       u8;
+    open_run:    u8;
+    open_draw:   u8;
+    open_rule:   u8;
+    open_view:   u8;
+    open_files:  u8;
+    scale_idx:   usize;
+    scroll:      f32;
+    content:     f32;
+    side_x0:     f32;
+    help:        u8;
+    toast:       str;
+    toast_t:     i32;
+    stroke:      bool;
+    last_x:      i64;
+    last_y:      i64;
+    shot:        bool;
 }
 
 # the randomize area's side length (cells) for a bounds-table index
@@ -72,41 +106,50 @@ pub fun bounds_size(i: usize) usize {
     ret (32::usize) << (i::u64);
 }
 
-# seed the application state and place the world window
-# ---
-# a: state to initialize
+# the interface scale for a scale index
+pub fun scale(i: usize) f32 {
+    if (i == 1) { ret 1.25; }
+    if (i == 2) { ret 1.5; }
+    if (i == 3) { ret 2.0; }
+    ret 1.0;
+}
+
+# flash a message
+pub fun say(a: *App, s: str) {
+    a.toast   = s;
+    a.toast_t = TOAST_TICKS;
+}
+
+# seed the application state
 pub fun init(a: *App) {
-    a.speed         = 12.0;
-    a.zoom          = 1.0;
-    a.pan_x         = 0.0;
-    a.pan_y         = 0.0;
-    a.mode          = render.MODE_SOLID::usize;
-    a.gutter        = 0;
-    a.uncapped      = 0;
-    a.erase         = 0;
-    a.bounds_idx    = DEFAULT_BOUNDS;
-    a.ui_visible    = 1;
-    a.world.x       = 8.0;
-    a.world.y       = 8.0;
-    a.world.w       = 190.0;
-    a.world.open    = 1;
-    a.world.title   = "world";
-    a.kedit.x       = 210.0;
-    a.kedit.y       = 8.0;
-    a.kedit.w       = 200.0;
-    a.kedit.open    = 0;
-    a.kedit.title   = "kernel";
-    a.preset_sel    = 0;
-    a.arrange.x     = 210.0;
-    a.arrange.y     = 240.0;
-    a.arrange.w     = 200.0;
-    a.arrange.open  = 0;
-    a.arrange.title = "arrangements";
-    a.pattern_sel   = 0;
-    a.stamp_mode    = 0;
+    a.speed       = 12.0;
+    a.mode        = render.MODE_SOLID::usize;
+    a.gutter      = 0;
+    a.uncapped    = 0;
+    a.tool        = TOOL_DRAW;
+    a.bounds_idx  = DEFAULT_BOUNDS;
+    a.pattern_sel = 0;
     pattern.init(?a.custom, 16, 16, "custom");
-    a.solid_r = 1.0;
-    a.solid_g = 1.0;
-    a.solid_b = 1.0;
-    a.status  = "";
+    a.solid      = theme.swatch(0);
+    a.zoom       = 1.0;
+    a.pan_x      = 0.0;
+    a.pan_y      = 0.0;
+    a.refit      = true;
+    a.panel      = 1;
+    a.open_run   = 1;
+    a.open_draw  = 1;
+    a.open_rule  = 0;
+    a.open_view  = 1;
+    a.open_files = 0;
+    a.scale_idx  = 0;
+    a.scroll     = 0.0;
+    a.content    = 0.0;
+    a.side_x0    = 0.0;
+    a.help       = 0;
+    a.toast      = "";
+    a.toast_t    = 0;
+    a.stroke     = false;
+    a.last_x     = 0;
+    a.last_y     = 0;
+    a.shot       = false;
 }
