@@ -6,8 +6,10 @@
 # the rate the speed slider sets. the frame draws the grid and the control
 # windows as one blit draw list, submitted through a single overlay pass, and
 # paints cells under the cursor once blit has said the windows are not in the
-# way. uncapped stepping runs per frame against a wall-clock budget, since its
-# unit is the frame the user is waiting on rather than a tick.
+# way. uncapped stepping runs on its own thread (cellar.runner), as fast as the
+# machine allows. the hooks hold the runner's lock while they touch the world,
+# so a frame always draws a completed generation, and release it before the
+# renderer waits to present.
 #
 #   space play/pause   S step   C clear   R randomize   M color mode
 #   LMB paint   RMB drag pan   scroll zoom   arrows pan
@@ -32,15 +34,16 @@ use cellar.config;
 use cellar.kedit;
 use cellar.persist;
 use cellar.render;
+use cellar.runner;
 use cellar.sim;
 use cellar.worldwin;
 use allo: std.allocator;
 use std.allocator.page;
 use std.chrono.duration.Duration;
-use std.chrono.duration.MILLISECOND;
 use std.chrono.duration.SECOND;
 use std.chrono.time;
 use std.print;
+use std.sync.thread;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -61,11 +64,6 @@ val ZOOM_MIN: f32 = 0.25;
 val ZOOM_MAX: f32 = 16.0;
 # cap on capped-mode catch-up per tick, so a slow frame cannot spiral
 val MAX_STEPS_PER_TICK: i32 = 16;
-# wall clock spent stepping per frame when uncapped, sized to keep a core busy
-# between presents without starving drawing and input
-val UNCAPPED_BUDGET: Duration = 12 * MILLISECOND;
-# hard ceiling on steps per uncapped frame, a runaway backstop
-val UNCAPPED_MAX: i32 = 100000;
 # side length in pixels of the restore icon shown while the UI is hidden
 val ICON: f32 = 26.0;
 
@@ -75,6 +73,7 @@ val ICON: f32 = 26.0;
 # app:         view and editing state
 # sim:         the simulation
 # ui:          the blit context building each frame's draw list
+# runner:      the uncapped stepping thread and the lock over the world
 # renderer:    boom's renderer on the window
 # atlas:       blit's font atlas on the GPU
 # owed:        seconds of capped stepping carried to the next tick
@@ -87,6 +86,7 @@ pub rec Game {
     app:         app.App;
     sim:         sim.Sim;
     ui:          bc.Context;
+    runner:      runner.Runner;
     renderer:    gfx.Renderer;
     atlas:       gfx.Texture;
     owed:        f64;
@@ -170,6 +170,9 @@ pub fun on_init(ctx: *Context) {
     }
     g.atlas    = tr.ok;
     g.atlas_ok = true;
+
+    val spawned: err[thread.ThreadError] = runner.start(?g.runner, ?g.sim);
+    if (sel spawned.err) { give_up(ctx, "could not start the simulation thread"); }
 }
 
 # flip between windowed and borderless fullscreen on the current monitor
@@ -203,7 +206,7 @@ fun step_capped(g: *Game) {
 # read the keyboard, scroll and pan, and run capped stepping
 # ---
 # ctx: the running context
-pub fun on_tick(ctx: *Context) {
+fun tick(ctx: *Context) {
     val g:  *Game      = game_of(ctx);
     val in: *inp.Input = ?ctx.input;
     val a:  *app.App   = ?g.app;
@@ -244,20 +247,22 @@ pub fun on_tick(ctx: *Context) {
     or                   { g.owed = 0.0; }
 }
 
-# step for up to UNCAPPED_BUDGET of wall clock
+# whether the worker should be stepping
 # ---
-# g: the game
-fun step_uncapped(g: *Game) {
-    val start: time.InstantClock = time.instant();
-    if (sel start.err) { ret; }
-    var n: i32 = 0;
-    for (n < UNCAPPED_MAX) {
-        sim.step(?g.sim);
-        n = n + 1;
-        val now: time.InstantClock = time.instant();
-        if (sel now.err)                                           { brk; }
-        if (time.instant_sub(now.ok, start.ok) >= UNCAPPED_BUDGET) { brk; }
-    }
+# g:   the game
+# ret: true while the simulation runs uncapped
+fun uncapped(g: *Game) bool {
+    ret g.sim.running != 0 && g.app.uncapped != 0;
+}
+
+# read input and run capped stepping with the world locked
+# ---
+# ctx: the running context
+pub fun on_tick(ctx: *Context) {
+    val g: *Game = game_of(ctx);
+    runner.enter(?g.runner);
+    tick(ctx);
+    runner.leave(?g.runner, uncapped(g));
 }
 
 # a translucent three-bar icon that brings the hidden windows back
@@ -304,8 +309,7 @@ fun edit_world(g: *Game, cam: render.Camera) {
 # ctx: the running context
 pub fun on_draw(ctx: *Context) {
     val g: *Game = game_of(ctx);
-    if (!g.atlas_ok)                               { ret; }
-    if (g.sim.running != 0 && g.app.uncapped != 0) { step_uncapped(g); }
+    if (!g.atlas_ok) { ret; }
 
     val br: res[bool, gfx.Error] = gfx.renderer_begin_frame(?g.renderer);
     if (sel br.err) {
@@ -324,6 +328,9 @@ pub fun on_draw(ctx: *Context) {
     in.down = 0;
     if (inp.button_down(?ctx.input, inp.BUTTON_LEFT)) { in.down = 1; }
 
+    # the world is locked from reading it to recording the pass, and unlocked
+    # before present, which can block for a whole refresh
+    runner.enter(?g.runner);
     val a:   *app.App      = ?g.app;
     val cam: render.Camera = render.fit(?g.sim.grid, sw, sh, a.zoom, a.pan_x, a.pan_y);
 
@@ -343,6 +350,8 @@ pub fun on_draw(ctx: *Context) {
     desc.clear = opt[gm.Vec4].some{gm.vec4(0.04, 0.05, 0.06, 1.0)};
     var pass: gfx.Pass = gfx.pass_begin(?g.renderer, ?desc);
     gfx.pass_draw_triangles(?pass, bc.draw_verts(?g.ui)::ptr, bc.draw_count(?g.ui)::i32, opt[*gfx.Texture].some{?g.atlas});
+    edit_world(g, cam);
+    runner.leave(?g.runner, uncapped(g));
     gfx.pass_end(?pass);
     val ended: err[gfx.Error] = gfx.renderer_end_frame(?g.renderer);
     if (sel ended.err) {
@@ -350,8 +359,6 @@ pub fun on_draw(ctx: *Context) {
         context_fail(ctx, 1);
         ret;
     }
-
-    edit_world(g, cam);
 }
 
 # save the settings and release everything on_init built, renderer last
@@ -359,6 +366,7 @@ pub fun on_draw(ctx: *Context) {
 # ctx: the running context
 pub fun on_dnit(ctx: *Context) {
     val g: *Game = game_of(ctx);
+    runner.stop(?g.runner);
     if (g.sim_ok) {
         val saved: err[persist.Error] = config.save(?g.a, ?g.app, ?g.sim, config.PATH);
         if (sel saved.err) {
