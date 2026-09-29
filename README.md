@@ -5,9 +5,13 @@ An interactive cellular-automata editor and visualizer written in
 [boom](https://github.com/briar-systems/boom) engine with an immediate-mode UI
 from [blit](https://github.com/briar-systems/blit).
 
-A double-buffered, toroidal grid runs a weighted outer-totalistic kernel on the
-CPU. boom owns the window, input, Vulkan renderer and frame loop; the grid and
-the control windows are one blit draw list, submitted through a single overlay
+The world is unbounded: a sparse pool of 64 by 64 chunks that holds only the
+regions with live cells and their neighbours, growing in any direction. It is
+stepped on the GPU by compute shaders written in Mach, and drawn straight from
+the GPU's buffers, so neither stepping nor drawing crosses to the CPU. Where no
+GPU can run the compute shaders, the CPU steps it instead, split across every
+core by chunk. boom owns the window, input, Vulkan renderer and frame loop; the
+control windows are one blit draw list drawn over the cells in a single overlay
 pass each frame.
 
 A kernel is a `(2r+1)x(2r+1)` integer-weight footprint plus birth and survive
@@ -37,7 +41,7 @@ Three windows sit over the world:
 
 - **world**: run state, speed, uncapped stepping, clear and randomize, erase
   mode, grid lines, color mode (solid with a picker, heat trails, or an
-  age-driven palette) and world size from 32 to 512
+  age-driven palette) and the area randomize seeds, from 32 to 4096 cells square
 - **kernel**: preset, radius, a clickable weight grid, and birth and survive
   toggles over the reachable sums
 - **arrangements**: a palette of built-in patterns and a custom one drawn in
