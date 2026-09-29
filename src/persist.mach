@@ -13,13 +13,15 @@ use cellar.sim;
 use cellar.text;
 use allo: std.allocator;
 use std.allocator.page;
+use alloc_testing: std.allocator.testing;
+use std.collections.vector;
+use std.collections.vector.Vector;
 use fs:       std.filesystem;
 use io_error: std.io.error;
 use std.types.error.err;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
-use std.types.string.str_len;
 
 # directory holding saved worlds and patterns, user data rather than source
 pub val DIR: str = "arrangements";
@@ -117,17 +119,17 @@ fun save_buffer(a: *allo.Allocator, cells: *u8, w: usize, h: usize, path: str) e
     ret err[Error].ok{};
 }
 
-# read a run of decimal digits from s at off into out
+# read a run of decimal digits at off into out
 # ---
-# s:   the text
+# b:   the file contents
 # off: where the digits start
 # out: receives the value
 # ret: the offset just past the digits
-fun parse_uint(s: str, off: usize, out: *usize) usize {
+fun parse_uint(b: *Vector[u8], off: usize, out: *usize) usize {
     var o: usize = off;
     var v: usize = 0;
-    for (s[o] >= '0' && s[o] <= '9') {
-        v = v * 10 + (s[o] - '0')::usize;
+    for (text.byte_at(b.data, b.len, o) >= '0' && text.byte_at(b.data, b.len, o) <= '9') {
+        v = v * 10 + (b.data[o] - '0')::usize;
         o = o + 1;
     }
     @out = v;
@@ -136,25 +138,25 @@ fun parse_uint(s: str, off: usize, out: *usize) usize {
 
 # skip any non-cell bytes from p to the next '0' or '1'
 # ---
-# s:   the text
+# b:   the file contents
 # p:   where to start
-# ret: the offset of the cell, or of the terminating NUL when none remains
-fun next_cell(s: str, p: usize) usize {
+# ret: the offset of the cell, or the length when none remains
+fun next_cell(b: *Vector[u8], p: usize) usize {
     var o: usize = p;
-    for (s[o] != 0 && s[o] != '0' && s[o] != '1') { o = o + 1; }
+    for (o < b.len && b.data[o] != '0' && b.data[o] != '1') { o = o + 1; }
     ret o;
 }
 
-# read "<w> <h>" from the start of data
+# read "<w> <h>" from the start of the file
 # ---
-# data: the text
-# w:    receives the width
-# h:    receives the height
-# ret:  the offset past the header
-fun parse_header(data: str, w: *usize, h: *usize) usize {
-    var i: usize = parse_uint(data, 0, w);
-    for (data[i] == ' ') { i = i + 1; }
-    ret parse_uint(data, i, h);
+# b:   the file contents
+# w:   receives the width
+# h:   receives the height
+# ret: the offset past the header
+fun parse_header(b: *Vector[u8], w: *usize, h: *usize) usize {
+    var i: usize = parse_uint(b, 0, w);
+    for (text.byte_at(b.data, b.len, i) == ' ') { i = i + 1; }
+    ret parse_uint(b, i, h);
 }
 
 # serialize the simulation grid to path
@@ -174,23 +176,22 @@ pub fun save_world(a: *allo.Allocator, s: *sim.Sim, path: str) err[Error] {
 # path: source file path
 # ret:  ok, or why the world was not loaded
 pub fun load_world(a: *allo.Allocator, s: *sim.Sim, path: str) err[Error] {
-    val rr: res[str, fs.FsError] = fs.read_string(a, path);
+    val rr: res[Vector[u8], fs.FsError] = fs.read_bytes(a, path);
     if (sel rr.err) { ret err[Error].err{Error.fs{rr.err}}; }
-    val data:  str   = rr.ok;
-    val total: usize = str_len(data) + 1;
+    var data: Vector[u8] = rr.ok;
 
     var w:     usize = 0;
     var h:     usize = 0;
-    val start: usize = parse_header(data, ?w, ?h);
+    val start: usize = parse_header(?data, ?w, ?h);
 
     if (w == 0 || h == 0 || w > MAX_DIM || h > MAX_DIM) {
-        allo.deallocate[u8](a, data, total);
+        vector.dnit[u8](?data);
         ret err[Error].err{Error.dimensions{}};
     }
 
     val e: err[allo.Error] = sim.resize(s, w, h);
     if (sel e.err) {
-        allo.deallocate[u8](a, data, total);
+        vector.dnit[u8](?data);
         ret err[Error].err{Error.alloc{e.err}};
     }
     grid.clear(?s.grid);
@@ -200,13 +201,13 @@ pub fun load_world(a: *allo.Allocator, s: *sim.Sim, path: str) err[Error] {
     for (y < h) {
         var x: usize = 0;
         for (x < w) {
-            p = next_cell(data, p);
-            if (data[p] == 0) {
-                allo.deallocate[u8](a, data, total);
+            p = next_cell(?data, p);
+            if (p >= data.len) {
+                vector.dnit[u8](?data);
                 ret err[Error].err{Error.truncated{}};
             }
             var v: u8 = 0;
-            if (data[p] == '1') { v = 1; }
+            if (data.data[p] == '1') { v = 1; }
             sim.paint(s, x, y, v);
             p = p + 1;
             x = x + 1;
@@ -214,7 +215,7 @@ pub fun load_world(a: *allo.Allocator, s: *sim.Sim, path: str) err[Error] {
         y = y + 1;
     }
 
-    allo.deallocate[u8](a, data, total);
+    vector.dnit[u8](?data);
     ret err[Error].ok{};
 }
 
@@ -235,17 +236,16 @@ pub fun save_pattern(a: *allo.Allocator, p: *pattern.Pattern, path: str) err[Err
 # path: source file path
 # ret:  ok, or why the pattern was not loaded
 pub fun load_pattern(a: *allo.Allocator, p: *pattern.Pattern, path: str) err[Error] {
-    val rr: res[str, fs.FsError] = fs.read_string(a, path);
+    val rr: res[Vector[u8], fs.FsError] = fs.read_bytes(a, path);
     if (sel rr.err) { ret err[Error].err{Error.fs{rr.err}}; }
-    val data:  str   = rr.ok;
-    val total: usize = str_len(data) + 1;
+    var data: Vector[u8] = rr.ok;
 
     var w:     usize = 0;
     var h:     usize = 0;
-    val start: usize = parse_header(data, ?w, ?h);
+    val start: usize = parse_header(?data, ?w, ?h);
 
     if (w == 0 || h == 0 || w * h > pattern.CAP) {
-        allo.deallocate[u8](a, data, total);
+        vector.dnit[u8](?data);
         ret err[Error].err{Error.dimensions{}};
     }
 
@@ -256,13 +256,13 @@ pub fun load_pattern(a: *allo.Allocator, p: *pattern.Pattern, path: str) err[Err
     for (y < h) {
         var x: usize = 0;
         for (x < w) {
-            pos = next_cell(data, pos);
-            if (data[pos] == 0) {
-                allo.deallocate[u8](a, data, total);
+            pos = next_cell(?data, pos);
+            if (pos >= data.len) {
+                vector.dnit[u8](?data);
                 ret err[Error].err{Error.truncated{}};
             }
             var v: u8 = 0;
-            if (data[pos] == '1') { v = 1; }
+            if (data.data[pos] == '1') { v = 1; }
             pattern.set(p, x, y, v);
             pos = pos + 1;
             x   = x + 1;
@@ -270,7 +270,7 @@ pub fun load_pattern(a: *allo.Allocator, p: *pattern.Pattern, path: str) err[Err
         y = y + 1;
     }
 
-    allo.deallocate[u8](a, data, total);
+    vector.dnit[u8](?data);
     ret err[Error].ok{};
 }
 
@@ -379,5 +379,30 @@ test load_pattern__round_trips {
     }
 
     fs.remove_file(path);
+    ret 0;
+}
+
+test load_pattern__reads_by_length_past_an_embedded_nul {
+    var t:    alloc_testing.Testing;
+    val made: err[allo.Error] = alloc_testing.make(?t);
+    if (sel made.err) { ret 1; }
+    val a: *allo.Allocator = alloc_testing.allocator_of(?t);
+
+    # a NUL inside the body ended the old NUL-terminated read early
+    var body: [9]u8           = [9]u8{'3', ' ', '1', '\n', '1', 0, '0', '1', '\n'};
+    val path: str             = "arrangements/test_nul.cells";
+    val dir:  err[fs.FsError] = fs.create_dir_all(a, DIR, DIR_MODE);
+    if (sel dir.err) { ret 2; }
+    val wrote: err[fs.FsError] = fs.write_bytes(path, ?body[0], 9, FILE_MODE);
+    if (sel wrote.err) { ret 3; }
+
+    var p: pattern.Pattern;
+    pattern.init(?p, 1, 1, "custom");
+    val loaded: err[Error] = load_pattern(a, ?p, path);
+    fs.remove_file(path);
+    if (sel loaded.err)                                                                                     { ret 4; }
+    if (p.w != 3 || pattern.get(?p, 0, 0) != 1 || pattern.get(?p, 1, 0) != 0 || pattern.get(?p, 2, 0) != 1) { ret 5; }
+    if (alloc_testing.leaked(?t))                                                                           { ret 6; }
+    alloc_testing.dnit(?t);
     ret 0;
 }
