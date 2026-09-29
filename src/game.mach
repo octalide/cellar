@@ -1,0 +1,387 @@
+# the boom hooks that run cellar: setup, input, stepping, drawing, teardown
+#
+# boom owns the window, the input fold, the renderer and the frame loop. the
+# keyboard, scroll and right-drag pan are read in the fixed tick, where boom
+# gives every edge to exactly one tick, and capped stepping runs there too at
+# the rate the speed slider sets. the frame draws the grid and the control
+# windows as one blit draw list, submitted through a single overlay pass, and
+# paints cells under the cursor once blit has said the windows are not in the
+# way. uncapped stepping runs on its own thread (cellar.runner), as fast as the
+# machine allows. the hooks hold the runner's lock while they touch the world,
+# so a frame always draws a completed generation, and release it before the
+# renderer waits to present.
+#
+#   space play/pause   S step   C clear   R randomize   M color mode
+#   LMB paint   RMB drag pan   scroll zoom   arrows pan
+#   Tab hide UI   F11 fullscreen   Esc quit
+
+use bc: blit.context;
+use bd: blit.draw;
+use bf: blit.font;
+use bi: blit.input;
+use bw: blit.widget;
+use boom.context.Context;
+use boom.context.context_fail;
+use boom.context.context_stop;
+use boom.context.context_user;
+use gfx: boom.graphics;
+use inp: boom.input;
+use gm:  boom.math;
+use win: boom.window;
+use cellar.app;
+use cellar.arrange;
+use cellar.config;
+use cellar.kedit;
+use cellar.persist;
+use cellar.render;
+use cellar.runner;
+use cellar.sim;
+use cellar.worldwin;
+use allo: std.allocator;
+use std.allocator.page;
+use std.chrono.duration.Duration;
+use std.chrono.duration.SECOND;
+use std.chrono.time;
+use std.print;
+use std.sync.thread;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+# the fixed update step the input and capped stepping run at
+pub val TICK: Duration = SECOND / 60;
+# pixels the view pans per tick while an arrow key is held
+val PAN_STEP: f32 = 12.0;
+# zoom multiplier change per scroll notch
+val ZOOM_STEP: f32 = 0.1;
+# clamp on the user zoom multiplier
+val ZOOM_MIN: f32 = 0.25;
+val ZOOM_MAX: f32 = 16.0;
+# cap on capped-mode catch-up per tick, so a slow frame cannot spiral
+val MAX_STEPS_PER_TICK: i32 = 16;
+# side length in pixels of the restore icon shown while the UI is hidden
+val ICON: f32 = 26.0;
+
+# everything cellar holds between hooks, reached through ctx.user
+# ---
+# a:           allocator backing the world, the draw lists and file buffers
+# app:         view and editing state
+# sim:         the simulation
+# ui:          the blit context building each frame's draw list
+# runner:      the uncapped stepping thread and the lock over the world
+# renderer:    boom's renderer on the window
+# atlas:       blit's font atlas on the GPU
+# owed:        seconds of capped stepping carried to the next tick
+# sim_ok:      sim holds a grid to release
+# ui_ok:       ui holds draw lists to release
+# renderer_ok: renderer is initialized
+# atlas_ok:    atlas holds a texture to release
+pub rec Game {
+    a:           allo.Allocator;
+    app:         app.App;
+    sim:         sim.Sim;
+    ui:          bc.Context;
+    runner:      runner.Runner;
+    renderer:    gfx.Renderer;
+    atlas:       gfx.Texture;
+    owed:        f64;
+    sim_ok:      bool;
+    ui_ok:       bool;
+    renderer_ok: bool;
+    atlas_ok:    bool;
+}
+
+fun game_of(ctx: *Context) *Game {
+    ret context_user(ctx)::*Game;
+}
+
+fun give_up(ctx: *Context, what: str) {
+    print.eprintln(what);
+    context_fail(ctx, 1);
+}
+
+# build the world, the renderer and the UI; a failure stops the run
+# ---
+# ctx: the running context
+pub fun on_init(ctx: *Context) {
+    val g: *Game = game_of(ctx);
+    g.sim_ok      = false;
+    g.ui_ok       = false;
+    g.renderer_ok = false;
+    g.atlas_ok    = false;
+    g.owed        = 0.0;
+    val paged: err[allo.Error] = page.make(?g.a);
+    if (sel paged.err) {
+        give_up(ctx, "could not make the page allocator");
+        ret;
+    }
+
+    app.init(?g.app);
+    val made: err[allo.Error] = sim.init(?g.sim, ?g.a, sim.DEFAULT_W, sim.DEFAULT_H);
+    if (sel made.err) {
+        give_up(ctx, "could not allocate the world");
+        ret;
+    }
+    g.sim_ok = true;
+    # restore saved settings, kernel, and window layout before sizing the world
+    val loaded: err[persist.Error] = config.load(?g.a, ?g.app, ?g.sim, config.PATH);
+    if (sel loaded.err) {
+        print.eprintlnf("settings ignored: {}", persist.error_message(loaded.err));
+    }
+    val side:    usize           = app.bounds_size(g.app.bounds_idx);
+    val resized: err[allo.Error] = sim.resize(?g.sim, side, side);
+    if (sel resized.err) {
+        give_up(ctx, "could not allocate the world");
+        ret;
+    }
+    sim.randomize(?g.sim, sim.DEFAULT_DENSITY);
+
+    val atlas: err[allo.Error] = bf.build_atlas(?g.a);
+    if (sel atlas.err) {
+        give_up(ctx, "could not build the font atlas");
+        ret;
+    }
+    val drawn: err[allo.Error] = bc.init(?g.ui, ?g.a);
+    if (sel drawn.err) {
+        give_up(ctx, "could not allocate the UI draw lists");
+        ret;
+    }
+    g.ui_ok = true;
+
+    val rr: err[gfx.Error] = gfx.renderer_init(?g.renderer, ?ctx.window);
+    if (sel rr.err) {
+        print.eprintlnf("could not start the renderer: {}", gfx.error_message(rr.err));
+        context_fail(ctx, 1);
+        ret;
+    }
+    g.renderer_ok = true;
+
+    val d:  *gfx.Device                 = gfx.renderer_device(?g.renderer);
+    val tr: res[gfx.Texture, gfx.Error] = gfx.texture(d, bf.atlas_pixels(), bf.ATLAS_W::i32, bf.ATLAS_H::i32, gfx.ColorSpace.linear{});
+    if (sel tr.err) {
+        print.eprintlnf("could not upload the font atlas: {}", gfx.error_message(tr.err));
+        context_fail(ctx, 1);
+        ret;
+    }
+    g.atlas    = tr.ok;
+    g.atlas_ok = true;
+
+    val spawned: err[thread.ThreadError] = runner.start(?g.runner, ?g.sim);
+    if (sel spawned.err) { give_up(ctx, "could not start the simulation thread"); }
+}
+
+# flip between windowed and borderless fullscreen on the current monitor
+# ---
+# ctx: the running context, outside a render frame
+fun toggle_fullscreen(ctx: *Context) {
+    var mode: win.WindowMode = win.WindowMode.borderless{};
+    if (!sel ctx.window.mode.windowed) { mode = win.WindowMode.windowed{}; }
+    val set: err[win.WindowError] = win.window_set_mode(?ctx.window, mode);
+    if (sel set.err) {
+        print.eprintlnf("fullscreen refused: {}", win.window_error_message(set.err));
+    }
+}
+
+# advance the simulation by the time one tick represents at the chosen speed
+# ---
+# g: the game
+fun step_capped(g: *Game) {
+    g.owed = g.owed + TICK::f64 / SECOND::f64;
+    val interval: f64 = 1.0 / g.app.speed::f64;
+    var n:        i32 = 0;
+    for (g.owed >= interval && n < MAX_STEPS_PER_TICK) {
+        sim.step(?g.sim);
+        g.owed = g.owed - interval;
+        n      = n + 1;
+    }
+    # a backlog the cap refused is dropped rather than carried into a spiral
+    if (n >= MAX_STEPS_PER_TICK) { g.owed = 0.0; }
+}
+
+# read the keyboard, scroll and pan, and run capped stepping
+# ---
+# ctx: the running context
+fun tick(ctx: *Context) {
+    val g:  *Game      = game_of(ctx);
+    val in: *inp.Input = ?ctx.input;
+    val a:  *app.App   = ?g.app;
+
+    if (inp.key_pressed(in, inp.KEY_ESCAPE)) {
+        context_stop(ctx);
+        ret;
+    }
+    if (inp.key_pressed(in, inp.KEY_SPACE)) { sim.toggle_running(?g.sim); }
+    if (inp.key_pressed(in, inp.KEY_S))     { sim.step(?g.sim); }
+    if (inp.key_pressed(in, inp.KEY_C))     { sim.clear(?g.sim); }
+    if (inp.key_pressed(in, inp.KEY_R))     { sim.randomize(?g.sim, sim.DEFAULT_DENSITY); }
+    if (inp.key_pressed(in, inp.KEY_M))     { a.mode = (a.mode + 1) % app.MODE_COUNT; }
+    if (inp.key_pressed(in, inp.KEY_TAB))   { a.ui_visible = 1 - a.ui_visible; }
+    if (inp.key_pressed(in, inp.KEY_F11))   { toggle_fullscreen(ctx); }
+
+    if (in.scroll_y != 0.0) {
+        a.zoom = a.zoom + in.scroll_y::f32 * ZOOM_STEP;
+        if (a.zoom < ZOOM_MIN) { a.zoom = ZOOM_MIN; }
+        if (a.zoom > ZOOM_MAX) { a.zoom = ZOOM_MAX; }
+    }
+
+    if (inp.key_down(in, inp.KEY_LEFT))  { a.pan_x = a.pan_x + PAN_STEP; }
+    if (inp.key_down(in, inp.KEY_RIGHT)) { a.pan_x = a.pan_x - PAN_STEP; }
+    if (inp.key_down(in, inp.KEY_UP))    { a.pan_y = a.pan_y + PAN_STEP; }
+    if (inp.key_down(in, inp.KEY_DOWN))  { a.pan_y = a.pan_y - PAN_STEP; }
+    # the tick's movement only, so the press that starts a drag never jumps
+    if (inp.button_down(in, inp.BUTTON_RIGHT)) {
+        a.pan_x = a.pan_x + in.mouse_dx::f32;
+        a.pan_y = a.pan_y + in.mouse_dy::f32;
+    }
+
+    if (g.sim.running == 0) {
+        g.owed = 0.0;
+        ret;
+    }
+    if (a.uncapped == 0) { step_capped(g); }
+    or                   { g.owed = 0.0; }
+}
+
+# whether the worker should be stepping
+# ---
+# g:   the game
+# ret: true while the simulation runs uncapped
+fun uncapped(g: *Game) bool {
+    ret g.sim.running != 0 && g.app.uncapped != 0;
+}
+
+# read input and run capped stepping with the world locked
+# ---
+# ctx: the running context
+pub fun on_tick(ctx: *Context) {
+    val g: *Game = game_of(ctx);
+    runner.enter(?g.runner);
+    tick(ctx);
+    runner.leave(?g.runner, uncapped(g));
+}
+
+# a translucent three-bar icon that brings the hidden windows back
+# ---
+# g: the game
+fun restore_icon(g: *Game) {
+    val ctx: *bc.Context = ?g.ui;
+    val x0:  f32         = 8.0;
+    val y0:  f32         = 8.0;
+    val x1:  f32         = x0 + ICON;
+    val y1:  f32         = y0 + ICON;
+    bc.quad(ctx, x0, y0, x1, y1, bd.rgba(0.10, 0.11, 0.14, 0.70));
+    val bar: bd.Color = bd.rgba(0.75, 0.80, 0.90, 0.90);
+    bc.quad(ctx, x0 + 6.0, y0 + 8.0, x1 - 6.0, y0 + 10.0, bar);
+    bc.quad(ctx, x0 + 6.0, y0 + 12.0, x1 - 6.0, y0 + 14.0, bar);
+    bc.quad(ctx, x0 + 6.0, y0 + 16.0, x1 - 6.0, y0 + 18.0, bar);
+    if (bw.region_clicked(ctx, x0, y0, x1, y1) != 0) { g.app.ui_visible = 1; }
+}
+
+# paint or stamp the cell under the cursor when no window is in the way
+# ---
+# g:   the game
+# cam: the camera the frame drew with
+fun edit_world(g: *Game, cam: render.Camera) {
+    val ui: *bc.Context = ?g.ui;
+    # hover is the topmost window claim under the cursor, and active a widget
+    # still held from a press that began on one
+    if (ui.hover != 0 || ui.active != 0) { ret; }
+    var cx: usize = 0;
+    var cy: usize = 0;
+    if (render.cell_at(cam, ?g.sim.grid, ui.in.mx, ui.in.my, ?cx, ?cy) == 0) { ret; }
+    if (g.app.stamp_mode != 0 && g.app.erase == 0) {
+        if (bi.pressed(ui.in) != 0) { arrange.stamp_active(?g.app, ?g.sim, cx, cy); }
+        ret;
+    }
+    if (ui.in.down == 0) { ret; }
+    var v: u8 = 1;
+    if (g.app.erase != 0) { v = 0; }
+    sim.paint(?g.sim, cx, cy, v);
+}
+
+# build the frame's draw list and submit it through one overlay pass
+# ---
+# ctx: the running context
+pub fun on_draw(ctx: *Context) {
+    val g: *Game = game_of(ctx);
+    if (!g.atlas_ok) { ret; }
+
+    val br: res[bool, gfx.Error] = gfx.renderer_begin_frame(?g.renderer);
+    if (sel br.err) {
+        print.eprintlnf("could not begin a frame: {}", gfx.error_message(br.err));
+        context_fail(ctx, 1);
+        ret;
+    }
+    if (!br.ok) { ret; }
+
+    # the overlay pass and the cursor are both in framebuffer pixels
+    val sw: f32 = gfx.renderer_width(?g.renderer)::f32;
+    val sh: f32 = gfx.renderer_height(?g.renderer)::f32;
+    var in: bi.Input;
+    in.mx   = ctx.input.mouse_x::f32;
+    in.my   = ctx.input.mouse_y::f32;
+    in.down = 0;
+    if (inp.button_down(?ctx.input, inp.BUTTON_LEFT)) { in.down = 1; }
+
+    # the world is locked from reading it to recording the pass, and unlocked
+    # before present, which can block for a whole refresh
+    runner.enter(?g.runner);
+    val a:   *app.App      = ?g.app;
+    val cam: render.Camera = render.fit(?g.sim.grid, sw, sh, a.zoom, a.pan_x, a.pan_y);
+
+    bc.begin(?g.ui, in, sw, sh);
+    render.draw_grid(?g.ui, ?g.sim, cam, a.mode::u8, a.gutter, a.solid_r, a.solid_g, a.solid_b);
+    if (a.ui_visible != 0) {
+        worldwin.draw(?g.ui, a, ?g.sim);
+        kedit.draw(?g.ui, a, ?g.sim);
+        arrange.draw(?g.ui, a, ?g.sim);
+    }
+    or {
+        restore_icon(g);
+    }
+    bc.end(?g.ui);
+
+    var desc: gfx.PassDesc = gfx.pass_overlay();
+    desc.clear = opt[gm.Vec4].some{gm.vec4(0.04, 0.05, 0.06, 1.0)};
+    var pass: gfx.Pass = gfx.pass_begin(?g.renderer, ?desc);
+    gfx.pass_draw_triangles(?pass, bc.draw_verts(?g.ui)::ptr, bc.draw_count(?g.ui)::i32, opt[*gfx.Texture].some{?g.atlas});
+    edit_world(g, cam);
+    runner.leave(?g.runner, uncapped(g));
+    gfx.pass_end(?pass);
+    val ended: err[gfx.Error] = gfx.renderer_end_frame(?g.renderer);
+    if (sel ended.err) {
+        print.eprintlnf("could not present a frame: {}", gfx.error_message(ended.err));
+        context_fail(ctx, 1);
+        ret;
+    }
+}
+
+# save the settings and release everything on_init built, renderer last
+# ---
+# ctx: the running context
+pub fun on_dnit(ctx: *Context) {
+    val g: *Game = game_of(ctx);
+    runner.stop(?g.runner);
+    if (g.sim_ok) {
+        val saved: err[persist.Error] = config.save(?g.a, ?g.app, ?g.sim, config.PATH);
+        if (sel saved.err) {
+            print.eprintlnf("settings not saved: {}", persist.error_message(saved.err));
+        }
+    }
+    if (g.renderer_ok) {
+        gfx.renderer_wait_idle(?g.renderer);
+        if (g.atlas_ok) { gfx.texture_delete(gfx.renderer_device(?g.renderer), ?g.atlas); }
+        val down: err[gfx.Error] = gfx.renderer_dnit(?g.renderer);
+        if (sel down.err) {
+            print.eprintlnf("renderer refused to shut down: {}", gfx.error_message(down.err));
+            context_fail(ctx, 1);
+        }
+    }
+    if (g.ui_ok)  { bc.free(?g.ui); }
+    if (g.sim_ok) { sim.dnit(?g.sim); }
+}

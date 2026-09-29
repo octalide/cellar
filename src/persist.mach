@@ -1,53 +1,84 @@
-# cellar.persist: text serialization of a world or a pattern to disk.
+# text serialization of a world or a pattern to disk
 #
 # the on-disk format is a header line "<w> <h>\n" followed by h lines of w
 # characters, '1' for a live cell and '0' for a dead one. it is deliberately
-# trivial to read and write. saves create the arrangements/ directory first; the
-# world allocator (sim.grid.a) backs the transient buffers. both a grid and a
-# pattern store cells row-major as bytes, so one formatter serializes either.
+# trivial to read and write. saves create the arrangements directory first,
+# and the world allocator (sim.grid.a) backs the transient buffers. a grid and
+# a pattern both store cells row-major as bytes, so one formatter serializes
+# either.
 
-use std.types.bool.bool;
+use cellar.grid;
+use cellar.pattern;
+use cellar.sim;
+use cellar.text;
+use allo: std.allocator;
+use std.allocator.page;
+use alloc_testing: std.allocator.testing;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use fs:       std.filesystem;
+use io_error: std.io.error;
+use std.types.error.err;
+use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
-use std.types.string.str_len;
-use std.types.option.Option;
-use std.types.option.some;
-use std.types.option.none;
-use std.types.result.Result;
-use std.types.result.is_err;
-use std.types.result.unwrap_ok;
-use std.types.result.unwrap_err;
-use allo: std.allocator;
-use page: std.allocator.page;
-use fs:   std.filesystem;
-use sim:     cellar.sim;
-use grid:    cellar.grid;
-use pattern: cellar.pattern;
-use ui:      cellar.ui;
 
-# DIR: directory holding saved worlds and patterns (user data, not source).
+# directory holding saved worlds and patterns, user data rather than source
 pub val DIR: str = "arrangements";
 
-# DIR_MODE: permission bits for the arrangements directory.
-val DIR_MODE: i32 = 0o755;
-# FILE_MODE: permission bits for saved files.
-val FILE_MODE: i32 = 0o644;
-# HEADER_MAX: bytes reserved for the "<w> <h>\n" header when sizing a buffer.
+# permission bits for the arrangements directory
+pub val DIR_MODE: i32 = 0o755;
+# permission bits for saved files
+pub val FILE_MODE: i32 = 0o644;
+# bytes reserved for the "<w> <h>\n" header when sizing a buffer
 val HEADER_MAX: usize = 32;
-# MAX_DIM: largest world side length a loaded file may declare, bounding the
-# allocation a corrupt or hand-edited header can request.
+# largest world side a loaded file may declare, bounding the allocation a
+# corrupt or hand-edited header can request
 val MAX_DIM: usize = 4096;
 
-# write_cells: format a w x h field of row-major cells into buf as the header plus
-# '0'/'1' rows, each row newline-terminated. ret the byte count written.
+# why a save or load did not complete
+# ---
+# alloc:      the allocator refused a buffer
+# fs:         the file or its directory could not be read or written
+# dimensions: the header declares a size of zero or beyond the limit
+# truncated:  the body holds fewer cells than the header declares
+# version:    a settings file written by another format version
+pub tag Error: u8 {
+    alloc: allo.Error;
+    fs:    fs.FsError;
+    dimensions;
+    truncated;
+    version;
+}
+
+# a one-line description of a persistence failure
+# ---
+# e:   the failure
+# ret: static text naming the case
+pub fun error_message(e: Error) str {
+    if (sel e.alloc)      { ret "out of memory"; }
+    if (sel e.dimensions) { ret "bad dimensions"; }
+    if (sel e.truncated)  { ret "truncated body"; }
+    if (sel e.version)    { ret "version mismatch"; }
+    if (sel e.fs) {
+        if (sel e.fs.io) { ret io_error.kind_name(e.fs.io.kind); }
+    }
+    ret "file error";
+}
+
+# format a w x h field of row-major cells into buf as the header and rows
+# ---
+# buf:   destination, at least HEADER_MAX + h * (w + 1) bytes
+# cells: row-major 0/1 cells, length w*h
+# w:     field width
+# h:     field height
+# ret:   the byte count written
 fun write_cells(buf: *u8, cells: *u8, w: usize, h: usize) usize {
-    var off: usize = 0;
-    off = ui.buf_u64(buf, off, w::u64);
+    var off: usize = text.buf_u64(buf, 0, w::u64);
     buf[off] = ' ';
-    off = off + 1;
-    off = ui.buf_u64(buf, off, h::u64);
+    off      = text.buf_u64(buf, off + 1, h::u64);
     buf[off] = '\n';
-    off = off + 1;
+    off      = off + 1;
     var y: usize = 0;
     for (y < h) {
         var x: usize = 0;
@@ -55,254 +86,247 @@ fun write_cells(buf: *u8, cells: *u8, w: usize, h: usize) usize {
             var ch: u8 = '0';
             if (cells[y * w + x] != 0) { ch = '1'; }
             buf[off] = ch;
-            off = off + 1;
-            x = x + 1;
+            off      = off + 1;
+            x        = x + 1;
         }
         buf[off] = '\n';
-        off = off + 1;
-        y = y + 1;
+        off      = off + 1;
+        y        = y + 1;
     }
     ret off;
 }
 
-# save_buffer: allocate, format, and write a w x h field of row-major cells to
-# path, ensuring the arrangements/ directory exists first.
+# format a w x h field of row-major cells and write it to path
 # ---
 # a:     allocator backing the transient buffer
 # cells: row-major 0/1 cells, length w*h
 # w:     field width
 # h:     field height
 # path:  destination file path
-# ret:   none on success, some(message) on failure
-fun save_buffer(a: *allo.Allocator, cells: *u8, w: usize, h: usize, path: str) Option[str] {
-    fs.create_dir_all(a, DIR, DIR_MODE);
+# ret:   ok, or why the file was not written
+fun save_buffer(a: *allo.Allocator, cells: *u8, w: usize, h: usize, path: str) err[Error] {
+    val made: err[fs.FsError] = fs.create_dir_all(a, DIR, DIR_MODE);
+    if (sel made.err) { ret err[Error].err{Error.fs{made.err}}; }
 
-    val cap: usize = HEADER_MAX + h * (w + 1);
-    val rc: Result[*u8, str] = allo.allocate[u8](a, cap);
-    if (is_err[*u8, str](rc)) { ret some[str]("cellar.persist: buffer allocation failed"); }
-    val buf: *u8 = unwrap_ok[*u8, str](rc);
+    val cap: usize                = HEADER_MAX + h * (w + 1);
+    val rb:  res[*u8, allo.Error] = allo.allocate[u8](a, cap);
+    if (sel rb.err) { ret err[Error].err{Error.alloc{rb.err}}; }
 
-    val len: usize = write_cells(buf, cells, w, h);
-    val wr: Result[bool, str] = fs.write_file(path, buf, len, FILE_MODE);
-    allo.deallocate[u8](a, buf, cap);
-
-    if (is_err[bool, str](wr)) { ret some[str](unwrap_err[bool, str](wr)); }
-    ret none[str]();
+    val len:   usize           = write_cells(rb.ok, cells, w, h);
+    val wrote: err[fs.FsError] = fs.write_bytes(path, rb.ok, len, FILE_MODE);
+    allo.deallocate[u8](a, rb.ok, cap);
+    if (sel wrote.err) { ret err[Error].err{Error.fs{wrote.err}}; }
+    ret err[Error].ok{};
 }
 
-# parse_uint: read a run of decimal digits from s at off into out; ret the offset
-# just past the digits.
-fun parse_uint(s: str, off: usize, out: *usize) usize {
+# read a run of decimal digits at off into out
+# ---
+# b:   the file contents
+# off: where the digits start
+# out: receives the value
+# ret: the offset just past the digits
+fun parse_uint(b: *Vector[u8], off: usize, out: *usize) usize {
     var o: usize = off;
     var v: usize = 0;
-    for (s[o] >= '0' && s[o] <= '9') {
-        v = v * 10 + (s[o] - '0')::usize;
+    for (text.byte_at(b.data, b.len, o) >= '0' && text.byte_at(b.data, b.len, o) <= '9') {
+        v = v * 10 + (b.data[o] - '0')::usize;
         o = o + 1;
     }
     @out = v;
     ret o;
 }
 
-# next_cell: advance past any non-cell chars (newlines, header) to the next '0' or
-# '1'; ret the offset of that char, or of the terminating NUL if none remains.
-fun next_cell(s: str, p: usize) usize {
+# skip any non-cell bytes from p to the next '0' or '1'
+# ---
+# b:   the file contents
+# p:   where to start
+# ret: the offset of the cell, or the length when none remains
+fun next_cell(b: *Vector[u8], p: usize) usize {
     var o: usize = p;
-    for (s[o] != 0 && s[o] != '0' && s[o] != '1') { o = o + 1; }
+    for (o < b.len && b.data[o] != '0' && b.data[o] != '1') { o = o + 1; }
     ret o;
 }
 
-# parse_header: read "<w> <h>" from data into w and h; ret the offset past them.
-fun parse_header(data: str, w: *usize, h: *usize) usize {
-    var i: usize = 0;
-    i = parse_uint(data, i, w);
-    for (data[i] == ' ') { i = i + 1; }
-    i = parse_uint(data, i, h);
-    ret i;
+# read "<w> <h>" from the start of the file
+# ---
+# b:   the file contents
+# w:   receives the width
+# h:   receives the height
+# ret: the offset past the header
+fun parse_header(b: *Vector[u8], w: *usize, h: *usize) usize {
+    var i: usize = parse_uint(b, 0, w);
+    for (text.byte_at(b.data, b.len, i) == ' ') { i = i + 1; }
+    ret parse_uint(b, i, h);
 }
 
-# save_world: serialize the simulation grid to path.
+# serialize the simulation grid to path
 # ---
 # a:    allocator backing the transient buffer
 # s:    simulation whose grid is saved
 # path: destination file path
-# ret:  none on success, some(message) on failure
-pub fun save_world(a: *allo.Allocator, s: *sim.Sim, path: str) Option[str] {
+# ret:  ok, or why the file was not written
+pub fun save_world(a: *allo.Allocator, s: *sim.Sim, path: str) err[Error] {
     ret save_buffer(a, s.grid.cells, s.grid.w, s.grid.h, path);
 }
 
-# load_world: read path, resize the simulation to its dimensions, and set cells.
+# parse the w x h cells after the header into out, row-major as 0 or 1
+#
+# every cell is read before the caller changes anything, so a short body is
+# refused while the world or pattern it was meant for is still untouched.
 # ---
-# a:    allocator for the read buffer
+# b:     the file contents
+# start: the offset just past the header
+# w:     declared width
+# h:     declared height
+# out:   receives w*h cells
+# ret:   ok, or truncated when the body runs out first
+fun parse_body(b: *Vector[u8], start: usize, w: usize, h: usize, out: *u8) err[Error] {
+    var p: usize = start;
+    var i: usize = 0;
+    for (i < w * h) {
+        p = next_cell(b, p);
+        if (p >= b.len) { ret err[Error].err{Error.truncated{}}; }
+        out[i] = 0;
+        if (b.data[p] == '1') { out[i] = 1; }
+        p = p + 1;
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# read path, resize the simulation to its dimensions, and set its cells
+#
+# the whole file is validated before the world changes, so a refusal leaves
+# the world as it was.
+# ---
+# a:    allocator for the read and parse buffers
 # s:    simulation to populate
 # path: source file path
-# ret:  none on success, some(message) on failure
-pub fun load_world(a: *allo.Allocator, s: *sim.Sim, path: str) Option[str] {
-    val rr: Result[str, str] = fs.read_all(a, path);
-    if (is_err[str, str](rr)) { ret some[str](unwrap_err[str, str](rr)); }
-    val data: str = unwrap_ok[str, str](rr);
-    val total: usize = str_len(data) + 1;
+# ret:  ok, or why the world was not loaded
+pub fun load_world(a: *allo.Allocator, s: *sim.Sim, path: str) err[Error] {
+    val rr: res[Vector[u8], fs.FsError] = fs.read_bytes(a, path);
+    if (sel rr.err) { ret err[Error].err{Error.fs{rr.err}}; }
+    var data: Vector[u8] = rr.ok;
 
-    var w: usize = 0;
-    var h: usize = 0;
-    val start: usize = parse_header(data, ?w, ?h);
-
+    var w:     usize = 0;
+    var h:     usize = 0;
+    val start: usize = parse_header(?data, ?w, ?h);
     if (w == 0 || h == 0 || w > MAX_DIM || h > MAX_DIM) {
-        allo.deallocate[u8](a, data::ptr::*u8, total);
-        ret some[str]("cellar.persist.load_world: bad dimensions");
+        vector.dnit[u8](?data);
+        ret err[Error].err{Error.dimensions{}};
     }
 
-    val e: Option[str] = sim.resize(s, w, h);
-    if (e.has_value) {
-        allo.deallocate[u8](a, data::ptr::*u8, total);
-        ret e;
+    val rc: res[*u8, allo.Error] = allo.allocate[u8](a, w * h);
+    if (sel rc.err) {
+        vector.dnit[u8](?data);
+        ret err[Error].err{Error.alloc{rc.err}};
     }
-    grid.clear(?s.grid);
+    val cells:  *u8        = rc.ok;
+    val parsed: err[Error] = parse_body(?data, start, w, h, cells);
+    vector.dnit[u8](?data);
+    if (sel parsed.err) {
+        allo.deallocate[u8](a, cells, w * h);
+        ret parsed;
+    }
 
-    var p: usize = start;
+    # resize allocates before it frees, so a refusal here keeps the old world
+    val e: err[allo.Error] = sim.resize(s, w, h);
+    if (sel e.err) {
+        allo.deallocate[u8](a, cells, w * h);
+        ret err[Error].err{Error.alloc{e.err}};
+    }
     var y: usize = 0;
     for (y < h) {
         var x: usize = 0;
         for (x < w) {
-            p = next_cell(data, p);
-            if (data[p] == 0) {
-                allo.deallocate[u8](a, data::ptr::*u8, total);
-                ret some[str]("cellar.persist.load_world: truncated body");
-            }
-            var v: u8 = 0;
-            if (data[p] == '1') { v = 1; }
-            sim.paint(s, x, y, v);
-            p = p + 1;
+            sim.paint(s, x, y, cells[y * w + x]);
             x = x + 1;
         }
         y = y + 1;
     }
-
-    allo.deallocate[u8](a, data::ptr::*u8, total);
-    ret none[str]();
+    allo.deallocate[u8](a, cells, w * h);
+    ret err[Error].ok{};
 }
 
-# save_pattern: serialize a pattern to path.
+# serialize a pattern to path
 # ---
 # a:    allocator backing the transient buffer
 # p:    pattern to save
 # path: destination file path
-# ret:  none on success, some(message) on failure
-pub fun save_pattern(a: *allo.Allocator, p: *pattern.Pattern, path: str) Option[str] {
+# ret:  ok, or why the file was not written
+pub fun save_pattern(a: *allo.Allocator, p: *pattern.Pattern, path: str) err[Error] {
     ret save_buffer(a, ?p.cells[0], p.w, p.h, path);
 }
 
-# load_pattern: read path into a pattern, resizing it to the stored dimensions.
+# read path into a pattern, resizing it to the stored dimensions
+#
+# the file is parsed into a copy first, so a refusal leaves p as it was.
 # ---
 # a:    allocator for the read buffer
 # p:    pattern to populate
 # path: source file path
-# ret:  none on success, some(message) on failure
-pub fun load_pattern(a: *allo.Allocator, p: *pattern.Pattern, path: str) Option[str] {
-    val rr: Result[str, str] = fs.read_all(a, path);
-    if (is_err[str, str](rr)) { ret some[str](unwrap_err[str, str](rr)); }
-    val data: str = unwrap_ok[str, str](rr);
-    val total: usize = str_len(data) + 1;
+# ret:  ok, or why the pattern was not loaded
+pub fun load_pattern(a: *allo.Allocator, p: *pattern.Pattern, path: str) err[Error] {
+    val rr: res[Vector[u8], fs.FsError] = fs.read_bytes(a, path);
+    if (sel rr.err) { ret err[Error].err{Error.fs{rr.err}}; }
+    var data: Vector[u8] = rr.ok;
 
-    var w: usize = 0;
-    var h: usize = 0;
-    val start: usize = parse_header(data, ?w, ?h);
-
-    if (w == 0 || h == 0 || w * h > pattern.CAP) {
-        allo.deallocate[u8](a, data::ptr::*u8, total);
-        ret some[str]("cellar.persist.load_pattern: bad dimensions");
+    var w:     usize = 0;
+    var h:     usize = 0;
+    val start: usize = parse_header(?data, ?w, ?h);
+    if (w == 0 || h == 0 || w > pattern.CAP || h > pattern.CAP || w * h > pattern.CAP) {
+        vector.dnit[u8](?data);
+        ret err[Error].err{Error.dimensions{}};
     }
 
-    pattern.init(p, w, h, p.name);
-
-    var pos: usize = start;
-    var y: usize = 0;
-    for (y < h) {
-        var x: usize = 0;
-        for (x < w) {
-            pos = next_cell(data, pos);
-            if (data[pos] == 0) {
-                allo.deallocate[u8](a, data::ptr::*u8, total);
-                ret some[str]("cellar.persist.load_pattern: truncated body");
-            }
-            var v: u8 = 0;
-            if (data[pos] == '1') { v = 1; }
-            pattern.set(p, x, y, v);
-            pos = pos + 1;
-            x = x + 1;
-        }
-        y = y + 1;
-    }
-
-    allo.deallocate[u8](a, data::ptr::*u8, total);
-    ret none[str]();
-}
-
-test "persist: a 16x16 custom pattern and a 128x128 world save and reload" {
-    var a: allo.Allocator;
-    page.make(?a);
-
-    var p: pattern.Pattern;
-    pattern.init(?p, 16, 16, "custom");
-    pattern.set(?p, 0, 0, 1);
-    pattern.set(?p, 15, 15, 1);
-    pattern.set(?p, 8, 3, 1);
-    val ppath: str = "arrangements/test_custom16.cells";
-    if (save_pattern(?a, ?p, ppath).has_value) { ret 1; }
     var q: pattern.Pattern;
-    pattern.init(?q, 1, 1, "custom");
-    if (load_pattern(?a, ?q, ppath).has_value) { ret 1; }
-    if (q.w != 16 || q.h != 16) { ret 1; }
-    if (pattern.get(?q, 15, 15) != 1) { ret 1; }
-    fs.unlink(ppath);
-
-    var s2: sim.Sim;
-    if (sim.init(?s2, ?a, 128, 128).has_value) { ret 1; }
-    sim.paint(?s2, 1, 1, 1);
-    sim.paint(?s2, 127, 127, 1);
-    val wpath: str = "arrangements/test_world128.cells";
-    if (save_world(?a, ?s2, wpath).has_value) { ret 1; }
-    if (load_world(?a, ?s2, wpath).has_value) { ret 1; }
-    if (grid.get(?s2.grid, 127, 127) != 1) { ret 1; }
-    fs.unlink(wpath);
-    sim.dnit(?s2);
-    ret 0;
+    pattern.init(?q, w, h, p.name);
+    val parsed: err[Error] = parse_body(?data, start, w, h, ?q.cells[0]);
+    vector.dnit[u8](?data);
+    if (sel parsed.err) { ret parsed; }
+    @p = q;
+    ret err[Error].ok{};
 }
 
-test "persist: a world survives a save/load round trip" {
+test load_world__round_trips {
     var a: allo.Allocator;
     page.make(?a);
 
-    var s: sim.Sim;
-    if (sim.init(?s, ?a, 6, 4).has_value) { ret 1; }
+    var s:     sim.Sim;
+    val made2: err[allo.Error] = sim.init(?s, ?a, 6, 4);
+    if (sel made2.err) { ret 1; }
     sim.paint(?s, 0, 0, 1);
     sim.paint(?s, 5, 3, 1);
     sim.paint(?s, 2, 1, 1);
 
-    val path: str = "arrangements/test_roundtrip.cells";
-    if (save_world(?a, ?s, path).has_value) { ret 1; }
+    val path:   str        = "arrangements/test_world.cells";
+    val saved3: err[Error] = save_world(?a, ?s, path);
+    if (sel saved3.err) { ret 2; }
 
-    var t: sim.Sim;
-    if (sim.init(?t, ?a, 2, 2).has_value) { ret 1; }
-    if (load_world(?a, ?t, path).has_value) { ret 1; }
+    var t:     sim.Sim;
+    val made3: err[allo.Error] = sim.init(?t, ?a, 2, 2);
+    if (sel made3.err) { ret 3; }
+    val loaded3: err[Error] = load_world(?a, ?t, path);
+    if (sel loaded3.err) { ret 4; }
 
-    if (t.grid.w != 6 || t.grid.h != 4) { ret 1; }
+    if (t.grid.w != 6 || t.grid.h != 4) { ret 5; }
     var y: usize = 0;
     for (y < 4) {
         var x: usize = 0;
         for (x < 6) {
-            if (grid.get(?t.grid, x, y) != grid.get(?s.grid, x, y)) { ret 1; }
+            if (grid.get(?t.grid, x, y) != grid.get(?s.grid, x, y)) { ret 6; }
             x = x + 1;
         }
         y = y + 1;
     }
 
-    fs.unlink(path);
+    fs.remove_file(path);
     sim.dnit(?s);
     sim.dnit(?t);
     ret 0;
 }
 
-test "persist: a pattern survives a save/load round trip" {
+test load_pattern__round_trips {
     var a: allo.Allocator;
     page.make(?a);
 
@@ -312,24 +336,78 @@ test "persist: a pattern survives a save/load round trip" {
     pattern.set(?p, 4, 2, 1);
     pattern.set(?p, 2, 1, 1);
 
-    val path: str = "arrangements/test_pattern.cells";
-    if (save_pattern(?a, ?p, path).has_value) { ret 1; }
+    val path:   str        = "arrangements/test_pattern.cells";
+    val saved4: err[Error] = save_pattern(?a, ?p, path);
+    if (sel saved4.err) { ret 1; }
 
     var q: pattern.Pattern;
     pattern.init(?q, 1, 1, "custom");
-    if (load_pattern(?a, ?q, path).has_value) { ret 1; }
+    val loaded4: err[Error] = load_pattern(?a, ?q, path);
+    if (sel loaded4.err) { ret 2; }
 
-    if (q.w != 5 || q.h != 3) { ret 1; }
+    if (q.w != 5 || q.h != 3) { ret 3; }
     var y: usize = 0;
     for (y < 3) {
         var x: usize = 0;
         for (x < 5) {
-            if (pattern.get(?q, x, y) != pattern.get(?p, x, y)) { ret 1; }
+            if (pattern.get(?q, x, y) != pattern.get(?p, x, y)) { ret 4; }
             x = x + 1;
         }
         y = y + 1;
     }
 
-    fs.unlink(path);
+    fs.remove_file(path);
+    ret 0;
+}
+
+test load_pattern__reads_by_length_past_an_embedded_nul {
+    var t:    alloc_testing.Testing;
+    val made: err[allo.Error] = alloc_testing.make(?t);
+    if (sel made.err) { ret 1; }
+    val a: *allo.Allocator = alloc_testing.allocator_of(?t);
+
+    # a NUL inside the body ended the old NUL-terminated read early
+    var body: [9]u8           = [9]u8{'3', ' ', '1', '\n', '1', 0, '0', '1', '\n'};
+    val path: str             = "arrangements/test_nul.cells";
+    val dir:  err[fs.FsError] = fs.create_dir_all(a, DIR, DIR_MODE);
+    if (sel dir.err) { ret 2; }
+    val wrote: err[fs.FsError] = fs.write_bytes(path, ?body[0], 9, FILE_MODE);
+    if (sel wrote.err) { ret 3; }
+
+    var p: pattern.Pattern;
+    pattern.init(?p, 1, 1, "custom");
+    val loaded: err[Error] = load_pattern(a, ?p, path);
+    fs.remove_file(path);
+    if (sel loaded.err)                                                                                     { ret 4; }
+    if (p.w != 3 || pattern.get(?p, 0, 0) != 1 || pattern.get(?p, 1, 0) != 0 || pattern.get(?p, 2, 0) != 1) { ret 5; }
+    if (alloc_testing.leaked(?t))                                                                           { ret 6; }
+    alloc_testing.dnit(?t);
+    ret 0;
+}
+
+test load_world__short_body_leaves_the_world_intact {
+    var a: allo.Allocator;
+    page.make(?a);
+
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a, 4, 4);
+    if (sel made.err) { ret 1; }
+    sim.paint(?s, 2, 2, 1);
+
+    # declares 3x3 but carries four cells
+    var body: [9]u8           = [9]u8{'3', ' ', '3', '\n', '1', '1', '0', '1', '\n'};
+    val path: str             = "arrangements/test_short.cells";
+    val dir:  err[fs.FsError] = fs.create_dir_all(?a, DIR, DIR_MODE);
+    if (sel dir.err) { ret 2; }
+    val wrote: err[fs.FsError] = fs.write_bytes(path, ?body[0], 9, FILE_MODE);
+    if (sel wrote.err) { ret 3; }
+
+    val loaded: err[Error] = load_world(?a, ?s, path);
+    fs.remove_file(path);
+    if (!sel loaded.err)                { ret 4; }
+    if (!sel loaded.err.truncated)      { ret 5; }
+    if (s.grid.w != 4 || s.grid.h != 4) { ret 6; }
+    if (grid.get(?s.grid, 2, 2) != 1)   { ret 7; }
+    sim.dnit(?s);
     ret 0;
 }
