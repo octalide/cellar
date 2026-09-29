@@ -169,9 +169,37 @@ pub fun save_world(a: *allo.Allocator, s: *sim.Sim, path: str) err[Error] {
     ret save_buffer(a, s.grid.cells, s.grid.w, s.grid.h, path);
 }
 
-# read path, resize the simulation to its dimensions, and set its cells
+# parse the w x h cells after the header into out, row-major as 0 or 1
+#
+# every cell is read before the caller changes anything, so a short body is
+# refused while the world or pattern it was meant for is still untouched.
 # ---
-# a:    allocator for the read buffer
+# b:     the file contents
+# start: the offset just past the header
+# w:     declared width
+# h:     declared height
+# out:   receives w*h cells
+# ret:   ok, or truncated when the body runs out first
+fun parse_body(b: *Vector[u8], start: usize, w: usize, h: usize, out: *u8) err[Error] {
+    var p: usize = start;
+    var i: usize = 0;
+    for (i < w * h) {
+        p = next_cell(b, p);
+        if (p >= b.len) { ret err[Error].err{Error.truncated{}}; }
+        out[i] = 0;
+        if (b.data[p] == '1') { out[i] = 1; }
+        p = p + 1;
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# read path, resize the simulation to its dimensions, and set its cells
+#
+# the whole file is validated before the world changes, so a refusal leaves
+# the world as it was.
+# ---
+# a:    allocator for the read and parse buffers
 # s:    simulation to populate
 # path: source file path
 # ret:  ok, or why the world was not loaded
@@ -183,39 +211,40 @@ pub fun load_world(a: *allo.Allocator, s: *sim.Sim, path: str) err[Error] {
     var w:     usize = 0;
     var h:     usize = 0;
     val start: usize = parse_header(?data, ?w, ?h);
-
     if (w == 0 || h == 0 || w > MAX_DIM || h > MAX_DIM) {
         vector.dnit[u8](?data);
         ret err[Error].err{Error.dimensions{}};
     }
 
+    val rc: res[*u8, allo.Error] = allo.allocate[u8](a, w * h);
+    if (sel rc.err) {
+        vector.dnit[u8](?data);
+        ret err[Error].err{Error.alloc{rc.err}};
+    }
+    val cells:  *u8        = rc.ok;
+    val parsed: err[Error] = parse_body(?data, start, w, h, cells);
+    vector.dnit[u8](?data);
+    if (sel parsed.err) {
+        allo.deallocate[u8](a, cells, w * h);
+        ret parsed;
+    }
+
+    # resize allocates before it frees, so a refusal here keeps the old world
     val e: err[allo.Error] = sim.resize(s, w, h);
     if (sel e.err) {
-        vector.dnit[u8](?data);
+        allo.deallocate[u8](a, cells, w * h);
         ret err[Error].err{Error.alloc{e.err}};
     }
-    grid.clear(?s.grid);
-
-    var p: usize = start;
     var y: usize = 0;
     for (y < h) {
         var x: usize = 0;
         for (x < w) {
-            p = next_cell(?data, p);
-            if (p >= data.len) {
-                vector.dnit[u8](?data);
-                ret err[Error].err{Error.truncated{}};
-            }
-            var v: u8 = 0;
-            if (data.data[p] == '1') { v = 1; }
-            sim.paint(s, x, y, v);
-            p = p + 1;
+            sim.paint(s, x, y, cells[y * w + x]);
             x = x + 1;
         }
         y = y + 1;
     }
-
-    vector.dnit[u8](?data);
+    allo.deallocate[u8](a, cells, w * h);
     ret err[Error].ok{};
 }
 
@@ -230,6 +259,8 @@ pub fun save_pattern(a: *allo.Allocator, p: *pattern.Pattern, path: str) err[Err
 }
 
 # read path into a pattern, resizing it to the stored dimensions
+#
+# the file is parsed into a copy first, so a refusal leaves p as it was.
 # ---
 # a:    allocator for the read buffer
 # p:    pattern to populate
@@ -243,34 +274,17 @@ pub fun load_pattern(a: *allo.Allocator, p: *pattern.Pattern, path: str) err[Err
     var w:     usize = 0;
     var h:     usize = 0;
     val start: usize = parse_header(?data, ?w, ?h);
-
-    if (w == 0 || h == 0 || w * h > pattern.CAP) {
+    if (w == 0 || h == 0 || w > pattern.CAP || h > pattern.CAP || w * h > pattern.CAP) {
         vector.dnit[u8](?data);
         ret err[Error].err{Error.dimensions{}};
     }
 
-    pattern.init(p, w, h, p.name);
-
-    var pos: usize = start;
-    var y:   usize = 0;
-    for (y < h) {
-        var x: usize = 0;
-        for (x < w) {
-            pos = next_cell(?data, pos);
-            if (pos >= data.len) {
-                vector.dnit[u8](?data);
-                ret err[Error].err{Error.truncated{}};
-            }
-            var v: u8 = 0;
-            if (data.data[pos] == '1') { v = 1; }
-            pattern.set(p, x, y, v);
-            pos = pos + 1;
-            x   = x + 1;
-        }
-        y = y + 1;
-    }
-
+    var q: pattern.Pattern;
+    pattern.init(?q, w, h, p.name);
+    val parsed: err[Error] = parse_body(?data, start, w, h, ?q.cells[0]);
     vector.dnit[u8](?data);
+    if (sel parsed.err) { ret parsed; }
+    @p = q;
     ret err[Error].ok{};
 }
 
@@ -404,5 +418,32 @@ test load_pattern__reads_by_length_past_an_embedded_nul {
     if (p.w != 3 || pattern.get(?p, 0, 0) != 1 || pattern.get(?p, 1, 0) != 0 || pattern.get(?p, 2, 0) != 1) { ret 5; }
     if (alloc_testing.leaked(?t))                                                                           { ret 6; }
     alloc_testing.dnit(?t);
+    ret 0;
+}
+
+test load_world__short_body_leaves_the_world_intact {
+    var a: allo.Allocator;
+    page.make(?a);
+
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a, 4, 4);
+    if (sel made.err) { ret 1; }
+    sim.paint(?s, 2, 2, 1);
+
+    # declares 3x3 but carries four cells
+    var body: [9]u8           = [9]u8{'3', ' ', '3', '\n', '1', '1', '0', '1', '\n'};
+    val path: str             = "arrangements/test_short.cells";
+    val dir:  err[fs.FsError] = fs.create_dir_all(?a, DIR, DIR_MODE);
+    if (sel dir.err) { ret 2; }
+    val wrote: err[fs.FsError] = fs.write_bytes(path, ?body[0], 9, FILE_MODE);
+    if (sel wrote.err) { ret 3; }
+
+    val loaded: err[Error] = load_world(?a, ?s, path);
+    fs.remove_file(path);
+    if (!sel loaded.err)                { ret 4; }
+    if (!sel loaded.err.truncated)      { ret 5; }
+    if (s.grid.w != 4 || s.grid.h != 4) { ret 6; }
+    if (grid.get(?s.grid, 2, 2) != 1)   { ret 7; }
+    sim.dnit(?s);
     ret 0;
 }
