@@ -1,0 +1,168 @@
+# where cellar keeps its settings, worlds, patterns and screenshots
+#
+# the platform's per-user data directory: $XDG_DATA_HOME/cellar, or
+# ~/.local/share/cellar, on linux, ~/Library/Application Support/cellar on
+# macos, and %APPDATA%\cellar on windows. earlier versions kept everything under
+# arrangements/ in the working directory; the first run that finds no data
+# directory copies those files across, and the old place is not read again.
+
+use cellar.text;
+use allo: std.allocator;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use fs:       std.filesystem;
+use io_error: std.io.error;
+use std.process.env;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+# longest path held
+val CAP: usize = 1024;
+# the directory older versions saved into
+val LEGACY: str = "arrangements";
+
+# the settings file's name
+pub val SETTINGS: str = "cellar.config";
+# the saved world's name
+pub val WORLD: str = "world.cells";
+# the saved custom pattern's name
+pub val CUSTOM: str = "custom.cells";
+
+$if ($mach.build.os == $mach.os.windows) {
+    val SEP: str = "\\";
+}
+$or {
+    val SEP: str = "/";
+}
+
+# the resolved data directory
+# ---
+# dir: the directory, NUL-terminated
+# ok:  a directory was found; false when the platform names no home
+pub rec Paths {
+    dir: [1024]u8;
+    ok:  bool;
+}
+
+# append the value of an environment variable; ret the new offset, or CAP
+# when it is unset, empty or too long
+fun var_into(buf: *u8, off: usize, name: str) usize {
+    val got: res[opt[usize], env.EnvError] = env.get(name, ?buf[off], CAP - off);
+    var n:   usize                         = 0;
+    if (sel got.ok) {
+        if (sel got.ok.some) { n = got.ok.some; }
+    }
+    if (n == 0 || off + n + 64 >= CAP) { ret CAP; }
+    ret off + n;
+}
+
+$if ($mach.build.os == $mach.os.windows) {
+    fun base(buf: *u8) usize {
+        ret var_into(buf, 0, "APPDATA");
+    }
+}
+$or ($mach.build.os == $mach.os.darwin) {
+    fun base(buf: *u8) usize {
+        val o: usize = var_into(buf, 0, "HOME");
+        if (o == CAP) { ret CAP; }
+        ret text.buf_str(buf, o, "/Library/Application Support");
+    }
+}
+$or {
+    fun base(buf: *u8) usize {
+        val x: usize = var_into(buf, 0, "XDG_DATA_HOME");
+        # the spec ignores a relative XDG_DATA_HOME
+        if (x != CAP && buf[0] == '/') { ret x; }
+        val o: usize = var_into(buf, 0, "HOME");
+        if (o == CAP) { ret CAP; }
+        ret text.buf_str(buf, o, "/.local/share");
+    }
+}
+
+# resolve the data directory without creating it
+pub fun init(p: *Paths) {
+    p.ok = false;
+    val o: usize = base(?p.dir[0]);
+    if (o == CAP) {
+        p.dir[0] = 0;
+        ret;
+    }
+    var e: usize = text.buf_str(?p.dir[0], o, SEP);
+    e        = text.buf_str(?p.dir[0], e, "cellar");
+    p.dir[e] = 0;
+    p.ok     = true;
+}
+
+# the data directory
+pub fun dir(p: *Paths) str {
+    ret ?p.dir[0];
+}
+
+# join a file name onto the data directory into out, NUL-terminated
+# ---
+# p:    the paths
+# name: a bare file name
+# out:  at least CAP + 64 bytes
+# ret:  out
+pub fun file(p: *Paths, name: str, out: *u8) str {
+    var o: usize = text.buf_str(out, 0, ?p.dir[0]);
+    o      = text.buf_str(out, o, SEP);
+    o      = text.buf_str(out, o, name);
+    out[o] = 0;
+    ret out;
+}
+
+# copy one legacy file across if it exists
+fun carry(a: *allo.Allocator, p: *Paths, name: str) {
+    var from: [96]u8;
+    var fo:   usize = text.buf_str(?from[0], 0, LEGACY);
+    fo       = text.buf_str(?from[0], fo, "/");
+    fo       = text.buf_str(?from[0], fo, name);
+    from[fo] = 0;
+    val rr: res[Vector[u8], fs.FsError] = fs.read_bytes(a, ?from[0]);
+    if (sel rr.err) { ret; }
+    var data: Vector[u8] = rr.ok;
+    var to:   [1088]u8;
+    fs.write_bytes(file(p, name, ?to[0]), data.data, data.len, 0o644);
+    vector.dnit[u8](?data);
+}
+
+# create the data directory, the first time bringing over what older versions
+# left in arrangements/
+# ---
+# a:   allocator for transient buffers
+# p:   the paths
+# ret: ok, or why the directory could not be made
+pub fun prepare(a: *allo.Allocator, p: *Paths) err[fs.FsError] {
+    val there: res[bool, io_error.Error] = fs.is_dir(dir(p));
+    val fresh: bool                      = !(sel there.ok && there.ok);
+    val made:  err[fs.FsError]           = fs.create_dir_all(a, dir(p), 0o755);
+    if (sel made.err) { ret made; }
+    if (!fresh)       { ret made; }
+    val old: res[bool, io_error.Error] = fs.is_dir(LEGACY);
+    if (!(sel old.ok && old.ok)) { ret made; }
+    carry(a, p, SETTINGS);
+    carry(a, p, WORLD);
+    carry(a, p, CUSTOM);
+    ret made;
+}
+
+test init__names_a_cellar_directory {
+    var p: Paths;
+    init(?p);
+    if (!p.ok) { ret 0; }
+    var n: usize = 0;
+    for (p.dir[n] != 0) { n = n + 1; }
+    if (n < 7)                                      { ret 1; }
+    if (p.dir[n - 6] != 'c' || p.dir[n - 1] != 'r') { ret 2; }
+    var f: [1088]u8;
+    file(?p, WORLD, ?f[0]);
+    if (f[n] != SEP[0] || f[n + 1] != 'w') { ret 3; }
+    ret 0;
+}

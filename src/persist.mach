@@ -6,7 +6,7 @@
 # its signed chunk coordinates and 64 lines of 64 cells. a world file in the
 # pattern format, what every world was saved as before the world became
 # unbounded, still loads, centred on the origin. both are deliberately trivial
-# to read and write. saves create the arrangements directory first.
+# to read and write. saves create the file's directory first.
 
 use gfx: boom.graphics;
 use cellar.pattern;
@@ -28,10 +28,11 @@ use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 
-# directory holding saved worlds and patterns, user data rather than source
-pub val DIR: str = "arrangements";
+# directory tests write their files under
+#[testing]
+val TEST_DIR: str = "out/test";
 
-# permission bits for the arrangements directory
+# permission bits for a created data directory
 pub val DIR_MODE: i32 = 0o755;
 # permission bits for saved files
 pub val FILE_MODE: i32 = 0o644;
@@ -108,6 +109,29 @@ fun write_cells(buf: *u8, cells: *u8, w: usize, h: usize) usize {
     ret off;
 }
 
+# create the directory a file path lives in, when it names one
+# ---
+# a:    allocator for transient parent paths
+# path: a file path
+# ret:  ok, or why the directory does not exist
+pub fun make_parent(a: *allo.Allocator, path: str) err[fs.FsError] {
+    var cut: usize = 0;
+    var i:   usize = 0;
+    for (path[i] != 0) {
+        if (path[i] == '/' || path[i] == '\\') { cut = i; }
+        i = i + 1;
+    }
+    if (cut == 0 || cut >= 1100) { ret err[fs.FsError].ok{}; }
+    var dir: [1100]u8;
+    var k:   usize = 0;
+    for (k < cut) {
+        dir[k] = path[k];
+        k      = k + 1;
+    }
+    dir[cut] = 0;
+    ret fs.create_dir_all(a, ?dir[0], DIR_MODE);
+}
+
 # format a w x h field of row-major cells and write it to path
 # ---
 # a:     allocator backing the transient buffer
@@ -117,7 +141,7 @@ fun write_cells(buf: *u8, cells: *u8, w: usize, h: usize) usize {
 # path:  destination file path
 # ret:   ok, or why the file was not written
 fun save_buffer(a: *allo.Allocator, cells: *u8, w: usize, h: usize, path: str) err[Error] {
-    val made: err[fs.FsError] = fs.create_dir_all(a, DIR, DIR_MODE);
+    val made: err[fs.FsError] = make_parent(a, path);
     if (sel made.err) { ret err[Error].err{Error.fs{made.err}}; }
 
     val cap: usize                = HEADER_MAX + h * (w + 1);
@@ -216,7 +240,7 @@ fun buf_i64(buf: *u8, off: usize, v: i64) usize {
 pub fun save_world(a: *allo.Allocator, s: *sim.Sim, path: str) err[Error] {
     val synced: err[gfx.Error] = sim.sync(s);
     if (sel synced.err) { ret err[Error].err{Error.gpu{}}; }
-    val made: err[fs.FsError] = fs.create_dir_all(a, DIR, DIR_MODE);
+    val made: err[fs.FsError] = make_parent(a, path);
     if (sel made.err) { ret err[Error].err{Error.fs{made.err}}; }
 
     val sp:   *space.Space = ?s.space;
@@ -464,7 +488,7 @@ test load_world__round_trips_a_sparse_world {
     sim.paint(?s, -5, 3, 1);
     sim.paint(?s, 100000, -70000, 1);
 
-    val path:  str        = "arrangements/test_world.cells";
+    val path:  str        = "out/test/test_world.cells";
     val saved: err[Error] = save_world(?a, ?s, path);
     if (sel saved.err) { ret 2; }
 
@@ -491,8 +515,8 @@ test load_world__loads_an_old_dense_file_centred {
 
     # a 4 x 2 world from before the world was unbounded
     var body: [14]u8          = [14]u8{'4', ' ', '2', '\n', '1', '0', '0', '0', '\n', '0', '0', '0', '1', '\n'};
-    val path: str             = "arrangements/test_old.cells";
-    val dir:  err[fs.FsError] = fs.create_dir_all(?a, DIR, DIR_MODE);
+    val path: str             = "out/test/test_old.cells";
+    val dir:  err[fs.FsError] = fs.create_dir_all(?a, TEST_DIR, DIR_MODE);
     if (sel dir.err) { ret 1; }
     val wrote: err[fs.FsError] = fs.write_bytes(path, ?body[0], 14, FILE_MODE);
     if (sel wrote.err) { ret 2; }
@@ -519,7 +543,7 @@ test load_pattern__round_trips {
     pattern.set(?p, 4, 2, 1);
     pattern.set(?p, 2, 1, 1);
 
-    val path:   str        = "arrangements/test_pattern.cells";
+    val path:   str        = "out/test/test_pattern.cells";
     val saved4: err[Error] = save_pattern(?a, ?p, path);
     if (sel saved4.err) { ret 1; }
 
@@ -551,8 +575,8 @@ test load_pattern__reads_by_length_past_an_embedded_nul {
 
     # a NUL inside the body ended the old NUL-terminated read early
     var body: [9]u8           = [9]u8{'3', ' ', '1', '\n', '1', 0, '0', '1', '\n'};
-    val path: str             = "arrangements/test_nul.cells";
-    val dir:  err[fs.FsError] = fs.create_dir_all(a, DIR, DIR_MODE);
+    val path: str             = "out/test/test_nul.cells";
+    val dir:  err[fs.FsError] = fs.create_dir_all(a, TEST_DIR, DIR_MODE);
     if (sel dir.err) { ret 2; }
     val wrote: err[fs.FsError] = fs.write_bytes(path, ?body[0], 9, FILE_MODE);
     if (sel wrote.err) { ret 3; }
@@ -579,8 +603,8 @@ test load_world__short_body_leaves_the_world_intact {
 
     # declares 3x3 but carries four cells
     var body: [9]u8           = [9]u8{'3', ' ', '3', '\n', '1', '1', '0', '1', '\n'};
-    val path: str             = "arrangements/test_short.cells";
-    val dir:  err[fs.FsError] = fs.create_dir_all(?a, DIR, DIR_MODE);
+    val path: str             = "out/test/test_short.cells";
+    val dir:  err[fs.FsError] = fs.create_dir_all(?a, TEST_DIR, DIR_MODE);
     if (sel dir.err) { ret 2; }
     val wrote: err[fs.FsError] = fs.write_bytes(path, ?body[0], 9, FILE_MODE);
     if (sel wrote.err) { ret 3; }

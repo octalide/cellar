@@ -1,16 +1,20 @@
-# UI settings, the active kernel, and window layout kept between runs
+# interface settings and the active rule, kept between runs
 #
-# they are one fixed-order line of integers under arrangements/. every value is
-# stored as a non-negative integer, fractional fields scaled (speed x10, colors
-# x255) and floats truncated, so one integer formatter and
-# one whitespace tokenizer cover the whole file, with no float parsing. the world
-# contents are not part of settings; use the arrangements window to save a world.
+# they are one fixed-order line of integers in the data directory. every value
+# is stored as a non-negative integer, fractional fields scaled (speed x10,
+# colours x255), so one integer formatter and one whitespace tokenizer cover
+# the whole file, with no float parsing. version 1 files, written before the
+# side panel replaced the floating windows, are read for everything but their
+# window positions. the world is not part of settings; the files section saves
+# it.
 
 use cellar.app;
 use cellar.kernel;
+use cellar.pattern;
 use cellar.persist;
 use cellar.sim;
 use cellar.text;
+use cellar.theme;
 use allo: std.allocator;
 use std.allocator.page;
 use std.collections.vector;
@@ -23,11 +27,9 @@ use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 
-# settings file, under the (gitignored) arrangements/ data directory
-pub val PATH: str = "arrangements/cellar.config";
+# settings-format version written; version 1 is still read
+val VERSION: u64 = 2;
 
-# settings-format version; a file with a different version is ignored
-val VERSION: u64 = 1;
 # buffer size for the serialized settings line, ample for ~105 integers
 val CAP: usize = 4096;
 
@@ -37,6 +39,18 @@ fun wr(buf: *u8, off: usize, v: u64) usize {
     var o: usize = text.buf_u64(buf, off, v);
     buf[o] = ' ';
     ret o + 1;
+}
+
+# a stored flag as 0 or 1
+fun bit(v: usize) u8 {
+    if (v != 0) { ret 1; }
+    ret 0;
+}
+
+# a stored colour channel clamped to a byte
+fun byte(v: usize) u32 {
+    if (v > 255) { ret 255; }
+    ret v::u32;
 }
 
 # skip non-digits from pos, parse a run of digits, advance pos past
@@ -53,14 +67,14 @@ fun read_uint(b: *Vector[u8], pos: *usize) usize {
     ret v;
 }
 
-# write the current settings, kernel, and window layout to path
+# write the current settings and rule to path
 # ---
 # a:   allocator backing the transient buffer
 # ap:  application state to serialize
 # s:   simulation whose kernel is serialized
 # ret: ok, or why the settings were not written
 pub fun save(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) err[persist.Error] {
-    val made: err[fs.FsError] = fs.create_dir_all(a, persist.DIR, persist.DIR_MODE);
+    val made: err[fs.FsError] = persist.make_parent(a, path);
     if (sel made.err) { ret err[persist.Error].err{persist.Error.fs{made.err}}; }
 
     val rc: res[*u8, allo.Error] = allo.allocate[u8](a, CAP);
@@ -73,13 +87,13 @@ pub fun save(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) err[persi
     o = wr(buf, o, ap.mode::u64);
     o = wr(buf, o, ap.gutter::u64);
     o = wr(buf, o, ap.uncapped::u64);
-    o = wr(buf, o, ap.erase::u64);
+    o = wr(buf, o, (ap.tool == app.TOOL_ERASE)::u64);
     o = wr(buf, o, ap.bounds_idx::u64);
-    o = wr(buf, o, ap.stamp_mode::u64);
+    o = wr(buf, o, (ap.tool == app.TOOL_STAMP)::u64);
     o = wr(buf, o, ap.pattern_sel::u64);
-    o = wr(buf, o, (ap.solid_r * 255.0)::u64);
-    o = wr(buf, o, (ap.solid_g * 255.0)::u64);
-    o = wr(buf, o, (ap.solid_b * 255.0)::u64);
+    o = wr(buf, o, theme.red(ap.solid)::u64);
+    o = wr(buf, o, theme.green(ap.solid)::u64);
+    o = wr(buf, o, theme.blue(ap.solid)::u64);
     o = wr(buf, o, s.kernel.radius::u64);
     o = wr(buf, o, s.kernel.birth);
     o = wr(buf, o, s.kernel.survive);
@@ -88,15 +102,13 @@ pub fun save(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) err[persi
         o = wr(buf, o, s.kernel.weights[i]::u64);
         i = i + 1;
     }
-    o      = wr(buf, o, ap.world.x::u64);
-    o      = wr(buf, o, ap.world.y::u64);
-    o      = wr(buf, o, ap.world.open::u64);
-    o      = wr(buf, o, ap.kedit.x::u64);
-    o      = wr(buf, o, ap.kedit.y::u64);
-    o      = wr(buf, o, ap.kedit.open::u64);
-    o      = wr(buf, o, ap.arrange.x::u64);
-    o      = wr(buf, o, ap.arrange.y::u64);
-    o      = wr(buf, o, ap.arrange.open::u64);
+    o      = wr(buf, o, ap.panel::u64);
+    o      = wr(buf, o, ap.open_run::u64);
+    o      = wr(buf, o, ap.open_draw::u64);
+    o      = wr(buf, o, ap.open_rule::u64);
+    o      = wr(buf, o, ap.open_view::u64);
+    o      = wr(buf, o, ap.open_files::u64);
+    o      = wr(buf, o, ap.scale_idx::u64);
     buf[o] = '\n';
     o      = o + 1;
 
@@ -107,7 +119,7 @@ pub fun save(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) err[persi
 }
 
 # read settings from path into ap and s.kernel, if the file exists and its
-# version matches. a missing file leaves the defaults untouched.
+# version is known. a missing file leaves the defaults untouched.
 # ---
 # a:   allocator for the read buffer
 # ap:  application state to populate
@@ -121,24 +133,33 @@ pub fun load(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) err[persi
     }
     var data: Vector[u8] = rr.ok;
 
-    var p: usize = 0;
-    if (read_uint(?data, ?p) != VERSION::usize) {
+    var p:       usize = 0;
+    val version: usize = read_uint(?data, ?p);
+    if (version != 1 && version != VERSION::usize) {
         vector.dnit[u8](?data);
         ret err[persist.Error].err{persist.Error.version{}};
     }
 
-    ap.speed      = read_uint(?data, ?p)::f32 / 10.0;
-    ap.mode       = read_uint(?data, ?p);
-    ap.gutter     = read_uint(?data, ?p)::u8;
-    ap.uncapped   = read_uint(?data, ?p)::u8;
-    ap.erase      = read_uint(?data, ?p)::u8;
+    ap.speed = read_uint(?data, ?p)::f32 / 10.0;
+    if (ap.speed < 1.0)   { ap.speed = 1.0; }
+    if (ap.speed > 120.0) { ap.speed = 120.0; }
+    ap.mode = read_uint(?data, ?p);
+    if (ap.mode >= app.MODE_COUNT) { ap.mode = 0; }
+    ap.gutter   = bit(read_uint(?data, ?p));
+    ap.uncapped = bit(read_uint(?data, ?p));
+    val erase: usize = read_uint(?data, ?p);
     ap.bounds_idx = read_uint(?data, ?p);
     if (ap.bounds_idx >= app.BOUNDS_COUNT) { ap.bounds_idx = app.DEFAULT_BOUNDS; }
-    ap.stamp_mode  = read_uint(?data, ?p)::u8;
+    val stamp: usize = read_uint(?data, ?p);
+    ap.tool = app.TOOL_DRAW;
+    if (erase != 0) { ap.tool = app.TOOL_ERASE; }
+    if (stamp != 0) { ap.tool = app.TOOL_STAMP; }
     ap.pattern_sel = read_uint(?data, ?p);
-    ap.solid_r     = read_uint(?data, ?p)::f32 / 255.0;
-    ap.solid_g     = read_uint(?data, ?p)::f32 / 255.0;
-    ap.solid_b     = read_uint(?data, ?p)::f32 / 255.0;
+    if (ap.pattern_sel > pattern.BUILTIN_COUNT) { ap.pattern_sel = 0; }
+    val cr: u32 = byte(read_uint(?data, ?p));
+    val cg: u32 = byte(read_uint(?data, ?p));
+    val cb: u32 = byte(read_uint(?data, ?p));
+    ap.solid = (cr << 16) | (cg << 8) | cb;
 
     var r: usize = read_uint(?data, ?p);
     if (r < 1)                 { r = 1; }
@@ -151,23 +172,20 @@ pub fun load(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) err[persi
         s.kernel.weights[i] = read_uint(?data, ?p)::i32;
         i                   = i + 1;
     }
-    # a saved rule that matches a preset keeps that preset's name and selection
     s.kernel.name = "custom";
     val match: opt[usize] = kernel.match_preset(?s.kernel);
-    if (sel match.some) {
-        s.kernel.name = kernel.preset(match.some).name;
-        ap.preset_sel = match.some;
-    }
+    if (sel match.some) { s.kernel.name = kernel.preset(match.some).name; }
 
-    ap.world.x      = read_uint(?data, ?p)::f32;
-    ap.world.y      = read_uint(?data, ?p)::f32;
-    ap.world.open   = read_uint(?data, ?p)::u8;
-    ap.kedit.x      = read_uint(?data, ?p)::f32;
-    ap.kedit.y      = read_uint(?data, ?p)::f32;
-    ap.kedit.open   = read_uint(?data, ?p)::u8;
-    ap.arrange.x    = read_uint(?data, ?p)::f32;
-    ap.arrange.y    = read_uint(?data, ?p)::f32;
-    ap.arrange.open = read_uint(?data, ?p)::u8;
+    if (version == VERSION::usize) {
+        ap.panel      = bit(read_uint(?data, ?p));
+        ap.open_run   = bit(read_uint(?data, ?p));
+        ap.open_draw  = bit(read_uint(?data, ?p));
+        ap.open_rule  = bit(read_uint(?data, ?p));
+        ap.open_view  = bit(read_uint(?data, ?p));
+        ap.open_files = bit(read_uint(?data, ?p));
+        ap.scale_idx  = read_uint(?data, ?p);
+        if (ap.scale_idx >= app.SCALE_COUNT) { ap.scale_idx = 0; }
+    }
 
     vector.dnit[u8](?data);
     ret err[persist.Error].ok{};
@@ -186,13 +204,12 @@ test load__round_trips_settings {
     ap.speed       = 30.0;
     ap.mode        = 2;
     ap.uncapped    = 1;
-    ap.solid_r     = 1.0;
-    ap.solid_g     = 0.0;
-    ap.solid_b     = 0.5;
-    ap.kedit.open  = 1;
+    ap.solid       = 0xff0080;
+    ap.open_rule   = 1;
+    ap.tool        = app.TOOL_STAMP;
     s.kernel.birth = 42;
 
-    val path:  str                = "arrangements/test_config.cells";
+    val path:  str                = "out/test/test_config.cells";
     val saved: err[persist.Error] = save(?a, ?ap, ?s, path);
     if (sel saved.err) { ret 1; }
 
@@ -204,10 +221,12 @@ test load__round_trips_settings {
     val loaded: err[persist.Error] = load(?a, ?bp, ?t, path);
     if (sel loaded.err) { ret 1; }
 
-    if (bp.mode != 2)         { ret 1; }
-    if (bp.uncapped != 1)     { ret 1; }
-    if (bp.kedit.open != 1)   { ret 1; }
-    if (t.kernel.birth != 42) { ret 1; }
+    if (bp.mode != 2)              { ret 1; }
+    if (bp.uncapped != 1)          { ret 1; }
+    if (bp.open_rule != 1)         { ret 1; }
+    if (bp.solid != 0xff0080)      { ret 1; }
+    if (bp.tool != app.TOOL_STAMP) { ret 1; }
+    if (t.kernel.birth != 42)      { ret 1; }
     # speed x10 and color x255 round-trip within the quantization step
     if (bp.speed < 29.0 || bp.speed > 31.0) { ret 1; }
 

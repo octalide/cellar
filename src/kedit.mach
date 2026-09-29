@@ -1,30 +1,28 @@
-# the kernel-editor window
+# the rule section: presets, the rule's notation, and the kernel editor
 #
-# edits the simulation's live kernel in place: a preset quick-load, radius
-# controls, a clickable weight grid (each cell cycles its integer weight), and
-# birth/survive bit toggles over the reachable weighted sums. any edit relabels
-# the kernel "custom".
+# edits the simulation's live kernel in place: a preset quick-load, a radius
+# stepper, a clickable weight grid where each cell cycles its integer weight,
+# and birth and survive toggles over every reachable weighted sum. any edit
+# relabels the kernel "custom" unless it lands back on a preset.
 
-use bc: blit.context;
-use bd: blit.draw;
-use bw: blit.widget;
-use cellar.app;
 use cellar.kernel;
 use cellar.sim;
 use cellar.text;
+use cellar.theme;
+use cellar.ui;
+use cellar.world;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
 use std.types.size.usize;
 use std.types.string.str;
 
-# weight-grid cell size in pixels
-val CELL: f32 = 18.0;
-# birth/survive toggle square size in pixels
-val TOG: f32 = 16.0;
-# spacing matching blit's widget padding
-val PAD: f32 = 4.0;
 # weights cycle through 0..MAXW on click
 val MAXW: i32 = 4;
-# birth/survive toggles before wrapping to a new row
-val TOGS_PER_ROW: usize = 9;
+# largest unscaled weight-grid cell and sum toggle
+val CELL: f32 = 28.0;
+val TOG:  f32 = 26.0;
 
 # zero every footprint weight
 fun clear_weights(k: *kernel.Kernel) {
@@ -33,10 +31,9 @@ fun clear_weights(k: *kernel.Kernel) {
         k.weights[i] = 0;
         i            = i + 1;
     }
-    k.name = "custom";
 }
 
-# set every non-center footprint cell to weight 1
+# set every non-centre footprint cell to weight 1
 fun moore_ones(k: *kernel.Kernel) {
     clear_weights(k);
     val r:  i64 = k.radius::i64;
@@ -49,131 +46,158 @@ fun moore_ones(k: *kernel.Kernel) {
         }
         dy = dy + 1;
     }
-    k.name = "custom";
 }
 
-# render the clickable weight grid at the layout cursor, then
-# advance the cursor below it. each cell cycles its weight 0..MAXW on click.
-fun draw_weights(ctx: *bc.Context, k: *kernel.Kernel) {
-    val r:  i64 = k.radius::i64;
-    val n:  i64 = 2 * r + 1;
-    val x0: f32 = ctx.cx;
-    val y0: f32 = ctx.cy;
+# name the kernel after the preset it matches, or custom
+fun rename(k: *kernel.Kernel) {
+    k.name = "custom";
+    val m: opt[usize] = kernel.match_preset(k);
+    if (sel m.some) { k.name = kernel.preset(m.some).name; }
+}
+
+# the clickable weight grid, centred in the column
+fun weights(u: *ui.Ui, k: *kernel.Kernel) bool {
+    val r: i64 = k.radius::i64;
+    val n: i64 = 2 * r + 1;
+    var c: f32 = ui.px(u, CELL);
+    if (c * n::f32 > u.w) { c = u.w / n::f32; }
+    val x0: f32  = u.x + (u.w - c * n::f32) / 2.0;
+    val y0: f32  = u.y;
+    var ed: bool = false;
 
     var dy: i64 = 0 - r;
     for (dy <= r) {
         var dx: i64 = 0 - r;
         for (dx <= r) {
-            val cx0: f32 = x0 + (dx + r)::f32 * CELL;
-            val cy0: f32 = y0 + (dy + r)::f32 * CELL;
-            val cx1: f32 = cx0 + CELL - 1.0;
-            val cy1: f32 = cy0 + CELL - 1.0;
-
-            val wv: i32 = kernel.weight_at(k, dx, dy);
-            var t:  f32 = wv::f32 / MAXW::f32;
-            if (t > 1.0) { t = 1.0; }
-            bc.quad(ctx, cx0, cy0, cx1, cy1, bd.rgba(0.12 + 0.45 * t, 0.16 + 0.55 * t, 0.20 + 0.20 * t, 1.0));
-            bc.glyph(ctx, '0' + wv::u8, cx0 + (CELL - 8.0) / 2.0, cy0 + (CELL - 8.0) / 2.0, bd.rgba(0.95, 0.95, 1.0, 1.0));
-
-            if (bw.region_clicked(ctx, cx0, cy0, cx1, cy1) != 0) {
+            val cx0: f32    = x0 + (dx + r)::f32 * c;
+            val cy0: f32    = y0 + (dy + r)::f32 * c;
+            val cx1: f32    = cx0 + c - ui.px(u, 2.0);
+            val cy1: f32    = cy0 + c - ui.px(u, 2.0);
+            val hh:  ui.Hit = ui.region(u, cx0, cy0, cx1, cy1);
+            val wv:  i32    = kernel.weight_at(k, dx, dy);
+            ui.rect(u, cx0, cy0, cx1, cy1, ui.fill(hh, false), 1.0);
+            if (wv > 0) {
+                ui.rect(u, cx0, cy0, cx1, cy1, theme.ACCENT, 0.2 + 0.8 * wv::f32 / MAXW::f32);
+            }
+            if (dx == 0 && dy == 0) { ui.frame(u, cx0, cy0, cx1, cy1, ui.px(u, 1.0), theme.TEXT_DIM, 1.0); }
+            var digit: [2]u8;
+            digit[0] = '0' + wv::u8;
+            digit[1] = 0;
+            var ink: u32 = theme.TEXT_FAINT;
+            if (wv > 0) { ink = theme.ACCENT_INK; }
+            ui.text_centre(u, u.small, ?digit[0], cx0, cy0, cx1, cy1, ink, 1.0);
+            if (hh.clicked) {
                 var nv: i32 = wv + 1;
                 if (nv > MAXW) { nv = 0; }
                 kernel.set_weight(k, dx, dy, nv);
-                k.name = "custom";
+                ed = true;
             }
             dx = dx + 1;
         }
         dy = dy + 1;
     }
-
-    ctx.cy = y0 + n::f32 * CELL + PAD;
-    ctx.cx = ctx.ox;
+    ui.advance(u, c * n::f32);
+    ret ed;
 }
 
-# render one wrapped row of sum bits (birth or survive) at the
-# layout cursor and advance below it. clicking a square flips that sum's bit.
-fun draw_toggle_row(ctx: *bc.Context, ch: u8, k: *kernel.Kernel, is_birth: u8, ms: i32) {
-    val x0:       f32 = ctx.cx;
-    val y0:       f32 = ctx.cy;
-    val rowstart: f32 = x0 + 14.0;
-
-    bc.glyph(ctx, ch, x0, y0 + (TOG - 8.0) / 2.0, bd.rgba(0.92, 0.92, 0.95, 1.0));
-
-    val count:  usize = (ms + 1)::usize;
-    var maxrow: usize = 0;
-    var i:      usize = 0;
+# one labelled, wrapping row of sum toggles over a mask
+fun sums(u: *ui.Ui, label: str, mask: *u64, most: i32) bool {
+    ui.note(u, label);
+    val g:   f32   = ui.px(u, 3.0);
+    var t:   f32   = ui.px(u, TOG);
+    var per: usize = ((u.w + g) / (t + g))::usize;
+    if (per < 1) { per = 1; }
+    t = (u.w + g) / per::f32 - g;
+    val count: usize = (most + 1)::usize;
+    var ed:    bool  = false;
+    var i:     usize = 0;
     for (i < count) {
-        val rr:  usize = i / TOGS_PER_ROW;
-        val cc:  usize = i % TOGS_PER_ROW;
-        val bx0: f32   = rowstart + cc::f32 * TOG;
-        val by0: f32   = y0 + rr::f32 * TOG;
-        val bx1: f32   = bx0 + TOG - 2.0;
-        val by1: f32   = by0 + TOG - 2.0;
-
-        var set: u8 = kernel.has_bit(k.survive, i);
-        if (is_birth != 0) { set = kernel.has_bit(k.birth, i); }
-        var col: bd.Color = bd.rgba(0.15, 0.16, 0.20, 1.0);
-        if (set != 0) { col = bd.rgba(0.45, 0.80, 0.55, 1.0); }
-        bc.quad(ctx, bx0, by0, bx1, by1, col);
-        if (i < 10) {
-            bc.glyph(ctx, '0' + i::u8, bx0 + (TOG - 2.0 - 8.0) / 2.0, by0 + (TOG - 2.0 - 8.0) / 2.0, bd.rgba(0.92, 0.92, 0.95, 1.0));
+        val x0: f32    = u.x + (i % per)::f32 * (t + g);
+        val y0: f32    = u.y + (i / per)::f32 * (t + g);
+        val on: bool   = kernel.has_bit(@mask, i) != 0;
+        val hh: ui.Hit = ui.region(u, x0, y0, x0 + t, y0 + t);
+        ui.rect(u, x0, y0, x0 + t, y0 + t, ui.fill(hh, on), 1.0);
+        var num: [4]u8;
+        val o:   usize = text.buf_u64(?num[0], 0, i::u64);
+        num[o] = 0;
+        ui.text_centre(u, u.small, ?num[0], x0, y0, x0 + t, y0 + t, ui.ink(on), 1.0);
+        if (hh.clicked) {
+            @mask = kernel.toggle_bit(@mask, i);
+            ed    = true;
         }
+        i = i + 1;
+    }
+    val rows: usize = (count + per - 1) / per;
+    ui.advance(u, rows::f32 * (t + g) - g);
+    ret ed;
+}
 
-        if (bw.region_clicked(ctx, bx0, by0, bx1, by1) != 0) {
-            if (is_birth != 0) { k.birth = kernel.toggle_bit(k.birth, i); }
-            or                 { k.survive = kernel.toggle_bit(k.survive, i); }
-            k.name = "custom";
+# the radius stepper: its label, value and the two buttons
+fun radius(u: *ui.Ui, k: *kernel.Kernel) bool {
+    val h:  f32 = ui.px(u, ui.ROW);
+    val y0: f32 = u.y;
+    ui.text_mid(u, u.body, "Radius", u.x, y0, y0 + h, theme.TEXT, 1.0);
+    val b:  f32  = h;
+    val x1: f32  = u.x + u.w;
+    var ed: bool = false;
+    if (ui.button_at(u, "+", x1 - b, y0, x1, y0 + h, false) && k.radius < kernel.MAX_RADIUS) {
+        kernel.set_radius(k, k.radius + 1);
+        ed = true;
+    }
+    var num: [4]u8;
+    val o:   usize = text.buf_u64(?num[0], 0, k.radius::u64);
+    num[o] = 0;
+    ui.text_centre(u, u.body, ?num[0], x1 - b * 2.0, y0, x1 - b, y0 + h, theme.TEXT, 1.0);
+    if (ui.button_at(u, "-", x1 - b * 3.0, y0, x1 - b * 2.0, y0 + h, false) && k.radius > 1) {
+        kernel.set_radius(k, k.radius - 1);
+        ed = true;
+    }
+    ui.advance(u, h);
+    ret ed;
+}
+
+# draw the rule section and apply its edits
+# ---
+# u:    the interface
+# s:    the simulation whose kernel is edited, locked by the caller
+# open: whether the section is expanded
+pub fun section(u: *ui.Ui, s: *sim.Sim, open: *u8) {
+    if (!ui.heading(u, "RULE", open)) { ret; }
+    val k: *kernel.Kernel = world.rule(s);
+
+    val m: opt[usize] = world.rule_preset(s);
+    val h: f32        = ui.px(u, ui.ROW);
+    var i: usize      = 0;
+    for (i < kernel.PRESET_COUNT) {
+        val col: usize = i % 2;
+        val on:  bool  = sel m.some && m.some == i;
+        if (ui.button_at(u, world.preset_label(i), ui.cell_x0(u, col, 2), u.y, ui.cell_x1(u, col, 2), u.y + h, on)) {
+            s.kernel = kernel.preset(i);
         }
-
-        if (rr > maxrow) { maxrow = rr; }
+        if (col == 1) { ui.advance(u, h); }
         i = i + 1;
     }
 
-    ctx.cy = y0 + (maxrow + 1)::f32 * TOG + PAD;
-    ctx.cx = ctx.ox;
-}
+    var rb: [200]u8;
+    ui.text(u, u.body, world.rule_string(s, ?rb[0]), u.x, u.y, theme.ACCENT, 1.0);
+    u.y = u.y + ui.line(u.body) + ui.px(u, ui.GAP);
 
-# lay out the kernel-editor window and apply edits to the simulation's kernel
-# ---
-# ctx: blit context for this frame
-# a:   application state
-# s:   simulation whose kernel is edited
-pub fun draw(ctx: *bc.Context, a: *app.App, s: *sim.Sim) {
-    val handle: bw.Block = bw.begin_window(ctx, ?a.kedit);
-
-    if (a.kedit.open != 0) {
-        val k: *kernel.Kernel = ?s.kernel;
-
-        var presets: [4]str;
-        presets[0] = "life";
-        presets[1] = "highlife";
-        presets[2] = "seeds";
-        presets[3] = "day&night";
-        if (bw.dropdown(ctx, "preset", ?a.preset_sel, ?presets[0], 4) != 0) {
-            s.kernel = kernel.preset(a.preset_sel);
-        }
-
-        var rl: [16]u8;
-        var ro: usize = text.buf_str(?rl[0], 0, "radius ");
-        ro     = text.buf_u64(?rl[0], ro, k.radius::u64);
-        rl[ro] = 0;
-        bw.text(ctx, ?rl[0]);
-        if (bw.button(ctx, "radius -")) {
-            if (k.radius > 1) { kernel.set_radius(k, k.radius - 1); }
-        }
-        if (bw.button(ctx, "radius +")) {
-            if (k.radius < kernel.MAX_RADIUS) { kernel.set_radius(k, k.radius + 1); }
-        }
-
-        draw_weights(ctx, k);
-
-        if (bw.button(ctx, "clear weights")) { clear_weights(k); }
-        if (bw.button(ctx, "moore 1s"))      { moore_ones(k); }
-
-        val ms: i32 = kernel.max_sum(k);
-        draw_toggle_row(ctx, 'B', k, 1, ms);
-        draw_toggle_row(ctx, 'S', k, 0, ms);
+    var ed: bool = radius(u, k);
+    if (weights(u, k)) { ed = true; }
+    var acts: [2]str;
+    acts[0] = "Clear weights";
+    acts[1] = "Moore";
+    val hit: usize = ui.buttons(u, ?acts[0], 2);
+    if (hit == 0) {
+        clear_weights(k);
+        ed = true;
     }
-
-    bw.end_window(ctx, ?a.kedit, handle);
+    if (hit == 1) {
+        moore_ones(k);
+        ed = true;
+    }
+    val most: i32 = kernel.max_sum(k);
+    if (sums(u, "Birth", ?k.birth, most))     { ed = true; }
+    if (sums(u, "Survive", ?k.survive, most)) { ed = true; }
+    if (ed)                                   { rename(k); }
 }

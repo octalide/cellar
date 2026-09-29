@@ -1,197 +1,133 @@
-# the arrangements window: a pattern palette, a custom-pattern editor, and
-# whole-world persistence
+# the draw section: the tool, the pattern palette, and the custom-pattern editor
 #
-# a dropdown selects one of the built-in patterns or the user-drawn custom one; a
-# preview shows it, a stamp-mode toggle arms click-to-stamp on the world, and a
-# small grid editor draws the custom pattern. buttons save and load the world and
-# save the custom pattern under arrangements/.
+# the tool says what a press on the world does: paint live cells, erase them,
+# or stamp the selected pattern. picking a pattern arms the stamp. the custom
+# pattern is drawn in place in a small grid editor.
 
-use bc: blit.context;
-use bd: blit.draw;
-use bi: blit.input;
-use bw: blit.widget;
 use cellar.app;
 use cellar.pattern;
-use cellar.persist;
 use cellar.sim;
-use std.types.error.err;
+use cellar.theme;
+use cellar.ui;
+use cellar.world;
+use std.types.bool.bool;
+use std.types.bool.false;
 use std.types.size.usize;
 use std.types.string.str;
 
-# spacing matching blit's widget padding
-val PAD: f32 = 4.0;
-# side length in pixels of the square pattern preview
-val PREVIEW: f32 = 120.0;
-# side length in pixels of one cell in the custom editor
-val EDIT_CELL: f32 = 11.0;
-# fixed path for the saved/loaded world
-val WORLD_PATH: str = "arrangements/world.cells";
-# fixed path for the saved custom pattern
-val CUSTOM_PATH: str = "arrangements/custom.cells";
+# unscaled height of the pattern preview
+val PREVIEW: f32 = 96.0;
 
-fun c_back() bd.Color {
-    ret bd.rgba(0.08, 0.09, 0.11, 1.0);
+# the selected pattern, built-in or custom
+pub fun active(a: *app.App) pattern.Pattern {
+    if (a.pattern_sel == pattern.BUILTIN_COUNT) { ret a.custom; }
+    ret pattern.builtin(a.pattern_sel);
 }
 
-fun c_cell() bd.Color {
-    ret bd.rgba(0.40, 0.85, 0.55, 1.0);
+# stamp the selected pattern centred on world (x, y)
+pub fun stamp_active(a: *app.App, s: *sim.Sim, x: i64, y: i64) {
+    var p: pattern.Pattern = active(a);
+    world.stamp(s, ?p, x, y);
 }
 
-fun c_lines() bd.Color {
-    ret bd.rgba(0.18, 0.20, 0.26, 1.0);
-}
-
-# record a persistence outcome for display in the window
-# ---
-# a:  application state holding the status line
-# ok: the label shown on success
-# e:  the outcome
-fun set_status(a: *app.App, ok: str, e: err[persist.Error]) {
-    if (sel e.err) {
-        a.status = persist.error_message(e.err);
-        ret;
-    }
-    a.status = ok;
-}
-
-# copy the selected pattern (built-in[pattern_sel], or the custom pattern
-# when pattern_sel == BUILTIN_COUNT) into out.
-fun active(a: *app.App, out: *pattern.Pattern) {
-    if (a.pattern_sel == pattern.BUILTIN_COUNT) {
-        @out = a.custom;
-    }
-    or {
-        @out = pattern.builtin(a.pattern_sel);
-    }
-}
-
-# render a pattern scaled to fit a square box at the layout cursor,
-# then advance the cursor below it.
-fun draw_preview(ctx: *bc.Context, p: *pattern.Pattern) {
-    val x0:   f32        = ctx.cx;
-    val y0:   f32        = ctx.cy;
-    val surf: bc.Surface = bc.begin_surface(ctx, x0, y0, PREVIEW, PREVIEW, 0.0, 0.0);
-    bc.quad(ctx, 0.0, 0.0, PREVIEW, PREVIEW, c_back());
-
+# draw a pattern's live cells scaled into a box
+fun preview(u: *ui.Ui, p: *pattern.Pattern, x0: f32, y0: f32, x1: f32, y1: f32) {
+    ui.rect(u, x0, y0, x1, y1, theme.WORLD, 1.0);
     var span: usize = p.w;
     if (p.h > span) { span = p.h; }
     if (span == 0)  { span = 1; }
-    val cs: f32 = PREVIEW / span::f32;
-    val px: f32 = (PREVIEW - p.w::f32 * cs) / 2.0;
-    val py: f32 = (PREVIEW - p.h::f32 * cs) / 2.0;
-
+    var cs: f32 = (y1 - y0 - ui.px(u, 12.0)) / span::f32;
+    if ((x1 - x0 - ui.px(u, 12.0)) / span::f32 < cs) { cs = (x1 - x0 - ui.px(u, 12.0)) / span::f32; }
+    val ox:  f32 = x0 + (x1 - x0 - p.w::f32 * cs) / 2.0;
+    val oy:  f32 = y0 + (y1 - y0 - p.h::f32 * cs) / 2.0;
+    var gap: f32 = 0.0;
+    if (cs >= 4.0) { gap = 1.0; }
     var y: usize = 0;
     for (y < p.h) {
         var x: usize = 0;
         for (x < p.w) {
             if (pattern.get(p, x, y) != 0) {
-                val qx: f32 = px + x::f32 * cs;
-                val qy: f32 = py + y::f32 * cs;
-                bc.quad(ctx, qx, qy, qx + cs, qy + cs, c_cell());
+                val qx: f32 = ox + x::f32 * cs;
+                val qy: f32 = oy + y::f32 * cs;
+                ui.rect(u, qx, qy, qx + cs - gap, qy + cs - gap, theme.ACCENT, 1.0);
             }
             x = x + 1;
         }
         y = y + 1;
     }
-
-    bc.end_surface(ctx, surf);
-    ctx.cy = y0 + PREVIEW + PAD;
-    ctx.cx = ctx.ox;
 }
 
-# render the custom pattern as a clickable cell grid at the layout
-# cursor; a press inside toggles the cell under the cursor. advance below it.
-fun draw_editor(ctx: *bc.Context, p: *pattern.Pattern) {
-    val x0:    f32 = ctx.cx;
-    val y0:    f32 = ctx.cy;
-    val bw_px: f32 = p.w::f32 * EDIT_CELL;
-    val bh_px: f32 = p.h::f32 * EDIT_CELL;
-
-    val surf: bc.Surface = bc.begin_surface(ctx, x0, y0, bw_px, bh_px, 0.0, 0.0);
-    bc.quad(ctx, 0.0, 0.0, bw_px, bh_px, c_back());
-
+# the custom pattern as a clickable grid; a press toggles the cell under it
+fun editor(u: *ui.Ui, p: *pattern.Pattern) {
+    val c:  f32    = u.w / p.w::f32;
+    val x0: f32    = u.x;
+    val y0: f32    = u.y;
+    val x1: f32    = x0 + c * p.w::f32;
+    val y1: f32    = y0 + c * p.h::f32;
+    val hh: ui.Hit = ui.region(u, x0, y0, x1, y1);
+    ui.rect(u, x0, y0, x1, y1, theme.WORLD, 1.0);
     var y: usize = 0;
     for (y < p.h) {
         var x: usize = 0;
         for (x < p.w) {
-            val cx0: f32      = x::f32 * EDIT_CELL;
-            val cy0: f32      = y::f32 * EDIT_CELL;
-            var col: bd.Color = c_lines();
-            if (pattern.get(p, x, y) != 0) { col = c_cell(); }
-            bc.quad(ctx, cx0 + 1.0, cy0 + 1.0, cx0 + EDIT_CELL, cy0 + EDIT_CELL, col);
+            val cx0: f32 = x0 + x::f32 * c;
+            val cy0: f32 = y0 + y::f32 * c;
+            var col: u32 = theme.CONTROL;
+            if (pattern.get(p, x, y) != 0) { col = theme.ACCENT; }
+            ui.rect(u, cx0 + 1.0, cy0 + 1.0, cx0 + c, cy0 + c, col, 1.0);
             x = x + 1;
         }
         y = y + 1;
     }
-
-    # toggle on the press edge so a single click flips exactly one cell
-    if (surf.inside != 0 && bi.pressed(ctx.in) != 0) {
-        val ux: usize = (surf.local_mx / EDIT_CELL)::usize;
-        val uy: usize = (surf.local_my / EDIT_CELL)::usize;
+    # toggle on the press, so one click flips exactly one cell
+    if (hh.hot && u.pressed) {
+        val ux: usize = ((u.mx - x0) / c)::usize;
+        val uy: usize = ((u.my - y0) / c)::usize;
         if (ux < p.w && uy < p.h) {
             var v: u8 = 1;
             if (pattern.get(p, ux, uy) != 0) { v = 0; }
             pattern.set(p, ux, uy, v);
         }
     }
-
-    bc.end_surface(ctx, surf);
-    ctx.cy = y0 + bh_px + PAD;
-    ctx.cx = ctx.ox;
+    ui.advance(u, y1 - y0);
 }
 
-# stamp the active pattern onto the world centered on cell (cx, cy)
-# main calls this on the stamp-mode click edge.
+# draw the draw section and apply its controls
 # ---
-# a:  application state (selects the pattern)
-# s:  simulation to stamp onto
-# cx: target column
-# cy: target row
-pub fun stamp_active(a: *app.App, s: *sim.Sim, cx: i64, cy: i64) {
-    if (a.pattern_sel == pattern.BUILTIN_COUNT) {
-        pattern.stamp(s, ?a.custom, cx, cy);
-    }
-    or {
-        var p: pattern.Pattern = pattern.builtin(a.pattern_sel);
-        pattern.stamp(s, ?p, cx, cy);
-    }
-}
+# u: the interface
+# a: application state
+pub fun section(u: *ui.Ui, a: *app.App) {
+    if (!ui.heading(u, "DRAW", ?a.open_draw)) { ret; }
+    var tools: [3]str;
+    tools[0] = "Draw";
+    tools[1] = "Erase";
+    tools[2] = "Stamp";
+    ui.segmented(u, ?tools[0], 3, ?a.tool);
 
-# lay out the arrangements window and apply its controls
-# ---
-# ctx: blit context for this frame
-# a:   application state
-# s:   simulation the controls drive
-pub fun draw(ctx: *bc.Context, a: *app.App, s: *sim.Sim) {
-    val handle: bw.Block = bw.begin_window(ctx, ?a.arrange);
-
-    if (a.arrange.open != 0) {
-        var opts: [8]str;
-        var i:    usize = 0;
-        for (i < pattern.BUILTIN_COUNT) {
-            opts[i] = pattern.builtin_name(i);
-            i       = i + 1;
+    val h: f32   = ui.px(u, ui.ROW);
+    val n: usize = pattern.BUILTIN_COUNT + 1;
+    var i: usize = 0;
+    for (i < n) {
+        val col:  usize = i % 2;
+        var name: str   = "custom";
+        if (i < pattern.BUILTIN_COUNT) { name = pattern.builtin_name(i); }
+        val on: bool = a.pattern_sel == i && a.tool == app.TOOL_STAMP;
+        if (ui.button_at(u, name, ui.cell_x0(u, col, 2), u.y, ui.cell_x1(u, col, 2), u.y + h, on)) {
+            a.pattern_sel = i;
+            a.tool        = app.TOOL_STAMP;
         }
-        opts[pattern.BUILTIN_COUNT] = "custom";
-        bw.dropdown(ctx, "", ?a.pattern_sel, ?opts[0], pattern.BUILTIN_COUNT + 1);
-
-        var pv: pattern.Pattern;
-        active(a, ?pv);
-        draw_preview(ctx, ?pv);
-
-        bw.checkbox(ctx, "stamp mode", ?a.stamp_mode);
-
-        bw.text(ctx, "custom");
-        draw_editor(ctx, ?a.custom);
-        if (bw.button(ctx, "clear custom")) { pattern.clear(?a.custom); }
-        if (bw.button(ctx, "save custom"))  { set_status(a, "custom saved", persist.save_pattern(s.space.a, ?a.custom, CUSTOM_PATH)); }
-        if (bw.button(ctx, "load custom"))  { set_status(a, "custom loaded", persist.load_pattern(s.space.a, ?a.custom, CUSTOM_PATH)); }
-
-        if (bw.button(ctx, "save world")) { set_status(a, "world saved", persist.save_world(s.space.a, s, WORLD_PATH)); }
-        if (bw.button(ctx, "load world")) { set_status(a, "world loaded", persist.load_world(s.space.a, s, WORLD_PATH)); }
-
-        if (a.status[0] != 0) { bw.text(ctx, a.status); }
+        if (col == 1 || i + 1 == n) { ui.advance(u, h); }
+        i = i + 1;
     }
 
-    bw.end_window(ctx, ?a.arrange, handle);
+    if (a.pattern_sel == pattern.BUILTIN_COUNT) {
+        ui.note(u, "Custom pattern, click cells to edit");
+        editor(u, ?a.custom);
+        if (ui.button(u, "Clear pattern", false)) { pattern.clear(?a.custom); }
+        ret;
+    }
+    var p:  pattern.Pattern = active(a);
+    val ph: f32             = ui.px(u, PREVIEW);
+    preview(u, ?p, u.x, u.y, u.x + u.w, u.y + ph);
+    ui.advance(u, ph);
 }
