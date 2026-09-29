@@ -1,0 +1,172 @@
+# a fork-join team of threads for splitting a step across chunks
+#
+# the caller and its helpers share one round at a time: run hands every helper
+# the job, each of them takes indices off one counter until none remain, and
+# run returns once every helper has finished the round. a job only ever writes
+# what belongs to its index, so nothing but the counter is shared.
+
+use std.sync.atomic;
+use std.sync.condition;
+use std.sync.mutex;
+use std.sync.thread;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+
+# a job: its argument and one index
+pub def Job: fun(*u8, usize);
+
+# the most helper threads a team keeps
+pub val MAX_HELPERS: usize = 31;
+# the most CPUs looked at when sizing a team
+val CPU_LIST: usize = 256;
+
+# the team
+# ---
+# lock:    guards the round and the fields below
+# wake:    signalled when a round starts or the team quits
+# done:    signalled when the last helper finishes a round
+# threads: the helpers
+# helpers: how many were started
+# job:     the round's job
+# arg:     its argument
+# total:   indices in the round
+# next:    the next index to take, shared through atomics
+# busy:    helpers still in the round
+# round:   rounds started
+# quit:    the helpers should exit
+pub rec Team {
+    lock:    mutex.Mutex;
+    wake:    condition.Condition;
+    done:    condition.Condition;
+    threads: [31]thread.Thread;
+    helpers: usize;
+    job:     Job;
+    arg:     *u8;
+    total:   i64;
+    next:    i64;
+    busy:    i64;
+    round:   u64;
+    quit:    bool;
+}
+
+fun take(t: *Team) {
+    for (true) {
+        val i: i64 = atomic.fetch_add(?t.next, 1);
+        if (i >= t.total) { ret; }
+        t.job(t.arg, i::usize);
+    }
+}
+
+fun help(arg: *u8) {
+    val t:    *Team = arg::*Team;
+    var seen: u64   = 0;
+    mutex.lock(?t.lock);
+    for (true) {
+        for (t.round == seen && !t.quit) { condition.wait(?t.wake, ?t.lock); }
+        if (t.quit) { brk; }
+        seen = t.round;
+        mutex.unlock(?t.lock);
+        take(t);
+        mutex.lock(?t.lock);
+        t.busy = t.busy - 1;
+        if (t.busy == 0) { condition.signal(?t.done); }
+    }
+    mutex.unlock(?t.lock);
+}
+
+# start a team with one helper per CPU beyond the caller's
+#
+# a helper that cannot be spawned only makes the team smaller.
+# ---
+# t: team to start; it must not move while it runs
+pub fun start(t: *Team) {
+    t.lock    = mutex.make();
+    t.wake    = condition.make();
+    t.done    = condition.make();
+    t.helpers = 0;
+    t.round   = 0;
+    t.quit    = false;
+    t.total   = 0;
+    t.next    = 0;
+    t.busy    = 0;
+    var cpus:  [256]usize;
+    var count: usize = 0;
+    thread.allowed_cpus(?cpus[0], CPU_LIST, ?count);
+    var want: usize = 0;
+    if (count > 1)          { want = count - 1; }
+    if (want > MAX_HELPERS) { want = MAX_HELPERS; }
+    for (t.helpers < want) {
+        val spawned: thread.Operation = thread.spawn_with(help, t::*u8, ?t.threads[t.helpers]);
+        if (sel spawned.err) { brk; }
+        t.helpers = t.helpers + 1;
+    }
+}
+
+# run job over indices [0, count) across the team, returning when all are done
+pub fun run(t: *Team, job: Job, arg: *u8, count: usize) {
+    if (t.helpers == 0 || count < 2) {
+        var i: usize = 0;
+        for (i < count) {
+            job(arg, i);
+            i = i + 1;
+        }
+        ret;
+    }
+    mutex.lock(?t.lock);
+    t.job   = job;
+    t.arg   = arg;
+    t.total = count::i64;
+    atomic.store(?t.next, 0);
+    t.busy  = t.helpers::i64;
+    t.round = t.round + 1;
+    condition.broadcast(?t.wake);
+    mutex.unlock(?t.lock);
+    take(t);
+    mutex.lock(?t.lock);
+    for (t.busy != 0) { condition.wait(?t.done, ?t.lock); }
+    mutex.unlock(?t.lock);
+}
+
+# stop and join every helper
+pub fun stop(t: *Team) {
+    mutex.lock(?t.lock);
+    t.quit = true;
+    condition.broadcast(?t.wake);
+    mutex.unlock(?t.lock);
+    var i: usize = 0;
+    for (i < t.helpers) {
+        thread.join(?t.threads[i]);
+        i = i + 1;
+    }
+    t.helpers = 0;
+}
+
+fun mark(arg: *u8, i: usize) {
+    val seen: *u8 = arg;
+    seen[i] = seen[i] + 1;
+}
+
+test run__visits_every_index_once_over_many_rounds {
+    var t: Team;
+    start(?t);
+    var seen:  [1000]u8;
+    var round: usize = 0;
+    for (round < 50) {
+        var i: usize = 0;
+        for (i < 1000) {
+            seen[i] = 0;
+            i       = i + 1;
+        }
+        run(?t, mark, ?seen[0], 1000);
+        i = 0;
+        for (i < 1000) {
+            if (seen[i] != 1) { ret 1; }
+            i = i + 1;
+        }
+        round = round + 1;
+    }
+    stop(?t);
+    ret 0;
+}
