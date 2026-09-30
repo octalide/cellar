@@ -88,6 +88,13 @@ them, so `cellar -- -x.rle` opens a file whose name starts with a dash.
 `cellar --capture shot.png` draws a second of frames, saves the last one and
 exits, leaving the saved settings alone.
 
+`cellar run <file> --gens <n> [--rule <rule>] [--out <file>] [--quiet]` runs
+a world or pattern headless, with no window and no GPU. The file opens as it
+would at startup, runs under `--rule` or else its own rule for `n`
+generations on the CPU, and is written in the format `--out`'s extension names
+(`.rle`, `.cells`, `.mc`), or as RLE on stdout without one. The
+generation and population go to stderr unless `--quiet`.
+
 ## Install
 
 Release archives for linux (x86-64 and arm64), windows (x86-64) and macOS
