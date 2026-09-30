@@ -16,6 +16,12 @@
 # the rule family's next, over a table of every 3 by 3 block for a two-state
 # rule, so a family of more states slots in by giving next.
 #
+# a node also keeps what the rule shows of it: the cells in a state its sense
+# counts live, and the most heat any of its cells' words carries, so a dying
+# state is kept, stepped and blocks births like any other but is counted and
+# drawn as the pool counts and draws it. both follow from each state's word,
+# so a rule that words its states otherwise works them out afresh (relight).
+#
 # the root is centred on the origin: a root of level L holds the cells in
 # [-2^(L-1), 2^(L-1)) on both axes, and every node below it is aligned to its
 # own size. a step pads the root with empty squares until the pattern lies in
@@ -34,6 +40,7 @@
 # square already made of nodes, such as a file's, is laid over the world whole
 # instead (lay), costing its nodes rather than its chunks.
 
+use cellar.layout;
 use cellar.rule;
 use allo: std.allocator;
 use std.allocator.page;
@@ -57,7 +64,7 @@ pub val MAX_STATES: u32 = 256;
 pub val MAX_LEVEL: u32 = 60;
 # the largest step exponent, which leaves the root room to be padded for it
 pub val MAX_EXPONENT: u32 = 48;
-# nodes a table may hold unless told otherwise, 40 bytes each
+# nodes a table may hold unless told otherwise, 48 bytes each
 pub val DEFAULT_MAX: usize = 4194304;
 # the level of a chunk, 64 cells on a side
 pub val CHUNK: u32 = 6;
@@ -78,9 +85,10 @@ val CELLS: usize = 4096;
 # next:  the next node in its hash chain, or in the free list
 # level: its level
 # sk:    the exponent slow was worked out for
-# mark:  reached by the collector
-# used:  holds a node
+# flags: USED while it holds a node, MARK while a walk has reached it
+# heat:  the most heat the rule's word for any of its cells carries
 # pop:   cells in a state other than 0, held at the u64 ceiling
+# live:  cells in a state the rule counts live, held at the u64 ceiling
 rec Node {
     kids:  [4]u32;
     full:  u32;
@@ -88,10 +96,15 @@ rec Node {
     next:  u32;
     level: u8;
     sk:    u8;
-    mark:  u8;
-    used:  u8;
+    flags: u8;
+    heat:  u8;
     pop:   u64;
+    live:  u64;
 }
+
+# Node.flags
+val USED: u8 = 1;
+val MARK: u8 = 2;
 
 # the chunks an edit or a read has taken out of the tree
 # ---
@@ -125,6 +138,8 @@ rec Cache {
 # empty:  the empty node of each level, NONE until made
 # r:      the rule
 # states: states a cell of the rule can be in
+# lit:    each state is one the rule's sense counts live
+# hue:    the heat the rule's word for each state carries
 # table:  next state of every 3 by 3 block of a two-state rule, bit i of the
 #         index the block's cell i
 # tabled: table holds the rule's
@@ -147,6 +162,8 @@ pub rec Tree {
     empty:  [61]u32;
     r:      rule.Rule;
     states: u32;
+    lit:    [256]u8;
+    hue:    [256]u8;
     table:  [512]u8;
     tabled: bool;
     k:      u32;
@@ -168,6 +185,17 @@ pub fun init(t: *Tree, a: *allo.Allocator, max: usize) {
     t.cap  = 0;
     t.k    = 0;
     t.full = false;
+    # until a rule is set, every state but 0 shows as a live cell at full heat
+    var i: usize = 0;
+    for (i < MAX_STATES::usize) {
+        t.lit[i] = 0;
+        t.hue[i] = 0;
+        if (i != 0) {
+            t.lit[i] = 1;
+            t.hue[i] = 255;
+        }
+        i = i + 1;
+    }
 }
 
 # release the table and the cache
@@ -208,7 +236,7 @@ fun rehash(t: *Tree) {
     mem.fill[u32](t.heads, NONE, t.hcap);
     var i: usize = MAX_STATES::usize;
     for (i < t.hi) {
-        if (t.nodes[i].used != 0) {
+        if ((t.nodes[i].flags & USED) != 0) {
             val b: usize = bucket(t, i::u32);
             t.nodes[i].next = t.heads[b];
             t.heads[b]      = i::u32;
@@ -294,9 +322,11 @@ pub fun clear(t: *Tree) {
     var i: u32 = 0;
     for (i < MAX_STATES) {
         val n: *Node = ?t.nodes[i::usize];
-        n.used = 1;
-        n.full = NONE;
-        n.slow = NONE;
+        n.flags = USED;
+        n.full  = NONE;
+        n.slow  = NONE;
+        n.live  = t.lit[i::usize]::u64;
+        n.heat  = t.hue[i::usize];
         if (i != 0) { n.pop = 1; }
         i = i + 1;
     }
@@ -326,6 +356,18 @@ pub fun level_of(t: *Tree, n: u32) u32 {
 pub fun pop(t: *Tree, n: u32) u64 {
     if (n == NONE) { ret 0; }
     ret t.nodes[n::usize].pop;
+}
+
+# the cells of a node in a state the rule counts live
+pub fun live(t: *Tree, n: u32) u64 {
+    if (n == NONE) { ret 0; }
+    ret t.nodes[n::usize].live;
+}
+
+# the most heat the rule's word for any cell of a node carries
+pub fun heat(t: *Tree, n: u32) u32 {
+    if (n == NONE) { ret 0; }
+    ret t.nodes[n::usize].heat::u32;
 }
 
 # child q of a node, nw 0, ne 1, sw 2, se 3, or NONE for NONE
@@ -379,14 +421,65 @@ pub fun node(t: *Tree, nw: u32, ne: u32, sw: u32, se: u32) u32 {
     n.full      = NONE;
     n.slow      = NONE;
     n.sk        = 0;
-    n.mark      = 0;
-    n.used      = 1;
+    n.flags     = USED;
     n.level     = (t.nodes[nw::usize].level + 1)::u8;
     n.pop       = add_pop(add_pop(t.nodes[nw::usize].pop, t.nodes[ne::usize].pop), add_pop(t.nodes[sw::usize].pop, t.nodes[se::usize].pop));
     n.next      = t.heads[bb];
     t.heads[bb] = id;
     t.used      = t.used + 1;
+    light(t, id);
     ret id;
+}
+
+# work out a node's live cells and heat from its children's
+fun light(t: *Tree, n: u32) {
+    val d:    *Node = ?t.nodes[n::usize];
+    var live: u64   = 0;
+    var heat: u8    = 0;
+    var q:    usize = 0;
+    for (q < 4) {
+        val k: *Node = ?t.nodes[d.kids[q]::usize];
+        live = add_pop(live, k.live);
+        if (k.heat > heat) { heat = k.heat; }
+        q = q + 1;
+    }
+    d.live = live;
+    d.heat = heat;
+}
+
+# light a node once its children are, each node once, marking those done
+fun relight_from(t: *Tree, n: u32) {
+    val d: *Node = ?t.nodes[n::usize];
+    d.flags = d.flags | MARK;
+    var q: usize = 0;
+    for (q < 4) {
+        val k: u32 = d.kids[q];
+        if (k >= MAX_STATES && (t.nodes[k::usize].flags & MARK) == 0) { relight_from(t, k); }
+        q = q + 1;
+    }
+    light(t, n);
+}
+
+# work out every node's live cells and heat afresh, for a rule that words the
+# states otherwise
+fun relight(t: *Tree) {
+    var i: usize = 0;
+    for (i < MAX_STATES::usize) {
+        t.nodes[i].live = t.lit[i]::u64;
+        t.nodes[i].heat = t.hue[i];
+        i               = i + 1;
+    }
+    i = MAX_STATES::usize;
+    for (i < t.hi) {
+        val f: u8 = t.nodes[i].flags;
+        if ((f & USED) != 0 && (f & MARK) == 0) { relight_from(t, i::u32); }
+        i = i + 1;
+    }
+    i = MAX_STATES::usize;
+    for (i < t.hi) {
+        t.nodes[i].flags = t.nodes[i].flags & USED;
+        i                = i + 1;
+    }
 }
 
 # the empty node of a level
@@ -508,6 +601,20 @@ pub fun set_rule(t: *Tree, r: rule.Rule) {
     t.r      = r;
     t.states = rule.states(?t.r);
     t.tabled = t.states == 2;
+    val sn:    layout.Sense = rule.sense(?t.r);
+    var shown: bool         = false;
+    var st:    u32          = 0;
+    for (st < MAX_STATES) {
+        # a state past the rule's is read as the rule words it, as the pool would hold it
+        val w:   u32 = rule.word(?t.r, st);
+        val lit: u8  = layout.live(w, sn.live_mask, sn.live_lo, sn.live_hi)::u8;
+        val hue: u8  = layout.texel_heat(w, sn.heat_shift, sn.heat_mask)::u8;
+        if (lit != t.lit[st::usize] || hue != t.hue[st::usize]) { shown = true; }
+        t.lit[st::usize] = lit;
+        t.hue[st::usize] = hue;
+        st               = st + 1;
+    }
+    if (shown && t.made) { relight(t); }
     if (t.tabled) {
         var nb:  [9]u32;
         var idx: usize = 0;
@@ -576,8 +683,8 @@ pub fun set_exponent(t: *Tree, k: u32) {
 fun mark(t: *Tree, n: u32) {
     if (n == NONE || n < MAX_STATES) { ret; }
     val nd: *Node = ?t.nodes[n::usize];
-    if (nd.mark != 0) { ret; }
-    nd.mark = 1;
+    if ((nd.flags & MARK) != 0) { ret; }
+    nd.flags = nd.flags | MARK;
     var q: usize = 0;
     for (q < 4) {
         mark(t, t.nodes[n::usize].kids[q]);
@@ -604,11 +711,11 @@ pub fun collect(t: *Tree, extra: u32) {
     for (i > MAX_STATES::usize) {
         i = i - 1;
         val n: *Node = ?t.nodes[i];
-        if (n.used != 0 && n.mark == 0) {
-            n.used = 0;
-            t.used = t.used - 1;
+        if (n.flags == USED) {
+            n.flags = 0;
+            t.used  = t.used - 1;
         }
-        if (n.used == 0) {
+        if (n.flags == 0) {
             n.next = t.free;
             t.free = i::u32;
         }
@@ -616,10 +723,10 @@ pub fun collect(t: *Tree, extra: u32) {
     i = MAX_STATES::usize;
     for (i < t.hi) {
         val n: *Node = ?t.nodes[i];
-        if (n.used != 0) {
-            n.mark = 0;
-            if (n.full != NONE && n.full >= MAX_STATES && t.nodes[n.full::usize].used == 0) { n.full = NONE; }
-            if (n.slow != NONE && n.slow >= MAX_STATES && t.nodes[n.slow::usize].used == 0) { n.slow = NONE; }
+        if (n.flags != 0) {
+            n.flags = USED;
+            if (n.full != NONE && n.full >= MAX_STATES && t.nodes[n.full::usize].flags == 0) { n.full = NONE; }
+            if (n.slow != NONE && n.slow >= MAX_STATES && t.nodes[n.slow::usize].flags == 0) { n.slow = NONE; }
         }
         i = i + 1;
     }
@@ -913,10 +1020,10 @@ pub fun wrote(t: *Tree, cx: i64, cy: i64) {
     if (e != NONE) { t.cache.dirty[e::usize] = 1; }
 }
 
-# live cells in the world
+# cells in the world in a state the rule counts live
 pub fun population(t: *Tree) u64 {
     if (!t.made) { ret 0; }
-    ret pop(t, t.root);
+    ret live(t, t.root);
 }
 
 # one edge of the live cells in a node: the leftmost column, or with rows the
@@ -926,7 +1033,7 @@ pub fun population(t: *Tree) u64 {
 # cannot beat it is not searched, and once the half of a square nearer the edge
 # holds a cell the farther half cannot beat that.
 fun edge(t: *Tree, n: u32, l: u32, ox: i64, oy: i64, rows: bool, far: bool, best: i64, any: *bool) i64 {
-    if (t.nodes[n::usize].pop == 0) { ret best; }
+    if (t.nodes[n::usize].live == 0) { ret best; }
     val side: i64 = (1::i64) << l::i64;
     var o:    i64 = ox;
     if (rows)                            { o = oy; }
@@ -1166,15 +1273,16 @@ pub fun chunks(t: *Tree, f: Visit, ctx: *u8, buf: *u8) {
 }
 
 # what a draw of the tree hands each square it shows: its column and row in
-# squares, the side as a level, and its population
-pub def Show: fun(*u8, i64, i64, u64);
+# squares, and its node, whose live cells and heat say how it is drawn and
+# which at level 0 is its one cell's state
+pub def Show: fun(*u8, i64, i64, u32);
 
 fun show_walk(t: *Tree, n: u32, l: u32, ox: i64, oy: i64, s: u32, b: *i64, f: Show, ctx: *u8) {
     if (t.nodes[n::usize].pop == 0) { ret; }
     val side: i64 = (1::i64) << l::i64;
     if (ox >= b[2] || oy >= b[3] || ox + side <= b[0] || oy + side <= b[1]) { ret; }
     if (l <= s) {
-        f(ctx, ox >> s::i64, oy >> s::i64, t.nodes[n::usize].pop);
+        f(ctx, ox >> s::i64, oy >> s::i64, n);
         ret;
     }
     val h: i64 = side / 2;
@@ -1185,10 +1293,10 @@ fun show_walk(t: *Tree, n: u32, l: u32, ox: i64, oy: i64, s: u32, b: *i64, f: Sh
 }
 
 # hand f every square 2^s cells on a side, aligned to its size, that holds a
-# live cell and meets [x0, x1) by [y0, y1), with its population
+# cell in a state other than 0 and meets [x0, x1) by [y0, y1), with its node
 #
 # a square smaller than 2^s, when the whole root is, is handed as the square it
-# lies in, so one square may be handed more than once and its populations add.
+# lies in, so one square may be handed more than once and what it shows adds.
 # ---
 # t:   the tree
 # s:   the squares' level

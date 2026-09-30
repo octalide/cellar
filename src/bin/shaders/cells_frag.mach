@@ -12,7 +12,9 @@
 # at a pixel per cell or more a pixel shows the cell under its centre, and with
 # grid lines on and cells large enough, the last pixel of each cell shows the
 # backdrop. a drawn cell that stands for a square of cells (the view's shift)
-# holds the share of them alive, and shows it as a live region's density. below that a pixel shows every cell its footprint covers: it reads
+# holds the share of them alive and the hottest heat among them
+# (layout.SUMMARY_LIVE), and shows them as a pixel's footprint of cells would
+# be shown. below that a pixel shows every cell its footprint covers: it reads
 # the coarsest level of the coverage pyramid (cellar.layout.Mip) whose texels
 # are no wider than a pixel, and takes each texel whose centre lies inside the
 # pixel, reaching into neighbouring chunks through the page table. every texel
@@ -102,6 +104,24 @@ fun flipped() u32 {
     ret (meta.gen + meta.serial + 1) & 1;
 }
 
+# the colour of cells summarised as the draw below a pixel per cell takes them
+# ---
+# share: the part of them alive, 0 to 1
+# heat:  the most heat any carries
+# age:   the live ones' mean texel age
+fun summed(share: f32, heat: u32, age: u32) f32x4 {
+    if (view.mode == 1) {
+        if (heat != 0) { ret view.pal[heat]; }
+        ret view.back;
+    }
+    if (share <= 0.0) { ret view.back; }
+    var col: f32x4 = view.solid;
+    if (view.ink != 0)  { col = view.pal[512 + heat]; }
+    if (view.mode == 2) { col = view.pal[256 + age]; }
+    val a: f32 = cover(share);
+    ret view.back + (col - view.back) * f32x4{a, a, a, 1.0};
+}
+
 # the colour of a pixel at a pixel per cell or more
 fun sample() f32x4 {
     var lx: u32 = in_local[0]::u32;
@@ -110,10 +130,9 @@ fun sample() f32x4 {
     if (ly > layout.SIDE - 1) { ly = layout.SIDE - 1; }
     val c: u32 = cells.v[in_slot * layout.CELLS + ly * layout.SIDE + lx];
     if (view.shift != 0) {
-        # a square of cells summarised: the share of them alive, in 255ths
-        if (c == 0) { ret view.back; }
-        val a: f32 = cover(c::f32 / 255.0);
-        ret view.back + (view.solid - view.back) * f32x4{a, a, a, 1.0};
+        # a square of cells summarised, the share of them alive and the hottest
+        val share: f32 = (c & layout.SUMMARY_LIVE)::f32 / layout.SUMMARY_LIVE::f32;
+        ret summed(share, (c >> layout.SUMMARY_HEAT) & layout.HEAT_CAP, 0);
     }
     val heat: u32 = layout.texel_heat(c, meta.heat_shift, meta.heat_mask);
 
@@ -223,16 +242,11 @@ fun coverage() f32x4 {
         val on: f32 = cover((seen - live)::f32 / seen::f32);
         ret view.back + (view.solid - view.back) * f32x4{on, on, on, 1.0};
     }
-    if (view.mode == 1) {
-        if (heat != 0) { ret view.pal[heat]; }
-        ret view.back;
-    }
-    if (live == 0 || seen == 0) { ret view.back; }
-    var col: f32x4 = view.solid;
-    if (view.ink != 0)  { col = view.pal[512 + heat]; }
-    if (view.mode == 2) { col = view.pal[256 + ages / live]; }
-    val a: f32 = cover(live::f32 / seen::f32);
-    ret view.back + (col - view.back) * f32x4{a, a, a, 1.0};
+    var share: f32 = 0.0;
+    var age:   u32 = 0;
+    if (seen != 0) { share = live::f32 / seen::f32; }
+    if (live != 0) { age = ages / live; }
+    ret summed(share, heat, age);
 }
 
 #[stage("fragment")]
