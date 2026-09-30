@@ -40,7 +40,9 @@ state in its own colour. Built-in: Brian's Brain (`B2/S/C3`) and Star Wars
 | `D`, `E`, `T`, `V`     | draw, erase, stamp or select tool       |
 | `Z`, `X`               | rotate the stamp, flip the stamp        |
 | left mouse             | use the tool; drag to select            |
-| `Ctrl+C`, `Ctrl+X`     | copy or cut the selection to the stamp  |
+| `Ctrl+C`, `Ctrl+X`     | copy or cut the selection to the stamp and the clipboard, as RLE |
+| `Ctrl+V`               | paste a pattern as the stamp, keeping the current rule |
+| `Ctrl+Shift+V`         | paste a pattern as the stamp, taking its rule |
 | `Delete`               | clear the selection                     |
 | `Shift+Delete`         | clear outside the selection             |
 | `Ctrl+R`               | fill the selection at random            |
@@ -91,6 +93,12 @@ origin and framed, taking its rule when cellar can run it. A file that cannot be
 read, or a pattern too large for the world to hold, leaves the world as it was
 and says why. Options may come before or after the file, and `--` ends
 them, so `cellar -- -x.rle` opens a file whose name starts with a dash.
+
+A file dropped on the window opens the same way, a pattern stamped onto the
+world as it stands. When several are dropped the first opens and the rest are
+left alone. `Ctrl+V` reads any of those pattern formats from the clipboard as
+the stamp, and `Ctrl+C` puts a copied selection on the clipboard as RLE with
+its rule, ready to paste into LifeWiki or Golly.
 
 `cellar --capture shot.png` draws a second of frames, saves the last one and
 exits, leaving the saved settings alone.
