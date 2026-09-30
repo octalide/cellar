@@ -4,6 +4,8 @@
 # the colours, the panel and what it shows, and the messages it flashes.
 
 use cellar.command;
+use cellar.format;
+use cellar.library;
 use cellar.pattern;
 use cellar.render;
 use cellar.saves;
@@ -27,6 +29,11 @@ pub val MODE_COUNT: usize = 3;
 pub val BOUNDS_COUNT: usize = 8;
 # bounds-table index used at startup (128)
 pub val DEFAULT_BOUNDS: usize = 2;
+
+# the pattern_sel that selects the custom pattern rather than a library one
+pub val CUSTOM: usize = 0xffffffffffffffff;
+# the library pattern selected at startup
+val DEFAULT_PATTERN: str = "Glider";
 
 # paint live cells
 pub val TOOL_DRAW: usize = 0;
@@ -53,8 +60,14 @@ pub val ZOOM_MAX: f32 = 16.0;
 # uncapped:    1 to step as fast as the machine allows
 # tool:        what a left press does to the world (TOOL_*)
 # bounds_idx:  index into the power-of-two randomize-area table
-# pattern_sel: selected pattern; pattern.BUILTIN_COUNT selects the custom one
+# pattern_sel: the selected library pattern's index, or CUSTOM
+# library:     the bundled patterns, once attach has run
+# picked:      the selected library pattern, decoded
+# picked_at:   the library index picked holds, or CUSTOM for none
 # custom:      the user-drawn custom pattern
+# search:      the draw section's pattern search
+# browse:      the library category listed while the search is empty
+# page:        the page of the pattern list shown
 # orient:      how the stamp is laid down (pattern.ORIENT_*)
 # solid:       live-cell colour in solid mode, sRGB hex
 # zoom:        zoom multiplier, render.BASE_PPC pixels per cell at 1
@@ -93,8 +106,13 @@ pub rec App {
     tool:        usize;
     bounds_idx:  usize;
     pattern_sel: usize;
-    library:     [7]pattern.Pattern;
+    library:     library.Library;
+    picked:      pattern.Pattern;
+    picked_at:   usize;
     custom:      pattern.Pattern;
+    search:      ui.Field;
+    browse:      usize;
+    page:        usize;
     orient:      u8;
     solid:       u32;
     zoom:        f32;
@@ -212,34 +230,60 @@ pub fun note_full(a: *App, full: bool) {
     say(a, "the world outgrew its pool of chunks; clear it to run again");
 }
 
-# make the patterns the interface offers, once the allocator is up
+# make the patterns the interface offers, once the allocator is up, selecting
+# the default one
 # ---
 # a:     application state
 # alloc: allocator backing the patterns, outliving the application
-# ret:   ok, or the allocator's refusal
-pub fun attach(a: *App, alloc: *allo.Allocator) err[allo.Error] {
+# ret:   ok, or why the library or a pattern could not be made
+pub fun attach(a: *App, alloc: *allo.Allocator) err[format.Error] {
     a.alloc = alloc;
     command.init(?a.queue, alloc);
     saves.init(?a.saves, alloc);
-    var i: usize = 0;
-    for (i < pattern.BUILTIN_COUNT) {
-        val e: err[allo.Error] = pattern.builtin(?a.library[i], alloc, i);
-        if (sel e.err) { ret e; }
-        i = i + 1;
-    }
-    ret pattern.init(?a.custom, alloc, 16, 16, "custom");
+    val l: err[format.Error] = library.init(?a.library, alloc);
+    if (sel l.err) { ret l; }
+    val p: err[allo.Error] = pattern.init(?a.picked, alloc, 0, 0, "");
+    if (sel p.err) { ret err[format.Error].err{format.Error.alloc{p.err}}; }
+    val c: err[allo.Error] = pattern.init(?a.custom, alloc, 16, 16, "custom");
+    if (sel c.err) { ret err[format.Error].err{format.Error.alloc{c.err}}; }
+    select(a, library.count(?a.library));
+    ret err[format.Error].ok{};
 }
 
 # release the patterns attach made
 pub fun dnit(a: *App) {
-    var i: usize = 0;
-    for (i < pattern.BUILTIN_COUNT) {
-        pattern.dnit(?a.library[i]);
-        i = i + 1;
-    }
+    library.dnit(?a.library);
+    pattern.dnit(?a.picked);
     pattern.dnit(?a.custom);
     command.dnit(?a.queue);
     saves.dnit(?a.saves);
+}
+
+# select a library pattern and browse its category, or the custom pattern
+# ---
+# a: application state
+# i: a library index or CUSTOM; anything else selects the default pattern
+pub fun select(a: *App, i: usize) {
+    val n: usize = library.count(?a.library);
+    var s: usize = i;
+    if (s != CUSTOM && s >= n) { s = library.find(?a.library, DEFAULT_PATTERN); }
+    if (s != CUSTOM && s >= n) { s = 0; }
+    a.pattern_sel = s;
+    if (s < n) { a.browse = library.category_of(?a.library, s); }
+}
+
+# the selected pattern, the custom one or the library one, decoded on first use
+pub fun chosen(a: *App) *pattern.Pattern {
+    if (a.pattern_sel == CUSTOM || a.pattern_sel >= library.count(?a.library)) { ret ?a.custom; }
+    if (a.picked_at != a.pattern_sel) {
+        val r: err[format.Error] = library.load(?a.library, a.pattern_sel, ?a.picked);
+        if (sel r.err) {
+            say(a, format.error_message(r.err));
+            pattern.resize(?a.picked, 0, 0);
+        }
+        a.picked_at = a.pattern_sel;
+    }
+    ret ?a.picked;
 }
 
 # ask for a change to the world, applied at the start of the next frame
@@ -288,11 +332,16 @@ pub fun init(a: *App) {
     a.tool        = TOOL_DRAW;
     a.bounds_idx  = DEFAULT_BOUNDS;
     a.pattern_sel = 0;
-    a.orient      = 0;
-    a.solid       = theme.swatch(0);
-    a.zoom        = 1.0;
-    a.pan_x       = 0.0;
-    a.pan_y       = 0.0;
+    library.empty(?a.library);
+    a.picked_at = CUSTOM;
+    ui.field_init(?a.search, ui.FIELD_CAP, nil);
+    a.browse = 0;
+    a.page   = 0;
+    a.orient = 0;
+    a.solid  = theme.swatch(0);
+    a.zoom   = 1.0;
+    a.pan_x  = 0.0;
+    a.pan_y  = 0.0;
     frame_area(a);
     a.panel      = 1;
     a.open_run   = 1;
