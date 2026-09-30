@@ -1,0 +1,123 @@
+# the world's pending edits, as data
+#
+# the panel, the keys and the tools never touch the simulation or the files
+# themselves. they push a command here and the frame applies the queue once, at
+# its start, before anything is recorded: a save reads the GPU's cells back,
+# which is only valid before the frame records, and an edit applied after it
+# would wait a frame on the GPU anyway. a command owns everything it needs, so
+# a queue of them is also a history that can be replayed or undone.
+
+use cellar.kernel;
+use cellar.pattern;
+use allo: std.allocator;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+
+# a cell set live or dead
+# ---
+# x: column
+# y: row
+# v: 1 live, 0 dead
+pub rec Paint {
+    x: i64;
+    y: i64;
+    v: u8;
+}
+
+# every cell on the line from (x0, y0) to (x1, y1) set live or dead
+pub rec Line {
+    x0: i64;
+    y0: i64;
+    x1: i64;
+    y1: i64;
+    v:  u8;
+}
+
+# a pattern overlaid centred on (x, y)
+pub rec Stamp {
+    p: pattern.Pattern;
+    x: i64;
+    y: i64;
+}
+
+# one change to the world or to its files
+# ---
+# toggle:       start or pause stepping
+# step:         advance one generation
+# clear:        kill every cell
+# randomize:    replace the world with a random square this many cells across
+# paint:        set one cell
+# line:         set the cells along a line
+# stamp:        overlay a pattern
+# rule:         replace the rule
+# save_world:   write the world to its file
+# load_world:   replace the world with the file's
+# save_pattern: write the custom pattern to its file
+# load_pattern: replace the custom pattern with the file's
+pub tag Command: u8 {
+    toggle;
+    step;
+    clear;
+    randomize: usize;
+    paint:     Paint;
+    line:      Line;
+    stamp:     Stamp;
+    rule:      kernel.Kernel;
+    save_world;
+    load_world;
+    save_pattern;
+    load_pattern;
+}
+
+# commands waiting for the frame, oldest first
+#
+# the queue owns what its commands own, so every command leaves it through
+# release exactly once: clear frees what was applied, dnit what never was.
+# ---
+# items: the commands
+pub rec Queue {
+    items: Vector[Command];
+}
+
+# make an empty queue
+# ---
+# q: the queue
+# a: allocator for the commands and what they own, outliving the queue
+pub fun init(q: *Queue, a: *allo.Allocator) {
+    q.items = vector.init[Command](a);
+}
+
+# free what a command owns
+pub fun release(c: *Command) {
+    if (sel c.stamp) { pattern.dnit(?c.stamp.p); }
+}
+
+# add a command to the end, which then owns it
+# ---
+# q:   the queue
+# c:   the command, whose owned data moves into the queue on success
+# ret: ok, or the allocator's refusal, leaving c with the caller
+pub fun push(q: *Queue, c: Command) err[allo.Error] {
+    val r: res[usize, allo.Error] = vector.push[Command](?q.items, c);
+    if (sel r.err) { ret err[allo.Error].err{r.err}; }
+    ret err[allo.Error].ok{};
+}
+
+# release every command and empty the queue, keeping its storage
+pub fun clear(q: *Queue) {
+    var i: usize = 0;
+    for (i < q.items.len) {
+        release(?q.items.data[i]);
+        i = i + 1;
+    }
+    vector.clear[Command](?q.items);
+}
+
+# release every command and the queue's storage
+pub fun dnit(q: *Queue) {
+    clear(q);
+    vector.dnit[Command](?q.items);
+}

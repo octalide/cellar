@@ -9,21 +9,18 @@
 use gfx: boom.graphics;
 use cellar.app;
 use cellar.arrange;
+use cellar.command;
 use cellar.kedit;
 use cellar.paths;
 use cellar.pattern;
-use cellar.persist;
 use cellar.render;
 use cellar.sim;
 use cellar.text;
 use cellar.theme;
 use cellar.ui;
 use cellar.world;
-use allo: std.allocator;
-use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
-use std.types.error.err;
 use std.types.size.usize;
 use std.types.string.str;
 
@@ -34,17 +31,6 @@ val HEADER: f32 = 48.0;
 val DOCK_MIN: f32 = 760.0;
 # the version shown in the header
 val VERSION: str = $mach.project.version;
-
-# what the panel needs from the frame, and asks of it
-# ---
-# a:    allocator for file buffers
-# p:    the data directory
-# shot: set when a screenshot was asked for
-pub rec Deps {
-    a:    *allo.Allocator;
-    p:    *paths.Paths;
-    shot: bool;
-}
 
 # the panel's width in pixels for a window sw wide
 fun width(u: *ui.Ui, sw: f32) f32 {
@@ -89,22 +75,13 @@ fun areas(u: *ui.Ui, a: *app.App) {
     }
 }
 
-# save or load with the outcome flashed
-fun report(a: *app.App, ok: str, e: err[persist.Error]) {
-    if (sel e.err) {
-        app.say(a, persist.error_message(e.err));
-        ret;
-    }
-    app.say(a, ok);
-}
-
 fun run(u: *ui.Ui, a: *app.App, s: *sim.Sim) {
     if (!ui.heading(u, "RUN", ?a.open_run)) { ret; }
     val h:  f32 = ui.px(u, ui.ROW);
     var go: str = "Play";
     if (world.running(s))                                                                              { go = "Pause"; }
-    if (ui.button_at(u, go, ui.cell_x0(u, 0, 2), u.y, ui.cell_x1(u, 0, 2), u.y + h, world.running(s))) { world.toggle(s); }
-    if (ui.button_at(u, "Step", ui.cell_x0(u, 1, 2), u.y, ui.cell_x1(u, 1, 2), u.y + h, false))        { world.step(s); }
+    if (ui.button_at(u, go, ui.cell_x0(u, 0, 2), u.y, ui.cell_x1(u, 0, 2), u.y + h, world.running(s))) { app.submit(a, command.Command.toggle{}); }
+    if (ui.button_at(u, "Step", ui.cell_x0(u, 1, 2), u.y, ui.cell_x1(u, 1, 2), u.y + h, false))        { app.submit(a, command.Command.step{}); }
     ui.advance(u, h);
 
     var rd: [32]u8;
@@ -122,8 +99,8 @@ fun run(u: *ui.Ui, a: *app.App, s: *sim.Sim) {
     acts[0] = "Randomize";
     acts[1] = "Clear";
     val hit: usize = ui.buttons(u, ?acts[0], 2);
-    if (hit == 0) { world.randomize(s, app.bounds_size(a.bounds_idx)); }
-    if (hit == 1) { world.clear(s); }
+    if (hit == 0) { app.submit(a, command.Command.randomize{app.bounds_size(a.bounds_idx)}); }
+    if (hit == 1) { app.submit(a, command.Command.clear{}); }
     ui.note(u, "Randomize fills a square this wide");
     areas(u, a);
 }
@@ -174,35 +151,28 @@ fun tail(f: *gfx.Font, s: str, w: f32) str {
     ret t;
 }
 
-fun files(u: *ui.Ui, a: *app.App, s: *sim.Sim, d: *Deps) {
+fun files(u: *ui.Ui, a: *app.App, p: *paths.Paths) {
     if (!ui.heading(u, "FILES", ?a.open_files)) { ret; }
-    if (!d.p.ok) {
+    if (!p.ok) {
         ui.note(u, "no user data directory is known");
         ret;
     }
-    var world_path:  [1088]u8;
-    var custom_path: [1088]u8;
-    paths.file(d.p, paths.WORLD, ?world_path[0]);
-    paths.file(d.p, paths.CUSTOM, ?custom_path[0]);
 
     var wl: [2]str;
     wl[0] = "Save world";
     wl[1] = "Load world";
     val w: usize = ui.buttons(u, ?wl[0], 2);
-    if (w == 0) { report(a, "world saved", persist.save_world(d.a, s, ?world_path[0])); }
-    if (w == 1) { report(a, "world loaded", persist.load_world(d.a, s, ?world_path[0])); }
+    if (w == 0) { app.submit(a, command.Command.save_world{}); }
+    if (w == 1) { app.submit(a, command.Command.load_world{}); }
 
     var pl: [2]str;
     pl[0] = "Save pattern";
     pl[1] = "Load pattern";
     val q: usize = ui.buttons(u, ?pl[0], 2);
-    if (q == 0) { report(a, "custom pattern saved", persist.save_pattern(d.a, ?a.custom, ?custom_path[0])); }
-    if (q == 1) {
-        report(a, "custom pattern loaded", persist.load_pattern(d.a, ?a.custom, ?custom_path[0]));
-        a.pattern_sel = pattern.BUILTIN_COUNT;
-    }
-    if (ui.button(u, "Screenshot", false)) { d.shot = true; }
-    ui.note(u, tail(u.small, paths.dir(d.p), u.w));
+    if (q == 0)                            { app.submit(a, command.Command.save_pattern{}); }
+    if (q == 1)                            { app.submit(a, command.Command.load_pattern{}); }
+    if (ui.button(u, "Screenshot", false)) { a.shot = true; }
+    ui.note(u, tail(u.small, paths.dir(p), u.w));
 }
 
 # the header: name, version, and the help and hide buttons
@@ -234,10 +204,10 @@ fun restore(u: *ui.Ui, a: *app.App, sw: f32) {
 # u:  the interface
 # a:  application state
 # s:  the simulation, locked by the caller
-# d:  what the panel needs from the frame
+# p:  the data directory
 # sw: window width in pixels
 # sh: window height in pixels
-pub fun draw(u: *ui.Ui, a: *app.App, s: *sim.Sim, d: *Deps, sw: f32, sh: f32) {
+pub fun draw(u: *ui.Ui, a: *app.App, s: *sim.Sim, p: *paths.Paths, sw: f32, sh: f32) {
     if (a.panel == 0) {
         a.side_x0 = sw;
         restore(u, a, sw);
@@ -260,9 +230,9 @@ pub fun draw(u: *ui.Ui, a: *app.App, s: *sim.Sim, d: *Deps, sw: f32, sh: f32) {
     ui.column(u, x0 + pad, y0, sw - x0 - pad * 2.0);
     run(u, a, s);
     arrange.section(u, a);
-    kedit.section(u, s, ?a.open_rule);
+    kedit.section(u, a, s);
     look(u, a);
-    files(u, a, s, d);
+    files(u, a, p);
     a.content = u.y - y0 + ui.px(u, 12.0);
 
     # drawn last, so content scrolled up passes under it
