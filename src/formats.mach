@@ -16,6 +16,7 @@ use cellar.formats.life;
 use cellar.formats.macrocell;
 use cellar.formats.plaintext;
 use cellar.formats.rle;
+use cellar.hashlife;
 use cellar.pattern;
 use cellar.sim;
 use cellar.space;
@@ -198,6 +199,54 @@ fun same(p: *pattern.Pattern, q: *pattern.Pattern) bool {
     ret string.str_equals(pattern.rule(p), pattern.rule(q)) && string.str_equals(pattern.name(p), pattern.name(q)) && string.str_equals(pattern.comments(p), pattern.comments(q));
 }
 
+# write a pattern out in a format from a HashLife tree of its cells, not its
+# runs, read it back, and compare
+# ---
+# f:    the format
+# info: the text to write
+# ret:  whether it came back identical
+fun from_tree(a: *allo.Allocator, p: *pattern.Pattern, f: *format.Format, info: *format.Info) bool {
+    var t: hashlife.Tree;
+    hashlife.init(?t, a, hashlife.DEFAULT_MAX);
+    if (!hashlife.make(?t)) { ret false; }
+    var i: usize = 0;
+    for (i < p.w * p.h) {
+        if (p.cells[i] != 0) {
+            val x:  i64 = p.x + (i % p.w)::i64;
+            val y:  i64 = p.y + (i / p.w)::i64;
+            val cx: i64 = space.chunk_of(x);
+            val cy: i64 = space.chunk_of(y);
+            val c:  *u8 = hashlife.chunk(?t, cx, cy, true);
+            c[((y - cy * space.SIDE) * space.SIDE + x - cx * space.SIDE)::usize] = p.cells[i];
+            hashlife.wrote(?t, cx, cy);
+        }
+        i = i + 1;
+    }
+    var ok:   bool           = hashlife.flush(?t);
+    var src:  adapt.PatternSource;
+    var q:    format.Quadtree;
+    var out:  Vector[u8]     = vector.init[u8](a);
+    val from: *format.Source = adapt.pattern_source(?src, p);
+    from.tree = adapt.quadtree(?q, ?t);
+    val w: err[format.Error] = save(a, f, from, info, ?out);
+    if (sel w.err) { ok = false; }
+    var back: pattern.Pattern;
+    val m:    err[allo.Error] = pattern.init(?back, a, 0, 0, "");
+    if (sel m.err) { ok = false; }
+    var ps:  adapt.PatternSink;
+    var got: format.Info;
+    format.info_init(?got, a);
+    if (ok) {
+        val r: err[format.Error] = load(a, f, out.data, out.len, adapt.pattern_sink(?ps, ?back), ?got);
+        ok = sel r.ok && same(p, ?back);
+    }
+    if (!(sel m.err)) { pattern.dnit(?back); }
+    format.info_dnit(?got);
+    vector.dnit[u8](?out);
+    hashlife.dnit(?t);
+    ret ok;
+}
+
 # write a pattern out in a format, read it back, and compare
 # ---
 # id:   the format
@@ -236,8 +285,9 @@ fun roundtrip(a: *allo.Allocator, p: *pattern.Pattern, id: str, wrap: usize) u32
     val r: err[format.Error] = load(a, ?f, out.data, out.len, adapt.pattern_sink(?ps, ?q), ?got);
     if (sel r.err) { ret 6; }
     var ok: u32 = 0;
-    if (!same(p, ?q))                      { ok = 7; }
-    or (got.notes != 0 && got.states <= 2) { ok = 8; }
+    if (!same(p, ?q))                                                      { ok = 7; }
+    or (got.notes != 0 && got.states <= 2)                                 { ok = 8; }
+    or (string.str_equals(id, "macrocell") && !from_tree(a, p, ?f, ?info)) { ok = 9; }
     pattern.dnit(?q);
     format.info_dnit(?got);
     format.info_dnit(?info);
