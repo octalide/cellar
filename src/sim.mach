@@ -195,15 +195,17 @@ fun kept(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64, whole: bool, current: bool
 # and the other does not, the world reads as the held cells' complement from
 # then on: the world before it had an unbounded live background no pool can
 # hold.
+# a rule the GPU stepping the world cannot step is refused (see refusal).
 # ---
 # s:   simulation
 # r:   the rule
-# ret: false when the GPU's cells could not be read, which leaves the rule as
-#      it was
+# ret: false when the rule was refused or the GPU's cells could not be read,
+#      which leaves the rule as it was
 pub fun set_rule(s: *Sim, r: rule.Rule) bool {
-    var old:  rule.Rule = s.rule;
-    var new:  rule.Rule = r;
-    val same: bool      = alike(?old, ?new);
+    var old: rule.Rule = s.rule;
+    var new: rule.Rule = r;
+    if (refusal(s, ?new) != nil) { ret false; }
+    val same: bool = alike(?old, ?new);
     if (!same) {
         val synced: err[gfx.Error] = sync(s);
         if (sel synced.err) { ret false; }
@@ -237,6 +239,17 @@ pub fun set_rule(s: *Sim, r: rule.Rule) bool {
     ret true;
 }
 
+# why the world cannot run a rule, or nil when it can: a GPU steps the world
+# and its dispatches bind too few storage buffers for the rule's family
+# ---
+# s:   simulation
+# r:   the rule
+# ret: the reason, for the person who asked for the rule
+pub fun refusal(s: *Sim, r: *rule.Rule) str {
+    if (!on_gpu(s)) { ret nil; }
+    ret gpu.refusal(s.gpu, rule.family_of(r));
+}
+
 # whether two rules write every state as the same word, so cells of one read
 # alike under the other
 fun alike(a: *rule.Rule, b: *rule.Rule) bool {
@@ -264,10 +277,13 @@ pub fun on_gpu(s: *Sim) bool {
 #
 # the GPU mirrors the pool from then on, so the pool grows only as far as the
 # device's buffers can follow, and a growth the device refuses stops the world.
+# a GPU that cannot step the rule the world runs leaves the stepping to the
+# CPU, which steps every family.
 # ---
 # s: simulation
 # g: the GPU side, initialized with at least the pool's capacity
 pub fun attach(s: *Sim, g: *gpu.Gpu) {
+    if (!gpu.steps(g, rule.family_of(?s.rule))) { gpu.forgo_compute(g); }
     s.gpu = g;
     space.set_mirror(?s.space, gpu.mirror(g), g.slots);
     var t: usize = 0;
@@ -2072,6 +2088,114 @@ test b0__edits_and_reads_see_the_world_at_an_odd_generation {
     var row: [4]u8;
     if (!read_begin(?s, 4, 5, 8, 6) || !read_run(?s, 4, 5, 4, ?row[0]) || !read_end(?s)) { ret 5; }
     if (row[0] != 1 || row[1] != 0 || row[2] != 1 || row[3] != 1)                        { ret 6; }
+    dnit(?s);
+    ret 0;
+}
+
+# Bosco, the period-166 oscillator of Bosco's rule, from Golly's bosco.rle
+#[testing]
+val BOSCO: [11]str = [11]str{
+    "......o", "....ooooo", "..ooooo.oo", ".ooooo...oo", ".oooo.....o", "oooo.....ooo", ".oooo...ooo", ".ooooo.oooo",
+    "..oooooooo", "...ooooooo", "....ooooo",
+};
+
+# seed Bosco with its top-left at the origin
+#[testing]
+pub fun seed_bosco(s: *Sim) {
+    fill_begin(s);
+    var y: usize = 0;
+    for (y < 11) {
+        var x: usize = 0;
+        for (BOSCO[y][x] != 0) {
+            if (BOSCO[y][x] == 'o') { fill_cell(s, x::i64, y::i64, 1); }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    fill_end(s);
+}
+
+# whether two worlds hold the same live cells, their ages and trails aside
+#[testing]
+fun same_live(a: *Sim, b: *Sim) bool {
+    var y: i64 = -40;
+    for (y < 60) {
+        var x: i64 = -40;
+        for (x < 60) {
+            if (alive(a, x, y) != alive(b, x, y)) { ret false; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    ret population(a) == population(b);
+}
+
+test weighted__boscos_rule_brings_bosco_back_after_166_generations_on_both_engines {
+    val parsed: res[rule.Rule, str] = rule.parse("R5,C0,M1,S34..58,B34..45,NM");
+    if (sel parsed.err) { ret 1; }
+    var t:    Rig;
+    val code: i32 = rig_open(?t, parsed.ok, seed_bosco);
+    if (code != 0) { ret code; }
+    var start: Sim;
+    val made:  err[allo.Error] = init(?start, ?t.a);
+    if (sel made.err) { ret 2; }
+    set_rule(?start, parsed.ok);
+    seed_bosco(?start);
+    # it is not still: halfway round it is another shape
+    rig_step(?t, 83);
+    if (same_live(?t.cpu, ?start)) { ret 3; }
+    rig_step(?t, 83);
+    if (!same_live(?t.cpu, ?start)) { ret 4; }
+    if (!rig_same(?t))              { ret 5; }
+    dnit(?start);
+    rig_close(?t);
+    ret 0;
+}
+
+test weighted__a_radius_7_kernel_with_negative_weights_matches_an_unbounded_plane_on_both_engines {
+    val rs: str                 = rule.sample(0, 3);
+    val r:  res[rule.Rule, str] = rule.parse(rs);
+    if (sel r.err)               { ret 1; }
+    if (rule.radius(?r.ok) != 7) { ret 1; }
+    # the soup lives on under it, so the plane has something to hold it to
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    Sim;
+    val made: err[allo.Error] = init(?s, ?a);
+    if (sel made.err) { ret 2; }
+    set_rule(?s, r.ok);
+    seed_soup(?s);
+    var g: usize = 0;
+    for (g < 24) {
+        step(?s);
+        g = g + 1;
+    }
+    val pop: usize = population(?s);
+    dnit(?s);
+    if (pop == 0) { ret 3; }
+    ret matches_plane(rs);
+}
+
+test set_rule__refuses_a_family_the_stepping_gpu_cannot_bind {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    Sim;
+    val made: err[allo.Error] = init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    set_rule(?s, rule.preset_rule(4));
+    # a GPU that built the generations stage and not the weighted one
+    var g: gpu.Gpu;
+    g.stepping = true;
+    g.ready[0] = false;
+    g.ready[1] = true;
+    s.gpu      = ?g;
+    var life: rule.Rule = rule.preset_rule(0);
+    if (refusal(?s, ?life) == nil) { ret 2; }
+    if (set_rule(?s, life))        { ret 3; }
+    var brain: rule.Rule = rule.preset_rule(4);
+    if (!rule.same(?s.rule, ?brain) || refusal(?s, ?brain) != nil) { ret 4; }
+    s.gpu = nil;
+    if (refusal(?s, ?life) != nil) { ret 5; }
     dnit(?s);
     ret 0;
 }
