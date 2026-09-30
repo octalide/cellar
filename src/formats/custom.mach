@@ -1,0 +1,160 @@
+# cellar's own small pattern text, the format the custom pattern is kept in
+#
+# a header line "<w> <h>" then h lines of w characters, '1' a live cell and '0' a
+# dead one. any other byte in the body is skipped, so line endings do not matter,
+# extra cells past the declared ones are ignored, and every nonzero state writes
+# as live. it carries no name, rule or comments, and sides are limited to MAX_DIM.
+# files written before the world became unbounded are this format too.
+
+use cellar.format;
+use cellar.text;
+use allo: std.allocator;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+
+# the largest width or height, bounding what a corrupt header can ask for
+pub val MAX_DIM: usize = 4096;
+
+fun is_digit(b: u8) bool {
+    ret b >= '0' && b <= '9';
+}
+
+# read a run of decimal digits, stopping short of overflow
+# ---
+# p:   the bytes
+# n:   how many
+# i:   read position, left after the digits
+# out: receives the value, capped above MAX_DIM
+# ret: whether any digit was there
+fun read_dim(p: *u8, n: usize, i: *usize, out: *usize) bool {
+    var v:    usize = 0;
+    var seen: bool  = false;
+    for (is_digit(text.byte_at(p, n, @i))) {
+        if (v <= MAX_DIM) { v = v * 10 + (p[@i] - '0')::usize; }
+        seen = true;
+        @i   = @i + 1;
+    }
+    @out = v;
+    ret seen;
+}
+
+# how likely the bytes are a custom pattern: "<w> <h>" opens the file
+fun sniff(p: *u8, n: usize) u32 {
+    var i: usize = 0;
+    var v: usize = 0;
+    if (!read_dim(p, n, ?i, ?v))      { ret 0; }
+    if (text.byte_at(p, n, i) != ' ') { ret 0; }
+    for (text.byte_at(p, n, i) == ' ') { i = i + 1; }
+    if (!read_dim(p, n, ?i, ?v)) { ret 0; }
+    val end: u8 = text.byte_at(p, n, i);
+    if (end == 0 || end == '\n' || end == '\r') { ret 50; }
+    ret 0;
+}
+
+# decode a custom pattern
+fun decode(a: *allo.Allocator, p: *u8, n: usize, e: *format.Emit) err[format.Error] {
+    var i: usize = 0;
+    var w: usize = 0;
+    var h: usize = 0;
+    if (!read_dim(p, n, ?i, ?w)) { ret err[format.Error].err{format.Error.malformed{}}; }
+    for (text.byte_at(p, n, i) == ' ') { i = i + 1; }
+    if (!read_dim(p, n, ?i, ?h))                        { ret err[format.Error].err{format.Error.malformed{}}; }
+    if (w == 0 || h == 0 || w > MAX_DIM || h > MAX_DIM) { ret err[format.Error].err{format.Error.range{}}; }
+    format.cover(e.info, 0, 0, w::i64, h::i64);
+
+    var y: usize = 0;
+    for (y < h) {
+        var x:     usize = 0;
+        var start: usize = 0;
+        var len:   usize = 0;
+        for (x < w) {
+            for (i < n && p[i] != '0' && p[i] != '1') { i = i + 1; }
+            e.info.at = i;
+            if (i >= n) { ret err[format.Error].err{format.Error.truncated{}}; }
+            if (p[i] == '1') {
+                if (len == 0) { start = x; }
+                len = len + 1;
+            }
+            or {
+                if (len != 0 && !format.emit(e, start::i64, y::i64, len, 1)) { ret err[format.Error].err{format.Error.sink{}}; }
+                len = 0;
+            }
+            i = i + 1;
+            x = x + 1;
+        }
+        if (len != 0 && !format.emit(e, start::i64, y::i64, len, 1)) { ret err[format.Error].err{format.Error.sink{}}; }
+        y = y + 1;
+    }
+    ret err[format.Error].ok{};
+}
+
+fun put(out: *Vector[u8], b: u8) err[format.Error] {
+    val r: res[usize, allo.Error] = vector.push[u8](out, b);
+    if (sel r.err) { ret err[format.Error].err{format.Error.alloc{r.err}}; }
+    ret err[format.Error].ok{};
+}
+
+fun put_dim(out: *Vector[u8], v: usize) err[format.Error] {
+    var b: [24]u8;
+    val n: usize = text.buf_u64(?b[0], 0, v::u64);
+    var i: usize = 0;
+    for (i < n) {
+        val r: err[format.Error] = put(out, b[i]);
+        if (sel r.err) { ret r; }
+        i = i + 1;
+    }
+    ret err[format.Error].ok{};
+}
+
+# encode a source as a custom pattern, every live cell as '1'
+fun encode(a: *allo.Allocator, src: *format.Source, info: *format.Info, out: *Vector[u8]) err[format.Error] {
+    val w: i64 = src.x1 - src.x0;
+    val h: i64 = src.y1 - src.y0;
+    if (w <= 0 || h <= 0 || w > MAX_DIM::i64 || h > MAX_DIM::i64) { ret err[format.Error].err{format.Error.range{}}; }
+    val a1: err[format.Error] = put_dim(out, w::usize);
+    if (sel a1.err) { ret a1; }
+    val a2: err[format.Error] = put(out, ' ');
+    if (sel a2.err) { ret a2; }
+    val a3: err[format.Error] = put_dim(out, h::usize);
+    if (sel a3.err) { ret a3; }
+    val a4: err[format.Error] = put(out, '\n');
+    if (sel a4.err) { ret a4; }
+
+    var r: format.Run;
+    src.rewind(src.ctx);
+    var have: bool = src.next(src.ctx, ?r);
+    var y:    i64  = src.y0;
+    for (y < src.y1) {
+        var x: i64 = src.x0;
+        for (x < src.x1) {
+            for (have && (r.y < y || (r.y == y && r.x + r.n::i64 <= x))) { have = src.next(src.ctx, ?r); }
+            if (have && (r.y < src.y0 || r.x < src.x0 || r.x + r.n::i64 > src.x1 || r.y >= src.y1)) { ret err[format.Error].err{format.Error.range{}}; }
+            var c: u8 = '0';
+            if (have && r.y == y && r.x <= x) { c = '1'; }
+            val put_c: err[format.Error] = put(out, c);
+            if (sel put_c.err) { ret put_c; }
+            x = x + 1;
+        }
+        val nl: err[format.Error] = put(out, '\n');
+        if (sel nl.err) { ret nl; }
+        y = y + 1;
+    }
+    ret err[format.Error].ok{};
+}
+
+# the custom pattern format's registry record
+pub fun make() format.Format {
+    var f: format.Format;
+    f.id     = "custom";
+    f.exts   = "";
+    f.sniff  = sniff;
+    f.decode = decode;
+    f.encode = encode;
+    ret f;
+}
