@@ -5,9 +5,11 @@
 # live cell a line "<cx> <cy>" with its signed chunk coordinates and 64 lines of
 # 64 cells, '1' live and '0' dead. a reader skips header keys it does not know,
 # so a newer file's fields do not stop an older cellar from reading its cells.
-# the keys are rule (B/S notation, written only for a rule it expresses whole),
-# generation, pan_x and pan_y (the view's centre), zoom and mode (the colour
-# mode by name). a key a file leaves out keeps what the reader already had.
+# the keys are rule (B/S notation) for a Life-like rule or kernel (the whole
+# kernel, see kernel.structure) for any other, generation, pan_x and pan_y (the
+# view's centre), zoom and mode (the colour mode by name). a file naming both
+# rules is read by its kernel. a key a file leaves out keeps what the reader
+# already had.
 # a "cellar 2" file is the same without the header, and a file in the custom
 # pattern format, what every world was saved as before the world became
 # unbounded, loads centred on the origin. patterns are saved and loaded through
@@ -63,9 +65,9 @@ val OLDEST: u8 = '2';
 # bytes of one chunk record past its coordinate line
 val CHUNK_TEXT: usize = 64 * 65;
 # bytes reserved for a world file's first line and header
-val HEAD_MAX: usize = 512;
-# the longest header value read, less its NUL
-val VALUE_MAX: usize = 255;
+val HEAD_MAX: usize = 2048;
+# the longest header value read, less its NUL: a whole kernel
+val VALUE_MAX: usize = kernel.STRUCTURE_MAX;
 
 # how a world is being viewed, which a world file keeps beside its cells
 # ---
@@ -235,12 +237,17 @@ fun write_header(buf: *u8, s: *sim.Sim, v: *View) usize {
     off      = off + 1;
     buf[off] = '\n';
     off      = off + 1;
+    # the notation is the form other tools read, and the structure holds the rest
+    var rb: [1101]u8;
     if (kernel.life_like(?s.kernel)) {
-        var rb: [200]u8;
         off = text.buf_str(buf, off, "rule ");
         off = text.buf_str(buf, off, kernel.notation(?s.kernel, ?rb[0]));
-        off = text.buf_str(buf, off, "\n");
     }
+    or {
+        off = text.buf_str(buf, off, "kernel ");
+        off = text.buf_str(buf, off, kernel.structure(?s.kernel, ?rb[0]));
+    }
+    off = text.buf_str(buf, off, "\n");
     off = text.buf_str(buf, off, "generation ");
     off = text.buf_u64(buf, off, s.generation);
     off = text.buf_str(buf, off, "\npan_x ");
@@ -256,8 +263,7 @@ fun write_header(buf: *u8, s: *sim.Sim, v: *View) usize {
 
 # serialize the world's live chunks, its rule, its generation and the view to path
 #
-# on the GPU the cells are read back first, a stall. a rule that is not
-# kernel.life_like has no notation yet, so it is left out.
+# on the GPU the cells are read back first, a stall.
 # ---
 # a:    allocator backing the transient buffer
 # s:    simulation whose world is saved
@@ -363,13 +369,30 @@ fun world_version(b: *Vector[u8]) u8 {
 # ---
 # ruled:      the file names a rule
 # rule:       the rule it names, when kernel.parse reads it
+# shaped:     the file names a whole kernel
+# shape:      the kernel it names, when kernel.from_structure reads it
 # generation: the generation, 0 when the file names none
 # view:       the view, starting as the reader's own
 rec Head {
     ruled:      bool;
     rule:       opt[kernel.Kernel];
+    shaped:     bool;
+    shape:      opt[kernel.Kernel];
     generation: u64;
     view:       View;
+}
+
+# the rule a header names, preferring its whole kernel, or none when it names
+# none or names one this version cannot run
+fun head_rule(h: *Head) opt[kernel.Kernel] {
+    if (h.shaped) { ret h.shape; }
+    ret h.rule;
+}
+
+# whether a header names a rule this version cannot run
+fun foreign(h: *Head) bool {
+    val k: opt[kernel.Kernel] = head_rule(h);
+    ret (h.ruled || h.shaped) && sel k.none;
 }
 
 # whether a float is neither infinite nor NaN
@@ -396,6 +419,11 @@ fun field(key: str, v: str, h: *Head) bool {
     if (string.str_equals(key, "rule")) {
         h.ruled = true;
         h.rule  = kernel.parse(v);
+        ret true;
+    }
+    if (string.str_equals(key, "kernel")) {
+        h.shaped = true;
+        h.shape  = kernel.from_structure(v);
         ret true;
     }
     if (string.str_equals(key, "generation")) {
@@ -460,7 +488,7 @@ fun read_header(b: *Vector[u8], p: usize, out: *usize, h: *Head) err[Error] {
         var end: usize = e;
         for (end < b.len && b.data[end] != '\n') { end = end + 1; }
         for (end > e && (b.data[end - 1] == ' ' || b.data[end - 1] == '\t' || b.data[end - 1] == '\r')) { end = end - 1; }
-        var value: [256]u8;
+        var value: [1101]u8;
         var len:   usize = end - e;
         # a value too long for any field this version reads is read as none at all
         if (len > VALUE_MAX) { len = 0; }
@@ -564,6 +592,8 @@ pub fun load_world(a: *allo.Allocator, s: *sim.Sim, v: *View, path: str) res[Loa
         var h: Head;
         h.ruled      = false;
         h.rule       = opt[kernel.Kernel].none{};
+        h.shaped     = false;
+        h.shape      = opt[kernel.Kernel].none{};
         h.generation = 0;
         h.view       = @v;
         if (ver >= '3') {
@@ -592,13 +622,14 @@ pub fun load_world(a: *allo.Allocator, s: *sim.Sim, v: *View, path: str) res[Loa
             }
             sim.fill_end(s);
             s.generation = h.generation;
-            if (sel h.rule.some) { s.kernel = h.rule.some; }
+            val rule: opt[kernel.Kernel] = head_rule(?h);
+            if (sel rule.some) { s.kernel = rule.some; }
             @v = h.view;
         }
         vector.dnit[i64](?at);
         vector.dnit[u8](?cells);
         if (sel parsed.err) { ret res[Loaded, Error].err{parsed.err}; }
-        ret res[Loaded, Error].ok{Loaded{foreign: h.ruled && sel h.rule.none}};
+        ret res[Loaded, Error].ok{Loaded{foreign: foreign(?h)}};
     }
 
     # an old dense world is a custom pattern, centred on the origin
@@ -820,6 +851,36 @@ test load_world__round_trips_a_highlife_world_its_generation_and_view {
     sim.step(?t);
     if (t.generation != 5 || !sim.alive(?t, 50, 50)) { ret 11; }
 
+    sim.dnit(?s);
+    sim.dnit(?t);
+    ret 0;
+}
+
+test load_world__round_trips_a_wide_weighted_kernel {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    kernel.set_radius(?s.kernel, 2);
+    kernel.set_weight(?s.kernel, -2, 0, -4);
+    kernel.set_weight(?s.kernel, 1, 2, 3);
+    s.kernel.birth = kernel.set_bit(s.kernel.birth, 11);
+    block(?s, 0, 0);
+    var v: View = View{pan_x: 0.0, pan_y: 0.0, zoom: 1.0, mode: render.MODE_SOLID};
+
+    val path:  str        = "out/test/test_weighted.cellar";
+    val saved: err[Error] = save_world(?a, ?s, ?v, path);
+    if (sel saved.err) { ret 2; }
+    var t:     sim.Sim;
+    val made2: err[allo.Error] = sim.init(?t, ?a);
+    if (sel made2.err) { ret 3; }
+    val loaded: res[Loaded, Error] = load_world(?a, ?t, ?v, path);
+    fs.remove_file(path);
+    if (sel loaded.err)                                                      { ret 4; }
+    if (loaded.ok.foreign || t.kernel.radius != 2)                           { ret 5; }
+    if (!kernel.same_rule(?t.kernel, ?s.kernel))                             { ret 6; }
+    if (kernel.weight_at(?t.kernel, -2, 0) != -4 || sim.population(?t) != 4) { ret 7; }
     sim.dnit(?s);
     sim.dnit(?t);
     ret 0;
@@ -1055,6 +1116,15 @@ test load_world__reads_cellar_2_and_every_cellar_3_header {
     if (sel odd.err)                                                               { ret 7; }
     if (!odd.ok.foreign || !kernel.same_rule(?s.kernel, ?hl) || s.generation != 3) { ret 7; }
 
+    # a whole kernel is preferred to the notation beside it, and one this
+    # version cannot run is foreign even beside a rule it can
+    val both: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v3_both.cellar", "cellar 3\nrule B3/S23\nkernel 1 64 12 1 1 1 1 0 1 1 1 1\n\n");
+    if (sel both.err)                                                      { ret 12; }
+    if (both.ok.foreign || s.kernel.birth != 64 || s.kernel.survive != 12) { ret 12; }
+    val wide: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v3_wide.cellar", "cellar 3\nrule B3/S23\nkernel 9 8 12 1\n\n");
+    if (sel wide.err)                             { ret 13; }
+    if (!wide.ok.foreign || s.kernel.birth != 64) { ret 13; }
+
     # a version from the future, a header that never ends, and a value that
     # cannot be read, are refused untouched
     val four: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v4.cellar", "cellar 4\n\n");
@@ -1064,7 +1134,7 @@ test load_world__reads_cellar_2_and_every_cellar_3_header {
     if (!sel open.err) { ret 9; }
     val nan: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v3_nan.cellar", "cellar 3\nzoom nan\n\n");
     if (!sel nan.err)                                 { ret 10; }
-    if (sim.population(?s) != 2 || s.generation != 3) { ret 11; }
+    if (sim.population(?s) != 2 || s.generation != 0) { ret 11; }
     sim.dnit(?s);
     ret 0;
 }
