@@ -854,7 +854,7 @@ fun same_world(a: *Sim, b: *Sim) bool {
 
 # seed the same soups and far-flung glider into a world
 #[testing]
-fun seed_world(s: *Sim) {
+pub fun seed_world(s: *Sim) {
     s.rng = rand.seed(1, 2, 3, 4);
     fill_begin(s);
     var y: i64 = -70;
@@ -927,41 +927,125 @@ fun bulk_edit(s: *Sim) {
     edit_end(s);
 }
 
-test frame__steps_on_the_gpu_exactly_as_the_cpu_does {
+# a world the CPU steps and, where a GPU can step one, the same world on the GPU
+# beside it, for tests that hold the two engines to the same result
+# ---
+# a:    allocator behind both worlds
+# cpu:  the world the CPU steps
+# gpu:  the world the GPU steps, attached only when on
+# on:   a GPU steps gpu
+# w:    the window the renderer draws to
+# r:    the renderer
+# g:    the GPU side of gpu
+# made: how far the GPU's setup got, 1 window, 2 renderer, 3 GPU side
+#[testing]
+pub rec Rig {
+    a:    allo.Allocator;
+    cpu:  Sim;
+    gpu:  Sim;
+    on:   bool;
+    w:    window.Window;
+    r:    gfx.Renderer;
+    g:    gpu.Gpu;
+    made: u8;
+}
+
+# seed both worlds and attach the GPU world where a GPU can step it
+#
+# a machine with no window, no renderer or no compute stages leaves on false,
+# so a test runs on the CPU alone or skips.
+# ---
+# t:    the rig; it must not move once opened
+# seed: fills a world, run on each before the GPU is made
+# ret:  0 when open, or the failure's code
+#[testing]
+pub fun rig_open(t: *Rig, seed: fun(*Sim)) i32 {
+    t.on   = false;
+    t.made = 0;
+    page.make(?t.a);
+    val m1: err[allo.Error] = init(?t.cpu, ?t.a);
+    if (sel m1.err) { ret 1; }
+    val m2: err[allo.Error] = init(?t.gpu, ?t.a);
+    if (sel m2.err) { ret 2; }
+    seed(?t.cpu);
+    seed(?t.gpu);
+
     val opened: res[window.Window, window.WindowError] = window.window_open(64, 64, "cellar gpu test");
     if (sel opened.err) {
-        print.eprintln("skipped: no window can be opened here");
+        print.eprintln("no window can be opened here: the CPU alone runs");
         ret 0;
     }
-    var w:  window.Window  = opened.ok;
-    var r:  gfx.Renderer;
-    val up: err[gfx.Error] = gfx.renderer_init(?r, ?w);
+    t.w    = opened.ok;
+    t.made = 1;
+    val up: err[gfx.Error] = gfx.renderer_init(?t.r, ?t.w);
     if (sel up.err) {
-        print.eprintlnf("skipped: no renderer: {}", gfx.error_message(up.err));
+        print.eprintlnf("no renderer: the CPU alone runs: {}", gfx.error_message(up.err));
         ret 0;
     }
-    var a: allo.Allocator;
-    page.make(?a);
-
-    var cpu_world: Sim;
-    var gpu_world: Sim;
-    val m1:        err[allo.Error] = init(?cpu_world, ?a);
-    if (sel m1.err) { ret 1; }
-    val m2: err[allo.Error] = init(?gpu_world, ?a);
-    if (sel m2.err) { ret 2; }
-    seed_world(?cpu_world);
-    seed_world(?gpu_world);
-
+    t.made = 2;
     var heat: [1024]f32;
     var age:  [1024]f32;
-    var g:    gpu.Gpu;
-    val made: err[gfx.Error] = gpu.init(?g, ?a, ?r, gpu_world.space.cap, ?heat[0], ?age[0]);
+    val made: err[gfx.Error] = gpu.init(?t.g, ?t.a, ?t.r, t.gpu.space.cap, ?heat[0], ?age[0]);
     if (sel made.err) { ret 3; }
-    if (!g.stepping) {
-        print.eprintln("skipped: the compute stages were refused");
+    t.made = 3;
+    if (!t.g.stepping) {
+        print.eprintln("the compute stages were refused: the CPU alone runs");
         ret 0;
     }
-    attach(?gpu_world, ?g);
+    attach(?t.gpu, ?t.g);
+    t.on = true;
+    ret 0;
+}
+
+# advance both worlds n generations
+#[testing]
+pub fun rig_step(t: *Rig, n: u64) {
+    var i: u64 = 0;
+    for (i < n) {
+        step(?t.cpu);
+        step(?t.gpu);
+        i = i + 1;
+    }
+}
+
+# let the GPU record every generation owed and go idle, its cells left on the
+# device and the host's staging behind them
+#[testing]
+pub fun rig_settle(t: *Rig) bool {
+    if (!t.on)                                          { ret true; }
+    if (!settle_frames(?t.r, ?t.gpu, t.cpu.generation)) { ret false; }
+    gfx.renderer_wait_idle(?t.r);
+    ret true;
+}
+
+# settle the GPU and whether its world is the CPU's, cell for cell
+#[testing]
+pub fun rig_same(t: *Rig) bool {
+    if (!t.on)          { ret true; }
+    if (!rig_settle(t)) { ret false; }
+    val synced: err[gfx.Error] = sync(?t.gpu);
+    if (sel synced.err) { ret false; }
+    ret same_world(?t.cpu, ?t.gpu);
+}
+
+# release what rig_open made
+#[testing]
+pub fun rig_close(t: *Rig) {
+    if (t.made >= 3) { gpu.dnit(?t.g); }
+    dnit(?t.cpu);
+    dnit(?t.gpu);
+    if (t.made >= 2) { gfx.renderer_dnit(?t.r); }
+    if (t.made >= 1) { window.window_close(?t.w); }
+}
+
+test frame__steps_on_the_gpu_exactly_as_the_cpu_does {
+    var t:    Rig;
+    val code: i32 = rig_open(?t, seed_world);
+    if (code != 0) { ret code; }
+    if (!t.on) {
+        rig_close(?t);
+        ret 0;
+    }
 
     # blocks painted far apart grow the pool past what the GPU was built for
     var b: i64 = 0;
@@ -970,8 +1054,8 @@ test frame__steps_on_the_gpu_exactly_as_the_cpu_does {
         for (c < 4) {
             val x: i64 = b * 1000 + (c % 2)::i64;
             val y: i64 = 7000 + (c / 2)::i64;
-            paint(?cpu_world, x, y, 1);
-            paint(?gpu_world, x, y, 1);
+            paint(?t.cpu, x, y, 1);
+            paint(?t.gpu, x, y, 1);
             c = c + 1;
         }
         b = b + 1;
@@ -979,44 +1063,26 @@ test frame__steps_on_the_gpu_exactly_as_the_cpu_does {
 
     # life for 60 generations, then a wide weighted rule for 30 more
     var phase: usize = 0;
-    var gens:  u64   = 0;
     for (phase < 2) {
         var n: u64 = 60;
         if (phase == 1) {
             # the GPU runs on past the host's staging cells, and a bulk edit then
             # pulls the chunks it covers before writing them whole
-            var e: u64 = 0;
-            for (e < 5) {
-                step(?cpu_world);
-                step(?gpu_world);
-                e = e + 1;
-            }
-            gens = gens + 5;
-            if (!settle_frames(?r, ?gpu_world, gens)) { ret 4; }
-            gfx.renderer_wait_idle(?r);
-            bulk_edit(?cpu_world);
-            bulk_edit(?gpu_world);
-            n                = 30;
-            cpu_world.kernel = wide_rule();
-            gpu_world.kernel = wide_rule();
+            rig_step(?t, 5);
+            if (!rig_settle(?t)) { ret 4; }
+            bulk_edit(?t.cpu);
+            bulk_edit(?t.gpu);
+            n            = 30;
+            t.cpu.kernel = wide_rule();
+            t.gpu.kernel = wide_rule();
         }
-        var i: u64 = 0;
-        for (i < n) {
-            step(?cpu_world);
-            step(?gpu_world);
-            i = i + 1;
-        }
-        gens = gens + n;
-        if (!settle_frames(?r, ?gpu_world, gens)) { ret 4; }
-        gfx.renderer_wait_idle(?r);
-        val synced: err[gfx.Error] = sync(?gpu_world);
-        if (sel synced.err)                      { ret 5; }
-        if (!same_world(?cpu_world, ?gpu_world)) { ret 6 + phase::i32; }
+        rig_step(?t, n);
+        if (!rig_same(?t)) { ret 6 + phase::i32; }
         # the census the GPU's readout and graph read agrees with the CPU's
-        if (population(?cpu_world) != population(?gpu_world))                                             { ret 9; }
-        if (history.pop_at(?gpu_world.history, gpu_world.history.len - 1) != population(?cpu_world)::u64) { ret 10; }
-        val cb: opt[space.Box] = bounds(?cpu_world);
-        val gb: opt[space.Box] = bounds(?gpu_world);
+        if (population(?t.cpu) != population(?t.gpu))                                         { ret 9; }
+        if (history.pop_at(?t.gpu.history, t.gpu.history.len - 1) != population(?t.cpu)::u64) { ret 10; }
+        val cb: opt[space.Box] = bounds(?t.cpu);
+        val gb: opt[space.Box] = bounds(?t.gpu);
         if (sel cb.none) { ret 11; }
         if (sel gb.none) { ret 12; }
         if (cb.some.x0 != gb.some.x0 || cb.some.y0 != gb.some.y0 || cb.some.x1 != gb.some.x1 || cb.some.y1 != gb.some.y1) {
@@ -1024,12 +1090,7 @@ test frame__steps_on_the_gpu_exactly_as_the_cpu_does {
         }
         phase = phase + 1;
     }
-    if (population(?cpu_world) == 0) { ret 8; }
-
-    gpu.dnit(?g);
-    dnit(?cpu_world);
-    dnit(?gpu_world);
-    gfx.renderer_dnit(?r);
-    window.window_close(?w);
+    if (population(?t.cpu) == 0) { ret 8; }
+    rig_close(?t);
     ret 0;
 }
