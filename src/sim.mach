@@ -29,8 +29,16 @@
 # generations, which flipped says: the draw shows those inverted, and edits and
 # reads see the world through them, so a cell painted live is live whatever the
 # parity. the phase follows from the rule and the generation, which snapshots
-# and world files keep, so nothing else records it. the population and bounds
-# count the cells as held.
+# and world files keep, so nothing else records it.
+#
+# what a read returns on such a generation depends on the grid. on a grid
+# bounded along both axes the world is finite, and alive, read_run, population,
+# bounds, state_bounds and world_chunks all report its true cells: live inside
+# the grid as the draw shows, dead off it (complemented). on any other grid the
+# truth is infinite, and population, bounds, state_bounds and world_chunks
+# report the cells as held, while alive and read_run still see through the
+# phase. chunks and chunk_cells are the pool's storage as held on every grid,
+# for a world file that keeps the generation.
 #
 # the hashlife member holds the world in a hash-consed quadtree
 # (cellar.hashlife) and has no pool, no heat and no age: a step advances 2^k
@@ -1801,9 +1809,20 @@ pub fun alive(s: *Sim, x: i64, y: i64) bool {
     ret space.live(?s.space, cell(s, x, y)) != flipped(s);
 }
 
+# whether reads report the true cells of a world the pool holds as the
+# complement of them: a finite grid on a generation a flipping background is
+# held as its complement, see the header
+pub fun complemented(s: *Sim) bool {
+    ret flipped(s) && topology.finite(?s.rule.grid);
+}
+
 # live cells in the world, as of the last step or census
+#
+# on a complemented world, the grid's cells less the live cells as held, none
+# of which lie off the grid
 pub fun population(s: *Sim) usize {
-    if (on_tree(s)) { ret hashlife.population(?s.tree)::usize; }
+    if (complemented(s)) { ret (s.rule.grid.w * s.rule.grid.h)::usize - space.population(?s.space); }
+    if (on_tree(s))      { ret hashlife.population(?s.tree)::usize; }
     ret space.population(?s.space);
 }
 
@@ -1812,7 +1831,8 @@ pub fun population(s: *Sim) usize {
 # s:   simulation
 # ret: the box, or none when nothing is alive
 pub fun bounds(s: *Sim) opt[space.Box] {
-    if (!on_tree(s)) { ret space.bounds(?s.space); }
+    if (complemented(s)) { ret complement_bounds(s); }
+    if (!on_tree(s))     { ret space.bounds(?s.space); }
     if (s.boxed != s.epoch) {
         var e: [4]i64;
         s.box = opt[space.Box].none{};
@@ -1820,6 +1840,35 @@ pub fun bounds(s: *Sim) opt[space.Box] {
         s.boxed = s.epoch;
     }
     ret s.box;
+}
+
+# the smallest box holding every live cell of a complemented world
+#
+# the box starts as the grid and each side moves in past the rows or columns
+# with nothing alive. it reads the host's cells, so on the GPU only after sync.
+fun complement_bounds(s: *Sim) opt[space.Box] {
+    val g: *topology.Grid = ?s.rule.grid;
+    var b: space.Box      = space.Box{x0: topology.left(g), y0: topology.top(g), x1: topology.left(g) + g.w, y1: topology.top(g) + g.h};
+    if (population(s) == 0) { ret opt[space.Box].none{}; }
+    for (b.y0 < b.y1 && !any_alive(s, b.x0, b.y0, b.x1, b.y0 + 1)) { b.y0 = b.y0 + 1; }
+    for (b.y1 > b.y0 && !any_alive(s, b.x0, b.y1 - 1, b.x1, b.y1)) { b.y1 = b.y1 - 1; }
+    for (b.x0 < b.x1 && !any_alive(s, b.x0, b.y0, b.x0 + 1, b.y1)) { b.x0 = b.x0 + 1; }
+    for (b.x1 > b.x0 && !any_alive(s, b.x1 - 1, b.y0, b.x1, b.y1)) { b.x1 = b.x1 - 1; }
+    ret opt[space.Box].some{b};
+}
+
+# whether any cell in [x0, x1) by [y0, y1) is alive
+fun any_alive(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64) bool {
+    var y: i64 = y0;
+    for (y < y1) {
+        var x: i64 = x0;
+        for (x < x1) {
+            if (alive(s, x, y)) { ret true; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    ret false;
 }
 
 # hand every chunk holding a state but 0, a dying one included, to f, with its
@@ -1879,6 +1928,58 @@ pub fun chunk_cells(s: *Sim, cx: i64, cy: i64, out: *u8) {
     }
 }
 
+# the states of the chunk at (cx, cy) as the world reads them: chunk_cells, but
+# a complemented world's true cells, dead off the grid
+# ---
+# s:   simulation, with no edit open
+# cx:  chunk column
+# cy:  chunk row
+# out: receives space.CELLS states, row-major
+pub fun world_chunk_cells(s: *Sim, cx: i64, cy: i64, out: *u8) {
+    chunk_cells(s, cx, cy, out);
+    if (!complemented(s)) { ret; }
+    val g: *topology.Grid = ?s.rule.grid;
+    var i: usize          = 0;
+    for (i < space.CELLS) {
+        val x: i64 = cx * space.SIDE + (i % space.SIDE::usize)::i64;
+        val y: i64 = cy * space.SIDE + (i / space.SIDE::usize)::i64;
+        if (topology.holds(g, x, y)) { out[i] = 1 - out[i]; }
+        or                           { out[i] = 0; }
+        i = i + 1;
+    }
+}
+
+# hand every chunk holding a state but 0 as the world reads it to f: chunks, but
+# a complemented world's true cells, which lie in every chunk on the grid
+# ---
+# s:   simulation
+# f:   the visit
+# ctx: passed back to f
+pub fun world_chunks(s: *Sim, f: hashlife.Visit, ctx: *u8) {
+    if (!complemented(s)) {
+        chunks(s, f, ctx);
+        ret;
+    }
+    val g:   *topology.Grid = ?s.rule.grid;
+    var buf: [4096]u8;
+    var cy:  i64            = space.chunk_of(topology.top(g));
+    for (cy <= space.chunk_of(topology.top(g) + g.h - 1)) {
+        var cx: i64 = space.chunk_of(topology.left(g));
+        for (cx <= space.chunk_of(topology.left(g) + g.w - 1)) {
+            world_chunk_cells(s, cx, cy, ?buf[0]);
+            var any: bool  = false;
+            var i:   usize = 0;
+            for (i < space.CELLS) {
+                if (buf[i] != 0) { any = true; }
+                i = i + 1;
+            }
+            if (any) { f(ctx, cx, cy, ?buf[0]); }
+            cx = cx + 1;
+        }
+        cy = cy + 1;
+    }
+}
+
 # the smallest box holding every cell in a state but 0, dying ones included
 #
 # it reads the host's cells, so on the GPU only after sync. the tree counts
@@ -1887,7 +1988,7 @@ pub fun chunk_cells(s: *Sim, cx: i64, cy: i64, out: *u8) {
 # s:   simulation
 # ret: the box, half-open, or none when every cell is 0
 pub fun state_bounds(s: *Sim) opt[space.Box] {
-    if (on_tree(s)) { ret bounds(s); }
+    if (on_tree(s) || complemented(s)) { ret bounds(s); }
     val sp:  *space.Space = ?s.space;
     var b:   space.Box    = space.Box{x0: 0, y0: 0, x1: 0, y1: 0};
     var any: bool         = false;
