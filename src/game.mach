@@ -18,11 +18,14 @@ use boom.context.Context;
 use boom.context.context_fail;
 use boom.context.context_stop;
 use boom.context.context_user;
+use boom.event.Event;
+use boom.event.queue_pop;
 use gfx: boom.graphics;
 use inp: boom.input;
 use gm:  boom.math;
 use win: boom.window;
 use cellar.app;
+use cellar.args;
 use cellar.arrange;
 use cellar.command;
 use cellar.config;
@@ -92,13 +95,14 @@ val SMALL_PX: f32 = 14.0;
 # faces_at:    the interface scale the faces were built for, 0 for none
 # snap:        a screenshot being read back
 # capture:     a path to save one screenshot to and quit, or nil
+# open:        a world or pattern file to open at startup, or nil
 # countdown:   frames left before that screenshot
 # owed:        seconds of capped stepping carried to the next tick
 # sim_ok:      sim holds a pool to release
 # renderer_ok: renderer is initialized
 # gpu:         the world's side on the GPU
 # gpu_ok:      gpu is initialized
-# bench:       the measurement being run, BENCH_NONE for a normal session
+# bench:       the measurement being run, args.BENCH_NONE for a normal session
 # bench_cpu:   the measurement steps on the CPU
 # bench_secs:  seconds the measurement runs for
 # started:     when the measurement began
@@ -117,6 +121,7 @@ pub rec Game {
     faces_at:    f32;
     snap:        shot.Shot;
     capture:     str;
+    open:        str;
     countdown:   i32;
     owed:        f64;
     sim_ok:      bool;
@@ -133,12 +138,6 @@ pub rec Game {
 
 # frames a measurement lets pass before it starts the clock
 val WARMUP: u64 = 30;
-# no measurement: a normal session
-pub val BENCH_NONE: u8 = 0;
-# a 512 by 512 random soup
-pub val BENCH_DENSE: u8 = 1;
-# 400 small soups a thousand cells apart, a world twenty thousand cells across
-pub val BENCH_SPARSE: u8 = 2;
 
 fun game_of(ctx: *Context) *Game {
     ret context_user(ctx)::*Game;
@@ -193,7 +192,7 @@ pub fun on_init(ctx: *Context) {
     }
     g.sim_ok = true;
     # restore saved settings and the kernel before seeding the world
-    if (g.bench == BENCH_NONE && g.paths.ok) {
+    if (g.bench == args.BENCH_NONE && g.paths.ok) {
         var sp:     [1088]u8;
         val loaded: err[persist.Error] = config.load(?g.a, ?g.app, ?g.sim, settings(g, ?sp[0]));
         if (sel loaded.err) { print.eprintlnf("settings ignored: {}", persist.error_message(loaded.err)); }
@@ -231,15 +230,24 @@ pub fun on_init(ctx: *Context) {
     sim.attach(?g.sim, ?g.gpu);
 
     # the world is seeded once the GPU has set how far the pool may grow
-    if (g.bench != BENCH_NONE) { bench_world(g); }
+    if (g.bench != args.BENCH_NONE) { bench_world(g); }
     or {
-        world.randomize(?g.sim, app.bounds_size(g.app.bounds_idx));
+        # a file named on the command line is opened onto an empty world with the
+        # first frame, like any other load; with none the world starts random
+        if (g.open != nil) { open_at_start(g); }
+        or                 { world.randomize(?g.sim, app.bounds_size(g.app.bounds_idx)); }
         # a documentation capture shows the world a few generations in
         if (g.capture != nil) { world.toggle(?g.sim); }
     }
 
     val spawned: err[thread.ThreadError] = runner.start(?g.runner, ?g.sim);
     if (sel spawned.err) { give_up(ctx, "could not start the simulation thread"); }
+}
+
+# queue the file named on the command line to open with the first frame
+fun open_at_start(g: *Game) {
+    val f: opt[command.File] = app.file(?g.app, g.open);
+    if (sel f.some) { app.submit(?g.app, command.Command.open{f.some}); }
 }
 
 # release the faces
@@ -311,7 +319,7 @@ fun keys(ctx: *Context, g: *Game) {
     if (inp.key_pressed(in, inp.KEY_R))                                    { app.submit(a, command.Command.randomize{app.bounds_size(a.bounds_idx)}); }
     if (inp.key_pressed(in, inp.KEY_M))                                    { a.mode = (a.mode + 1) % app.MODE_COUNT; }
     if (inp.key_pressed(in, inp.KEY_G))                                    { a.gutter = 1 - a.gutter; }
-    if (inp.key_pressed(in, inp.KEY_F))                                    { a.refit = true; }
+    if (inp.key_pressed(in, inp.KEY_F))                                    { app.frame_area(a); }
     if (inp.key_pressed(in, inp.KEY_D))                                    { a.tool = app.TOOL_DRAW; }
     if (inp.key_pressed(in, inp.KEY_E))                                    { a.tool = app.TOOL_ERASE; }
     if (inp.key_pressed(in, inp.KEY_T))                                    { a.tool = app.TOOL_STAMP; }
@@ -323,6 +331,16 @@ fun keys(ctx: *Context, g: *Game) {
     if (inp.key_pressed(in, inp.KEY_F12))                                  { a.shot = true; }
 }
 
+# hand the window's queued events, typed text among them, to the interface in
+# order, so none waits for a later tick or is dropped when the queue fills
+fun events(ctx: *Context, g: *Game) {
+    for {
+        val e: opt[Event] = queue_pop(?ctx.events);
+        if (sel e.none) { brk; }
+        ui.feed(?g.ui, e.some);
+    }
+}
+
 # read the keyboard, scroll and pan, and run capped stepping
 fun tick(ctx: *Context) {
     val g:  *Game      = game_of(ctx);
@@ -330,7 +348,11 @@ fun tick(ctx: *Context) {
     val a:  *app.App   = ?g.app;
     val u:  *ui.Ui     = ?g.ui;
 
-    keys(ctx, g);
+    # while a field has the keyboard the key bindings stay quiet, including on
+    # the tick whose enter or escape gives it back
+    val typing: bool = ui.typing(u);
+    events(ctx, g);
+    if (!typing)       { keys(ctx, g); }
     if (a.toast_t > 0) { a.toast_t = a.toast_t - 1; }
 
     val sw: f32         = ctx.window.width::f32;
@@ -348,10 +370,12 @@ fun tick(ctx: *Context) {
     # the pan is the view centre in cells, moved by pixels at the current zoom
     val ppc:  f32 = render.BASE_PPC * a.zoom;
     val step: f32 = ui.px(u, PAN_STEP) / ppc;
-    if (inp.key_down(in, inp.KEY_LEFT))  { a.pan_x = a.pan_x - step::f64; }
-    if (inp.key_down(in, inp.KEY_RIGHT)) { a.pan_x = a.pan_x + step::f64; }
-    if (inp.key_down(in, inp.KEY_UP))    { a.pan_y = a.pan_y - step::f64; }
-    if (inp.key_down(in, inp.KEY_DOWN))  { a.pan_y = a.pan_y + step::f64; }
+    if (!typing && !ui.typing(u)) {
+        if (inp.key_down(in, inp.KEY_LEFT))  { a.pan_x = a.pan_x - step::f64; }
+        if (inp.key_down(in, inp.KEY_RIGHT)) { a.pan_x = a.pan_x + step::f64; }
+        if (inp.key_down(in, inp.KEY_UP))    { a.pan_y = a.pan_y - step::f64; }
+        if (inp.key_down(in, inp.KEY_DOWN))  { a.pan_y = a.pan_y + step::f64; }
+    }
     # the tick's movement only, so the press that starts a drag never jumps
     if (inp.button_down(in, inp.BUTTON_RIGHT) || inp.button_down(in, inp.BUTTON_MIDDLE)) {
         a.pan_x = a.pan_x - in.mouse_dx / ppc::f64;
@@ -387,14 +411,19 @@ fun zoom_at(a: *app.App, pt: render.Port, mx: f32, my: f32, notches: f32) {
     a.pan_y = a.pan_y + by - ay;
 }
 
-# centre the randomize area and zoom until it just fits
-fun frame_area(a: *app.App, pt: render.Port) {
-    var fit: f32 = pt.w;
-    if (pt.h < fit) { fit = pt.h; }
-    a.zoom  = fit * 0.9 / app.bounds_size(a.bounds_idx)::f32 / render.BASE_PPC;
-    a.zoom  = app.clamp_zoom(a.zoom);
-    a.pan_x = 0.0;
-    a.pan_y = 0.0;
+# centre the cells the app asks to frame, the randomize area or an opened
+# pattern, and zoom until they just fit
+fun frame(a: *app.App, pt: render.Port) {
+    val b: space.Box = app.fit_box(a);
+    var w: f32       = (b.x1 - b.x0)::f32;
+    var h: f32       = (b.y1 - b.y0)::f32;
+    if (w < 1.0) { w = 1.0; }
+    if (h < 1.0) { h = 1.0; }
+    var z: f32 = pt.w / w;
+    if (pt.h / h < z) { z = pt.h / h; }
+    a.zoom  = app.clamp_zoom(z * 0.9 / render.BASE_PPC);
+    a.pan_x = (b.x0 + b.x1)::f64 / 2.0;
+    a.pan_y = (b.y0 + b.y1)::f64 / 2.0;
 }
 
 # whether the simulation runs uncapped
@@ -535,7 +564,7 @@ pub fun on_draw(ctx: *Context) {
     runner.enter(?g.runner);
     # the world's edits and file actions run first: a save reads the GPU's
     # cells back, which is only valid before the frame records anything
-    var deps: exec.Deps = exec.Deps{a: ?g.a, p: ?g.paths};
+    var deps: exec.Deps = exec.Deps{a: ?g.a};
     exec.run(a, ?g.sim, ?deps);
     # take the census before this frame's own readback can reuse its slot
     sim.collect(?g.sim);
@@ -543,7 +572,7 @@ pub fun on_draw(ctx: *Context) {
     a.side_x0 = panel.left(u, a, sw);
     val pt: render.Port = panel.port(u, a, sw, sh);
     if (a.refit) {
-        frame_area(a, pt);
+        frame(a, pt);
         a.refit = false;
     }
     val cam: render.Camera = camera(a, pt);
@@ -558,7 +587,7 @@ pub fun on_draw(ctx: *Context) {
         context_fail(ctx, 1);
         ret;
     }
-    if (g.bench != BENCH_NONE) { bench_frame(ctx, g); }
+    if (g.bench != args.BENCH_NONE) { bench_frame(ctx, g); }
 
     var desc: gfx.PassDesc = gfx.pass_overlay();
     desc.clear = opt[gm.Vec4].some{gm.vec4(look.back[0], look.back[1], look.back[2], 1.0)};
@@ -569,7 +598,7 @@ pub fun on_draw(ctx: *Context) {
     outline(g, cam);
     hover(g, pt, cam);
     ghost(g, pt, cam);
-    if (g.bench == BENCH_NONE) {
+    if (g.bench == args.BENCH_NONE) {
         hud.readout(u, a, ?g.sim, pt);
         hud.position(u, cam, pt, u.mx < a.side_x0 && ui.inside(u, 0.0, 0.0, pt.w, pt.h));
         panel.draw(u, a, ?g.sim, ?g.paths, sw, sh);
@@ -641,7 +670,7 @@ pub fun capture_after(g: *Game, path: str, frames: i32) {
 pub fun on_dnit(ctx: *Context) {
     val g: *Game = game_of(ctx);
     runner.stop(?g.runner);
-    if (g.sim_ok && g.paths.ok && g.bench == BENCH_NONE && g.capture == nil) {
+    if (g.sim_ok && g.paths.ok && g.bench == args.BENCH_NONE && g.capture == nil) {
         var sp:    [1088]u8;
         val saved: err[persist.Error] = config.save(?g.a, ?g.app, ?g.sim, settings(g, ?sp[0]));
         if (sel saved.err) {
@@ -665,7 +694,7 @@ pub fun on_dnit(ctx: *Context) {
 # seed the measured world and frame it, running uncapped
 fun bench_world(g: *Game) {
     val s: *sim.Sim = ?g.sim;
-    if (g.bench == BENCH_DENSE) {
+    if (g.bench == args.BENCH_DENSE) {
         sim.randomize(s, sim.DEFAULT_DENSITY, 512);
         g.app.zoom = 900.0 / 512.0 / render.BASE_PPC;
     }
