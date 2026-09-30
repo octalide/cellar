@@ -70,9 +70,10 @@ windows. The first run brings over anything an older version left in
 
 `cellar <file>` opens a file at startup: a `.cellar` world loads as the world,
 and a pattern in any format cellar reads (RLE, plaintext `.cells`, Life 1.05
-and 1.06) is stamped onto an empty world centred on the origin and framed, taking its
-rule when cellar can run it. A file that cannot be read leaves the world as it
-was and says why. Options may come before or after the file, and `--` ends
+and 1.06, Golly's Macrocell `.mc`) is stamped onto an empty world centred on the
+origin and framed, taking its rule when cellar can run it. A file that cannot be
+read, or a pattern too large for the world to hold, leaves the world as it was
+and says why. Options may come before or after the file, and `--` ends
 them, so `cellar -- -x.rle` opens a file whose name starts with a dash.
 
 `cellar --capture shot.png` draws a second of frames, saves the last one and

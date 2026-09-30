@@ -15,10 +15,13 @@ use cellar.cpu;
 use cellar.gpu;
 use cellar.history;
 use cellar.kernel;
+use cellar.snapshot;
 use cellar.space;
 use cellar.team;
 use allo: std.allocator;
 use std.allocator.page;
+use std.collections.set;
+use std.collections.set.Set;
 use mem: std.memory;
 use std.print;
 use std.rand;
@@ -251,6 +254,21 @@ pub fun fill_cell(s: *Sim, x: i64, y: i64) bool {
     ret true;
 }
 
+# seed a chunk's cells whole, between fill_begin and fill_end
+# ---
+# s:     simulation
+# cx:    chunk column
+# cy:    chunk row
+# cells: space.CELLS cells, row-major
+# ret:   false when the pool is full
+pub fun fill_chunk(s: *Sim, cx: i64, cy: i64, cells: *u32) bool {
+    val sl: u32 = space.alloc(?s.space, cx, cy);
+    if (sl == space.NONE) { ret false; }
+    mem.copy[u32](?s.space.cells[sl::usize * space.CELLS], cells, space.CELLS);
+    s.space.dirty[sl::usize] = s.space.dirty[sl::usize] | space.DIRTY_CELLS;
+    ret true;
+}
+
 # count what fill_cell seeded and surround every live chunk
 # ---
 # s:   simulation
@@ -292,6 +310,52 @@ pub fun randomize(s: *Sim, density: f32, side: usize) {
     fill_end(s);
 }
 
+# copy the world, its generation and its rule into a snapshot, pulling the
+# cells from the GPU first when it steps
+#
+# call outside a frame, or in one before gpu frame has recorded anything.
+# ---
+# s:   simulation
+# sn:  the snapshot, whose previous copy is replaced
+# ret: false when the GPU's cells could not be read or the copy not stored,
+#      leaving nothing held
+pub fun take(s: *Sim, sn: *snapshot.Snapshot) bool {
+    val synced: err[gfx.Error] = sync(s);
+    if (sel synced.err) {
+        snapshot.drop(sn);
+        ret false;
+    }
+    val copied: err[allo.Error] = snapshot.capture(sn, ?s.space, s.generation, ?s.kernel);
+    if (sel copied.err) { ret false; }
+    ret true;
+}
+
+# replace the world with a snapshot's, at its generation and under its rule,
+# paused
+#
+# the population history starts over from the restored generation.
+# ---
+# s:   simulation
+# sn:  a held snapshot, left as it is
+# ret: false when nothing is held, or the pool could not hold the world, which
+#      marks it full
+pub fun restore(s: *Sim, sn: *snapshot.Snapshot) bool {
+    if (!sn.held) { ret false; }
+    fill_begin(s);
+    var ok: bool  = true;
+    var i:  usize = 0;
+    for (i < sn.n && ok) {
+        ok = fill_chunk(s, sn.at[i * 2], sn.at[i * 2 + 1], ?sn.cells[i * space.CELLS]);
+        i  = i + 1;
+    }
+    if (!fill_end(s)) { ok = false; }
+    if (!ok)          { overflow(s); }
+    s.generation = sn.generation;
+    s.kernel     = sn.kernel;
+    s.running    = 0;
+    ret ok;
+}
+
 # the cell a state is written as: a live state starts at age 1 and full heat, a
 # dead one cold
 fun cell_of(v: u8) u32 {
@@ -308,6 +372,11 @@ fun in_area(s: *Sim, sl: usize) bool {
         && cy >= space.chunk_of(e.y0) && cy <= space.chunk_of(e.y1 - 1);
 }
 
+# whether the cells in [x0, x1) by [y0, y1) lie within the world's reach, space.REACH
+pub fun reaches(x0: i64, y0: i64, x1: i64, y1: i64) bool {
+    ret x0 >= 0 - space.REACH && y0 >= 0 - space.REACH && x1 <= space.REACH && y1 <= space.REACH;
+}
+
 # open a bulk edit of the cells in [x0, x1) by [y0, y1)
 #
 # cells inside the area are written with edit_set and edit_run and the rest of
@@ -322,9 +391,10 @@ fun in_area(s: *Sim, sl: usize) bool {
 # y0:  first row
 # x1:  column after the last
 # y1:  row after the last
-# ret: false when an edit is already open or the GPU's cells could not be read
+# ret: false when an edit is already open, the area passes the world's reach,
+#      or the GPU's cells could not be read
 pub fun edit_begin(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64) bool {
-    if (s.edit.open) { ret false; }
+    if (s.edit.open || !reaches(x0, y0, x1, y1)) { ret false; }
     val e: *Edit = ?s.edit;
     e.x0 = x0;
     e.y0 = y0;
@@ -480,6 +550,82 @@ pub fun edit_end(s: *Sim) bool {
     if (s.gpu != nil)  { gpu.note_edit(s.gpu); }
     if (!ok || e.lost) { overflow(s); }
     ret ok && !e.lost;
+}
+
+# a chunk's coordinates
+rec ChunkAt {
+    cx: i64;
+    cy: i64;
+}
+
+# the chunks an edit would add to the pool, measured before it is written
+#
+# a live cell's chunk and its eight neighbours all exist once an edit ends, so
+# those of them the pool lacks are what the edit adds, and a pattern needing
+# more than the pool has room for can be refused before any of it is written.
+# ---
+# s:     simulation measured against
+# add:   the chunks the edit would allocate
+# room:  slots the pool may still take
+# last:  the chunk the last run ended in, whose block is already counted
+# any:   whether last holds one
+# spent: the measure ran out of room or memory
+pub rec Need {
+    s:     *Sim;
+    add:   Set[ChunkAt];
+    room:  usize;
+    last:  ChunkAt;
+    any:   bool;
+    spent: bool;
+}
+
+# start measuring an edit against the pool as it stands
+# ---
+# n: measure to initialize; need_dnit releases it
+# s: simulation, left alone until the edit is written
+pub fun need_init(n: *Need, s: *Sim) {
+    n.s     = s;
+    n.add   = set.init[ChunkAt](s.space.a);
+    n.room  = 0;
+    n.any   = false;
+    n.spent = false;
+    if (s.space.max_slots > s.space.live) { n.room = s.space.max_slots - s.space.live; }
+}
+
+# release a measure
+pub fun need_dnit(n: *Need) {
+    set.dnit[ChunkAt](?n.add);
+}
+
+# count n live cells from (x, y) rightward into a measure
+# ---
+# ret: false once the edit needs more chunks than the pool has room for, or
+#      the measure could not grow
+pub fun need_run(n: *Need, x: i64, y: i64, count: usize) bool {
+    if (n.spent) { ret false; }
+    val cy: i64 = space.chunk_of(y);
+    var cx: i64 = space.chunk_of(x);
+    val to: i64 = space.chunk_of(x + count::i64 - 1);
+    for (cx <= to) {
+        if (!n.any || n.last.cx != cx || n.last.cy != cy) {
+            var k: i64 = 0;
+            for (k < 9) {
+                val at: ChunkAt = ChunkAt{cx: cx + k % 3 - 1, cy: cy + k / 3 - 1};
+                if (space.find(?n.s.space, at.cx, at.cy) == space.NONE) {
+                    val put: res[bool, allo.Error] = set.insert[ChunkAt](?n.add, at);
+                    if (sel put.err || set.length[ChunkAt](n.add) > n.room) {
+                        n.spent = true;
+                        ret false;
+                    }
+                }
+                k = k + 1;
+            }
+            n.last = ChunkAt{cx: cx, cy: cy};
+            n.any  = true;
+        }
+        cx = cx + 1;
+    }
+    ret true;
 }
 
 # set the cell at (x, y) to v, fresh: a live cell starts at age 1 and full
@@ -893,6 +1039,8 @@ test frame__steps_on_the_gpu_exactly_as_the_cpu_does {
         val synced: err[gfx.Error] = sync(?gpu_world);
         if (sel synced.err)                      { ret 5; }
         if (!same_world(?cpu_world, ?gpu_world)) { ret 6 + phase::i32; }
+        # the pyramids the draw reads below a pixel per cell hold what the cells do
+        if (!gpu.pyramids_hold(?g, ?gpu_world.space)) { ret 14; }
         # the census the GPU's readout and graph read agrees with the CPU's
         if (population(?cpu_world) != population(?gpu_world))                                             { ret 9; }
         if (history.pop_at(?gpu_world.history, gpu_world.history.len - 1) != population(?cpu_world)::u64) { ret 10; }
@@ -909,6 +1057,136 @@ test frame__steps_on_the_gpu_exactly_as_the_cpu_does {
 
     gpu.dnit(?g);
     dnit(?cpu_world);
+    dnit(?gpu_world);
+    gfx.renderer_dnit(?r);
+    window.window_close(?w);
+    ret 0;
+}
+
+# whether two snapshots hold the same chunks, cells, generation and rule, in
+# whatever order they were taken
+#[testing]
+fun same_snapshot(a: *snapshot.Snapshot, b: *snapshot.Snapshot) bool {
+    if (!a.held || !b.held || a.n != b.n || a.generation != b.generation) { ret false; }
+    if (!kernel.same_rule(?a.kernel, ?b.kernel))                          { ret false; }
+    var i: usize = 0;
+    for (i < a.n) {
+        var j: usize = 0;
+        for (j < b.n && (b.at[j * 2] != a.at[i * 2] || b.at[j * 2 + 1] != a.at[i * 2 + 1])) { j = j + 1; }
+        if (j == b.n)                                                                           { ret false; }
+        if (!mem.equal[u32](?a.cells[i * space.CELLS], ?b.cells[j * space.CELLS], space.CELLS)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# advance a world n generations, and on the GPU until they are recorded and
+# the device is idle
+#[testing]
+fun advance(r: *gfx.Renderer, s: *Sim, n: u64) bool {
+    var i: u64 = 0;
+    for (i < n) {
+        step(s);
+        i = i + 1;
+    }
+    if (!on_gpu(s))                                          { ret true; }
+    if (!settle_frames(r, s, s.generation + s.pending::u64)) { ret false; }
+    gfx.renderer_wait_idle(r);
+    ret true;
+}
+
+# run a seeded world 5 generations, take the start, run 40 more, reset under
+# another rule, and run 40 again, leaving what each run reached in runs[0] and
+# runs[1]
+# ---
+# ret: 0, or the step that failed
+#[testing]
+fun run_reset_run(r: *gfx.Renderer, s: *Sim, a: *allo.Allocator, runs: *snapshot.Snapshot) i32 {
+    seed_world(s);
+    # on the GPU the device runs on past the host's staging cells before the
+    # start is taken, so taking it must pull
+    if (!advance(r, s, 5)) { ret 1; }
+    var start: snapshot.Snapshot;
+    snapshot.init(?start, a);
+    if (!take(s, ?start)) { ret 2; }
+    var pass: usize = 0;
+    for (pass < 2) {
+        if (!advance(r, s, 40))    { ret 3; }
+        if (!take(s, ?runs[pass])) { ret 4; }
+        if (pass == 0) {
+            s.kernel = wide_rule();
+            if (!restore(s, ?start) || s.generation != 5 || s.running != 0) { ret 5; }
+            var life: kernel.Kernel = kernel.life();
+            if (!kernel.same_rule(?s.kernel, ?life)) { ret 6; }
+            if (!advance(r, s, 0))                   { ret 7; }
+            var back: snapshot.Snapshot;
+            snapshot.init(?back, a);
+            if (!take(s, ?back) || !same_snapshot(?back, ?start)) { ret 8; }
+            snapshot.dnit(?back);
+        }
+        pass = pass + 1;
+    }
+    if (runs[0].n == 0 || runs[1].generation != 45) { ret 9; }
+    if (!same_snapshot(?runs[0], ?runs[1]))         { ret 10; }
+    snapshot.dnit(?start);
+    ret 0;
+}
+
+test reset__run_reset_run_reproduces_the_generations_on_both_engines {
+    var a: allo.Allocator;
+    page.make(?a);
+    var cpu_runs: [2]snapshot.Snapshot;
+    var gpu_runs: [2]snapshot.Snapshot;
+    var k:        usize = 0;
+    for (k < 2) {
+        snapshot.init(?cpu_runs[k], ?a);
+        snapshot.init(?gpu_runs[k], ?a);
+        k = k + 1;
+    }
+    var cpu_world: Sim;
+    val m1:        err[allo.Error] = init(?cpu_world, ?a);
+    if (sel m1.err) { ret 1; }
+    val on_cpu: i32 = run_reset_run(nil, ?cpu_world, ?a, ?cpu_runs[0]);
+    if (on_cpu != 0) { ret 10 + on_cpu; }
+    dnit(?cpu_world);
+
+    val opened: res[window.Window, window.WindowError] = window.window_open(64, 64, "cellar reset test");
+    if (sel opened.err) {
+        print.eprintln("skipped on the GPU: no window can be opened here");
+        ret 0;
+    }
+    var w:  window.Window  = opened.ok;
+    var r:  gfx.Renderer;
+    val up: err[gfx.Error] = gfx.renderer_init(?r, ?w);
+    if (sel up.err) {
+        print.eprintlnf("skipped on the GPU: no renderer: {}", gfx.error_message(up.err));
+        ret 0;
+    }
+    var gpu_world: Sim;
+    val m2:        err[allo.Error] = init(?gpu_world, ?a);
+    if (sel m2.err) { ret 2; }
+    var heat: [1024]f32;
+    var age:  [1024]f32;
+    var g:    gpu.Gpu;
+    val made: err[gfx.Error] = gpu.init(?g, ?a, ?r, gpu_world.space.cap, ?heat[0], ?age[0]);
+    if (sel made.err) { ret 3; }
+    if (!g.stepping) {
+        print.eprintln("skipped on the GPU: the compute stages were refused");
+        ret 0;
+    }
+    attach(?gpu_world, ?g);
+    val on_dev: i32 = run_reset_run(?r, ?gpu_world, ?a, ?gpu_runs[0]);
+    if (on_dev != 0) { ret 30 + on_dev; }
+    # the engines agree on every generation either run reached
+    if (!same_snapshot(?cpu_runs[0], ?gpu_runs[0])) { ret 4; }
+
+    k = 0;
+    for (k < 2) {
+        snapshot.dnit(?cpu_runs[k]);
+        snapshot.dnit(?gpu_runs[k]);
+        k = k + 1;
+    }
+    gpu.dnit(?g);
     dnit(?gpu_world);
     gfx.renderer_dnit(?r);
     window.window_close(?w);

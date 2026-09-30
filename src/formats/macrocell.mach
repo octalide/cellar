@@ -1,0 +1,928 @@
+# Macrocell, Golly's quadtree format for patterns far larger than memory
+#
+# a file opens with a "[M2]" line, then '#' lines and one node per line,
+# children before their parents, the last node the root. a node of level k is a
+# 2^k square split into four of level k - 1, written "k nw ne sw se" with each
+# child the line number of an earlier node, counting nodes only and from 1, or
+# 0 for an empty square. the two-state form writes its 8 by 8 squares as leaf
+# lines of '.' (dead), '*' (live) and '$' (end of row), top row first, and the
+# multi-state form writes its 2 by 2 squares as "1 nw ne sw se" with each a
+# state up to 255. a file may use both. the root of level k sits where Golly
+# puts it, its top-left cell at (-2^(k-1), 1 - 2^(k-1)). the '#' lines read are
+# #R (the rule, kept untouched), #N (name) and #C and #D (comments, kept
+# together); any other '#' line, such as Golly's #G and #FRAMES, is skipped.
+#
+# a node's population, live extent, highest state and the state it is
+# uniformly filled with are worked out once from its children. so validating a
+# file fills its Info from the root's alone, listing no cell, and the other
+# passes stream the runs by descending the tree, never laying the pattern out
+# in memory, with a square filled with one state written as whole rows. the root may be up to level
+# MAX_LEVEL as long as its live cells lie within format.LIMIT of the origin and
+# number at most format.LIMIT.
+#
+# the writer reads its source twice: once for the extent of the live cells,
+# which picks the smallest root holding them, and once band by band from the
+# top, turning each band of rows into leaves and pairing finished bands level
+# by level into their parents, so it holds a band of runs and the nodes
+# written, never the pattern. equal squares are one node, however often they
+# appear. a source of more than two states writes the multi-state form.
+
+use cellar.format;
+use cellar.text;
+use allo: std.allocator;
+use std.collections.map;
+use std.collections.map.Map;
+use std.collections.sort;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string;
+use std.types.string.str;
+
+# the deepest node read, so every offset inside the root fits an i64
+pub val MAX_LEVEL: u32 = 62;
+# Node.uni of a node whose cells hold more than one state
+val MIXED: u32 = 256;
+# the largest root the writer makes, the smallest one holding format.LIMIT of either side of the origin
+val TOP_LEVEL: u32 = 42;
+
+fun is_blank(b: u8) bool {
+    ret b == ' ' || b == '\t' || b == '\r' || b == '\n';
+}
+
+fun is_digit(b: u8) bool {
+    ret b >= '0' && b <= '9';
+}
+
+# 2^k
+fun pow2(k: u32) i64 {
+    var v: i64 = 1;
+    ret v << k::i64;
+}
+
+# a node read from a file, with what the decode works out from its children
+# ---
+# level: the node's level, its side 2^level; 0 only for the empty node
+# leaf:  an 8 by 8 leaf line, its rows in lo (rows 0..3) and hi (rows 4..7),
+#        bit 8 * row + column
+# kids:  the children nw, ne, sw, se as node numbers, or at level 1 their states
+# lo:    rows 0..3 of a leaf line
+# hi:    rows 4..7 of a leaf line
+# pop:   live cells, held at format.LIMIT + 1 once past it
+# uni:   the state every cell holds, or MIXED
+# top:   the highest state any cell holds
+# x0:    leftmost live column from the node's corner, when pop is nonzero
+# y0:    top live row
+# x1:    the column after the rightmost live one
+# y1:    the row after the bottom live one
+rec Node {
+    level: u32;
+    leaf:  bool;
+    nw:    u32;
+    ne:    u32;
+    sw:    u32;
+    se:    u32;
+    lo:    u32;
+    hi:    u32;
+    pop:   u64;
+    uni:   u32;
+    top:   u32;
+    x0:    i64;
+    y0:    i64;
+    x1:    i64;
+    y1:    i64;
+}
+
+# widen a node's extent over a live box at (x0, y0) to (x1, y1)
+fun widen(nd: *Node, x0: i64, y0: i64, x1: i64, y1: i64) {
+    if (nd.pop == 0 || x0 < nd.x0) { nd.x0 = x0; }
+    if (nd.pop == 0 || y0 < nd.y0) { nd.y0 = y0; }
+    if (nd.pop == 0 || x1 > nd.x1) { nd.x1 = x1; }
+    if (nd.pop == 0 || y1 > nd.y1) { nd.y1 = y1; }
+}
+
+# add live cells to a node's population, holding it just past format.LIMIT
+fun gain(nd: *Node, n: u64) {
+    nd.pop = nd.pop + n;
+    if (nd.pop > format.LIMIT::u64) { nd.pop = format.LIMIT::u64 + 1; }
+}
+
+# fold a cell of state v at (x, y) into a leaf being summed, the first cell setting uni
+fun fold_cell(nd: *Node, x: i64, y: i64, v: u32, first: bool) {
+    if (first)       { nd.uni = v; }
+    or (nd.uni != v) { nd.uni = MIXED; }
+    if (v == 0)      { ret; }
+    if (v > nd.top)  { nd.top = v; }
+    widen(nd, x, y, x + 1, y + 1);
+    gain(nd, 1);
+}
+
+# fold a child's sums into its parent's, the first child setting uni
+fun fold_kid(nd: *Node, c: *Node, dx: i64, dy: i64, first: bool) {
+    if (first)           { nd.uni = c.uni; }
+    or (nd.uni != c.uni) { nd.uni = MIXED; }
+    if (c.pop == 0)      { ret; }
+    if (c.top > nd.top)  { nd.top = c.top; }
+    widen(nd, c.x0 + dx, c.y0 + dy, c.x1 + dx, c.y1 + dy);
+    gain(nd, c.pop);
+}
+
+# a read position in the file
+# ---
+# p: the bytes
+# n: how many
+# i: the next byte
+rec Cur {
+    p: *u8;
+    n: usize;
+    i: usize;
+}
+
+fun skip_spaces(c: *Cur, end: usize) {
+    for (c.i < end && (c.p[c.i] == ' ' || c.p[c.i] == '\t')) { c.i = c.i + 1; }
+}
+
+# read an unsigned decimal number, bounded by format.LIMIT
+# ---
+# c:   read position, left after the digits
+# end: the line's end
+# out: receives the value
+fun read_num(c: *Cur, end: usize, out: *i64) err[format.Error] {
+    skip_spaces(c, end);
+    if (c.i >= end || !is_digit(c.p[c.i])) { ret err[format.Error].err{format.Error.malformed{}}; }
+    var v: i64 = 0;
+    for (c.i < end && is_digit(c.p[c.i])) {
+        v = v * 10 + (c.p[c.i] - '0')::i64;
+        if (v > format.LIMIT) { ret err[format.Error].err{format.Error.range{}}; }
+        c.i = c.i + 1;
+    }
+    @out = v;
+    ret err[format.Error].ok{};
+}
+
+# set an Info text from the bytes [from, to)
+fun keep(a: *allo.Allocator, o: *string.OwnedString, p: *u8, from: usize, to: usize) err[format.Error] {
+    val r: err[allo.Error] = format.set_text(a, o, ?p[from], to - from);
+    if (sel r.err) { ret err[format.Error].err{format.Error.alloc{r.err}}; }
+    ret err[format.Error].ok{};
+}
+
+# read a '#' line [i, end), past its '#'
+# ---
+# com:  the comments so far, appended to
+# info: receives the rule and name
+fun read_hash(a: *allo.Allocator, p: *u8, i: usize, end: usize, com: *Vector[u8], info: *format.Info) err[format.Error] {
+    if (i >= end) { ret err[format.Error].ok{}; }
+    val tag: u8    = p[i];
+    var s:   usize = i + 1;
+    for (s < end && (p[s] == ' ' || p[s] == '\t')) { s = s + 1; }
+    if (tag == 'R')               { ret keep(a, ?info.rule, p, s, end); }
+    if (tag == 'N')               { ret keep(a, ?info.name, p, s, end); }
+    if (tag != 'C' && tag != 'D') { ret err[format.Error].ok{}; }
+    if (com.len != 0) {
+        val nl: res[usize, allo.Error] = vector.push[u8](com, '\n');
+        if (sel nl.err) { ret err[format.Error].err{format.Error.alloc{nl.err}}; }
+    }
+    for (s < end) {
+        val r: res[usize, allo.Error] = vector.push[u8](com, p[s]);
+        if (sel r.err) { ret err[format.Error].err{format.Error.alloc{r.err}}; }
+        s = s + 1;
+    }
+    ret err[format.Error].ok{};
+}
+
+# read a leaf line [i, end) into a node
+fun read_leaf(p: *u8, i: usize, end: usize, nd: *Node) err[format.Error] {
+    var x: usize = 0;
+    var y: usize = 0;
+    var s: usize = i;
+    for (s < end) {
+        val ch: u8 = p[s];
+        if (ch == '$') {
+            x = 0;
+            y = y + 1;
+        }
+        or (ch == '.') { x = x + 1; }
+        or (ch == '*') {
+            if (x > 7 || y > 7) { ret err[format.Error].err{format.Error.malformed{}}; }
+            if (y < 4)          { nd.lo = nd.lo | (1::u32 << (y * 8 + x)::u32); }
+            or                  { nd.hi = nd.hi | (1::u32 << ((y - 4) * 8 + x)::u32); }
+            x = x + 1;
+        }
+        or { ret err[format.Error].err{format.Error.malformed{}}; }
+        s = s + 1;
+    }
+    nd.level = 3;
+    nd.leaf  = true;
+    var k: u32 = 0;
+    for (k < 64) {
+        var v: u32 = 0;
+        if (k < 32) { v = (nd.lo >> k) & 1; }
+        or          { v = (nd.hi >> (k - 32)) & 1; }
+        fold_cell(nd, (k % 8)::i64, (k / 8)::i64, v, k == 0);
+        k = k + 1;
+    }
+    ret err[format.Error].ok{};
+}
+
+# read a "k nw ne sw se" line [i, end) into a node
+# ---
+# nodes: the nodes read so far, node 0 the empty one
+fun read_node(p: *u8, i: usize, end: usize, nodes: *Vector[Node], nd: *Node) err[format.Error] {
+    var c: Cur;
+    c.p = p;
+    c.n = end;
+    c.i = i;
+    var v: [5]i64;
+    var k: usize = 0;
+    for (k < 5) {
+        val r: err[format.Error] = read_num(?c, end, ?v[k]);
+        if (sel r.err) { ret r; }
+        k = k + 1;
+    }
+    skip_spaces(?c, end);
+    if (c.i != end || v[0] == 0) { ret err[format.Error].err{format.Error.malformed{}}; }
+    if (v[0] > MAX_LEVEL::i64)   { ret err[format.Error].err{format.Error.range{}}; }
+    nd.level = v[0]::u32;
+    nd.nw    = v[1]::u32;
+    nd.ne    = v[2]::u32;
+    nd.sw    = v[3]::u32;
+    nd.se    = v[4]::u32;
+    k        = 1;
+    for (k < 5) {
+        if (nd.level == 1 && v[k] > 255) { ret err[format.Error].err{format.Error.range{}}; }
+        if (nd.level > 1) {
+            if (v[k] >= nodes.len::i64) { ret err[format.Error].err{format.Error.malformed{}}; }
+            val kid: *Node = ?nodes.data[v[k]::usize];
+            if (v[k] != 0 && kid.level + 1 != nd.level) { ret err[format.Error].err{format.Error.malformed{}}; }
+        }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < 4) {
+        val dx: i64 = (k % 2)::i64;
+        val dy: i64 = (k / 2)::i64;
+        if (nd.level == 1) { fold_cell(nd, dx, dy, v[k + 1]::u32, k == 0); }
+        or {
+            val half: i64 = pow2(nd.level - 1);
+            fold_kid(nd, ?nodes.data[v[k + 1]::usize], dx * half, dy * half, k == 0);
+        }
+        k = k + 1;
+    }
+    ret err[format.Error].ok{};
+}
+
+# emit a row of a leaf line's cells, 8 bits, from (x, y)
+fun emit_bits(e: *format.Emit, bits: u32, x: i64, y: i64) bool {
+    var c: u32 = 0;
+    for (c < 8) {
+        if (((bits >> c) & 1) == 0) {
+            c = c + 1;
+            cnt;
+        }
+        var k: u32 = c;
+        for (k < 8 && ((bits >> k) & 1) != 0) { k = k + 1; }
+        if (!format.emit(e, x + c::i64, y, (k - c)::usize, 1)) { ret false; }
+        c = k;
+    }
+    ret true;
+}
+
+# emit a level 1 row of two cells from (x, y)
+fun emit_pair(e: *format.Emit, a: u32, b: u32, x: i64, y: i64) bool {
+    if (a == b) { ret format.emit(e, x, y, 2, a::u8); }
+    ret format.emit(e, x, y, 1, a::u8) && format.emit(e, x + 1, y, 1, b::u8);
+}
+
+# emit every live run under a node whose top-left cell is (x, y)
+# ---
+# ret: false when the sink refused a run
+fun walk(nodes: *Node, id: u32, x: i64, y: i64, e: *format.Emit) bool {
+    val nd: *Node = ?nodes[id::usize];
+    if (nd.pop == 0) { ret true; }
+    if (nd.uni != MIXED) {
+        val side: i64 = pow2(nd.level);
+        var r:    i64 = 0;
+        for (r < side) {
+            if (!format.emit(e, x, y + r, side::usize, nd.uni::u8)) { ret false; }
+            r = r + 1;
+        }
+        ret true;
+    }
+    if (nd.leaf) {
+        var r: u32 = 0;
+        for (r < 8) {
+            var bits: u32 = 0;
+            if (r < 4)                              { bits = (nd.lo >> (r * 8)) & 0xff; }
+            or                                      { bits = (nd.hi >> ((r - 4) * 8)) & 0xff; }
+            if (!emit_bits(e, bits, x, y + r::i64)) { ret false; }
+            r = r + 1;
+        }
+        ret true;
+    }
+    if (nd.level == 1) { ret emit_pair(e, nd.nw, nd.ne, x, y) && emit_pair(e, nd.sw, nd.se, x, y + 1); }
+    val half: i64 = pow2(nd.level - 1);
+    ret walk(nodes, nd.nw, x, y, e) && walk(nodes, nd.ne, x + half, y, e)
+        && walk(nodes, nd.sw, x, y + half, e) && walk(nodes, nd.se, x + half, y + half, e);
+}
+
+# whether the bytes [i, e) begin with s
+fun starts(p: *u8, i: usize, e: usize, s: str) bool {
+    var k: usize = 0;
+    for (s[k] != 0) {
+        if (i + k >= e || p[i + k] != s[k]) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# the offset of the first byte that is not blank
+fun first_byte(p: *u8, n: usize) usize {
+    var i: usize = 0;
+    for (i < n && is_blank(p[i])) { i = i + 1; }
+    ret i;
+}
+
+fun read_all(a: *allo.Allocator, p: *u8, n: usize, e: *format.Emit, nodes: *Vector[Node], com: *Vector[u8]) err[format.Error] {
+    var empty: Node;
+    val z:     res[usize, allo.Error] = vector.push[Node](nodes, empty);
+    if (sel z.err) { ret err[format.Error].err{format.Error.alloc{z.err}}; }
+    var i: usize = first_byte(p, n);
+    e.info.at = i;
+    if (!starts(p, i, n, "[M2]")) { ret err[format.Error].err{format.Error.malformed{}}; }
+    for (i < n && p[i] != '\n') { i = i + 1; }
+    for (i < n) {
+        i = i + 1;
+        var end: usize = i;
+        for (end < n && p[end] != '\n') { end = end + 1; }
+        var s: usize = i;
+        for (s < end && (p[s] == ' ' || p[s] == '\t')) { s = s + 1; }
+        var t: usize = end;
+        for (t > s && is_blank(p[t - 1])) { t = t - 1; }
+        e.info.at = i;
+        i         = end;
+        if (s == t) { cnt; }
+        if (p[s] == '#') {
+            val h: err[format.Error] = read_hash(a, p, s + 1, t, com, e.info);
+            if (sel h.err) { ret h; }
+            cnt;
+        }
+        var nd: Node;
+        if (p[s] == '.' || p[s] == '*' || p[s] == '$') {
+            val l: err[format.Error] = read_leaf(p, s, t, ?nd);
+            if (sel l.err) { ret l; }
+        }
+        or (is_digit(p[s])) {
+            val r: err[format.Error] = read_node(p, s, t, nodes, ?nd);
+            if (sel r.err) { ret r; }
+        }
+        or { ret err[format.Error].err{format.Error.malformed{}}; }
+        val put: res[usize, allo.Error] = vector.push[Node](nodes, nd);
+        if (sel put.err) { ret err[format.Error].err{format.Error.alloc{put.err}}; }
+    }
+    e.info.at = n;
+    val m: err[allo.Error] = format.set_text(a, ?e.info.comments, com.data, com.len);
+    if (sel m.err)      { ret err[format.Error].err{format.Error.alloc{m.err}}; }
+    if (nodes.len == 1) { ret err[format.Error].ok{}; }
+
+    val root: u32   = (nodes.len - 1)::u32;
+    val rn:   *Node = ?nodes.data[root::usize];
+    if (rn.pop == 0)                { ret err[format.Error].ok{}; }
+    if (rn.pop > format.LIMIT::u64) { ret err[format.Error].err{format.Error.range{}}; }
+    val half: i64 = pow2(rn.level - 1);
+    val ox:   i64 = 0 - half;
+    val oy:   i64 = 1 - half;
+    if (ox + rn.x0 < 0 - format.LIMIT || ox + rn.x1 > format.LIMIT || oy + rn.y0 < 0 - format.LIMIT || oy + rn.y1 > format.LIMIT) {
+        ret err[format.Error].err{format.Error.range{}};
+    }
+    # validating, the root's sums are the Info, and no cell need be listed
+    if (e.sink == nil) {
+        format.gather(e.info, ox + rn.x0, oy + rn.y0, ox + rn.x1, oy + rn.y1, rn.pop, rn.top::u8);
+        ret err[format.Error].ok{};
+    }
+    if (!walk(nodes.data, root, ox, oy, e)) { ret err[format.Error].err{format.Error.sink{}}; }
+    ret err[format.Error].ok{};
+}
+
+# decode a Macrocell file
+fun decode(a: *allo.Allocator, p: *u8, n: usize, e: *format.Emit) err[format.Error] {
+    var nodes: Vector[Node]      = vector.init[Node](a);
+    var com:   Vector[u8]        = vector.init[u8](a);
+    val r:     err[format.Error] = read_all(a, p, n, e, ?nodes, ?com);
+    vector.dnit[Node](?nodes);
+    vector.dnit[u8](?com);
+    ret r;
+}
+
+# how likely the bytes are Macrocell: its files open with "[M2]"
+fun sniff(p: *u8, n: usize) u32 {
+    if (starts(p, first_byte(p, n), n, "[M2]")) { ret 100; }
+    ret 0;
+}
+
+# a node the writer made: its level and children, or a leaf's cells
+# ---
+# level: the node's level
+# nw:    the north-west child's number, a two-state leaf's rows 0..3, or a
+#        level 1 node's state
+# ne:    the north-east child, rows 4..7, or state
+# sw:    the south-west child, or state
+# se:    the south-east child, or state
+rec Key {
+    level: u32;
+    nw:    u32;
+    ne:    u32;
+    sw:    u32;
+    se:    u32;
+}
+
+# a piece of a leaf in the band being read
+# ---
+# xb: the leaf's column in the band, in leaves from the root's left edge
+# k:  its cells as a leaf Key holds them, OR-ed with the other pieces
+rec Piece {
+    xb: i64;
+    nw: u32;
+    ne: u32;
+    sw: u32;
+    se: u32;
+}
+
+# a node placed in a band
+# ---
+# xb: its column, in nodes of its level from the root's left edge
+# id: its number
+rec Ent {
+    xb: i64;
+    id: u32;
+}
+
+# a band of nodes of one level waiting for the band it pairs with
+# ---
+# on:   holds a band
+# idx:  the band's row, in nodes of its level from the root's top
+# ents: its nonempty nodes, left to right
+rec Band {
+    on:   bool;
+    idx:  i64;
+    ents: Vector[Ent];
+}
+
+# the writer's quadtree
+# ---
+# a:     allocator for everything it holds
+# multi: the source has more than two states, so leaves are level 1
+# base:  the leaves' level, 1 or 3
+# top:   the root's level
+# ox:    the root's leftmost column
+# oy:    the root's top row
+# nodes: every node made, node i + 1 at i, children before their parents
+# ids:   each node's number by its key, so equal squares are one node
+# bands: the waiting band of each level
+# pcs:   the leaf pieces of the band being read
+# row:   that band's row, in leaves from the root's top
+# fresh: pcs holds nothing yet
+rec Tree {
+    a:     *allo.Allocator;
+    multi: bool;
+    base:  u32;
+    top:   u32;
+    ox:    i64;
+    oy:    i64;
+    nodes: Vector[Key];
+    ids:   Map[Key, u32];
+    bands: [64]Band;
+    pcs:   Vector[Piece];
+    row:   i64;
+    fresh: bool;
+}
+
+fun alloc_err(e: allo.Error) err[format.Error] {
+    ret err[format.Error].err{format.Error.alloc{e}};
+}
+
+# the number of the node a key describes, made when it is new
+# ---
+# out: receives it
+fun intern(t: *Tree, k: Key, out: *u32) err[format.Error] {
+    val have: opt[*u32] = map.get[Key, u32](?t.ids, ?k);
+    if (sel have.some) {
+        @out = @have.some;
+        ret err[format.Error].ok{};
+    }
+    val put: res[usize, allo.Error] = vector.push[Key](?t.nodes, k);
+    if (sel put.err) { ret alloc_err(put.err); }
+    val id:  u32                   = t.nodes.len::u32;
+    val ins: res[bool, allo.Error] = map.insert[Key, u32](?t.ids, k, id);
+    if (sel ins.err) { ret alloc_err(ins.err); }
+    @out = id;
+    ret err[format.Error].ok{};
+}
+
+# the band of level k + 1 two bands of level k make, either of them empty
+# ---
+# k:     their level
+# upper: the band above, or nil
+# lower: the band below, or nil
+# out:   receives the parents, left to right
+fun pair(t: *Tree, k: u32, upper: *Vector[Ent], lower: *Vector[Ent], out: *Vector[Ent]) err[format.Error] {
+    var i:  usize = 0;
+    var j:  usize = 0;
+    var un: usize = 0;
+    var ln: usize = 0;
+    if (upper != nil) { un = upper.len; }
+    if (lower != nil) { ln = lower.len; }
+    for (i < un || j < ln) {
+        var px: i64 = 0;
+        if (i < un)                                              { px = upper.data[i].xb >> 1; }
+        if (j < ln && (i >= un || (lower.data[j].xb >> 1) < px)) { px = lower.data[j].xb >> 1; }
+        var q: Key = Key{level: k + 1, nw: 0, ne: 0, sw: 0, se: 0};
+        for (i < un && (upper.data[i].xb >> 1) == px) {
+            if ((upper.data[i].xb & 1) == 0) { q.nw = upper.data[i].id; }
+            or                               { q.ne = upper.data[i].id; }
+            i = i + 1;
+        }
+        for (j < ln && (lower.data[j].xb >> 1) == px) {
+            if ((lower.data[j].xb & 1) == 0) { q.sw = lower.data[j].id; }
+            or                               { q.se = lower.data[j].id; }
+            j = j + 1;
+        }
+        var id: u32               = 0;
+        val r:  err[format.Error] = intern(t, q, ?id);
+        if (sel r.err) { ret r; }
+        val put: res[usize, allo.Error] = vector.push[Ent](out, Ent{xb: px, id: id});
+        if (sel put.err) { ret alloc_err(put.err); }
+    }
+    ret err[format.Error].ok{};
+}
+
+# hand a finished band of level k up the tree, pairing it with the band waiting
+# at its level when they share a parent row
+# ---
+# idx:  its row, in nodes of level k
+# ents: its nodes, taken over
+fun arrive(t: *Tree, k: u32, idx: i64, ents: Vector[Ent]) err[format.Error] {
+    var mine: Vector[Ent] = ents;
+    val b:    *Band       = ?t.bands[k::usize];
+    if (k < t.top && b.on) {
+        var up:   Vector[Ent]       = vector.init[Ent](t.a);
+        var r:    err[format.Error] = err[format.Error].ok{};
+        val same: bool              = (b.idx >> 1) == (idx >> 1);
+        if (same) { r = pair(t, k, ?b.ents, ?mine, ?up); }
+        or        { r = lift(t, k, b, ?up); }
+        val from: i64 = b.idx >> 1;
+        vector.dnit[Ent](?b.ents);
+        b.on = false;
+        if (sel r.err) {
+            vector.dnit[Ent](?up);
+            vector.dnit[Ent](?mine);
+            ret r;
+        }
+        if (same) {
+            vector.dnit[Ent](?mine);
+            ret arrive(t, k + 1, from, up);
+        }
+        val carried: err[format.Error] = arrive(t, k + 1, from, up);
+        if (sel carried.err) {
+            vector.dnit[Ent](?mine);
+            ret carried;
+        }
+    }
+    b.on   = true;
+    b.idx  = idx;
+    b.ents = mine;
+    ret err[format.Error].ok{};
+}
+
+# the parents of a waiting band whose pair never came
+fun lift(t: *Tree, k: u32, b: *Band, out: *Vector[Ent]) err[format.Error] {
+    if ((b.idx & 1) == 0) { ret pair(t, k, ?b.ents, nil, out); }
+    ret pair(t, k, nil, ?b.ents, out);
+}
+
+# turn the leaf pieces read into a band of leaves and hand it up
+fun close_band(t: *Tree) err[format.Error] {
+    if (t.fresh) { ret err[format.Error].ok{}; }
+    t.fresh = true;
+    sort.sort[Piece](t.pcs.data, t.pcs.len);
+    var ents: Vector[Ent] = vector.init[Ent](t.a);
+    var i:    usize       = 0;
+    for (i < t.pcs.len) {
+        var q:  Key = Key{level: t.base, nw: 0, ne: 0, sw: 0, se: 0};
+        val xb: i64 = t.pcs.data[i].xb;
+        for (i < t.pcs.len && t.pcs.data[i].xb == xb) {
+            q.nw = q.nw | t.pcs.data[i].nw;
+            q.ne = q.ne | t.pcs.data[i].ne;
+            q.sw = q.sw | t.pcs.data[i].sw;
+            q.se = q.se | t.pcs.data[i].se;
+            i    = i + 1;
+        }
+        var id: u32               = 0;
+        val r:  err[format.Error] = intern(t, q, ?id);
+        if (sel r.err) {
+            vector.dnit[Ent](?ents);
+            ret r;
+        }
+        val put: res[usize, allo.Error] = vector.push[Ent](?ents, Ent{xb: xb, id: id});
+        if (sel put.err) {
+            vector.dnit[Ent](?ents);
+            ret alloc_err(put.err);
+        }
+    }
+    vector.clear[Piece](?t.pcs);
+    ret arrive(t, t.base, t.row, ents);
+}
+
+# add a run to the band it lies in, closing the band before it
+fun add_run(t: *Tree, r: *format.Run) err[format.Error] {
+    val side: i64 = pow2(t.base);
+    val ry:   i64 = r.y - t.oy;
+    val row:  i64 = ry >> t.base::i64;
+    if (!t.fresh && row != t.row) {
+        val c: err[format.Error] = close_band(t);
+        if (sel c.err) { ret c; }
+    }
+    t.row   = row;
+    t.fresh = false;
+    val y:   i64 = ry - row * side;
+    var at:  i64 = r.x - t.ox;
+    val end: i64 = at + r.n::i64;
+    for (at < end) {
+        val xb:   i64 = at >> t.base::i64;
+        var stop: i64 = (xb + 1) * side;
+        if (stop > end) { stop = end; }
+        var pc: Piece = Piece{xb: xb, nw: 0, ne: 0, sw: 0, se: 0};
+        val c0: i64   = at - xb * side;
+        val c1: i64   = stop - xb * side;
+        if (t.multi) {
+            var c: i64 = c0;
+            for (c < c1) {
+                val q: i64 = y * 2 + c;
+                if (q == 0) { pc.nw = r.v::u32; }
+                if (q == 1) { pc.ne = r.v::u32; }
+                if (q == 2) { pc.sw = r.v::u32; }
+                if (q == 3) { pc.se = r.v::u32; }
+                c = c + 1;
+            }
+        }
+        or {
+            val bits: u32 = ((1::u32 << (c1 - c0)::u32) - 1) << c0::u32;
+            if (y < 4) { pc.nw = bits << (y * 8)::u32; }
+            or         { pc.ne = bits << ((y - 4) * 8)::u32; }
+        }
+        val put: res[usize, allo.Error] = vector.push[Piece](?t.pcs, pc);
+        if (sel put.err) { ret alloc_err(put.err); }
+        at = stop;
+    }
+    ret err[format.Error].ok{};
+}
+
+# the writer's output
+fun put(out: *Vector[u8], b: u8) err[format.Error] {
+    val r: res[usize, allo.Error] = vector.push[u8](out, b);
+    if (sel r.err) { ret alloc_err(r.err); }
+    ret err[format.Error].ok{};
+}
+
+fun put_n(out: *Vector[u8], p: *u8, n: usize) err[format.Error] {
+    var i: usize = 0;
+    for (i < n) {
+        val r: err[format.Error] = put(out, p[i]);
+        if (sel r.err) { ret r; }
+        i = i + 1;
+    }
+    ret err[format.Error].ok{};
+}
+
+fun put_str(out: *Vector[u8], s: str) err[format.Error] {
+    ret put_n(out, s, string.str_len(s));
+}
+
+fun put_num(out: *Vector[u8], v: u64) err[format.Error] {
+    var b: [24]u8;
+    ret put_n(out, ?b[0], text.buf_u64(?b[0], 0, v));
+}
+
+# write a '#' line of a tag and the text up to its end or a newline
+# ---
+# s:   the text
+# ret: ok, and the text's offset past the line it wrote
+fun put_line(out: *Vector[u8], tag: str, s: str, at: *usize) err[format.Error] {
+    val a: err[format.Error] = put_str(out, tag);
+    if (sel a.err) { ret a; }
+    var i: usize = @at;
+    for (s[i] != 0 && s[i] != '\n') {
+        val b: err[format.Error] = put(out, s[i]);
+        if (sel b.err) { ret b; }
+        i = i + 1;
+    }
+    if (s[i] == '\n') { i = i + 1; }
+    @at = i;
+    ret put(out, '\n');
+}
+
+# the header and '#' lines
+fun write_head(out: *Vector[u8], info: *format.Info) err[format.Error] {
+    val h: err[format.Error] = put_str(out, "[M2] (cellar)\n");
+    if (sel h.err) { ret h; }
+    var at:   usize = 0;
+    val rule: str   = format.text_of(?info.rule);
+    if (rule[0] != 0) {
+        val r: err[format.Error] = put_line(out, "#R ", rule, ?at);
+        if (sel r.err) { ret r; }
+    }
+    at = 0;
+    val name: str = format.text_of(?info.name);
+    if (name[0] != 0) {
+        val n: err[format.Error] = put_line(out, "#N ", name, ?at);
+        if (sel n.err) { ret n; }
+    }
+    at = 0;
+    val com: str = format.text_of(?info.comments);
+    for (com[at] != 0) {
+        val c: err[format.Error] = put_line(out, "#C ", com, ?at);
+        if (sel c.err) { ret c; }
+    }
+    ret err[format.Error].ok{};
+}
+
+# write a two-state leaf as Golly does: each row to its last live cell and a
+# '$', stopping after the last row that has one
+fun write_leaf(out: *Vector[u8], k: *Key) err[format.Error] {
+    var last: u32 = 0;
+    var r:    u32 = 0;
+    for (r < 8) {
+        if (row_bits(k, r) != 0) { last = r + 1; }
+        r = r + 1;
+    }
+    r = 0;
+    for (r < last) {
+        val bits: u32 = row_bits(k, r);
+        var c:    u32 = 0;
+        for ((bits >> c) != 0) {
+            var ch: u8 = '.';
+            if (((bits >> c) & 1) != 0) { ch = '*'; }
+            val w: err[format.Error] = put(out, ch);
+            if (sel w.err) { ret w; }
+            c = c + 1;
+        }
+        val d: err[format.Error] = put(out, '$');
+        if (sel d.err) { ret d; }
+        r = r + 1;
+    }
+    ret put(out, '\n');
+}
+
+fun row_bits(k: *Key, r: u32) u32 {
+    if (r < 4) { ret (k.nw >> (r * 8)) & 0xff; }
+    ret (k.ne >> ((r - 4) * 8)) & 0xff;
+}
+
+# write a node as "level nw ne sw se"
+fun write_node(out: *Vector[u8], k: *Key) err[format.Error] {
+    val l: err[format.Error] = put_num(out, k.level::u64);
+    if (sel l.err) { ret l; }
+    var v: [4]u32 = [4]u32{k.nw, k.ne, k.sw, k.se};
+    var i: usize  = 0;
+    for (i < 4) {
+        val s: err[format.Error] = put(out, ' ');
+        if (sel s.err) { ret s; }
+        val n: err[format.Error] = put_num(out, v[i]::u64);
+        if (sel n.err) { ret n; }
+        i = i + 1;
+    }
+    ret put(out, '\n');
+}
+
+# read the source once for the extent of its live cells, checking its order
+# ---
+# box: receives x0, y0, x1, y1
+# any: receives whether there are any live cells
+# ret: ok, or range when a run is out of order or place
+fun measure(src: *format.Source, box: *i64, any: *bool) err[format.Error] {
+    var r:   format.Run;
+    var cy:  i64  = src.y0;
+    var cx:  i64  = src.x0;
+    var got: bool = false;
+    src.rewind(src.ctx);
+    for (src.next(src.ctx, ?r)) {
+        if (r.n == 0 || r.v == 0 || r.y < cy || r.y >= src.y1 || r.x < src.x0 || r.n::i64 > src.x1 - r.x) {
+            ret err[format.Error].err{format.Error.range{}};
+        }
+        if (r.y > cy) { cx = src.x0; }
+        if (r.x < cx) { ret err[format.Error].err{format.Error.range{}}; }
+        cy = r.y;
+        cx = r.x + r.n::i64;
+        if (!got || r.x < box[0])  { box[0] = r.x; }
+        if (!got || r.y < box[1])  { box[1] = r.y; }
+        if (!got || cx > box[2])   { box[2] = cx; }
+        if (!got || r.y >= box[3]) { box[3] = r.y + 1; }
+        got = true;
+    }
+    @any = got;
+    ret err[format.Error].ok{};
+}
+
+# build the tree from the source's second reading and write it
+fun build(t: *Tree, src: *format.Source, out: *Vector[u8]) err[format.Error] {
+    var r: format.Run;
+    src.rewind(src.ctx);
+    for (src.next(src.ctx, ?r)) {
+        val a: err[format.Error] = add_run(t, ?r);
+        if (sel a.err) { ret a; }
+    }
+    val c: err[format.Error] = close_band(t);
+    if (sel c.err) { ret c; }
+    var k: u32 = t.base;
+    for (k < t.top) {
+        val b: *Band = ?t.bands[k::usize];
+        if (b.on) {
+            var up:   Vector[Ent]       = vector.init[Ent](t.a);
+            val l:    err[format.Error] = lift(t, k, b, ?up);
+            val from: i64               = b.idx >> 1;
+            vector.dnit[Ent](?b.ents);
+            b.on = false;
+            if (sel l.err) {
+                vector.dnit[Ent](?up);
+                ret l;
+            }
+            val g: err[format.Error] = arrive(t, k + 1, from, up);
+            if (sel g.err) { ret g; }
+        }
+        k = k + 1;
+    }
+    var i: usize = 0;
+    for (i < t.nodes.len) {
+        val k: *Key              = ?t.nodes.data[i];
+        var w: err[format.Error] = err[format.Error].ok{};
+        if (k.level == 3 && !t.multi) { w = write_leaf(out, k); }
+        or                            { w = write_node(out, k); }
+        if (sel w.err)                { ret w; }
+        i = i + 1;
+    }
+    ret err[format.Error].ok{};
+}
+
+# release everything a tree holds
+fun tree_dnit(t: *Tree) {
+    vector.dnit[Key](?t.nodes);
+    map.dnit[Key, u32](?t.ids);
+    vector.dnit[Piece](?t.pcs);
+    var k: usize = 0;
+    for (k < 64) {
+        if (t.bands[k].on) { vector.dnit[Ent](?t.bands[k].ents); }
+        k = k + 1;
+    }
+}
+
+# encode a source as a Macrocell file
+fun encode(a: *allo.Allocator, src: *format.Source, info: *format.Info, out: *Vector[u8]) err[format.Error] {
+    if (src.x0 < 0 - format.LIMIT || src.y0 < 0 - format.LIMIT || src.x1 > format.LIMIT || src.y1 > format.LIMIT || src.states > 256) {
+        ret err[format.Error].err{format.Error.range{}};
+    }
+    var box: [4]i64;
+    var any: bool              = false;
+    val m:   err[format.Error] = measure(src, ?box[0], ?any);
+    if (sel m.err) { ret m; }
+    val h: err[format.Error] = write_head(out, info);
+    if (sel h.err || !any) { ret h; }
+
+    var t: Tree;
+    t.a     = a;
+    t.multi = src.states > 2;
+    t.base  = 3;
+    if (t.multi) { t.base = 1; }
+    t.top = t.base;
+    for (t.top < TOP_LEVEL) {
+        val half: i64 = pow2(t.top - 1);
+        if (box[0] >= 0 - half && box[2] <= half && box[1] >= 1 - half && box[3] <= 1 + half) { brk; }
+        t.top = t.top + 1;
+    }
+    t.ox    = 0 - pow2(t.top - 1);
+    t.oy    = 1 - pow2(t.top - 1);
+    t.nodes = vector.init[Key](a);
+    t.ids   = map.init[Key, u32](a);
+    t.pcs   = vector.init[Piece](a);
+    t.row   = 0;
+    t.fresh = true;
+    val r: err[format.Error] = build(?t, src, out);
+    tree_dnit(?t);
+    ret r;
+}
+
+# the Macrocell format's registry record
+pub fun make() format.Format {
+    var f: format.Format;
+    f.id     = "macrocell";
+    f.exts   = "mc";
+    f.sniff  = sniff;
+    f.decode = decode;
+    f.encode = encode;
+    ret f;
+}
