@@ -21,6 +21,7 @@ use cellar.cpu;
 use cellar.gpu;
 use cellar.history;
 use cellar.rule;
+use cellar.rules.weighted;
 use cellar.rules.weighted.word;
 use cellar.snapshot;
 use cellar.space;
@@ -1418,5 +1419,162 @@ test reset__run_reset_run_reproduces_the_generations_on_both_engines {
     dnit(?gpu_world);
     gfx.renderer_dnit(?r);
     window.window_close(?w);
+    ret 0;
+}
+
+# side of the reference plane's grid, centred on the origin, reaching past the
+# chunks a soup's world allocates
+#[testing]
+val PLANE: i64 = 320;
+
+# seed a 32 by 32 soup centred on the origin
+#[testing]
+fun seed_soup(s: *Sim) {
+    s.rng = rand.seed(5, 6, 7, 8);
+    fill_begin(s);
+    var y: i64 = -16;
+    for (y < 16) {
+        var x: i64 = -16;
+        for (x < 16) {
+            if (rand.range(?s.rng, 0, 1000) < 400) { fill_cell(s, x, y, 1); }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    fill_end(s);
+}
+
+# one generation of a naive unbounded plane: a grid, and bg every cell beyond it
+# ---
+# k:    the rule
+# from: the grid, PLANE by PLANE
+# to:   receives the grid one generation on
+# bg:   the state of every cell beyond the grid
+# ret:  that state one generation on
+#[testing]
+fun plane_step(k: *weighted.Kernel, from: *u8, to: *u8, bg: u8) u8 {
+    val r: i64 = k.radius::i64;
+    var y: i64 = 0;
+    for (y < PLANE) {
+        var x: i64 = 0;
+        for (x < PLANE) {
+            var sum: i32 = 0;
+            var dy:  i64 = 0 - r;
+            for (dy <= r) {
+                var dx: i64 = 0 - r;
+                for (dx <= r) {
+                    var c: u8 = bg;
+                    if (x + dx >= 0 && x + dx < PLANE && y + dy >= 0 && y + dy < PLANE) { c = from[((y + dy) * PLANE + x + dx)::usize]; }
+                    if (c != 0)                                                         { sum = sum + weighted.weight_at(k, dx, dy); }
+                    dx = dx + 1;
+                }
+                dy = dy + 1;
+            }
+            to[(y * PLANE + x)::usize] = weighted.next_state(k, from[(y * PLANE + x)::usize], sum);
+            x                          = x + 1;
+        }
+        y = y + 1;
+    }
+    var all: i32 = 0;
+    if (bg != 0) { all = weighted.total(k); }
+    ret weighted.next_state(k, bg, all);
+}
+
+# run a soup under a rule on both engines and hold what the world shows to a
+# naive unbounded plane's, over a grid reaching past every allocated chunk
+#
+# a rule in the COMPLEMENT form shows the plane's complement, as Golly does.
+# ---
+# rs:  the rule string
+# ret: 0 when they agree throughout, else the failed check
+#[testing]
+fun matches_plane(rs: str) i32 {
+    val parsed: res[rule.Rule, str] = rule.parse(rs);
+    if (sel parsed.err) { ret 1; }
+    var r: rule.Rule = parsed.ok;
+    var k: weighted.Kernel;
+    if (sel r.weighted) { k = r.weighted; }
+    var comp: u8 = 0;
+    if (weighted.form(?k) == word.COMPLEMENT) { comp = 1; }
+    var t:    Rig;
+    val code: i32 = rig_open(?t, r, seed_soup);
+    if (code != 0) { ret code; }
+    val n:  usize                = (PLANE * PLANE)::usize;
+    val ga: res[*u8, allo.Error] = allo.allocate[u8](?t.a, n);
+    if (sel ga.err) { ret 2; }
+    val gb: res[*u8, allo.Error] = allo.allocate[u8](?t.a, n);
+    if (sel gb.err) { ret 2; }
+    var from: *u8   = ga.ok;
+    var to:   *u8   = gb.ok;
+    var bg:   u8    = comp;
+    val half: i64   = PLANE / 2;
+    var i:    usize = 0;
+    for (i < n) {
+        from[i] = alive(?t.cpu, (i % PLANE::usize)::i64 - half, (i / PLANE::usize)::i64 - half) ^ comp;
+        i       = i + 1;
+    }
+    var outside: usize = 0;
+    var fail:    i32   = 0;
+    var g:       u64   = 1;
+    for (g <= 24 && fail == 0) {
+        rig_step(?t, 1);
+        bg = plane_step(?k, from, to, bg);
+        val was: *u8 = from;
+        from = to;
+        to   = was;
+        i    = 0;
+        for (i < n && fail == 0) {
+            val x: i64 = (i % PLANE::usize)::i64 - half;
+            val y: i64 = (i / PLANE::usize)::i64 - half;
+            if (alive(?t.cpu, x, y) != (from[i] ^ comp)) {
+                print.eprintlnf("{}: generation {} differs from the plane at ({}, {})", rs, g, x, y);
+                fail = 10;
+            }
+            if (space.find(?t.cpu.space, space.chunk_of(x), space.chunk_of(y)) == space.NONE) { outside = outside + 1; }
+            i = i + 1;
+        }
+        # an odd generation and an even one on the GPU as well
+        if (fail == 0 && g >= 23 && !rig_same(?t)) { fail = 20 + g::i32; }
+        g = g + 1;
+    }
+    if (fail == 0 && outside == 0) { fail = 30; }
+    allo.deallocate[u8](?t.a, ga.ok, n);
+    allo.deallocate[u8](?t.a, gb.ok, n);
+    rig_close(?t);
+    ret fail;
+}
+
+test b0__rules_match_an_unbounded_plane_on_both_engines {
+    var rules: [3]str = [3]str{"B0123478/S01234678", "B0/S8", "B03/S23"};
+    var i:     usize  = 0;
+    for (i < 3) {
+        val got: i32 = matches_plane(rules[i]);
+        if (got != 0) {
+            print.eprintlnf("{}: check {} failed", rules[i], got);
+            ret got;
+        }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test b0__edits_and_reads_see_the_world_at_an_odd_generation {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    Sim;
+    val made: err[allo.Error] = init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    val parsed: res[rule.Rule, str] = rule.parse("B03/S23");
+    if (sel parsed.err) { ret 2; }
+    set_rule(?s, parsed.ok);
+    step(?s);
+    # the empty world's background flipped live, held as nothing
+    if (!flipped(?s) || !alive(?s, 900, -900) || population(?s) != 0) { ret 3; }
+    paint(?s, 5, 5, 0);
+    if (alive(?s, 5, 5) || !alive(?s, 6, 5)) { ret 4; }
+    var row: [4]u8;
+    if (!read_begin(?s, 4, 5, 8, 6) || !read_run(?s, 4, 5, 4, ?row[0]) || !read_end(?s)) { ret 5; }
+    if (row[0] != 1 || row[1] != 0 || row[2] != 1 || row[3] != 1)                        { ret 6; }
+    dnit(?s);
     ret 0;
 }
