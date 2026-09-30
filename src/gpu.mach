@@ -23,8 +23,12 @@
 # next can skip the chunks with nothing alive nearby. whatever the host uploads
 # is stamped alive and warm, so it is stepped in full at least once.
 #
+# below a pixel per cell the draw reads each chunk's coverage pyramid
+# (cellar.layout.Mip), which a reduce stage builds after the frame's last
+# generation, skipping the chunks the steps left cold.
+#
 # where the compute stages cannot be built, the CPU steps and this only draws,
-# uploading the chunks in view every frame.
+# uploading the chunks in view every frame with their pyramids.
 
 use gfx: boom.graphics;
 use gm:  boom.math;
@@ -52,6 +56,8 @@ val CLEAR_SPV:  [_]u8;
 val GROW_SPV:   [_]u8;
 #[embed("{artifact.stage-census_comp.out}")]
 val CENSUS_SPV: [_]u8;
+#[embed("{artifact.stage-reduce_comp.out}")]
+val REDUCE_SPV: [_]u8;
 #[embed("{artifact.stage-cells_vert.out}")]
 val VERT_SPV:   [_]u8;
 #[embed("{artifact.stage-cells_frag.out}")]
@@ -61,10 +67,12 @@ val FRAG_SPV:   [_]u8;
 pub val HEAD: usize = layout.HEAD::usize;
 # words of the view buffer ahead of the palettes
 pub val LOOK: usize = 20;
+# words of a slot's coverage pyramid
+pub val MIP: usize = layout.MIP::usize;
 # entries in each palette
 pub val SHADES: usize = 256;
 # generations one frame may record, leaving storage binding sets for the
-# census and the draw
+# clear, the growth, the census, the reduction and the draw
 pub val MAX_STEPS: usize = 240;
 # cells a census that gave every live chunk the neighbours its cells lean towards
 # leaves room to spread: the census asks for a side when a live cell lies within
@@ -148,6 +156,7 @@ rec Write {
 # meta:   the rule and the page table
 # flags:  per slot the serials of the last step that left it alive and warm
 # list:   the slots the clear stage empties
+# mip:    every slot's coverage pyramid
 # status: the census stage's output
 # rb:     the census readback
 # got:    where a landed census is copied
@@ -158,6 +167,7 @@ rec Pool {
     meta:   gfx.StorageBuffer;
     flags:  gfx.StorageBuffer;
     list:   gfx.StorageBuffer;
+    mip:    gfx.StorageBuffer;
     status: gfx.StorageBuffer;
     rb:     gfx.Readback;
     got:    *u32;
@@ -182,6 +192,7 @@ rec Pool {
 # clear:    the clear stage
 # grow:     the stage that carries the world into larger buffers
 # census:   the census stage
+# reduce:   the stage that builds the coverage pyramids
 # draw:     the cell shader
 # mat:      the draw's material
 # xf:       the draw's transform
@@ -203,6 +214,7 @@ rec Pool {
 # last:     when the last uncapped frame was recorded
 # timed:    last holds an uncapped frame
 # head:     the meta header staged for upload
+# built:    a pyramid built on the host, staged for upload
 pub rec Gpu {
     a:        *allo.Allocator;
     r:        *gfx.Renderer;
@@ -218,6 +230,7 @@ pub rec Gpu {
     clear:    gfx.Compute;
     grow:     gfx.Compute;
     census:   gfx.Compute;
+    reduce:   gfx.Compute;
     draw:     gfx.Shader;
     mat:      gfx.Material;
     xf:       gm.Transform;
@@ -239,6 +252,7 @@ pub rec Gpu {
     last:     Instant;
     timed:    bool;
     head:     [96]u32;
+    built:    [layout.MIP]u32;
 }
 
 # the census id's four words, then a packed word, a mask and an extent per slot
@@ -277,8 +291,9 @@ fun fit(n: usize, words: usize, head: usize, per: usize) usize {
 pub fun ceiling(l: gfx.Limits) usize {
     val words: usize = l.max_storage_buffer_range / 4;
     var n:     usize = layout.MAX_SLOTS::usize;
-    # the cells, the meta, the status, the flags and the list
+    # the cells, the pyramids, the meta, the status, the flags and the list
     n = fit(n, words, 0, space.CELLS);
+    n = fit(n, words, 0, MIP);
     n = fit(n, words, HEAD, space.ENTRY);
     n = fit(n, words, status_bytes(0) / 4, 3);
     n = fit(n, words, 0, 2);
@@ -348,6 +363,17 @@ fun make_pool(g: *Gpu, pp: *Pool, cap: usize) err[gfx.Error] {
         gfx.storage_buffer_delete(g.d, ?pp.status);
         ret e5l;
     }
+    val e5m: err[gfx.Error] = make(g.d, cap * MIP * 4, ?pp.mip);
+    if (sel e5m.err) {
+        gfx.storage_buffer_delete(g.d, ?pp.list);
+        gfx.storage_buffer_delete(g.d, ?pp.flags);
+        gfx.readback_delete(?pp.rb, g.d);
+        gfx.storage_buffer_delete(g.d, ?pp.cells[0]);
+        gfx.storage_buffer_delete(g.d, ?pp.cells[1]);
+        gfx.storage_buffer_delete(g.d, ?pp.meta);
+        gfx.storage_buffer_delete(g.d, ?pp.status);
+        ret e5m;
+    }
     val rg: res[*u32, allo.Error] = allo.allocate[u32](g.a, status_bytes(cap) / 4);
     if (sel rg.err) {
         drop_pool(g, pp);
@@ -365,6 +391,7 @@ fun make_pool(g: *Gpu, pp: *Pool, cap: usize) err[gfx.Error] {
 }
 
 fun drop_pool(g: *Gpu, p: *Pool) {
+    gfx.storage_buffer_delete(g.d, ?p.mip);
     gfx.storage_buffer_delete(g.d, ?p.list);
     gfx.storage_buffer_delete(g.d, ?p.flags);
     gfx.readback_delete(?p.rb, g.d);
@@ -432,8 +459,12 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
             val gc: err[gfx.Error] = gfx.compute(?g.grow, g.d, ?GROW_SPV[0], $length_of(GROW_SPV));
             if (sel gc.ok) {
                 val cc: err[gfx.Error] = gfx.compute(?g.census, g.d, ?CENSUS_SPV[0], $length_of(CENSUS_SPV));
-                if (sel cc.ok) { g.stepping = true; }
-                or             { gfx.compute_delete(?g.grow, g.d); }
+                if (sel cc.ok) {
+                    val rc: err[gfx.Error] = gfx.compute(?g.reduce, g.d, ?REDUCE_SPV[0], $length_of(REDUCE_SPV));
+                    if (sel rc.ok) { g.stepping = true; }
+                    or             { gfx.compute_delete(?g.census, g.d); }
+                }
+                if (!g.stepping) { gfx.compute_delete(?g.grow, g.d); }
             }
             if (!g.stepping) { gfx.compute_delete(?g.clear, g.d); }
         }
@@ -489,6 +520,7 @@ pub fun forgo_compute(g: *Gpu) {
     gfx.compute_delete(?g.clear, g.d);
     gfx.compute_delete(?g.grow, g.d);
     gfx.compute_delete(?g.census, g.d);
+    gfx.compute_delete(?g.reduce, g.d);
     g.stepping = false;
 }
 
@@ -505,6 +537,7 @@ pub fun dnit(g: *Gpu) {
         gfx.compute_delete(?g.clear, g.d);
         gfx.compute_delete(?g.grow, g.d);
         gfx.compute_delete(?g.census, g.d);
+        gfx.compute_delete(?g.reduce, g.d);
     }
     vector.dnit[Write](?g.writes);
     vector.dnit[u32](?g.zeros);
@@ -925,12 +958,71 @@ fun upload_view(g: *Gpu, sp: *space.Space, look: *Look) err[gfx.Error] {
             if (x >= x0 && x <= x1 && y >= y0 && y <= y1) {
                 val e: err[gfx.Error] = upload_cells(g, sp, s, 1, false);
                 if (sel e.err) { ret e; }
+                pyramid(?sp.cells[s * space.CELLS], ?g.built[0]);
+                val em: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.mip, s * MIP * 4, (?g.built[0])::*u8, MIP * 4);
+                if (sel em.err) { ret em; }
                 sent = sent + 1;
             }
         }
         s = s + 1;
     }
     ret err[gfx.Error].ok{};
+}
+
+# a chunk's coverage pyramid built from its cells, as the reduce stage builds it
+# ---
+# cells: the chunk's space.CELLS cells
+# out:   receives MIP texels
+pub fun pyramid(cells: *u32, out: *u32) {
+    var l: u32 = 1;
+    for (l <= layout.LEVELS) {
+        val s:    u32 = 1 << l;
+        val side: u32 = layout.mip_side(l);
+        val at:   u32 = layout.mip_at(l);
+        var t:    u32 = 0;
+        for (t < side * side) {
+            val ox:   u32 = (t % side) * s;
+            val oy:   u32 = (t / side) * s;
+            var live: u32 = 0;
+            var heat: u32 = 0;
+            var ages: u32 = 0;
+            var i:    u32 = 0;
+            for (i < s * s) {
+                val c: u32 = cells[((oy + i / s) * layout.SIDE + ox + i % s)::usize];
+                if (c >= layout.LIVE) {
+                    live = live + 1;
+                    ages = ages + layout.texel_age(c);
+                }
+                if ((c & layout.HEAT_MASK) > heat) { heat = c & layout.HEAT_MASK; }
+                i = i + 1;
+            }
+            out[(at + t)::usize] = layout.texel(live, heat, ages);
+            t                    = t + 1;
+        }
+        l = l + 1;
+    }
+}
+
+# whether the GPU's pyramid of every chunk the host's staging holds as the GPU
+# does is the one its cells give; call after a pull, outside a frame
+#[testing]
+pub fun pyramids_hold(g: *Gpu, sp: *space.Space) bool {
+    var got: [layout.MIP]u32;
+    var s:   usize = 0;
+    for (s < g.hi && s < sp.hi) {
+        if (space.used(sp, s) && sp.dirty[s] == 0) {
+            val e: err[gfx.Error] = gfx.storage_buffer_read(g.d, ?g.p.mip, s * MIP * 4, (?got[0])::*u8, MIP * 4);
+            if (sel e.err) { ret false; }
+            pyramid(?sp.cells[s * space.CELLS], ?g.built[0]);
+            var i: usize = 0;
+            for (i < MIP) {
+                if (got[i] != g.built[i]) { ret false; }
+                i = i + 1;
+            }
+        }
+        s = s + 1;
+    }
+    ret true;
 }
 
 fun write_head(g: *Gpu, k: *kernel.Kernel) {
@@ -1002,6 +1094,16 @@ pub fun frame(g: *Gpu, sp: *space.Space, k: *kernel.Kernel, steps: usize, look: 
         i        = i + 1;
     }
 
+    if (g.hi != 0) {
+        var rb: [4]*gfx.StorageBuffer;
+        rb[0] = ?g.p.cells[g.front];
+        rb[1] = ?g.p.meta;
+        rb[2] = ?g.p.flags;
+        rb[3] = ?g.p.mip;
+        val er: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.reduce, ?rb[0], 4, 1, g.hi::u32, 1);
+        if (sel er.err) { ret res[usize, gfx.Error].err{er.err}; }
+    }
+
     var groups: u32 = ((g.hi + 63) / 64)::u32;
     if (groups == 0) { groups = 1; }
     var cb: [4]*gfx.StorageBuffer;
@@ -1027,11 +1129,12 @@ pub fun frame(g: *Gpu, sp: *space.Space, k: *kernel.Kernel, steps: usize, look: 
 # draw every chunk into an open pass
 pub fun draw(g: *Gpu, p: *gfx.Pass) {
     if (g.hi == 0) { ret; }
-    var bufs: [3]*gfx.StorageBuffer;
+    var bufs: [4]*gfx.StorageBuffer;
     bufs[0] = ?g.p.cells[g.front];
     bufs[1] = ?g.p.meta;
     bufs[2] = ?g.view;
-    gfx.pass_draw_storage(p, ?bufs[0], 3, 6, g.hi::u32, ?g.mat, ?g.xf, ?g.draw);
+    bufs[3] = ?g.p.mip;
+    gfx.pass_draw_storage(p, ?bufs[0], 4, 6, g.hi::u32, ?g.mat, ?g.xf, ?g.draw);
 }
 
 test ceiling__is_the_cells_share_of_the_storage_range {
