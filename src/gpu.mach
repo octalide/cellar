@@ -28,7 +28,9 @@
 # generation, skipping the chunks the steps left cold.
 #
 # where the compute stages cannot be built, the CPU steps and this only draws,
-# uploading the chunks in view every frame with their pyramids.
+# uploading the chunks in view every frame with their pyramids. where the
+# world is not in the pool at all, the host fills the pool with what is to be
+# drawn and show uploads it, stepping nothing.
 
 use gfx: boom.graphics;
 use gm:  boom.math;
@@ -99,7 +101,8 @@ val MAX_VIEW: usize = 4096;
 # half_w:  half the viewport width in pixels
 # half_h:  half the viewport height in pixels
 # win_w:   the window width in pixels; the view is its left half_w * 2
-# pad1:    alignment
+# shift:   0 when a drawn cell is a cell; else it stands for a square of
+#          2^shift cells a side and holds the share of them alive in 255ths
 # pad2:    alignment
 # solid:   the solid live colour, in the target's space
 # back:    the backdrop, in the target's space
@@ -114,7 +117,7 @@ pub rec Look {
     half_w:  f32;
     half_h:  f32;
     win_w:   f32;
-    pad1:    u32;
+    shift:   u32;
     pad2:    u32;
     solid:   [4]f32;
     back:    [4]f32;
@@ -802,8 +805,9 @@ fun upload_cells(g: *Gpu, sp: *space.Space, s: usize, n: usize, stall: bool) err
 }
 
 # bring the GPU's pool level with the host's: grow it, then upload changed
-# page-table entries, whole chunks and painted cells
-fun flush(g: *Gpu, sp: *space.Space) err[gfx.Error] {
+# page-table entries, whole chunks and painted cells. chunks are uploaded where
+# the GPU steps, or with whole where the host fills them for the draw
+fun flush(g: *Gpu, sp: *space.Space, whole: bool) err[gfx.Error] {
     # buffers a growth replaced are freed once the frame that copied out of
     # them has run, which deleting waits for
     if (g.retired) {
@@ -896,7 +900,9 @@ fun flush(g: *Gpu, sp: *space.Space) err[gfx.Error] {
             val ez: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.clear, ?zb[0], 4, 64, g.zeros.len::u32, 1);
             if (sel ez.err) { ret ez; }
         }
+    }
 
+    if (g.stepping || whole) {
         # chunks the host filled are uploaded, and stamped so they step in full.
         # a stalled upload would land before this frame's growth copy, which
         # would then overwrite it, so a growing frame records its uploads
@@ -912,14 +918,14 @@ fun flush(g: *Gpu, sp: *space.Space) err[gfx.Error] {
                     run = run + 1;
                 }
                 val e12: err[gfx.Error] = upload_cells(g, sp, s, run, stall);
-                if (sel e12.err) { ret e12; }
-                if (!stall)      { vector.push[u32](?g.stamped, s::u32); }
+                if (sel e12.err)          { ret e12; }
+                if (!stall && g.stepping) { vector.push[u32](?g.stamped, s::u32); }
                 s = s + run;
                 cnt;
             }
             s = s + 1;
         }
-        if (stall) {
+        if (stall && g.stepping) {
             # many at once: every slot is stamped, which only costs one full step
             val rs: res[*u32, allo.Error] = allo.allocate[u32](g.a, top * 2);
             if (sel rs.err) { ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.empty{}}}; }
@@ -1079,7 +1085,7 @@ fun write_head(g: *Gpu, r: *rule.Rule) {
 # look:  the camera and colours for the draw
 # ret:   the generations recorded, or why recording failed
 pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, steps: usize, look: *Look) res[usize, gfx.Error] {
-    val e14: err[gfx.Error] = flush(g, sp);
+    val e14: err[gfx.Error] = flush(g, sp, false);
     if (sel e14.err) { ret res[usize, gfx.Error].err{e14.err}; }
     val e15: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.view, 0, look::*u8, LOOK * 4);
     if (sel e15.err) { ret res[usize, gfx.Error].err{e15.err}; }
@@ -1153,6 +1159,25 @@ pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, steps: usize, look: *Loo
     snap.cap    = g.p.cap;
     snap.hi     = g.hi;
     ret res[usize, gfx.Error].ok{n};
+}
+
+# ready a draw of a pool the host filled with what is to be seen, stepping nothing
+#
+# for a world held outside the pool: its chunks marked DIRTY_CELLS are
+# uploaded whole, whether or not the GPU could step. call where frame would be.
+# ---
+# g:    the GPU side
+# sp:   the pool, holding what is drawn
+# r:    the rule, whose sense the draw reads
+# look: the camera and colours
+# ret:  ok, or why the upload failed
+pub fun show(g: *Gpu, sp: *space.Space, r: *rule.Rule, look: *Look) err[gfx.Error] {
+    val ef: err[gfx.Error] = flush(g, sp, true);
+    if (sel ef.err) { ret ef; }
+    val ev: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.view, 0, look::*u8, LOOK * 4);
+    if (sel ev.err) { ret ev; }
+    write_head(g, r);
+    ret gfx.renderer_buffer_update(g.r, ?g.p.meta, 0, (?g.head[0])::*u8, HEAD * 4);
 }
 
 # draw every chunk into an open pass
