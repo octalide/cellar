@@ -32,6 +32,36 @@ var flags: Flags;
 #[builtin("global_invocation")]
 var gid: u32x3;
 
+# the index in the source pool of the cell at (x, y) of a slot's frame, taken
+# through the links where it lies outside the window (cellar.layout), or NONE
+# where no chunk holds it
+fun reach(slot: u32, x: i32, y: i32) u32 {
+    var sl: u32 = slot;
+    var px: i32 = x;
+    var py: i32 = y;
+    var at: u32 = layout.NONE;
+    var h:  u32 = 0;
+    for (h <= layout.HOPS) {
+        val b: u32 = sl * layout.ENTRY;
+        val k: u32 = layout.edge_side(meta.table[b + layout.EDGE_AT], px, py);
+        val n: u32 = meta.table[b + k];
+        if (k == 4) {
+            at = sl * layout.CELLS + (py * layout.SIDE::i32 + px)::u32;
+            h  = layout.HOPS;
+        }
+        or (n == layout.NONE) { h = layout.HOPS; }
+        or {
+            val t:  u32 = meta.table[b + layout.LINK_AT + k];
+            val nx: i32 = layout.hop_x(t, px, py);
+            py = layout.hop_y(t, px, py);
+            px = nx;
+            sl = n;
+        }
+        h = h + 1;
+    }
+    ret at;
+}
+
 fun cool(v: u32) u32 {
     val heat: u32 = v & word.HEAT_MASK;
     if (heat > word.DECAY) { ret heat - word.DECAY; }
@@ -46,7 +76,11 @@ fun comp_main() {
     val x0:   u32 = (gid[0] % 8) * 8;
     val base: u32 = slot * layout.ENTRY;
     val row:  u32 = slot * layout.CELLS + (ly * layout.SIDE::i32)::u32;
-    if (meta.table[base + (layout.ENTRY - 1)] == 0) { ret; }
+    if (meta.table[base + layout.INCARNATION_AT] == 0) { ret; }
+    # a seamed chunk reads its block through its links, and holds its cells
+    # off the grid at zero
+    val edge:   u32 = meta.table[base + layout.EDGE_AT];
+    val seamed: u32 = layout.seamed(edge);
 
     # the serial that produced the source. a stamp this step already wrote
     # may have replaced it, so a stamp of either serial counts as set then; a
@@ -64,6 +98,7 @@ fun comp_main() {
         }
         k = k + 1;
     }
+    if (seamed != 0) { busy = 1; }
     var x: u32 = x0;
     if (busy == 0) {
         val warm: u32 = flags.v[slot * 2 + 1];
@@ -121,9 +156,14 @@ fun comp_main() {
                         xx = xx - layout.SIDE::i32;
                         cx = 2;
                     }
-                    val n: u32 = meta.table[base + cy * 3 + cx];
-                    if (n != layout.NONE) {
-                        if (src.v[n * layout.CELLS + (y * layout.SIDE::i32 + xx)::u32] >= word.LIVE) { sum = sum + w; }
+                    var at: u32 = layout.NONE;
+                    if (seamed != 0) { at = reach(slot, lx + dx, ly + dy); }
+                    or {
+                        val n: u32 = meta.table[base + cy * 3 + cx];
+                        if (n != layout.NONE) { at = n * layout.CELLS + (y * layout.SIDE::i32 + xx)::u32; }
+                    }
+                    if (at != layout.NONE) {
+                        if (src.v[at] >= word.LIVE) { sum = sum + w; }
                     }
                 }
                 dx = dx + 1;
@@ -150,9 +190,10 @@ fun comp_main() {
             var age: u32 = (cur >> word.AGE_SHIFT) + 1;
             if (age > word.AGE_MAX) { age = word.AGE_MAX; }
             next = (age << word.AGE_SHIFT) | word.HEAT_MASK;
-            live = 1;
         }
-        or { next = cool(cur); }
+        or                                                      { next = cool(cur); }
+        if (seamed != 0 && layout.edge_side(edge, lx, ly) != 4) { next = 0; }
+        if (next >= word.LIVE)                                  { live = 1; }
         warm           = warm | (next & word.HEAT_MASK);
         dst.v[row + x] = next;
         x              = x + 1;

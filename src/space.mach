@@ -10,6 +10,13 @@
 #               NONE where that chunk does not exist
 #   words 9, 10 the chunk's coordinates biased by BIAS, so they stay positive
 #   word 11     the slot's incarnation, zero while it is free
+#   words 12..21 a link word per neighbour slot, and the edge word
+#
+# on the unbounded plane the neighbours are the chunks around it and every
+# link a move of one chunk. on a bounded grid (cellar.topology) a chunk off the
+# grid never exists, the links of a chunk at the grid's edge reach across its
+# seams, and the halo a live chunk asks for lands where the seams take it (see
+# cellar.layout for how a step reads through them).
 #
 # a cell is a word the rule family gives its meaning, which the pool reads
 # through the family's sense (cellar.layout.Sense). the front cells are the
@@ -29,6 +36,7 @@
 # runs within, and a chunk counted on the host asks for the same.
 
 use cellar.layout;
+use cellar.topology;
 use allo: std.allocator;
 use std.allocator.page;
 use mem: std.memory;
@@ -162,6 +170,7 @@ pub rec Mirror {
 # sense:     how the census reads a cell, the running rule's
 # wide:      a chunk counted or painted on the host asks for the wide halo,
 #            as the GPU's census does while it steps uncapped
+# grid:      the grid the world runs on
 pub rec Space {
     a:         *allo.Allocator;
     cap:       usize;
@@ -185,6 +194,7 @@ pub rec Space {
     stepped:   bool;
     sense:     layout.Sense;
     wide:      bool;
+    grid:      topology.Grid;
 }
 
 # one chunk's step, as a rule family's CPU step sees it
@@ -442,6 +452,7 @@ pub fun init(sp: *Space, a: *allo.Allocator, stepped: bool) err[allo.Error] {
     sp.stepped   = stepped;
     mem.zero[u8]((?sp.sense)::*u8, $size_of(layout.Sense));
     sp.wide = false;
+    sp.grid = topology.open();
     ret alloc_arrays(sp, FIRST_CAP);
 }
 
@@ -501,6 +512,132 @@ pub fun reset(sp: *Space) {
     sp.hi    = 0;
 }
 
+# whether a slot's chunk is read through its links (cellar.layout.seamed)
+pub fun seamed(sp: *Space, s: usize) bool {
+    ret layout.seamed(sp.table[s * ENTRY + layout.EDGE_AT::usize]) != 0;
+}
+
+# whether the cell at (x, y) is on the world's grid
+pub fun holds(sp: *Space, x: i64, y: i64) bool {
+    ret topology.holds(?sp.grid, x, y);
+}
+
+# whether the chunk at (cx, cy) has a cell on the world's grid
+pub fun on_grid(sp: *Space, cx: i64, cy: i64) bool {
+    ret topology.inside(?sp.grid, cx, cy);
+}
+
+# set every neighbour slot, link word and the edge word of a slot's entry from
+# the grid, and mark it dirty
+fun link(sp: *Space, s: usize) {
+    val e:  *u32 = ?sp.table[s * ENTRY];
+    val cx: i64  = slot_x(sp, s);
+    val cy: i64  = slot_y(sp, s);
+    var k:  u32  = 0;
+    for (k < 9) {
+        val at: usize = layout.LINK_AT::usize + k::usize;
+        if (k == 4) {
+            e[4]  = s::u32;
+            e[at] = layout.plain_link(4);
+        }
+        or {
+            val l: topology.Link = topology.link(?sp.grid, cx, cy, k);
+            e[at]       = l.word;
+            e[k::usize] = NONE;
+            if (l.any) { e[k::usize] = find(sp, l.cx, l.cy); }
+        }
+        k = k + 1;
+    }
+    e[layout.EDGE_AT::usize] = topology.edge_word(?sp.grid, cx, cy);
+    sp.dirty[s]              = sp.dirty[s] | DIRTY_ENTRY;
+}
+
+# relink every seamed chunk that may link to the chunk at (cx, cy) across a
+# seam: those around it, and around each chunk its own links reach. a link
+# across a seam need not be returned by one the other way, so a chunk made or
+# freed by a seam tells them this way.
+fun relink_near(sp: *Space, cx: i64, cy: i64) {
+    var k: u32 = 0;
+    for (k < 9) {
+        var l: topology.Link = topology.Link{any: true, cx: cx, cy: cy, word: 0};
+        if (k != 4) { l = topology.link(?sp.grid, cx, cy, k); }
+        var j: i64 = 0;
+        for (l.any && j < 9) {
+            val n: u32 = find(sp, l.cx + j % 3 - 1, l.cy + j / 3 - 1);
+            if (n != NONE && seamed(sp, n::usize)) { link(sp, n::usize); }
+            j = j + 1;
+        }
+        k = k + 1;
+    }
+}
+
+# clip the run of cells [x0, x1) of row y to the world's grid
+# ---
+# ret: false when nothing of the run is on the grid
+pub fun clip(sp: *Space, y: i64, x0: *i64, x1: *i64) bool {
+    ret topology.clip(?sp.grid, y, x0, x1);
+}
+
+# zero a slot's cells that lie off the grid, marking them dirty when any was set
+pub fun mask(sp: *Space, s: usize) {
+    val e: u32   = sp.table[s * ENTRY + layout.EDGE_AT::usize];
+    val c: *u32  = ?sp.cells[s * CELLS];
+    var i: usize = 0;
+    for (i < CELLS) {
+        if (c[i] != 0 && layout.edge_side(e, (i & 63)::i32, (i >> 6)::i32) != 4) {
+            c[i]        = 0;
+            sp.dirty[s] = sp.dirty[s] | DIRTY_CELLS;
+        }
+        i = i + 1;
+    }
+}
+
+# put the world on a grid: the chunks off it are freed, every other chunk is
+# relinked and its cells off it cleared. the census is left as it was, for the
+# caller to recount.
+# ---
+# sp: the pool
+# g:  the grid
+pub fun set_grid(sp: *Space, g: topology.Grid) {
+    sp.grid = g;
+    var s: usize = 0;
+    for (s < sp.hi) {
+        if (used(sp, s) && !topology.inside(?sp.grid, slot_x(sp, s), slot_y(sp, s))) { release(sp, s); }
+        s = s + 1;
+    }
+    s = 0;
+    for (s < sp.hi) {
+        if (used(sp, s)) {
+            link(sp, s);
+            mask(sp, s);
+        }
+        s = s + 1;
+    }
+    compact(sp);
+}
+
+# the word of the cell at (x, y) of a slot's frame, taken through the links
+# where it lies outside the window (cellar.layout), zero where no chunk holds it
+pub fun resolve(sp: *Space, s: usize, x: i32, y: i32) u32 {
+    var sl: usize = s;
+    var px: i32   = x;
+    var py: i32   = y;
+    var h:  u32   = 0;
+    for (true) {
+        val e: *u32 = ?sp.table[sl * ENTRY];
+        val k: u32  = layout.edge_side(e[layout.EDGE_AT::usize], px, py);
+        if (k == 4)                                  { ret sp.cells[sl * CELLS + (py * 64 + px)::usize]; }
+        if (h == layout.HOPS || e[k::usize] == NONE) { ret 0; }
+        val t:  u32 = e[layout.LINK_AT::usize + k::usize];
+        val nx: i32 = layout.hop_x(t, px, py);
+        py = layout.hop_y(t, px, py);
+        px = nx;
+        sl = e[k::usize]::usize;
+        h  = h + 1;
+    }
+    ret 0;
+}
+
 # the slot of the chunk at (cx, cy), allocating it empty when it does not exist
 #
 # a new chunk is linked into its neighbours' entries, and its own entry and
@@ -509,11 +646,13 @@ pub fun reset(sp: *Space) {
 # sp:  the pool
 # cx:  chunk column
 # cy:  chunk row
-# ret: the slot, or NONE when the pool is at its ceiling, or the allocator or
-#      the mirror refused to grow it
+# ret: the slot, or NONE when the chunk lies off the grid or the pool is at its
+#      ceiling, or the allocator or the mirror refused to grow it
 pub fun alloc(sp: *Space, cx: i64, cy: i64) u32 {
     val have: u32 = find(sp, cx, cy);
     if (have != NONE) { ret have; }
+    val bounded: bool = topology.bounded(?sp.grid);
+    if (bounded && !topology.inside(?sp.grid, cx, cy)) { ret NONE; }
     var s: usize = 0;
     if (sp.nfree != 0) {
         sp.nfree = sp.nfree - 1;
@@ -543,8 +682,24 @@ pub fun alloc(sp: *Space, cx: i64, cy: i64) u32 {
     sp.live     = sp.live + 1;
     sp.dirty[s] = DIRTY_ENTRY | DIRTY_ZERO;
 
+    if (bounded) {
+        link(sp, s);
+        var j: usize = 0;
+        for (j < 9) {
+            val n: u32 = e[j];
+            if (j != 4 && n != NONE && (e[layout.LINK_AT::usize + j] & layout.LINK_SEAM) == 0) {
+                sp.table[n::usize * ENTRY + 8 - j] = s::u32;
+                sp.dirty[n::usize]                 = sp.dirty[n::usize] | DIRTY_ENTRY;
+            }
+            j = j + 1;
+        }
+        if (seamed(sp, s)) { relink_near(sp, cx, cy); }
+        ret s::u32;
+    }
+    e[layout.EDGE_AT::usize] = layout.EDGE_WHOLE;
     var k: usize = 0;
     for (k < 9) {
+        e[layout.LINK_AT::usize + k] = layout.plain_link(k::u32);
         val dx: i64 = (k % 3)::i64 - 1;
         val dy: i64 = (k / 3)::i64 - 1;
         var n:  u32 = s::u32;
@@ -563,11 +718,14 @@ pub fun alloc(sp: *Space, cx: i64, cy: i64) u32 {
 pub fun release(sp: *Space, s: usize) {
     if (!used(sp, s)) { ret; }
     hash_remove(sp, s);
-    val e: *u32  = ?sp.table[s * ENTRY];
-    var k: usize = 0;
+    val e:    *u32  = ?sp.table[s * ENTRY];
+    val cx:   i64   = slot_x(sp, s);
+    val cy:   i64   = slot_y(sp, s);
+    val seam: bool  = seamed(sp, s);
+    var k:    usize = 0;
     for (k < 9) {
         val n: u32 = e[k];
-        if (n != NONE && k != 4) {
+        if (n != NONE && k != 4 && (e[layout.LINK_AT::usize + k] & layout.LINK_SEAM) == 0) {
             sp.table[n::usize * ENTRY + 8 - k] = NONE;
             sp.dirty[n::usize]                 = sp.dirty[n::usize] | DIRTY_ENTRY;
         }
@@ -579,6 +737,7 @@ pub fun release(sp: *Space, s: usize) {
     sp.frees[sp.nfree] = s::u32;
     sp.nfree           = sp.nfree + 1;
     sp.live            = sp.live - 1;
+    if (seam) { relink_near(sp, cx, cy); }
 }
 
 # lower hi past the free slots at the top of the pool, and order the free
@@ -605,6 +764,7 @@ pub fun compact(sp: *Space) {
 # mask: a bit per chunk of the 5 by 5 block around it, its own ignored
 # ret:  false when the pool could not hold them
 pub fun surround_by(sp: *Space, s: usize, mask: u32) bool {
+    if (topology.bounded(?sp.grid)) { ret surround_grid(sp, s, mask); }
     val cx: i64   = slot_x(sp, s);
     val cy: i64   = slot_y(sp, s);
     val w:  usize = HALO_SIDE::usize;
@@ -620,6 +780,42 @@ pub fun surround_by(sp: *Space, s: usize, mask: u32) bool {
             if (n == NONE)                                  { n = alloc(sp, cx + dx, cy + dy); }
             if (n == NONE)                                  { ok = false; }
             or                                              { sp.asked[n::usize] = 1; }
+        }
+        k = k + 1;
+    }
+    ret ok;
+}
+
+# the chunks on a bounded grid holding the cells of the chunk at (cx, cy) off
+# it once taken across the seams, or the chunk itself where it lies on the grid
+# ---
+# out: topology.IMAGES_MAX pairs of chunk column and row
+# ret: the pairs written
+pub fun images(sp: *Space, cx: i64, cy: i64, out: *i64) usize {
+    ret topology.images(?sp.grid, cx * SIDE, cy * SIDE, (cx + 1) * SIDE, (cy + 1) * SIDE, out);
+}
+
+# surround_by on a bounded grid, where each chunk of the halo is the chunks its
+# cells land in
+fun surround_grid(sp: *Space, s: usize, mask: u32) bool {
+    val cx: i64   = slot_x(sp, s);
+    val cy: i64   = slot_y(sp, s);
+    val w:  usize = HALO_SIDE::usize;
+    var ok: bool  = true;
+    var at: [72]i64;
+    var k:  usize = 0;
+    for (k < w * w) {
+        if (k != HALO_SELF::usize && ((mask >> k::u32) & 1) != 0) {
+            val dx: i64   = (k % w)::i64 - (w / 2)::i64;
+            val dy: i64   = (k / w)::i64 - (w / 2)::i64;
+            val n:  usize = images(sp, cx + dx, cy + dy, ?at[0]);
+            var i:  usize = 0;
+            for (i < n) {
+                val t: u32 = alloc(sp, at[i * 2], at[i * 2 + 1]);
+                if (t == NONE) { ok = false; }
+                or             { sp.asked[t::usize] = 1; }
+                i = i + 1;
+            }
         }
         k = k + 1;
     }
