@@ -70,8 +70,8 @@ exits, leaving the saved settings alone.
 
 ## Install
 
-Release archives for linux (x86-64), windows (x86-64) and macOS (x86-64 and
-Apple silicon) are on the
+Release archives for linux (x86-64 and arm64), windows (x86-64) and macOS
+(x86-64 and Apple silicon) are on the
 [releases page](https://github.com/octalide/cellar/releases). cellar needs a
 Vulkan driver; on macOS that is MoltenVK.
 
