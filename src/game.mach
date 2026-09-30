@@ -24,7 +24,9 @@ use gm:  boom.math;
 use win: boom.window;
 use cellar.app;
 use cellar.arrange;
+use cellar.command;
 use cellar.config;
+use cellar.exec;
 use cellar.gpu;
 use cellar.hud;
 use cellar.panel;
@@ -299,10 +301,10 @@ fun keys(ctx: *Context, g: *Game) {
         or               { context_stop(ctx); }
         ret;
     }
-    if (inp.key_pressed(in, inp.KEY_SPACE))                                { world.toggle(?g.sim); }
-    if (inp.key_pressed(in, inp.KEY_S))                                    { world.step(?g.sim); }
-    if (inp.key_pressed(in, inp.KEY_C))                                    { world.clear(?g.sim); }
-    if (inp.key_pressed(in, inp.KEY_R))                                    { world.randomize(?g.sim, app.bounds_size(a.bounds_idx)); }
+    if (inp.key_pressed(in, inp.KEY_SPACE))                                { app.submit(a, command.Command.toggle{}); }
+    if (inp.key_pressed(in, inp.KEY_S))                                    { app.submit(a, command.Command.step{}); }
+    if (inp.key_pressed(in, inp.KEY_C))                                    { app.submit(a, command.Command.clear{}); }
+    if (inp.key_pressed(in, inp.KEY_R))                                    { app.submit(a, command.Command.randomize{app.bounds_size(a.bounds_idx)}); }
     if (inp.key_pressed(in, inp.KEY_M))                                    { a.mode = (a.mode + 1) % app.MODE_COUNT; }
     if (inp.key_pressed(in, inp.KEY_G))                                    { a.gutter = 1 - a.gutter; }
     if (inp.key_pressed(in, inp.KEY_F))                                    { a.refit = true; }
@@ -411,38 +413,6 @@ pub fun on_tick(ctx: *Context) {
     runner.leave(?g.runner, worker(g));
 }
 
-# paint every cell on the line from the stroke's last cell to (x, y)
-fun paint_line(s: *sim.Sim, x0: i64, y0: i64, x1: i64, y1: i64, v: u8) {
-    var dx: i64 = x1 - x0;
-    var dy: i64 = y1 - y0;
-    var sx: i64 = 1;
-    var sy: i64 = 1;
-    if (dx < 0) {
-        dx = 0 - dx;
-        sx = -1;
-    }
-    if (dy < 0) {
-        dy = 0 - dy;
-        sy = -1;
-    }
-    var e: i64 = dx - dy;
-    var x: i64 = x0;
-    var y: i64 = y0;
-    for {
-        world.paint(s, x, y, v);
-        if (x == x1 && y == y1) { brk; }
-        val e2: i64 = e * 2;
-        if (e2 > 0 - dy) {
-            e = e - dy;
-            x = x + sx;
-        }
-        if (e2 < dx) {
-            e = e + dx;
-            y = y + sy;
-        }
-    }
-}
-
 # apply the tool under the cursor when nothing of the interface is in the way
 fun edit_world(g: *Game, pt: render.Port, cam: render.Camera) {
     val u: *ui.Ui   = ?g.ui;
@@ -455,7 +425,7 @@ fun edit_world(g: *Game, pt: render.Port, cam: render.Camera) {
     var cy: i64 = 0;
     render.cell_at(cam, u.mx, u.my, ?cx, ?cy);
     if (a.tool == app.TOOL_STAMP) {
-        if (u.pressed) { arrange.stamp_active(a, ?g.sim, cx, cy); }
+        if (u.pressed) { arrange.stamp_active(a, cx, cy); }
         ret;
     }
     if (!u.down) {
@@ -464,8 +434,8 @@ fun edit_world(g: *Game, pt: render.Port, cam: render.Camera) {
     }
     var v: u8 = 1;
     if (a.tool == app.TOOL_ERASE) { v = 0; }
-    if (a.stroke)                 { paint_line(?g.sim, a.last_x, a.last_y, cx, cy, v); }
-    or                            { world.paint(?g.sim, cx, cy, v); }
+    if (a.stroke)                 { app.submit(a, command.Command.line{command.Line{x0: a.last_x, y0: a.last_y, x1: cx, y1: cy, v: v}}); }
+    or                            { app.submit(a, command.Command.paint{command.Paint{x: cx, y: cy, v: v}}); }
     a.stroke = true;
     a.last_x = cx;
     a.last_y = cy;
@@ -545,6 +515,10 @@ pub fun on_draw(ctx: *Context) {
     # the world is locked from reading it to recording the pass, and unlocked
     # before present, which can block for a whole refresh
     runner.enter(?g.runner);
+    # the world's edits and file actions run first: a save reads the GPU's
+    # cells back, which is only valid before the frame records anything
+    var deps: exec.Deps = exec.Deps{a: ?g.a, p: ?g.paths};
+    exec.run(a, ?g.sim, ?deps);
     # take the census before this frame's own readback can reuse its slot
     sim.collect(?g.sim);
     app.note_full(a, world.full(?g.sim));
@@ -556,8 +530,8 @@ pub fun on_draw(ctx: *Context) {
     }
     val cam: render.Camera = camera(a, pt);
 
-    # record the frame's generations and the view; the panel's edits this
-    # frame reach the GPU with the next one
+    # record the frame's generations and the view; edits made after this wait
+    # in the queue for the next frame
     var look: gpu.Look       = render.look(cam, sw, a.mode::u8, a.gutter, a.solid, u.srgb);
     val rec:  err[gfx.Error] = sim.record(?g.sim, uncapped(g), ?look);
     if (sel rec.err) {
@@ -579,9 +553,7 @@ pub fun on_draw(ctx: *Context) {
     if (g.bench == BENCH_NONE) {
         hud.readout(u, a, ?g.sim, pt);
         hud.position(u, cam, pt, u.mx < a.side_x0 && ui.inside(u, 0.0, 0.0, pt.w, pt.h));
-        var deps: panel.Deps = panel.Deps{a: ?g.a, p: ?g.paths, shot: false};
-        panel.draw(u, a, ?g.sim, ?deps, sw, sh);
-        if (deps.shot) { a.shot = true; }
+        panel.draw(u, a, ?g.sim, ?g.paths, sw, sh);
         hud.toast(u, a, pt);
         hud.help(u, a, sw, sh);
         edit_world(g, pt, cam);
