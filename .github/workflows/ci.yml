@@ -1,61 +1,79 @@
 name: CI
 
-# the family's tiered pipeline (briar-systems/.github mach-lib.yml). a pull
-# request into dev runs the linux legs, a pull request into main runs every
-# leg. mach-glfw builds GLFW from C with each host's own toolchain, so every
-# target is built natively on its own leg rather than cross-built from linux,
-# and .github/ci/setup.sh installs what a leg's C step needs. nothing runs on
-# push. cd.yml calls this with heavy: all.
-
 on:
   pull_request:
-  workflow_call:
-    inputs:
-      heavy:
-        type: string
-        default: none
   workflow_dispatch:
     inputs:
-      heavy:
-        description: heavy work to run on this ref
-        type: choice
-        default: none
-        options: [none, all, x86_64-windows, x86_64-darwin, aarch64-darwin]
+      runners:
+        description: runners to test on, as a JSON array, e.g. ["macos-15", "windows-latest"]
+        type: string
+  workflow_call:
+    inputs:
+      runners:
+        type: string
+      profile:
+        type: string
+        default: debug
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  MACH_VERSION: 6.8.0
+  PROFILE: ${{ inputs.profile || 'debug' }}
+
 jobs:
-  lib:
-    uses: briar-systems/.github/.github/workflows/mach-lib.yml@main
-    with:
-      heavy: ${{ inputs.heavy }}
-      mach-version: v6.7.2
-      # the windows and darwin targets need their own host's C toolchain for
-      # glfw, so the legs below build them instead
-      all-targets: false
-      # the linux legs build GLFW's x11 and wayland backends from source; a
-      # mach-o image on either darwin silicon is position independent
-      legs: >-
-        [{"name": "x86_64-linux", "runs-on": "ubuntu-latest", "target": "linux-x86_64",
-          "apt": ["xorg-dev", "libwayland-bin", "libwayland-dev", "libxkbcommon-dev",
-                  "wayland-protocols"]},
-         {"name": "aarch64-linux", "runs-on": "ubuntu-24.04-arm", "target": "linux-aarch64",
-          "apt": ["xorg-dev", "libwayland-bin", "libwayland-dev", "libxkbcommon-dev",
-                  "wayland-protocols"]},
-         {"name": "x86_64-windows", "runs-on": "windows-latest", "tier": "heavy",
-          "target": "windows-x86_64"},
-         {"name": "x86_64-darwin", "runs-on": "macos-15-intel", "tier": "heavy",
-          "target": "darwin-x86_64", "build-args": ["--pie"], "test-args": ["--pie"]},
-         {"name": "aarch64-darwin", "runs-on": "macos-15", "tier": "heavy",
-          "target": "darwin-aarch64", "build-args": ["--pie"], "test-args": ["--pie"]}]
+  # every runner builds every artifact for its own target and tests it
+  test:
+    name: test (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(inputs.runners || '["ubuntu-latest"]') }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+      - name: install mach
+        run: |
+          export MACH_INSTALL_DIR="$RUNNER_TEMP/mach"
+          url="https://raw.githubusercontent.com/briar-systems/mach/v$MACH_VERSION/dist"
+          if [ "$RUNNER_OS" = Windows ]; then
+            pwsh -NoProfile -Command "irm $url/install.ps1 | iex"
+          else
+            curl -fsSL "$url/install.sh" | sh
+          fi
+          echo "$MACH_INSTALL_DIR" >> "$GITHUB_PATH"
+      # mach-glfw builds GLFW from source: x11 and wayland headers on linux, zig on windows
+      - if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xorg-dev libwayland-bin libwayland-dev libxkbcommon-dev wayland-protocols
+      - if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "zig-x86_64-windows-0.16.0"
+          Invoke-WebRequest "https://ziglang.org/download/0.16.0/$name.zip" -OutFile "$env:RUNNER_TEMP\zig.zip"
+          Expand-Archive "$env:RUNNER_TEMP\zig.zip" -DestinationPath $env:RUNNER_TEMP
+          "$env:RUNNER_TEMP\$name" >> $env:GITHUB_PATH
+      - run: mach dep pull .
+      - if: strategy.job-index == 0
+        run: mach fmt --check .
+      # glfw's C step cannot cross-build darwin (the Apple SDK) or link linux
+      # arm64 from another host, so each runner builds its own target. glfw's
+      # darwin archive is PIC, so a darwin executable linking it is PIE
+      - run: mach test . -a '*' -p "$PROFILE" ${{ runner.os == 'macOS' && '--pie' || '' }}
 
   gate:
     if: always()
-    needs: [lib]
+    needs: [test]
     runs-on: ubuntu-latest
-    timeout-minutes: 5
     steps:
-      - uses: briar-systems/.github/.github/actions/gate@main
-        with:
-          needs: ${{ toJSON(needs) }}
+      - run: exit ${{ (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) && 1 || 0 }}

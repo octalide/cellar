@@ -1,146 +1,131 @@
 name: Release
 
-# the family's shared release (briar-systems/.github mach-release.yml): a pushed
-# v* tag is verified against mach.toml and the changelog, runs the full CI with
-# heavy: all, builds a release binary natively on each supported host, and
-# publishes them with SHA256SUMS. a workflow_dispatch rehearses the same path
-# and deletes its draft.
-#
-# asset names:
-#   cellar-<version>-<platform>.tar.gz   (linux, darwin)
-#   cellar-<version>-<platform>.zip      (windows)
-
 on:
   push:
     tags: ['v*']
-  workflow_dispatch:
 
 permissions:
   contents: read
 
-# one run per tag: GitHub can deliver a tag push twice, and two runs reaching
-# publish leaves an orphan draft. the second waits, finds the release, and ends
-# green. never cancel, since that could abort a publish part way
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  MACH_VERSION: 6.8.0
+
 jobs:
   verify:
-    uses: briar-systems/.github/.github/workflows/mach-release.yml@main
-    with:
-      stage: verify
-      assets: >-
-        ["cellar-{version}-x86_64-linux.tar.gz", "cellar-{version}-aarch64-linux.tar.gz",
-         "cellar-{version}-x86_64-windows.zip",
-         "cellar-{version}-x86_64-darwin.tar.gz", "cellar-{version}-aarch64-darwin.tar.gz"]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("mach.toml", "rb"))["project"]["version"])')
+          [ "$TAG" = "v$version" ] || { echo "::error::tag $TAG does not match mach.toml version $version"; exit 1; }
 
+  # the hosts this project ships to, tested natively before anything is published
   ci:
     needs: verify
     uses: ./.github/workflows/ci.yml
     with:
-      heavy: all
+      profile: release
+      runners: '["ubuntu-latest", "ubuntu-24.04-arm", "windows-latest", "macos-15", "macos-15-intel"]'
 
-  # each binary is built and run on its own host: GLFW's C step needs that
-  # host's toolchain, the version check executes the binary, and a darwin lane
-  # on the wrong silicon would ship a translated build
-  build:
-    name: build ${{ matrix.asset }}
+  # the binary, built natively on each host it ships to: mach-glfw cannot cross-build darwin
+  # or link linux arm64 from another host
+  package:
     needs: verify
-    runs-on: ${{ matrix.runs-on }}
-    timeout-minutes: 60
+    name: package (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { asset: x86_64-linux,   target: linux-x86_64,   runs-on: ubuntu-latest }
-          - { asset: aarch64-linux,  target: linux-aarch64,  runs-on: ubuntu-24.04-arm }
-          - { asset: x86_64-windows, target: windows-x86_64, runs-on: windows-latest }
-          - { asset: x86_64-darwin,  target: darwin-x86_64,  runs-on: macos-15-intel, machine: x86_64, args: --pie }
-          - { asset: aarch64-darwin, target: darwin-aarch64, runs-on: macos-15,       machine: arm64,  args: --pie }
-    env:
-      MACH_CI_LEG: ${{ matrix.asset }}
+        runner: ["ubuntu-latest", "ubuntu-24.04-arm", "windows-latest", "macos-15", "macos-15-intel"]
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@v6
-
-      - name: the darwin lane landed on real silicon
-        if: runner.os == 'macOS'
-        env:
-          WANT: ${{ matrix.machine }}
+      - name: install mach
         run: |
-          set -euo pipefail
-          got=$(uname -m); translated=$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)
-          [ "$got" = "$WANT" ] && [ "$translated" = 0 ] || { echo "::error::the $WANT lane landed on a $got host (proc_translated=$translated)"; exit 1; }
-
-      - name: glfw build dependencies
-        if: runner.os == 'Linux'
+          export MACH_INSTALL_DIR="$RUNNER_TEMP/mach"
+          url="https://raw.githubusercontent.com/briar-systems/mach/v$MACH_VERSION/dist"
+          if [ "$RUNNER_OS" = Windows ]; then
+            pwsh -NoProfile -Command "irm $url/install.ps1 | iex"
+          else
+            curl -fsSL "$url/install.sh" | sh
+          fi
+          echo "$MACH_INSTALL_DIR" >> "$GITHUB_PATH"
+      - if: runner.os == 'Linux'
         run: |
-          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y xorg-dev libwayland-bin libwayland-dev libxkbcommon-dev wayland-protocols
-
-      - name: host toolchain
-        run: bash .github/ci/setup.sh
-
-      - name: seed
-        uses: briar-systems/.github/.github/actions/seed-mach@main
-        with:
-          tag: v6.7.2
-
-      - name: release build
-        env:
-          TARGET: ${{ matrix.target }}
-          ARGS: ${{ matrix.args }}
+      - if: runner.os == 'Windows'
+        shell: pwsh
         run: |
-          set -euo pipefail
-          mach dep pull .
-          mach build . --target "$TARGET" --profile release $ARGS
-
-      - name: the binary reports this version
-        env:
-          TARGET: ${{ matrix.target }}
-          VERSION: ${{ needs.verify.outputs.version }}
+          $name = "zig-x86_64-windows-0.16.0"
+          Invoke-WebRequest "https://ziglang.org/download/0.16.0/$name.zip" -OutFile "$env:RUNNER_TEMP\zig.zip"
+          Expand-Archive "$env:RUNNER_TEMP\zig.zip" -DestinationPath $env:RUNNER_TEMP
+          "$env:RUNNER_TEMP\$name" >> $env:GITHUB_PATH
+      - run: mach dep pull .
+      - env:
+          PIE: ${{ runner.os == 'macOS' && '--pie' || '' }}
         run: |
-          set -euo pipefail
-          exe=; [ "$RUNNER_OS" = Windows ] && exe=.exe
-          got="$("out/$TARGET/release/bin/cellar$exe" --version | tr -d '\r')"
-          [ "$got" = "cellar $VERSION" ] || { echo "::error::cellar --version printed '$got', expected 'cellar $VERSION'"; exit 1; }
-
-      - name: package
-        env:
-          TARGET: ${{ matrix.target }}
-          ASSET: ${{ matrix.asset }}
-          VERSION: ${{ needs.verify.outputs.version }}
-        run: |
-          set -euo pipefail
-          mkdir -p dist pkg
-          cp LICENSE README.md pkg/
-          if [ "$RUNNER_OS" = Windows ]; then
-            cp "out/$TARGET/release/bin/cellar.exe" pkg/cellar.exe
-            (cd pkg && 7z a -tzip "../dist/cellar-$VERSION-$ASSET.zip" cellar.exe LICENSE README.md >/dev/null)
-          else
-            cp "out/$TARGET/release/bin/cellar" pkg/cellar
-            tar -C pkg -czf "dist/cellar-$VERSION-$ASSET.tar.gz" cellar LICENSE README.md
-          fi
-
+          # shellcheck disable=SC2086
+          mach build . -a cellar -p release $PIE
+          version=${GITHUB_REF_NAME#v}
+          mkdir dist
+          # shellcheck disable=SC2086
+          mach build . -a cellar -p release $PIE --plan | awk '
+            /^unit / { name = $3; target = $6 }
+            $1 == "tuple" { split($2, t, "-"); os = t[2] }
+            $1 == "out" && name == "cellar" { print name, target, os, $2 }' |
+          while read -r name target os path; do
+            archive="$PWD/dist/$name-$version-$target"
+            case "$os" in
+              windows) (cd "$(dirname "$path")" && 7z a -tzip -bso0 "$(cygpath -w "$archive.zip")" "$(basename "$path")") ;;
+              *)       tar -czf "$archive.tar.gz" -C "$(dirname "$path")" "$(basename "$path")" ;;
+            esac
+          done
+          ls dist
+          [ -n "$(ls dist)" ] || { echo "::error::no cellar archive for this host"; exit 1; }
       - uses: actions/upload-artifact@v7
         with:
-          name: release-${{ matrix.asset }}
-          path: dist/cellar-*
+          name: dist-${{ matrix.runner }}
+          path: dist/*
           if-no-files-found: error
-          retention-days: 1
 
   publish:
-    needs: [verify, ci, build]
-    uses: briar-systems/.github/.github/workflows/mach-release.yml@main
+    needs: [verify, ci, package]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
-    with:
-      stage: publish
-      assets: >-
-        ["cellar-{version}-x86_64-linux.tar.gz", "cellar-{version}-aarch64-linux.tar.gz",
-         "cellar-{version}-x86_64-windows.zip",
-         "cellar-{version}-x86_64-darwin.tar.gz", "cellar-{version}-aarch64-darwin.tar.gz"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - run: cd dist && sha256sum * > SHA256SUMS
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # a doubled tag push waits on the concurrency group, then finds the release
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "release $TAG already exists"
+            exit 0
+          fi
+          # notes are the changelog section for this version when there is one
+          notes=$(awk -v v="${TAG#v}" '/^## \[/ { on = index($0, "[" v "]") > 0; next } on' CHANGELOG.md 2>/dev/null || true)
+          flags=(--verify-tag --title "$TAG" --draft)
+          [ -n "$notes" ] && flags+=(--notes "$notes") || flags+=(--generate-notes)
+          case "$TAG" in *-*) flags+=(--prerelease) ;; esac
+          gh release create "$TAG" dist/* "${flags[@]}"
+          gh release edit "$TAG" --draft=false
