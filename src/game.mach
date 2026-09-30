@@ -118,6 +118,9 @@ val SMALL_PX: f32 = 14.0;
 # bench_secs:  seconds the measurement runs for
 # bench_r:     the radius the measured rule reads, Life's weights widened to it
 # bench_gps:   generations a second the measurement is capped at, 0 uncapped
+# engine:      the args.ENGINE_* the command line named
+# want_tree:   the world is to move onto HashLife with the first frame, and
+#              the run stops if it cannot
 # started:     when the measurement began
 # frames:      frames drawn since it began
 # gen0:        the generation it began at
@@ -146,6 +149,8 @@ pub rec Game {
     bench_secs:  f64;
     bench_r:     usize;
     bench_gps:   usize;
+    engine:      u8;
+    want_tree:   bool;
     started:     Instant;
     frames:      u64;
     gen0:        u64;
@@ -240,8 +245,12 @@ pub fun on_init(ctx: *Context) {
         ret;
     }
     g.gpu_ok = true;
-    if (g.bench_cpu)     { gpu.forgo_compute(?g.gpu); }
-    if (!g.gpu.stepping) { print.eprintln("the GPU cannot step the world; stepping on the CPU"); }
+    if (g.bench_cpu || g.engine == args.ENGINE_CPU) { gpu.forgo_compute(?g.gpu); }
+    if (!g.gpu.stepping && g.engine == args.ENGINE_GPU) {
+        give_up(ctx, "cellar: --engine gpu: the GPU here cannot step the world");
+        ret;
+    }
+    if (!g.gpu.stepping && g.engine != args.ENGINE_CPU) { print.eprintln("the GPU cannot step the world; stepping on the CPU"); }
     sim.attach(?g.sim, ?g.gpu);
 
     # the world is seeded once the GPU has set how far the pool may grow
@@ -254,9 +263,23 @@ pub fun on_init(ctx: *Context) {
         # a documentation capture shows the world a few generations in
         if (g.capture != nil) { world.toggle(?g.sim); }
     }
+    # onto HashLife after the file, which may bring the rule
+    g.want_tree = g.engine == args.ENGINE_HASHLIFE;
+    if (g.want_tree) { app.submit(?g.app, command.Command.engine{true}); }
 
     val spawned: err[thread.ThreadError] = runner.start(?g.runner, ?g.sim);
     if (sel spawned.err) { give_up(ctx, "could not start the simulation thread"); }
+}
+
+# stop the run that asked for HashLife on the command line when it could not
+# have it, saying why
+fun refuse_tree(ctx: *Context, g: *Game) {
+    var rb: [200]u8;
+    if (!world.hashlife_runs(?g.sim)) {
+        print.eprintlnf("cellar: --engine hashlife: HashLife cannot run {}; it runs radius 1 rules without B0", world.rule_string(?g.sim, ?rb[0]));
+    }
+    or { print.eprintln("cellar: --engine hashlife: HashLife could not take the world"); }
+    context_fail(ctx, 1);
 }
 
 # queue the file named on the command line to open with the first frame
@@ -617,6 +640,14 @@ pub fun on_draw(ctx: *Context) {
     # cells back, which is only valid before the frame records anything
     var deps: exec.Deps = exec.Deps{a: ?g.a};
     exec.run(a, ?g.sim, ?deps);
+    if (g.want_tree) {
+        g.want_tree = false;
+        if (!world.hashlife(?g.sim)) {
+            runner.leave(?g.runner, false);
+            refuse_tree(ctx, g);
+            ret;
+        }
+    }
     app.fit_engine(a, world.hashlife(?g.sim));
     if (a.clip_ready) {
         win.window_clipboard_set(?ctx.window, a.clip.data::str);
