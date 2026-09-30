@@ -58,6 +58,9 @@ pub val TOAST_TICKS: i32 = 150;
 # needs (cellar.gpu)
 pub val ZOOM_MIN: f32 = 0.005;
 pub val ZOOM_MAX: f32 = 16.0;
+# the least zoom while HashLife holds the world, which draws a square of cells
+# a pixel however far out, so a pixel may stand for 2^37 cells
+pub val ZOOM_TREE_MIN: f32 = 0.000000000001;
 
 # all interactive state not owned by the simulation
 # ---
@@ -78,6 +81,7 @@ pub val ZOOM_MAX: f32 = 16.0;
 # orient:      how the stamp is laid down (pattern.ORIENT_*)
 # solid:       live-cell colour in solid mode, sRGB hex
 # zoom:        zoom multiplier, render.BASE_PPC pixels per cell at 1
+# zoom_min:    the least zoom the engine holding the world draws
 # pan_x:       world column at the view's centre
 # pan_y:       world row at the view's centre
 # refit:       frame fit, or the randomize area, on the next frame
@@ -97,6 +101,7 @@ pub val ZOOM_MAX: f32 = 16.0;
 # toast:       the message being flashed
 # toast_t:     ticks it has left
 # said:        the text of a message built at run time
+# go_to:       the generation the run section goes to on HashLife
 # name:        the name the files section saves under
 # saves:       the worlds and patterns in the data directory
 # stroke:      a paint stroke is under way
@@ -129,6 +134,7 @@ pub rec App {
     orient:      u8;
     solid:       u32;
     zoom:        f32;
+    zoom_min:    f32;
     pan_x:       f64;
     pan_y:       f64;
     refit:       bool;
@@ -148,6 +154,7 @@ pub rec App {
     toast:       str;
     toast_t:     i32;
     said:        [256]u8;
+    go_to:       ui.Field;
     name:        ui.Field;
     saves:       saves.Saves;
     stroke:      bool;
@@ -181,11 +188,19 @@ pub fun scale(i: usize) f32 {
     ret 1.0;
 }
 
-# a zoom multiplier brought within ZOOM_MIN and ZOOM_MAX
-pub fun clamp_zoom(z: f32) f32 {
-    if (z < ZOOM_MIN) { ret ZOOM_MIN; }
-    if (z > ZOOM_MAX) { ret ZOOM_MAX; }
+# a zoom multiplier brought within the least the engine draws and ZOOM_MAX
+pub fun clamp_zoom(a: *App, z: f32) f32 {
+    if (z < a.zoom_min) { ret a.zoom_min; }
+    if (z > ZOOM_MAX)   { ret ZOOM_MAX; }
     ret z;
+}
+
+# take the least zoom of the engine holding the world, HashLife's with tree,
+# bringing the zoom within it
+pub fun fit_engine(a: *App, tree: bool) {
+    a.zoom_min = ZOOM_MIN;
+    if (tree) { a.zoom_min = ZOOM_TREE_MIN; }
+    a.zoom = clamp_zoom(a, a.zoom);
 }
 
 # frame the randomize area on the next frame
@@ -238,15 +253,19 @@ pub fun say_why(a: *App, what: str, why: str) {
     say(a, ?a.said[0]);
 }
 
-# flash the full pool once per fill, and rearm when the world is cleared
-pub fun note_full(a: *App, full: bool) {
+# flash the full world once per fill, and rearm when the world is cleared
+# ---
+# a:    application state
+# full: the world is full
+# why:  what that means, for the message
+pub fun note_full(a: *App, full: bool, why: str) {
     if (!full) {
         a.full_said = false;
         ret;
     }
     if (a.full_said) { ret; }
     a.full_said = true;
-    say(a, "the world outgrew its pool of chunks; clear it to run again");
+    say(a, why);
 }
 
 # make the patterns the interface offers, once the allocator is up, selecting
@@ -389,6 +408,11 @@ pub fun area(a: *App, op: u8) {
     submit(a, command.Command.area{command.Area{op: op, box: a.area}});
 }
 
+# whether a character may be typed into a generation
+fun digit(c: u32) bool {
+    ret c >= '0' && c <= '9';
+}
+
 # seed the application state
 pub fun init(a: *App) {
     a.speed       = 12.0;
@@ -401,13 +425,14 @@ pub fun init(a: *App) {
     library.empty(?a.library);
     a.picked_at = CUSTOM;
     ui.field_init(?a.search, ui.FIELD_CAP, nil);
-    a.browse = 0;
-    a.page   = 0;
-    a.orient = 0;
-    a.solid  = theme.swatch(0);
-    a.zoom   = 1.0;
-    a.pan_x  = 0.0;
-    a.pan_y  = 0.0;
+    a.browse   = 0;
+    a.page     = 0;
+    a.orient   = 0;
+    a.solid    = theme.swatch(0);
+    a.zoom     = 1.0;
+    a.zoom_min = ZOOM_MIN;
+    a.pan_x    = 0.0;
+    a.pan_y    = 0.0;
     frame_area(a);
     a.panel      = 1;
     a.open_run   = 1;
@@ -425,6 +450,7 @@ pub fun init(a: *App) {
     a.toast_t    = 0;
     a.said[0]    = 0;
     ui.field_init(?a.name, saves.NAME_MAX, saves.name_char);
+    ui.field_init(?a.go_to, 19, digit);
     a.stroke   = false;
     a.last_x   = 0;
     a.last_y   = 0;
