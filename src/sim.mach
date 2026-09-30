@@ -3781,18 +3781,21 @@ test step__bounded_grids_match_a_reference_stepper {
     var a: allo.Allocator;
     page.make(?a);
     # sizes off the 64 cell chunks, twists of odd and even sizes, slivers of a
-    # chunk and a grid narrower than one, a radius-2 rule reaching two hops, and
-    # a rule whose background flips
-    val strings: [10]str = [10]str{
+    # chunk and a grid narrower than one, a radius-2 rule reaching two hops, a
+    # rule whose background flips, on a twisted grid and on planes, one of them
+    # empty so only the edge it holds live on odd generations brings anything
+    # alive, and a B0 rule with S-max, which runs as its complement rule, Life,
+    # its plane's edge dead as held
+    val strings: [13]str = [13]str{
         "B3/S23:T100,100", "B3/S23:K100*,90", "B3/S23:K37,41*", "B3/S23:C45,53",
         "B3/S23:P70,50", "B3/S23:T130,3", "B3/S23:K7*,5",
         "R2,C0,M0,S5..9,B7..8,NM:T130,67", "R2,C0,M0,S5..9,B7..8,NM:C66,65",
-        "B0123/S123:K70*,60",
+        "B0123/S123:K70*,60", "B0123/S123:P70,50", "B0123/S123:P130,120", "B0123478/S01234678:P70,50",
     };
     var cur: [16384]u8;
     var nxt: [16384]u8;
     var k:   usize = 0;
-    for (k < 10) {
+    for (k < 13) {
         val r: res[rule.Rule, str] = rule.parse(strings[k]);
         if (sel r.err) {
             print.eprintlnf("{} does not parse: {}", strings[k], r.err);
@@ -3812,10 +3815,12 @@ test step__bounded_grids_match_a_reference_stepper {
             sl = 5;
             sh = 9;
         }
-        if (k == 9) {
+        if (k >= 9 && k <= 11) {
             bl = 0;
             sl = 1;
         }
+        var density: i64 = 350;
+        if (k == 11) { density = 0; }
         var s:    Sim;
         val made: err[allo.Error] = init(?s, ?a);
         if (sel made.err)      { ret 2; }
@@ -3827,7 +3832,7 @@ test step__bounded_grids_match_a_reference_stepper {
         for (y < g.h) {
             var x: i64 = 0;
             for (x < g.w) {
-                if (rand.range(?s.rng, 0, 1000) < 350) {
+                if (rand.range(?s.rng, 0, 1000) < density) {
                     fill_cell(?s, topology.left(?g) + x, topology.top(?g) + y, 1);
                     cur[(y * g.w + x)::usize] = 1;
                 }
@@ -4090,6 +4095,10 @@ test step__a_plane_kills_what_reaches_its_edge {
     ret 0;
 }
 
+# leave the world as the rule found it
+#[testing]
+fun seed_nothing(s: *Sim) {}
+
 # a soup over the whole of the rule's bounded grid
 #[testing]
 fun seed_grid_soup(s: *Sim) {
@@ -4115,20 +4124,30 @@ test frame__bounded_grids_step_on_the_gpu_as_on_the_cpu {
     val n:    usize = string.str_len(rule.sample(0, 3));
     mem.raw_copy(?wide[0], rule.sample(0, 3), n);
     mem.raw_copy(?wide[n], ":T100,90", 9);
-    val strings: [8]str = [8]str{"B3/S23:T100,100", "B2/S/C3:K37,41*", "345/2/4:T100,90", "R2,C0,M0,S5..9,B7..8,NM:C66,65", "B3/S23:P70,50", "B0123/S123:T100,90",
-        "R5,C0,M1,S34..58,B34..45,NM:K70*,60", ?wide[0]};
+    # then a rule whose background flips on a plane, seeded and empty, whose
+    # edge the stage reads live on odd generations
+    val strings: [10]str = [10]str{"B3/S23:T100,100", "B2/S/C3:K37,41*", "345/2/4:T100,90", "R2,C0,M0,S5..9,B7..8,NM:C66,65", "B3/S23:P70,50", "B0123/S123:T100,90",
+        "R5,C0,M1,S34..58,B34..45,NM:K70*,60", ?wide[0], "B0123/S123:P130,120", "B0123/S123:P130,120"};
     var k: usize = 0;
-    for (k < 8) {
+    for (k < 10) {
         var t:    Rig;
-        val code: i32 = rig_open(?t, rule_named(strings[k]), seed_grid_soup);
+        var seed: fun(*Sim) = seed_grid_soup;
+        if (k == 9) { seed = seed_nothing; }
+        val code: i32 = rig_open(?t, rule_named(strings[k]), seed);
         if (code != 0)                           { ret code; }
         if (!topology.bounded(?t.cpu.rule.grid)) { ret 1; }
-        rig_step(?t, 40);
-        if (!rig_same(?t)) {
-            print.eprintlnf("{} differs between the engines", strings[k]);
-            ret 10 + k::i32;
+        # an odd generation, then an even one
+        val steps: [2]u64 = [2]u64{39, 1};
+        var i:     usize  = 0;
+        for (i < 2) {
+            rig_step(?t, steps[i]);
+            if (!rig_same(?t)) {
+                print.eprintlnf("{} differs between the engines at generation {}", strings[k], t.cpu.generation);
+                ret 10 + k::i32;
+            }
+            if (population(?t.cpu) != population(?t.gpu)) { ret 20 + k::i32; }
+            i = i + 1;
         }
-        if (population(?t.cpu) != population(?t.gpu)) { ret 20 + k::i32; }
         rig_close(?t);
         k = k + 1;
     }
