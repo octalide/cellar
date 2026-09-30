@@ -10,6 +10,10 @@
 # GPU before the host's cells there are read. outside the pool every cell is
 # dead, so a rule that births from nothing (B0) only acts inside the chunks
 # that exist.
+#
+# a watch (the undo journal) is shown the cells an edit, a clear or a rule
+# change that re-encodes them is about to change, brought level with the GPU's
+# first, before anything is written.
 
 use gfx: boom.graphics;
 use boom.window;
@@ -79,6 +83,25 @@ pub rec Read {
     y1:   i64;
 }
 
+# what is shown the cells a change is about to write, so it can keep them
+#
+# wants is asked before an edit of a box writes anything, or before a clear or
+# a re-encoding rule change with whole set, and says whether the cells there
+# are wanted as they stand.
+# when they are, the host's cells over the box, or everywhere with whole, are
+# brought level with the GPU's and keep is called before the change goes
+# ahead. current false tells keep they could not be read, and a clear goes
+# ahead anyway, where an edit is refused.
+# ---
+# ctx:   passed back to each call
+# wants: (ctx, box in cells, whole) whether the cells are wanted
+# keep:  (ctx, box in cells, whole, current) keep them now
+pub rec Watch {
+    ctx:   *u8;
+    wants: fun(*u8, space.Box, bool) bool;
+    keep:  fun(*u8, space.Box, bool, bool);
+}
+
 # cellular-automaton simulation state
 # ---
 # space:      the pool of chunks
@@ -93,6 +116,8 @@ pub rec Read {
 # edit:       the open bulk edit, if any
 # read:       the open read, if any
 # history:    recent populations by generation, since the last clear
+# watched:    watch is set
+# watch:      what is shown the cells a change is about to write
 pub rec Sim {
     space:      space.Space;
     rule:       rule.Rule;
@@ -106,6 +131,8 @@ pub rec Sim {
     edit:       Edit;
     read:       Read;
     history:    history.History;
+    watched:    bool;
+    watch:      Watch;
 }
 
 # an empty world stepped by the CPU, with the first preset's rule
@@ -128,8 +155,26 @@ pub fun init(s: *Sim, a: *allo.Allocator) err[allo.Error] {
     s.running     = 0;
     s.edit.open   = false;
     s.read.open   = false;
+    s.watched     = false;
     history.clear(?s.history);
     ret e;
+}
+
+# show every edit and clear from now on to a watch, replacing any before it
+pub fun set_watch(s: *Sim, w: Watch) {
+    s.watch   = w;
+    s.watched = true;
+}
+
+# whether the watch wants the cells over [x0, x1) by [y0, y1), or everywhere with whole
+fun wanted(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64, whole: bool) bool {
+    if (!s.watched) { ret false; }
+    ret s.watch.wants(s.watch.ctx, space.Box{x0: x0, y0: y0, x1: x1, y1: y1}, whole);
+}
+
+# hand the watch the cells it wanted
+fun kept(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64, whole: bool, current: bool) {
+    s.watch.keep(s.watch.ctx, space.Box{x0: x0, y0: y0, x1: x1, y1: y1}, whole, current);
 }
 
 # replace the rule the world runs
@@ -152,6 +197,8 @@ pub fun set_rule(s: *Sim, r: rule.Rule) bool {
     if (!same) {
         val synced: err[gfx.Error] = sync(s);
         if (sel synced.err) { ret false; }
+        # re-encoding rewrites every cell, so the watch is shown the world whole
+        if (wanted(s, 0, 0, 0, 0, true)) { kept(s, 0, 0, 0, 0, true, true); }
     }
     s.rule        = r;
     s.space.sense = rule.sense(?s.rule);
@@ -307,6 +354,10 @@ pub fun sync(s: *Sim) err[gfx.Error] {
 # ---
 # s: simulation
 pub fun clear(s: *Sim) {
+    if (wanted(s, 0, 0, 0, 0, true)) {
+        val synced: err[gfx.Error] = sync(s);
+        kept(s, 0, 0, 0, 0, true, sel synced.ok);
+    }
     space.reset(?s.space);
     s.generation = 0;
     s.pending    = 0;
@@ -579,7 +630,8 @@ pub fun reaches(x0: i64, y0: i64, x1: i64, y1: i64) bool {
 # the world is left alone. the chunks the area covers are pulled from the GPU
 # first, unless an open read over the area already pulled them, so writing them
 # whole loses nothing, and an area of up to SPARSE_CELLS
-# cells skips that and is written cell by cell, recorded as small writes.
+# cells skips that and is written cell by cell, recorded as small writes,
+# unless the watch wants its cells, which are then pulled all the same.
 # call outside a frame, or in one before gpu frame has recorded anything, and
 # between begin and end make no other edit.
 # ---
@@ -604,14 +656,17 @@ pub fun edit_begin(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64) bool {
     e.lost   = false;
     e.sparse = e.x1 - e.x0 <= SPARSE_CELLS::i64 && e.y1 - e.y0 <= SPARSE_CELLS::i64
         && (e.x1 - e.x0) * (e.y1 - e.y0) <= SPARSE_CELLS::i64;
-    if (e.sparse) {
-        e.open = true;
-        ret true;
-    }
+    val watch: bool = e.x1 > e.x0 && wanted(s, e.x0, e.y0, e.x1, e.y1, false);
     # an open read over the area has pulled its chunks already, and nothing
     # has stepped since
     val pull: bool = !read_covers(s, e.x0, e.y0, e.x1, e.y1);
-    if (!stage(s, e.x0, e.y0, e.x1, e.y1, pull, true)) { ret false; }
+    if (e.sparse) {
+        # a small edit writes single cells and pulls nothing, unless the watch
+        # needs the chunks as they stand
+        if (watch && !stage(s, e.x0, e.y0, e.x1, e.y1, pull, false)) { ret false; }
+    }
+    or (!stage(s, e.x0, e.y0, e.x1, e.y1, pull, true)) { ret false; }
+    if (watch)                                         { kept(s, e.x0, e.y0, e.x1, e.y1, false, true); }
     e.open = true;
     ret true;
 }
@@ -684,6 +739,37 @@ pub fun edit_run(s: *Sim, x: i64, y: i64, n: usize, v: u8) bool {
     }
     if (!ok) { e.lost = true; }
     ret ok;
+}
+
+# write a whole chunk's cells in the open edit, as they are given
+#
+# the edit must not be a small one and must cover the chunk whole.
+# ---
+# s:     simulation
+# cx:    chunk column
+# cy:    chunk row
+# cells: space.CELLS words, row-major, or nil to kill every cell of the chunk
+# ret:   false when no such edit is open, the chunk lies outside it, or the
+#        pool was full
+pub fun edit_chunk(s: *Sim, cx: i64, cy: i64, cells: *u32) bool {
+    val e: *Edit = ?s.edit;
+    if (!e.open || e.sparse)                                                                                              { ret false; }
+    if (cx * space.SIDE < e.x0 || cy * space.SIDE < e.y0 || (cx + 1) * space.SIDE > e.x1 || (cy + 1) * space.SIDE > e.y1) { ret false; }
+    val sp: *space.Space = ?s.space;
+    var sl: u32          = space.find(sp, cx, cy);
+    if (sl == space.NONE) {
+        if (cells == nil) { ret true; }
+        sl = space.alloc(sp, cx, cy);
+        if (sl == space.NONE) {
+            e.lost = true;
+            ret false;
+        }
+    }
+    val to: *u32 = ?sp.cells[sl::usize * space.CELLS];
+    if (cells == nil) { mem.zero[u32](to, space.CELLS); }
+    or                { mem.copy[u32](to, cells, space.CELLS); }
+    sp.dirty[sl::usize] = sp.dirty[sl::usize] | space.DIRTY_CELLS;
+    ret true;
 }
 
 # close the open edit: count the chunks it wrote, surround the live ones, and
@@ -1518,7 +1604,7 @@ test frame__steps_on_the_gpu_exactly_as_the_cpu_does_for_every_family {
 # whether two snapshots hold the same chunks, cells, generation and rule, in
 # whatever order they were taken
 #[testing]
-fun same_snapshot(a: *snapshot.Snapshot, b: *snapshot.Snapshot) bool {
+pub fun same_snapshot(a: *snapshot.Snapshot, b: *snapshot.Snapshot) bool {
     if (!a.held || !b.held || a.n != b.n || a.generation != b.generation) { ret false; }
     if (!rule.same(?a.rule, ?b.rule))                                     { ret false; }
     var i: usize = 0;
