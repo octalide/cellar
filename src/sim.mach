@@ -1590,3 +1590,164 @@ test reset__run_reset_run_reproduces_the_generations_on_both_engines {
     window.window_close(?w);
     ret 0;
 }
+
+# a radius-4 rule that births on one or two live cells anywhere in its footprint
+# and keeps none, so a pattern's edge spreads close to four cells a generation
+#[testing]
+fun far_rule() rule.Rule {
+    var out: rule.Rule           = rule.preset_rule(2);
+    val r:   res[rule.Rule, str] = rule.parse("4 6 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1");
+    if (sel r.ok)  { out = r.ok; }
+    if (sel r.err) { print.eprintlnf("the far rule does not parse: {}", r.err); }
+    ret out;
+}
+
+# seed small soups against chunk edges and corners, where the halo leans
+#[testing]
+fun seed_edges(s: *Sim) {
+    s.rng = rand.seed(5, 6, 7, 8);
+    fill_begin(s);
+    var k: usize = 0;
+    for (k < 3) {
+        var ox: i64 = 0 - 6;
+        var oy: i64 = 20;
+        if (k == 1) {
+            ox = 3000 + 54;
+            oy = 3000 - 6;
+        }
+        or (k == 2) {
+            ox = 0 - 3000 + 30;
+            oy = 1000 + 30;
+        }
+        var y: i64 = 0;
+        for (y < 12) {
+            var x: i64 = 0;
+            for (x < 12) {
+                if (rand.range(?s.rng, 0, 1000) < 400) { fill_cell(s, ox + x, oy + y, 1); }
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        k = k + 1;
+    }
+    fill_end(s);
+}
+
+# run uncapped frames, each asking for as many generations as the budget
+# allows, until the GPU has recorded at least want, then pause and let the
+# census of the last land
+# ---
+# wide: set when the halo was wide on the way
+# ret:  the most generations one frame recorded, 0 when a frame failed
+#[testing]
+fun uncapped_frames(r: *gfx.Renderer, s: *Sim, want: u64, wide: *bool) usize {
+    var most:   usize = 0;
+    var frames: usize = 0;
+    var look:   gpu.Look;
+    look.ppc    = 1.0;
+    look.half_w = 32.0;
+    look.half_h = 32.0;
+    look.win_w  = 64.0;
+    s.running   = 1;
+    for (s.generation < want && frames < 1000) {
+        window.window_poll();
+        val br: res[bool, gfx.Error] = gfx.renderer_begin_frame(r);
+        if (sel br.err) { ret 0; }
+        if (br.ok) {
+            collect(s);
+            # pacing would shrink the stride, and a slow machine keep the halo
+            # from widening; here the budget alone limits the frames
+            s.gpu.pace = gpu.MAX_STEPS;
+            s.gpu.want = true;
+            val before: u64            = s.generation;
+            val rec:    err[gfx.Error] = record(s, true, ?look);
+            if (sel rec.err)                           { ret 0; }
+            if ((s.generation - before)::usize > most) { most = (s.generation - before)::usize; }
+            if (s.gpu.wide)                            { @wide = true; }
+            val ended: err[gfx.Error] = gfx.renderer_end_frame(r);
+            if (sel ended.err) { ret 0; }
+        }
+        frames = frames + 1;
+    }
+    s.running = 0;
+    if (s.full || !settle_frames(r, s, s.generation)) { ret 0; }
+    ret most;
+}
+
+# the width of the box around every live cell, 0 when nothing lives
+#[testing]
+fun spread_of(s: *Sim) i64 {
+    val b: opt[space.Box] = bounds(s);
+    if (sel b.none) { ret 0; }
+    ret b.some.x1 - b.some.x0;
+}
+
+# step the CPU's world on to the GPU's generation, and whether the two match
+#[testing]
+fun caught_up(t: *Rig) bool {
+    for (t.cpu.generation < t.gpu.generation) { step(?t.cpu); }
+    if (t.cpu.full || t.cpu.generation != t.gpu.generation) { ret false; }
+    ret rig_same(t) && population(?t.cpu) == population(?t.gpu);
+}
+
+test frame__uncapped_steps_past_the_old_reach_exactly_as_the_cpu_does {
+    var t:    Rig;
+    val code: i32 = rig_open(?t, rule.preset_rule(2), seed_edges);
+    if (code != 0) { ret code; }
+    if (!t.on) {
+        rig_close(?t);
+        ret 0;
+    }
+    # seeds at radius 1 for a few censuses, then a radius-4 rule, each from the
+    # same soups; either spreads well past the 32 cells a census once allowed
+    var phase: usize = 0;
+    for (phase < 2) {
+        var k:    rule.Rule = rule.preset_rule(2);
+        var want: u64       = 200;
+        if (phase == 1) {
+            k    = far_rule();
+            want = 50;
+            set_rule(?t.cpu, k);
+            set_rule(?t.gpu, k);
+            seed_edges(?t.cpu);
+            seed_edges(?t.gpu);
+        }
+        val from: i64   = spread_of(?t.cpu);
+        var wide: bool  = false;
+        val most: usize = uncapped_frames(?t.r, ?t.gpu, want, ?wide);
+        if (!wide) { ret 4 + phase::i32 * 10; }
+        # a frame ran more generations than the ring allowed a census
+        if (most * rule.radius(?k) <= space.SPREAD_RING::usize) { ret 5 + phase::i32 * 10; }
+        if (!caught_up(?t))                                     { ret 6 + phase::i32 * 10; }
+        # the soups spread past the halo the pool held when they were seeded
+        if (spread_of(?t.cpu) < from + 4 * space.SIDE) { ret 7 + phase::i32 * 10; }
+        phase = phase + 1;
+    }
+    rig_close(?t);
+    ret 0;
+}
+
+test frame__switching_between_uncapped_and_capped_steps_exactly_as_the_cpu_does {
+    var t:    Rig;
+    val code: i32 = rig_open(?t, rule.preset_rule(2), seed_edges);
+    if (code != 0) { ret code; }
+    if (!t.on) {
+        rig_close(?t);
+        ret 0;
+    }
+    # uncapped widens the halo, capped narrows it while the fronts still spread
+    # a cell a generation, and uncapped widens it again
+    var round: usize = 0;
+    for (round < 2) {
+        var wide: bool = false;
+        if (uncapped_frames(?t.r, ?t.gpu, t.gpu.generation + 100, ?wide) == 0) { ret 4 + round::i32 * 10; }
+        if (!wide)                                                             { ret 5 + round::i32 * 10; }
+        if (!caught_up(?t))                                                    { ret 6 + round::i32 * 10; }
+        rig_step(?t, 80);
+        if (!rig_settle(?t) || t.g.wide) { ret 7 + round::i32 * 10; }
+        if (!caught_up(?t))              { ret 8 + round::i32 * 10; }
+        round = round + 1;
+    }
+    rig_close(?t);
+    ret 0;
+}
