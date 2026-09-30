@@ -18,8 +18,15 @@ use boom.context.Context;
 use boom.context.context_fail;
 use boom.context.context_stop;
 use boom.context.context_user;
+use boom.event.DropEvent;
 use boom.event.Event;
+use boom.event.EventQueue;
+use boom.event.QueueError;
+use boom.event.drop_new;
+use boom.event.queue_clear;
+use boom.event.queue_new;
 use boom.event.queue_pop;
+use boom.event.queue_push;
 use gfx: boom.graphics;
 use inp: boom.input;
 use gm:  boom.math;
@@ -62,6 +69,7 @@ use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
+use std.types.string;
 use std.types.string.str;
 
 # the interface face, a DejaVu Sans subset (res/fonts/LICENSE-DejaVu)
@@ -330,7 +338,8 @@ fun keys(ctx: *Context, g: *Game) {
     if (inp.key_pressed(in, inp.KEY_D))                                    { a.tool = app.TOOL_DRAW; }
     if (inp.key_pressed(in, inp.KEY_E))                                    { a.tool = app.TOOL_ERASE; }
     if (inp.key_pressed(in, inp.KEY_T))                                    { a.tool = app.TOOL_STAMP; }
-    if (inp.key_pressed(in, inp.KEY_V))                                    { a.tool = app.TOOL_SELECT; }
+    if (inp.key_pressed(in, inp.KEY_V) && !ctrl)                           { a.tool = app.TOOL_SELECT; }
+    if (inp.key_pressed(in, inp.KEY_V) && ctrl)                            { paste(ctx, a, shift); }
     if (inp.key_pressed(in, inp.KEY_Z))                                    { a.orient = pattern.orient_turn(a.orient); }
     if (inp.key_pressed(in, inp.KEY_X) && !ctrl)                           { a.orient = pattern.orient_flip(a.orient); }
     if (inp.key_pressed(in, inp.KEY_C) && ctrl)                            { app.area(a, command.AREA_COPY); }
@@ -346,13 +355,27 @@ fun keys(ctx: *Context, g: *Game) {
     if (inp.key_pressed(in, inp.KEY_F12))                                  { a.shot = true; }
 }
 
+# read the clipboard, on the main thread where the window lives, and ask to
+# paste it as the stamp, taking its rule with shift
+fun paste(ctx: *Context, a: *app.App, rule: bool) {
+    val got: res[str, allo.Error] = win.window_clipboard_get(a.alloc, ?ctx.window);
+    if (sel got.err) {
+        app.say(a, "out of memory");
+        ret;
+    }
+    app.paste(a, got.ok, rule);
+}
+
 # hand the window's queued events, typed text among them, to the interface in
-# order, so none waits for a later tick or is dropped when the queue fills
-fun events(ctx: *Context, g: *Game) {
+# order, so none waits for a later tick or is dropped when the queue fills, and
+# open a file dropped on the window. a drop's paths live until the next poll,
+# so the command takes its own copy here
+fun events(q: *EventQueue, u: *ui.Ui, a: *app.App) {
     for {
-        val e: opt[Event] = queue_pop(?ctx.events);
-        if (sel e.none) { brk; }
-        ui.feed(?g.ui, e.some);
+        val e: opt[Event] = queue_pop(q);
+        if (sel e.none)      { brk; }
+        if (sel e.some.drop) { app.drop(a, e.some.drop.paths, e.some.drop.count); }
+        or                   { ui.feed(u, e.some); }
     }
 }
 
@@ -366,7 +389,7 @@ fun tick(ctx: *Context) {
     # while a field has the keyboard the key bindings stay quiet, including on
     # the tick whose enter or escape gives it back
     val typing: bool = ui.typing(u);
-    events(ctx, g);
+    events(?ctx.events, u, a);
     if (!typing)       { keys(ctx, g); }
     if (a.toast_t > 0) { a.toast_t = a.toast_t - 1; }
 
@@ -588,6 +611,10 @@ pub fun on_draw(ctx: *Context) {
     # cells back, which is only valid before the frame records anything
     var deps: exec.Deps = exec.Deps{a: ?g.a};
     exec.run(a, ?g.sim, ?deps);
+    if (a.clip_ready) {
+        win.window_clipboard_set(?ctx.window, a.clip.data::str);
+        a.clip_ready = false;
+    }
     # take the census before this frame's own readback can reuse its slot
     sim.collect(?g.sim);
     app.note_full(a, world.full(?g.sim));
@@ -769,4 +796,46 @@ fun bench_frame(ctx: *Context, g: *Game) {
     print.printlnf("bench {} chunks {} population {} gens/s {} frame us {}", engine, g.sim.space.live::u64,
         sim.population(?g.sim)::u64, (gens / secs)::u64, frame::u64);
     context_stop(ctx);
+}
+
+test events__open_the_first_dropped_file_and_say_the_rest_were_ignored {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    var ap: app.App;
+    app.init(?ap);
+    val shown: err[format.Error] = app.attach(?ap, ?a);
+    if (sel shown.err) { ret 1; }
+    val dir: err[fs.FsError] = persist.make_parent(?a, "out/test/drop/x");
+    if (sel dir.err) { ret 1; }
+    val rle: str = "x = 3, y = 1, rule = B3/S23\n3o!\n";
+    fs.write_bytes("out/test/drop/row.rle", rle, string.str_len(rle), persist.FILE_MODE);
+
+    # the drop as the platform delivers it, two files in one event
+    var q:     EventQueue = queue_new();
+    var names: [2]*u8;
+    names[0] = "out/test/drop/row.rle"::*u8;
+    names[1] = "out/test/drop/other.rle"::*u8;
+    val got: res[DropEvent, allo.Error] = drop_new(2, ?names[0]);
+    if (sel got.err) { ret 1; }
+    val pushed: err[QueueError] = queue_push(?q, Event.drop{got.ok});
+    if (sel pushed.err) { ret 1; }
+    var u: ui.Ui;
+    events(?q, ?u, ?ap);
+    queue_clear(?q);
+    if (ap.queue.items.len != 1) { ret 2; }
+
+    var d: exec.Deps = exec.Deps{a: ?a};
+    exec.run(?ap, ?s, ?d);
+    if (sim.population(?s) != 3 || !sim.alive(?s, -1, 0) || !sim.alive(?s, 1, 0)) { ret 3; }
+    val fit: space.Box = app.fit_box(?ap);
+    if (!ap.refit || fit.x0 != -1 || fit.x1 != 2)                                              { ret 4; }
+    if (!string.str_equals(ap.toast, "row.rle: opened; the other dropped files were ignored")) { ret 5; }
+
+    fs.remove_file("out/test/drop/row.rle");
+    app.dnit(?ap);
+    sim.dnit(?s);
+    ret 0;
 }
