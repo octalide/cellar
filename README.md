@@ -11,7 +11,12 @@ regions with live cells and their neighbours, growing in any direction. It is
 stepped on the GPU by compute shaders written in Mach, and drawn straight from
 the GPU's buffers, so neither stepping nor drawing crosses to the CPU. Where no
 GPU can run the compute shaders, the CPU steps it instead, split across every
-core by chunk. boom owns the window, input, Vulkan renderer and frame loop; the
+core by chunk. For huge patterns and generation counts, a rule of radius 1
+without B0 can instead run on HashLife: the world becomes a hash-consed
+quadtree stepped by Gosper's algorithm, a power of two generations at a time,
+and drawn from the tree at the current zoom, so a Gosper gun reaches
+generation 2^30 in a moment. HashLife keeps no heat or age, so it draws in the
+solid colour. boom owns the window, input, Vulkan renderer and frame loop; the
 interface is drawn over the cells in the same overlay pass by a small
 immediate-mode layer of cellar's own, with text from an embedded TrueType face.
 
@@ -73,8 +78,10 @@ change clears what could be redone.
 A readout of the generation, population, rule and speed sits in the top-left
 corner, and the side panel groups every control by task:
 
-- **run**: play, step, speed, uncapped stepping, randomize and clear, and the
-  area randomize fills, from 32 to 4096 cells square
+- **run**: play, step, speed, uncapped stepping, randomize and clear, the
+  area randomize fills, from 32 to 4096 cells square, and the engine: the chunk
+  pool, or HashLife where the rule allows, with its step of 2^k generations
+  and a generation to go straight to
 - **draw**: the tool, a library of about three hundred classic patterns
   (still lifes, oscillators, spaceships, guns, puffers, methuselahs and growth)
   to browse by category or search by name, a custom pattern drawn in place, and

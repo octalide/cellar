@@ -104,9 +104,11 @@ pub fun pattern_sink(s: *PatternSink, p: *pattern.Pattern) *format.Sink {
 # a sink that overlays the cells onto the world, offset, in one bulk edit
 #
 # it plans and fits without touching the world: a box past the world's reach is
-# refused, and the chunks the runs would add to the pool are counted, so a
-# pattern the pool cannot hold is refused whole while one far larger than the
-# pool in extent but sparse enough loads. only open begins the edit.
+# refused, and the engine holding the world judges the rest. the pool's counts
+# the chunks the runs would add, so a pattern the pool cannot hold is refused
+# whole while one far larger than the pool in extent but sparse enough loads.
+# the quadtree has no pool, so a pattern of any extent loads straight into it,
+# up to sim.LOAD_CELLS live cells. only open begins the edit.
 # ---
 # s:       simulation to write onto
 # dx:      columns to shift every cell by
@@ -136,6 +138,7 @@ fun world_plan(ctx: *u8, info: *format.Info) bool {
         w.dy = pattern.corner(0, (info.y1 - info.y0)::usize) - info.y0;
     }
     if (!sim.reaches(info.x0 + w.dx, info.y0 + w.dy, info.x1 + w.dx, info.y1 + w.dy)) { ret false; }
+    if (!sim.load_fits(w.s, info.live))                                               { ret false; }
     sim.need_init(?w.need, w.s);
     w.planned = true;
     ret true;
@@ -268,11 +271,9 @@ pub fun pattern_source(s: *PatternSource, p: *pattern.Pattern) *format.Source {
 # ---
 # cx: chunk column
 # cy: chunk row
-# sl: its slot in the pool
 rec Held {
     cx: i64;
     cy: i64;
-    sl: usize;
 }
 
 # a source that reads the world's cells in a state but 0, dying ones included,
@@ -281,11 +282,13 @@ rec Held {
 # it keeps the chunks holding such a state ordered by row and then column, so a
 # row of the world is read from its chunks alone, and a run reaching a chunk's
 # edge goes on into the next chunk of the row when that one lies beside it. the
-# cost is the held chunks', not the extent's. the world must not change while
-# the source is in use.
+# cells of one chunk row at a time are read through the simulation, whichever
+# engine holds the world. the cost is the held chunks', not the extent's. the
+# world must not change while the source is in use.
 # ---
 # s:      simulation to read
 # held:   the chunks holding a state, ordered
+# cells:  the states of the chunks of the row being read, in order
 # band:   the first chunk of the chunk row being read
 # end:    the chunk after that row's last
 # ly:     the row within the chunk row
@@ -295,6 +298,7 @@ rec Held {
 pub rec WorldSource {
     s:      *sim.Sim;
     held:   Vector[Held];
+    cells:  Vector[u8];
     band:   usize;
     end:    usize;
     ly:     i64;
@@ -313,10 +317,24 @@ fun held_order(a: *Held, b: *Held) i64 {
     ret 0;
 }
 
-# the chunk after the chunk row starting at from
+# the chunk after the chunk row starting at from, whose chunks' cells are read
+# into cells, or the end of the list when there is no memory for them, which
+# ends the runs early
 fun band_end(w: *WorldSource, from: usize) usize {
     var e: usize = from;
     for (e < w.held.len && w.held.data[e].cy == w.held.data[from].cy) { e = e + 1; }
+    vector.clear[u8](?w.cells);
+    val room: res[usize, allo.Error] = vector.reserve[u8](?w.cells, (e - from) * space.CELLS);
+    if (sel room.err) {
+        w.band = w.held.len;
+        ret w.held.len;
+    }
+    var k: usize = from;
+    for (k < e) {
+        sim.chunk_cells(w.s, w.held.data[k].cx, w.held.data[k].cy, ?w.cells.data[(k - from) * space.CELLS]);
+        k = k + 1;
+    }
+    w.cells.len = (e - from) * space.CELLS;
     ret e;
 }
 
@@ -329,16 +347,15 @@ fun world_rewind(ctx: *u8) {
     w.lx   = 0;
 }
 
-# the state of a chunk's cell
-fun state_at(w: *WorldSource, c: *Held, lx: i64, ly: i64) u8 {
-    val word: u32 = w.s.space.cells[c.sl * space.CELLS + (ly * space.SIDE + lx)::usize];
-    ret rule.state(?w.s.rule, word)::u8;
+# the state of a cell of chunk k of the row being read
+fun state_at(w: *WorldSource, k: usize, lx: i64, ly: i64) u8 {
+    ret w.cells.data[(k - w.band) * space.CELLS + (ly * space.SIDE + lx)::usize];
 }
 
 # how many cells of state v run from column lx of a chunk's row, to its edge at most
-fun run_of(w: *WorldSource, c: *Held, lx: i64, ly: i64, v: u8) i64 {
+fun run_of(w: *WorldSource, k: usize, lx: i64, ly: i64, v: u8) i64 {
     var x: i64 = lx;
-    for (x < space.SIDE && state_at(w, c, x, ly) == v) { x = x + 1; }
+    for (x < space.SIDE && state_at(w, k, x, ly) == v) { x = x + 1; }
     ret x - lx;
 }
 
@@ -347,14 +364,14 @@ fun world_next(ctx: *u8, r: *format.Run) bool {
     for (w.band < w.held.len) {
         for (w.k < w.end) {
             val c: *Held = ?w.held.data[w.k];
-            for (w.lx < space.SIDE && state_at(w, c, w.lx, w.ly) == 0) { w.lx = w.lx + 1; }
+            for (w.lx < space.SIDE && state_at(w, w.k, w.lx, w.ly) == 0) { w.lx = w.lx + 1; }
             if (w.lx == space.SIDE) {
                 w.k  = w.k + 1;
                 w.lx = 0;
                 cnt;
             }
-            val v: u8  = state_at(w, c, w.lx, w.ly);
-            val m: i64 = run_of(w, c, w.lx, w.ly, v);
+            val v: u8  = state_at(w, w.k, w.lx, w.ly);
+            val m: i64 = run_of(w, w.k, w.lx, w.ly, v);
             r.x  = c.cx * space.SIDE + w.lx;
             r.y  = c.cy * space.SIDE + w.ly;
             r.v  = v;
@@ -363,7 +380,7 @@ fun world_next(ctx: *u8, r: *format.Run) bool {
             # a run reaching the edge goes on into the chunk beside it
             for (w.lx == space.SIDE && w.k + 1 < w.end && w.held.data[w.k + 1].cx == w.held.data[w.k].cx + 1) {
                 w.k = w.k + 1;
-                val more: i64 = run_of(w, ?w.held.data[w.k], 0, w.ly, v);
+                val more: i64 = run_of(w, w.k, 0, w.ly, v);
                 n    = n + more;
                 w.lx = more;
             }
@@ -383,6 +400,21 @@ fun world_next(ctx: *u8, r: *format.Run) bool {
     ret false;
 }
 
+# the chunks a WorldSource is listing
+# ---
+# held: the list
+# ok:   every chunk was kept
+rec Listed {
+    held: *Vector[Held];
+    ok:   bool;
+}
+
+fun list_chunk(ctx: *u8, cx: i64, cy: i64, cells: *u8) {
+    val at:  *Listed                = ctx::*Listed;
+    val put: res[usize, allo.Error] = vector.push[Held](at.held, Held{cx: cx, cy: cy});
+    if (sel put.err) { at.ok = false; }
+}
+
 # point a WorldSource at a simulation, its extent the box of its cells in a
 # state but 0
 #
@@ -393,19 +425,14 @@ fun world_next(ctx: *u8, r: *format.Run) bool {
 # a:   allocator for the chunk list
 # ret: the source, or why the chunks could not be listed or read
 pub fun world_source(w: *WorldSource, s: *sim.Sim, a: *allo.Allocator) res[*format.Source, format.Error] {
-    w.s    = s;
-    w.held = vector.init[Held](a);
+    w.s     = s;
+    w.held  = vector.init[Held](a);
+    w.cells = vector.init[u8](a);
     val synced: err[gfx.Error] = sim.sync(s);
     if (sel synced.err) { ret res[*format.Source, format.Error].err{format.Error.sink{}}; }
-    val sp: *space.Space = ?s.space;
-    var sl: usize        = 0;
-    for (sl < sp.hi) {
-        if (sim.holds_state(s, sl)) {
-            val put: res[usize, allo.Error] = vector.push[Held](?w.held, Held{cx: space.slot_x(sp, sl), cy: space.slot_y(sp, sl), sl: sl});
-            if (sel put.err) { ret res[*format.Source, format.Error].err{format.Error.alloc{put.err}}; }
-        }
-        sl = sl + 1;
-    }
+    var at: Listed = Listed{held: ?w.held, ok: true};
+    sim.chunks(s, list_chunk, (?at)::*u8);
+    if (!at.ok) { ret res[*format.Source, format.Error].err{format.Error.alloc{allo.Error.exhausted{}}}; }
     sort.sort_by[Held](w.held.data, w.held.len, held_order);
     val box: opt[space.Box] = sim.state_bounds(s);
     w.source.ctx = w::*u8;
@@ -426,7 +453,8 @@ pub fun world_source(w: *WorldSource, s: *sim.Sim, a: *allo.Allocator) res[*form
     ret res[*format.Source, format.Error].ok{?w.source};
 }
 
-# release a WorldSource's chunk list
+# release a WorldSource's chunk list and cells
 pub fun world_source_dnit(w: *WorldSource) {
     vector.dnit[Held](?w.held);
+    vector.dnit[u8](?w.cells);
 }
