@@ -108,7 +108,11 @@ Settings and the rule are kept between runs. They, saved worlds and patterns,
 and screenshots live in the platform's user data directory:
 `$XDG_DATA_HOME/cellar` (or `~/.local/share/cellar`) on linux,
 `~/Library/Application Support/cellar` on macOS and `%APPDATA%\cellar` on
-windows. The first run brings over anything an older version left in
+windows. The engine chosen in the run section and HashLife's step exponent are
+kept too. `--engine` overrides the saved engine for that run and leaves the
+saved choice alone until the panel changes it, and a saved HashLife that cannot
+run the loaded rule starts on the chunk engine with a message. The first run
+brings over anything an older version left in
 `arrangements/` in the working directory.
 
 `cellar <file>` opens a file at startup: a `.cellar` world loads as the world,
