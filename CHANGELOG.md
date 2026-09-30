@@ -6,6 +6,34 @@ All notable changes to cellar are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-30
+
+### Added
+
+- Linux on arm64, tested natively in CI and shipped as a release build. A plain `mach build .` on an arm64 linux host builds for it (#23).
+- Pattern files through one format registry that recognises a file by its contents: RLE read and write, LifeWiki plaintext `.cells` read and write, and Life 1.05 and 1.06 read (#32, #33).
+- `cellar <file>` opens a world or a pattern at startup and frames it. Options may come before or after the file, and a bad one is refused with a usage line (#35).
+- Named saves. The files section lists the data directory, and a name field saves worlds and patterns under any name (#35).
+- World files record the rule, weighted kernels included, along with the generation, the camera and the colour mode (#34).
+- Rotate (Z) and flip (X) the stamp, with the preview following (#38).
+- A population graph in the run section, and the live cells' bounding box outlined in the world and sized in the readout (#54).
+
+### Changed
+
+- Worlds are saved as `.cellar` and the custom pattern as RLE. Saves from 0.3.0 are moved over at startup (#33).
+- Edits and file actions apply from a queue at the start of a frame, so a save always sees the world it was asked for (#26).
+- Patterns can be any size, and a large stamp applies in one bulk edit (#31).
+- The chunk pool's ceiling comes from the GPU's storage limits instead of a fixed count (#25).
+- Built on boom 0.35, with mach-glfw 0.10, mach-audio 0.11 and mach-vk 0.8.
+
+### Fixed
+
+- A save made while the GPU was running could write a stale or empty world (#26).
+- A world that outgrows its pool stops with a message on both engines, where it stalled silently or exited (#25, #27).
+- The view no longer jitters far from the origin (#28).
+- Negative weights are saved as signed numbers, and a rule string uses one separator style throughout (#30).
+- Flipping the stamp after a rotation mirrors it on screen (#38).
+
 ## [0.3.0] - 2026-09-30
 
 ### Changed
@@ -32,5 +60,6 @@ All notable changes to cellar are recorded here. The format follows
 - The world is no longer stretched while the side panel is open (#15).
 - A restored rule that matches a preset keeps the preset's name.
 
-[Unreleased]: https://github.com/octalide/cellar/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/octalide/cellar/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/octalide/cellar/releases/tag/v0.4.0
 [0.3.0]: https://github.com/octalide/cellar/releases/tag/v0.3.0
