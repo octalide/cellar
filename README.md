@@ -37,6 +37,17 @@ states (`345/2/4` for Star Wars), reads too. The trails colour mode shows each
 state in its own colour. Built-in: Brian's Brain (`B2/S/C3`) and Star Wars
 (`B2/S345/C4`).
 
+Isotropic non-totalistic rules see how the eight neighbours are arranged,
+not only how many are live, in Hensel's notation as Golly writes it: a count
+followed by letters takes the arrangements the letters name, with their
+rotations and reflections, and a minus before the letters every arrangement
+but those, so `B2-a/S12` (Just Friends) births on two neighbours unless they
+sit side by side. Golly's MAP strings, `MAP` and 86 base64 characters, name any
+two-state rule of the Moore neighbourhood, isotropic or not, and read into the
+same kind of rule. B0 rules of either form run as the weighted ones do, and
+those without B0 run on HashLife too. Built-in: tlife (`B3/S2-i34q`) and Just
+Friends (`B2-a/S12`).
+
 Rule tables are Golly's RuleLoader `.rule` files: a `@TABLE` of transitions
 over the von Neumann, Moore or hexagonal neighbourhood (Golly's, on the square
 grid) with its variables and symmetries, or a `@TREE`, of up to 256 states,
