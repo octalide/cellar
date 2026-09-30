@@ -35,10 +35,10 @@
 # generation, skipping the chunks the steps left cold.
 #
 # where the compute stages cannot be built, the CPU steps and this only draws,
-# uploading the chunks in view every frame with their pyramids. the CPU steps
-# on a thread of its own while uncapped, so a growth it asks for there is only
-# noted, and the next frame makes the buffers on the thread that owns the
-# device.
+# uploading the chunks in view whose cells changed since they were last sent,
+# with their pyramids. the CPU steps on a thread of its own while uncapped, so
+# a growth it asks for there is only noted, and the next frame makes the
+# buffers on the thread that owns the device.
 
 use gfx: boom.graphics;
 use gm:  boom.math;
@@ -181,6 +181,8 @@ rec Write {
 # rb:     the census readback
 # got:    where a landed census is copied
 # landed: the landed census unpacked to space.CENSUS words per slot
+# held:   per slot 1 once its cells and pyramid were sent while the CPU steps
+#         and have not changed on the host since
 # cap:    slots the buffers hold
 rec Pool {
     cells:  [2]gfx.StorageBuffer;
@@ -192,6 +194,7 @@ rec Pool {
     rb:     gfx.Readback;
     got:    *u32;
     landed: *u32;
+    held:   *u8;
     cap:    usize;
 }
 
@@ -221,6 +224,7 @@ rec Pool {
 # stepping: the compute stages built, so the GPU steps
 # owed:     slots a growth asked for while the CPU steps, which the next frame
 #           makes the buffers for
+# drawn:    the sense the held pyramids were built with
 # serial:   the serial of the last step recorded; stamps equal to it are current
 # ring:     recent censuses
 # id:       the last census id
@@ -271,6 +275,7 @@ pub rec Gpu {
     front:    usize;
     stepping: bool;
     owed:     usize;
+    drawn:    layout.Sense;
     serial:   u32;
     ring:     [8]Snap;
     id:       u32;
@@ -365,6 +370,7 @@ fun forget_censuses(g: *Gpu) {
 fun make_pool(g: *Gpu, pp: *Pool, cap: usize) err[gfx.Error] {
     pp.got    = nil;
     pp.landed = nil;
+    pp.held   = nil;
     pp.cap    = 0;
     val e1: err[gfx.Error] = make(g.d, cap * space.CELLS * 4, ?pp.cells[0]);
     if (sel e1.err) { ret e1; }
@@ -436,7 +442,13 @@ fun make_pool(g: *Gpu, pp: *Pool, cap: usize) err[gfx.Error] {
         ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.empty{}}};
     }
     pp.landed = ru.ok;
-    pp.cap    = cap;
+    val rh: res[*u8, allo.Error] = allo.zallocate[u8](g.a, cap);
+    if (sel rh.err) {
+        drop_pool(g, pp);
+        ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.empty{}}};
+    }
+    pp.held = rh.ok;
+    pp.cap  = cap;
     ret err[gfx.Error].ok{};
 }
 
@@ -451,8 +463,10 @@ fun drop_pool(g: *Gpu, p: *Pool) {
     gfx.storage_buffer_delete(g.d, ?p.cells[0]);
     if (p.got != nil)    { allo.deallocate[u32](g.a, p.got, status_bytes(p.cap) / 4); }
     if (p.landed != nil) { allo.deallocate[u32](g.a, p.landed, p.cap * space.CENSUS); }
+    if (p.held != nil)   { allo.deallocate[u8](g.a, p.held, p.cap); }
     p.got    = nil;
     p.landed = nil;
+    p.held   = nil;
     p.cap    = 0;
 }
 
@@ -476,9 +490,11 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     g.slots    = ceiling(gfx.renderer_limits(r));
     g.p.got    = nil;
     g.p.landed = nil;
+    g.p.held   = nil;
     g.p.cap    = 0;
     g.owed     = 0;
     g.reserved = false;
+    mem.zero[u8]((?g.drawn)::*u8, $size_of(layout.Sense));
     g.retired  = false;
     g.hi       = 0;
     g.front    = 0;
@@ -1067,8 +1083,10 @@ fun flush(g: *Gpu, sp: *space.Space) err[gfx.Error] {
     }
     vector.clear[u32](?g.stamped);
 
+    # while the CPU steps, a chunk the host changed is sent again with its pyramid
     s = 0;
     for (s < top) {
+        if (!g.stepping && (sp.dirty[s] & (space.DIRTY_CELLS | space.DIRTY_ZERO)) != 0) { g.p.held[s] = 0; }
         sp.dirty[s] = 0;
         s           = s + 1;
     }
@@ -1076,8 +1094,14 @@ fun flush(g: *Gpu, sp: *space.Space) err[gfx.Error] {
     ret err[gfx.Error].ok{};
 }
 
-# while the CPU steps, upload the chunks the view can see
+# while the CPU steps, upload the chunks the view can see that changed since
+# they were last sent
 fun upload_view(g: *Gpu, sp: *space.Space, look: *Look) err[gfx.Error] {
+    # a pyramid reads its cells through the rule's sense
+    if (!mem.equal[u8]((?g.drawn)::*u8, (?sp.sense)::*u8, $size_of(layout.Sense))) {
+        mem.zero[u8](g.p.held, g.p.cap);
+        g.drawn = sp.sense;
+    }
     if (look.ppc <= 0.0) { ret err[gfx.Error].ok{}; }
     val bx:   i64   = look.base_cx::i64 - space.BIAS;
     val by:   i64   = look.base_cy::i64 - space.BIAS;
@@ -1092,10 +1116,11 @@ fun upload_view(g: *Gpu, sp: *space.Space, look: *Look) err[gfx.Error] {
     var sent: usize = 0;
     var s:    usize = 0;
     for (s < sp.hi && sent < MAX_VIEW) {
-        if (space.used(sp, s)) {
+        if (space.used(sp, s) && g.p.held[s] == 0) {
             val x: i64 = space.slot_x(sp, s);
             val y: i64 = space.slot_y(sp, s);
             if (x >= x0 && x <= x1 && y >= y0 && y <= y1) {
+                g.p.held[s] = 1;
                 val e: err[gfx.Error] = upload_cells(g, sp, s, 1, false);
                 if (sel e.err) { ret e; }
                 pyramid(?sp.cells[s * space.CELLS], sp.sense, ?g.built[0]);
