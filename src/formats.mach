@@ -24,6 +24,7 @@ use allo: std.allocator;
 use std.allocator.page;
 use std.collections.vector;
 use std.collections.vector.Vector;
+use mem: std.memory;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -497,6 +498,9 @@ test load__refuses_mangled_plaintext_life_and_macrocell_without_touching_the_wor
     if (fuzz(?a, ?s, "life", "#Life 1.06\n#R 23/3\n0 -1\n1 0\n-1 1\n0 1\n1 1\n1 1\n", junk::*u8, jn) != 0)          { ret 4; }
     val mc: str = "[M2] (golly 2.0)\n#R B3/S23\n#C two\n$$..*$...*$.***$\n1 0 3 2 0\n2 2 0 0 0\n3 0 3 0 0\n4 1 4 0 1\n5 0 0 5 0\n";
     if (fuzz(?a, ?s, "macrocell", mc, "0123459*.$#[M \n\0"::*u8, 16) != 0) { ret 5; }
+    # and built into the tree from its nodes
+    if (!sim.use_hashlife(?s, true))                                       { ret 6; }
+    if (fuzz(?a, ?s, "macrocell", mc, "0123459*.$#[M \n\0"::*u8, 16) != 0) { ret 7; }
     sim.dnit(?s);
     ret 0;
 }
@@ -743,6 +747,11 @@ test load__judges_a_giant_macrocell_by_its_nodes {
     var live: u64 = 0;
     if (world_takes(?a, ?s, "macrocell", text::*u8, string.str_len(text), ?live)) { ret 7; }
     if (sim.population(?s) != 0 || s.full || s.space.live != 0)                   { ret 8; }
+    # where the tree is built from the nodes, whatever the cells number
+    if (!sim.use_hashlife(?s, true))                                                             { ret 9; }
+    if (!world_takes(?a, ?s, "macrocell", text::*u8, string.str_len(text), ?live))               { ret 10; }
+    if (sim.population(?s)::u64 != format.LIMIT::u64 || s.full)                                  { ret 11; }
+    if (!sim.alive(?s, 0 - side / 2, 1 - side / 2) || sim.alive(?s, 0 - side / 2, 0 - side / 2)) { ret 12; }
     sim.dnit(?s);
     ret 0;
 }
@@ -836,6 +845,86 @@ test load__takes_a_sparse_giant_and_refuses_what_the_world_cannot_hold {
     if (sim.population(?s) != 0 || s.full)                          { ret 10; }
     vector.dnit[u8](?out);
     sim.dnit(?s);
+    ret 0;
+}
+
+# load a Macrocell file shifted by (dx, dy) into a world on the tree, built
+# from its nodes or, with runs, cell by cell, and write the world back out
+# ---
+# runs: take the runs rather than the tree
+# out:  receives the world as Macrocell
+fun tree_load(a: *allo.Allocator, text: str, dx: i64, dy: i64, runs: bool, out: *Vector[u8]) bool {
+    var s: sim.Sim;
+    val m: err[allo.Error] = sim.init(?s, a);
+    if (sel m.err) { ret false; }
+    var f:    format.Format;
+    var ok:   bool = by_id("macrocell", ?f) && sim.use_hashlife(?s, true);
+    var ws:   adapt.WorldSink;
+    var info: format.Info;
+    format.info_init(?info, a);
+    val k: *format.Sink = adapt.world_sink(?ws, ?s, dx, dy);
+    if (runs) { k.tree = nil; }
+    if (ok) {
+        val r: err[format.Error] = load(a, ?f, text::*u8, string.str_len(text), k, ?info);
+        ok = sel r.ok && sim.population(?s)::u64 == info.live && !s.full;
+    }
+    format.info_dnit(?info);
+    var src: adapt.WorldSource;
+    var got: format.Info;
+    format.info_init(?got, a);
+    val w: res[*format.Source, format.Error] = adapt.world_source(?src, ?s, a);
+    if (sel w.err) { ok = false; }
+    if (sel w.ok) {
+        if (ok) {
+            val e: err[format.Error] = save(a, ?f, w.ok, ?got, out);
+            ok = sel e.ok;
+        }
+    }
+    adapt.world_source_dnit(?src);
+    format.info_dnit(?got);
+    sim.dnit(?s);
+    ret ok;
+}
+
+test load__a_macrocell_built_into_the_tree_holds_the_cells_its_runs_would {
+    var a: allo.Allocator;
+    page.make(?a);
+    # a sparse spread wide enough that the tree's squares straddle the file's
+    val far:  i64 = 1000;
+    var runs: [5]format.Run;
+    runs[0] = format.Run{x: -40, y: -70, n: 3, v: 1};
+    runs[1] = format.Run{x: -38, y: -69, n: 1, v: 1};
+    runs[2] = format.Run{x: 5, y: 0, n: 20, v: 1};
+    runs[3] = format.Run{x: far, y: 3, n: 1, v: 1};
+    runs[4] = format.Run{x: -far, y: far, n: 2, v: 1};
+    var sparse: Vector[u8] = vector.init[u8](?a);
+    if (!write_runs(?a, ?runs[0], 5, ?sparse)) { ret 1; }
+    val nul: res[usize, allo.Error] = vector.push[u8](?sparse, 0);
+    if (sel nul.err) { ret 1; }
+    var texts: [4]str;
+    texts[0] = "[M2] (golly 2.0)\n#R B3/S23\n#C two\n$$..*$...*$.***$\n1 0 3 2 0\n2 2 0 0 0\n3 0 3 0 0\n4 1 4 0 1\n5 0 0 5 0\n";
+    texts[1] = "[M2] (golly 3.0)\n1 0 2 3 0\n2 1 0 0 0\n";
+    texts[2] = "[M2]\n**$**$\n4 1 0 0 0\n5 2 0 0 2\n6 0 3 3 0\n";
+    texts[3] = sparse.data::str;
+    # shifts on and off the file's grid, a row, a column and odd ones
+    var dx: [6]i64 = [6]i64{0, 0, 1, -37, 5, 64};
+    var dy: [6]i64 = [6]i64{0, -1, 0, 91, 3, -64};
+    var t:  usize  = 0;
+    for (t < 4) {
+        var k: usize = 0;
+        for (k < 6) {
+            var built: Vector[u8] = vector.init[u8](?a);
+            var cells: Vector[u8] = vector.init[u8](?a);
+            if (!tree_load(?a, texts[t], dx[k], dy[k], false, ?built))                                         { ret 2; }
+            if (!tree_load(?a, texts[t], dx[k], dy[k], true, ?cells))                                          { ret 3; }
+            if (built.len == 0 || built.len != cells.len || !mem.equal[u8](built.data, cells.data, built.len)) { ret 4; }
+            vector.dnit[u8](?built);
+            vector.dnit[u8](?cells);
+            k = k + 1;
+        }
+        t = t + 1;
+    }
+    vector.dnit[u8](?sparse);
     ret 0;
 }
 
