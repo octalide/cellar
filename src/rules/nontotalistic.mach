@@ -1,0 +1,712 @@
+# the non-totalistic family: two-state rules over the radius-1 Moore
+# neighbourhood that see how the eight neighbours are arranged, not only how
+# many are live
+#
+# a rule is a map from each of the 512 neighbourhoods, the 3 by 3 block around
+# a cell, to the state the cell becomes. a neighbourhood's index reads the
+# block row-major from the north-west cell, its most significant bit, to the
+# south-east, so the cell itself is bit 4 (CENTRE) and the map is a 256-entry
+# birth table, the neighbourhoods whose cell is dead, beside a 256-entry
+# survive table, 64 bytes in all. this is Golly's MAP order.
+#
+# its rule string is Hensel's isotropic non-totalistic notation, "B2-a/S12"
+# for Just Friends: a neighbour count alone takes every arrangement of that
+# many live neighbours, a count followed by letters the arrangements the
+# letters name, each with its rotations and reflections, and a count followed
+# by a minus and letters every arrangement but those. or it is Golly's MAP
+# string, "MAP" and the map in 86 base64 characters, which names any rule of
+# the family, isotropic or not. format writes Hensel's notation in Golly's
+# canonical form for a map every rotation and reflection leaves alike, and a
+# MAP string for any other.
+#
+# its cell word is the weighted family's two-state word
+# (cellar.rules.weighted.word), and a rule that births on 0 runs in the forms
+# a weighted one does: neighbourhood 0 is birth on 0, and neighbourhood 511
+# survival with every neighbour live (S-max). stepping from a generation held
+# as the complement reads a cell's neighbourhood complemented, and writes the
+# result complemented when the generation stepped to is held so. its step
+# stage is nontotalistic_comp, which reads the form and the map from the
+# family's window of the meta head (cellar.rules.nontotalistic.window).
+
+use cellar.layout;
+use cellar.rules.nontotalistic.window;
+use cellar.rules.weighted.word;
+use cellar.space;
+use cellar.text;
+use mem: std.memory;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string;
+use std.types.string.str;
+
+#[embed("{artifact.stage-nontotalistic_comp.out}")]
+val STAGE: [_]u8;
+
+# what the family's capabilities come to for one rule
+# ---
+# b0:        the background flips each generation, so odd generations hold
+#            the world's complement: the STROBE form
+# isotropic: every rotation and reflection of a neighbourhood steps alike
+# hashlife:  a quadtree engine can run it: any rule that does not birth on 0
+# bounded:   it can run on a bounded grid
+# life_like: the map depends only on the cell and its live neighbours' count,
+#            so it is the Life-like rule of those counts, and it does not
+#            birth on 0
+pub rec Caps {
+    b0:        bool;
+    isotropic: bool;
+    hashlife:  bool;
+    bounded:   bool;
+    life_like: bool;
+}
+
+# neighbourhoods of the 3 by 3 block
+pub val NEIGHBOURHOODS: u32 = 512;
+# the bit of a neighbourhood's index that is the cell itself
+pub val CENTRE: u32 = 16;
+# the bits of a neighbourhood's index that are its eight neighbours
+pub val RING: u32 = 0x1ef;
+
+# a non-totalistic rule
+# ---
+# map: bit i % 32 of word i / 32 is the state a cell of neighbourhood i becomes
+pub rec Rule {
+    map: [window.MAP_WORDS]u32;
+}
+
+# the state a cell of neighbourhood i becomes
+pub fun at(r: *Rule, i: u32) u32 {
+    ret (r.map[(i / 32)::usize] >> (i % 32)) & 1;
+}
+
+# set the state a cell of neighbourhood i becomes
+fun put(r: *Rule, i: u32, v: u32) {
+    val w: usize = (i / 32)::usize;
+    val b: u32   = 1::u32 << (i % 32);
+    if (v != 0) { r.map[w] = r.map[w] | b; }
+    or          { r.map[w] = r.map[w] & ~b; }
+}
+
+# a neighbourhood turned a quarter clockwise, as Golly turns it
+fun turn(x: u32) u32 {
+    ret ((x & 0x4) << 6) | ((x & 0x20) << 2) | ((x & 0x100) >> 2) | ((x & 0x2) << 4) | (x & 0x10) | ((x & 0x80) >> 4) | ((x & 0x1) << 2) | ((x & 0x8) >> 2) | ((x & 0x40) >> 6);
+}
+
+# a neighbourhood with its top and bottom rows swapped
+fun mirror(x: u32) u32 {
+    ret ((x & 0x07) << 6) | ((x & 0x1c0) >> 6) | (x & 0x38);
+}
+
+# how many live neighbours a neighbourhood holds
+fun count(x: u32) u32 {
+    var n: u32 = 0;
+    var m: u32 = x & RING;
+    for (m != 0) {
+        n = n + (m & 1);
+        m = m >> 1;
+    }
+    ret n;
+}
+
+# set a neighbourhood, and every rotation and reflection of it, to a state
+fun put_all(r: *Rule, x: u32, v: u32) {
+    var y: u32 = x;
+    var k: u32 = 0;
+    for (k < 4) {
+        put(r, y, v);
+        y = turn(y);
+        k = k + 1;
+    }
+    y = mirror(y);
+    k = 0;
+    for (k < 4) {
+        put(r, y, v);
+        y = turn(y);
+        k = k + 1;
+    }
+}
+
+# Hensel's letters, in the order LETTER_COUNT and SHAPES number them
+val LETTERS: str = "ceaiknjqrytwz";
+# the letters in the order format writes them, Golly's canonical order
+val ALPHABETICAL: str = "aceijknqrtwyz";
+# how many letters name arrangements of each count of live neighbours
+val LETTER_COUNT: [9]u32 = [9]u32{0, 2, 6, 10, 13, 10, 6, 2, 0};
+# where each count's shapes start in SHAPES, for counts 1 to 4
+val SHAPE_AT: [5]usize = [5]usize{0, 0, 2, 8, 18};
+# a neighbourhood of each letter of counts 1 to 4, in LETTERS' order, Golly's;
+# a count past 4 takes the letter's shape for 8 less the count, complemented
+val SHAPES: [31]u32 = [31]u32{
+    1, 2,
+    5, 10, 3, 40, 33, 68,
+    69, 42, 11, 7, 98, 13, 14, 70, 41, 97,
+    325, 170, 15, 45, 99, 71, 106, 102, 43, 101, 105, 78, 108,
+};
+
+# a neighbourhood, its cell dead, of the arrangement letter l names among n
+# live neighbours
+# ---
+# n: the count, 1 to 7
+# l: the letter's index in LETTERS, below LETTER_COUNT[n]
+fun shape(n: u32, l: u32) u32 {
+    if (n <= 4) { ret SHAPES[SHAPE_AT[n::usize] + l::usize]; }
+    ret SHAPES[SHAPE_AT[(8 - n)::usize] + l::usize] ^ RING;
+}
+
+# the index in LETTERS of a letter, or 13 for any other character
+fun letter(c: u8) u32 {
+    var l: u32 = 0;
+    for (l < 13) {
+        if (LETTERS[l::usize] == c) { ret l; }
+        l = l + 1;
+    }
+    ret 13;
+}
+
+# lowercase an ASCII letter
+fun lower(c: u8) u8 {
+    if (c >= 'A' && c <= 'Z') { ret c + 32; }
+    ret c;
+}
+
+# read one half of Hensel's notation, counts each with letters, a minus and
+# letters, or neither, up to a slash or the end
+# ---
+# s:      the text
+# i:      read position, left after the half
+# centre: CENTRE for the survive half, 0 for the birth half
+# r:      the rule it sets
+# ret:    what is wrong with the half, or nil
+fun half(s: str, i: *usize, centre: u32, r: *Rule) str {
+    for (s[@i] != 0 && s[@i] != '/') {
+        val c: u8 = s[@i];
+        if (c < '0' || c > '9') { ret "not B/S notation with Hensel's letters"; }
+        if (c == '9')           { ret "a neighbour count is beyond 8"; }
+        val n: u32 = (c - '0')::u32;
+        @i = @i + 1;
+        var minus: bool = false;
+        if (s[@i] == '-') {
+            minus = true;
+            @i    = @i + 1;
+        }
+        var named: u32 = 0;
+        var l:     u32 = letter(lower(s[@i]));
+        for (l < 13) {
+            if (l >= LETTER_COUNT[n::usize]) { ret "a letter names no arrangement of that many neighbours"; }
+            named = named | (1::u32 << l);
+            @i    = @i + 1;
+            l     = letter(lower(s[@i]));
+        }
+        if (minus && named == 0) { ret "a minus needs letters after it"; }
+        if (named == 0 || minus) {
+            var x: u32 = 0;
+            for (x < NEIGHBOURHOODS) {
+                if ((x & CENTRE) == centre && count(x) == n) { put(r, x, 1); }
+                x = x + 1;
+            }
+        }
+        l = 0;
+        for (l < 13) {
+            if ((named & (1::u32 << l)) != 0) {
+                var v: u32 = 1;
+                if (minus) { v = 0; }
+                put_all(r, shape(n, l) | centre, v);
+            }
+            l = l + 1;
+        }
+    }
+    ret nil;
+}
+
+# the base64 alphabet MAP strings are written in
+val BASE64: str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+# base64 characters a MAP string of the Moore neighbourhood holds
+pub val MAP_CHARS: usize = 86;
+
+# the value of a base64 character, or 64 for any other
+fun base64(c: u8) u32 {
+    var v: u32 = 0;
+    for (v < 64) {
+        if (BASE64[v::usize] == c) { ret v; }
+        v = v + 1;
+    }
+    ret 64;
+}
+
+# whether text starts with MAP, in any case
+fun map_prefix(s: str) bool {
+    ret lower(s[0]) == 'm' && lower(s[1]) == 'a' && lower(s[2]) == 'p';
+}
+
+# read a MAP string's base64, the first character's high bit the map's
+# neighbourhood 0, less any padding
+fun map_parse(s: str) res[Rule, str] {
+    var n: usize = 0;
+    for (s[n] != 0) { n = n + 1; }
+    if (n == MAP_CHARS + 2 && s[MAP_CHARS] == '=' && s[MAP_CHARS + 1] == '=') { n = MAP_CHARS; }
+    if (n != MAP_CHARS)                                                       { ret res[Rule, str].err{"a MAP rule holds 86 base64 characters, one bit for each neighbourhood of the Moore neighbourhood"}; }
+    var r: Rule;
+    mem.zero[u32](?r.map[0], window.MAP_WORDS::usize);
+    var k: usize = 0;
+    for (k < n) {
+        val v: u32 = base64(s[k]);
+        if (v == 64) { ret res[Rule, str].err{"a MAP rule holds a character that is not base64"}; }
+        var b: u32 = 0;
+        for (b < 6) {
+            val x: u32 = k::u32 * 6 + b;
+            if (x < NEIGHBOURHOODS) { put(?r, x, (v >> (5 - b)) & 1); }
+            b = b + 1;
+        }
+        k = k + 1;
+    }
+    ret res[Rule, str].ok{r};
+}
+
+# read the family's rule string: Hensel's notation, "B2-a/S12", with the
+# letters in any case, or a MAP string
+# ---
+# s:   NUL-terminated rule text
+# ret: the rule, or what is wrong with s
+pub fun parse(s: str) res[Rule, str] {
+    var i: usize = 0;
+    for (s[i] == ' ') { i = i + 1; }
+    if (map_prefix(?s[i])) { ret map_parse(?s[i + 3]); }
+    var r: Rule;
+    mem.zero[u32](?r.map[0], window.MAP_WORDS::usize);
+    val shape_err: str = "not B/S notation with Hensel's letters";
+    if (lower(s[i]) != 'b') { ret res[Rule, str].err{shape_err}; }
+    i = i + 1;
+    val birth: str = half(s, ?i, 0, ?r);
+    if (birth != nil)                          { ret res[Rule, str].err{birth}; }
+    if (s[i] != '/' || lower(s[i + 1]) != 's') { ret res[Rule, str].err{"B needs /S after it"}; }
+    i = i + 2;
+    val survive: str = half(s, ?i, CENTRE, ?r);
+    if (survive != nil) { ret res[Rule, str].err{survive}; }
+    if (s[i] != 0)      { ret res[Rule, str].err{"text follows the rule"}; }
+    ret res[Rule, str].ok{r};
+}
+
+# whether a rule string is plausibly this family's, so that a string every
+# family refuses reports the error of the family it meant: a MAP string, or B/S
+# notation, which the weighted family leaves to this one when it holds
+# Hensel's letters or a minus (cellar.rules.weighted.claims)
+# ---
+# s: NUL-terminated rule text
+pub fun claims(s: str) bool {
+    var i: usize = 0;
+    for (s[i] == ' ') { i = i + 1; }
+    if (map_prefix(?s[i])) { ret true; }
+    var slashes: usize = 0;
+    var j:       usize = i;
+    for (s[j] != 0) {
+        if (s[j] == '/') { slashes = slashes + 1; }
+        j = j + 1;
+    }
+    ret lower(s[i]) == 'b' && slashes == 1;
+}
+
+# the longest rule string format writes, less its NUL: a MAP string, Hensel's
+# notation taking at most 71
+pub val FORMAT_MAX: usize = 3 + MAP_CHARS;
+
+# append a half of Hensel's notation in Golly's canonical form: each count
+# with any arrangement set, alone when every one is, with the letters set, or
+# with a minus and the letters not set where that is shorter
+# ---
+# r:      an isotropic rule
+# centre: CENTRE for the survive half, 0 for the birth half
+fun write_half(r: *Rule, centre: u32, buf: *u8, off: usize) usize {
+    var o: usize = off;
+    var n: u32   = 0;
+    for (n <= 8) {
+        val m:    u32 = LETTER_COUNT[n::usize];
+        var set:  u32 = 0;
+        var many: u32 = 0;
+        if (m == 0) {
+            var x: u32 = centre;
+            if (n == 8) { x = x | RING; }
+            many = at(r, x);
+        }
+        var l: u32 = 0;
+        for (l < m) {
+            if (at(r, shape(n, l) | centre) != 0) {
+                set  = set | (1::u32 << l);
+                many = many + 1;
+            }
+            l = l + 1;
+        }
+        if (many != 0) {
+            buf[o] = '0' + n::u8;
+            o      = o + 1;
+        }
+        if (many != 0 && many != m && m != 0) {
+            var want: u32 = 1;
+            if (m - many + 1 < many) {
+                buf[o] = '-';
+                o      = o + 1;
+                want   = 0;
+            }
+            var a: usize = 0;
+            for (a < 13) {
+                val ch: u8  = ALPHABETICAL[a];
+                val li: u32 = letter(ch);
+                if (li < m && ((set >> li) & 1) == want) {
+                    buf[o] = ch;
+                    o      = o + 1;
+                }
+                a = a + 1;
+            }
+        }
+        n = n + 1;
+    }
+    ret o;
+}
+
+# write the family's rule string: Hensel's notation for an isotropic rule, a
+# MAP string for any other
+# ---
+# r:   the rule
+# buf: at least FORMAT_MAX + 1 bytes
+# ret: buf, which parse reads back as r
+pub fun format(r: *Rule, buf: *u8) str {
+    var o: usize = 0;
+    if (isotropic(r)) {
+        o = text.buf_str(buf, 0, "B");
+        o = write_half(r, 0, buf, o);
+        o = text.buf_str(buf, o, "/S");
+        o = write_half(r, CENTRE, buf, o);
+    }
+    or {
+        o = text.buf_str(buf, 0, "MAP");
+        var k: usize = 0;
+        for (k < MAP_CHARS) {
+            var v: u32 = 0;
+            var b: u32 = 0;
+            for (b < 6) {
+                val x: u32 = k::u32 * 6 + b;
+                if (x < NEIGHBOURHOODS) { v = v | (at(r, x) << (5 - b)); }
+                b = b + 1;
+            }
+            buf[o] = BASE64[v::usize];
+            o      = o + 1;
+            k      = k + 1;
+        }
+    }
+    buf[o] = 0;
+    ret buf;
+}
+
+# write a rule's short form for the readout, its whole rule string
+pub fun display(r: *Rule, buf: *u8) str {
+    ret format(r, buf);
+}
+
+# whether two rules step alike: they hold the same map
+pub fun same_rule(a: *Rule, b: *Rule) bool {
+    var k: usize = 0;
+    for (k < window.MAP_WORDS::usize) {
+        if (a.map[k] != b.map[k]) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# states a cell of any rule can be in: dead and live
+pub fun states(r: *Rule) u32 {
+    ret 2;
+}
+
+# the word a cell of a state is written as: a live one starts at age 1 and
+# full heat, a dead one cold
+pub fun word_of(r: *Rule, state: u32) u32 {
+    if (state != 0) { ret word.BORN; }
+    ret 0;
+}
+
+# the state a word holds, its display channels aside
+pub fun state_of(c: u32) u32 {
+    if (c >= word.LIVE) { ret 1; }
+    ret 0;
+}
+
+# how shared code reads the family's cell word
+pub fun sense() layout.Sense {
+    ret word.sense();
+}
+
+# how far one generation reaches: the eight neighbours
+pub fun radius(r: *Rule) usize {
+    ret 1;
+}
+
+# the form a rule runs in: PLAIN, STROBE or COMPLEMENT (cellar.rules.weighted.word)
+pub fun form(r: *Rule) u32 {
+    if (at(r, 0) == 0)                  { ret word.PLAIN; }
+    if (at(r, NEIGHBOURHOODS - 1) != 0) { ret word.COMPLEMENT; }
+    ret word.STROBE;
+}
+
+# whether every rotation and reflection of each neighbourhood steps alike
+fun isotropic(r: *Rule) bool {
+    var x: u32 = 0;
+    for (x < NEIGHBOURHOODS) {
+        val v: u32 = at(r, x);
+        if (at(r, turn(x)) != v || at(r, mirror(x)) != v) { ret false; }
+        x = x + 1;
+    }
+    ret true;
+}
+
+# whether the map depends only on the cell and its live neighbours' count
+fun totalistic(r: *Rule) bool {
+    var first: [18]u32;
+    var k:     usize = 0;
+    for (k < 18) {
+        first[k] = 2;
+        k        = k + 1;
+    }
+    var x: u32 = 0;
+    for (x < NEIGHBOURHOODS) {
+        var c: usize = count(x)::usize;
+        if ((x & CENTRE) != 0) { c = c + 9; }
+        val v: u32 = at(r, x);
+        if (first[c] == 2) { first[c] = v; }
+        or (first[c] != v) { ret false; }
+        x = x + 1;
+    }
+    ret true;
+}
+
+# the capabilities the family has for a rule
+pub fun caps(r: *Rule) Caps {
+    val f: u32 = form(r);
+    ret Caps{b0: f == word.STROBE, isotropic: isotropic(r), hashlife: f == word.PLAIN, bounded: true, life_like: f == word.PLAIN && totalistic(r)};
+}
+
+# the state a cell becomes from the states of the 3 by 3 block around it, for
+# a rule that does not birth on 0, the only ones caps lets a quadtree engine run
+# ---
+# r:   the rule
+# nb:  the nine states, row-major with the cell at 4
+# ret: its next state
+pub fun next_of(r: *Rule, nb: *u32) u32 {
+    var x: u32   = 0;
+    var i: usize = 0;
+    for (i < 9) {
+        x = x << 1;
+        if (nb[i] != 0) { x = x | 1; }
+        i = i + 1;
+    }
+    ret at(r, x);
+}
+
+# side of the cells a chunk's step reads, the chunk and a cell around it
+val FRAME: usize = 66;
+
+# step one chunk on the CPU, the rule the family's stage applies word for word
+#
+# a chunk with nothing alive nearby only cools, which holds in every form,
+# since the held background steps to itself. otherwise the live cells of the
+# chunk and the ring around it are read once, the ring through
+# space.block_cell, and each cell's neighbourhood indexes the map.
+# ---
+# r: the rule
+# b: the chunk's block and back cells, at generation b.gen
+# t: the tally of the cells written
+pub fun step_chunk(r: *Rule, b: *space.Block, t: *space.Tally) {
+    val own: *u32 = b.nb[4];
+    val out: *u32 = b.out;
+    if (!b.busy) {
+        var i: usize = 0;
+        for (i < space.CELLS) {
+            val v: u32 = word.cool(own[i]);
+            out[i] = v;
+            if (v != 0) { t.warm = 1; }
+            i = i + 1;
+        }
+        ret;
+    }
+    val f:       u32 = form(r);
+    var flip:    u32 = 0;
+    val inv_out: u32 = word.inverted(f, ((b.gen + 1) & 1)::u32);
+    if (word.inverted(f, (b.gen & 1)::u32) != 0) { flip = NEIGHBOURHOODS - 1; }
+    var lit: [FRAME * FRAME]u32;
+    var y:   i64 = -1;
+    for (y <= 64) {
+        var x: i64 = -1;
+        for (x <= 64) {
+            var c: u32 = 0;
+            if (x >= 0 && x < 64 && y >= 0 && y < 64) { c = own[(y * 64 + x)::usize]; }
+            or                                        { c = space.block_cell(b, x, y); }
+            lit[((y + 1) * FRAME::i64 + x + 1)::usize] = (c >= word.LIVE)::u32;
+            x                                          = x + 1;
+        }
+        y = y + 1;
+    }
+    y = 0;
+    for (y < 64) {
+        val up:  usize = y::usize * FRAME;
+        val mid: usize = up + FRAME;
+        val dn:  usize = mid + FRAME;
+        var x:   usize = 0;
+        for (x < 64) {
+            val n: u32   = (lit[up + x] << 8) | (lit[up + x + 1] << 7) | (lit[up + x + 2] << 6) | (lit[mid + x] << 5) | (lit[mid + x + 1] << 4) | (lit[mid + x + 2] << 3) | (lit[dn + x] << 2) | (lit[dn + x + 1] << 1) | lit[dn + x + 2];
+            val i: usize = y::usize * 64 + x;
+            val v: u32   = word.become(own[i], at(r, n ^ flip) ^ inv_out);
+            out[i] = v;
+            space.note(t, v, x::u32, y::u32);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+# pack a rule into the family's window of the meta head, as its stage reads it
+# ---
+# r: the rule
+# w: layout.RULE words
+pub fun pack(r: *Rule, w: *u32) {
+    mem.zero[u32](w, layout.RULE::usize);
+    w[window.FORM_AT] = form(r);
+    var k: u32 = 0;
+    for (k < window.MAP_WORDS) {
+        w[window.MAP_AT + k] = r.map[k::usize];
+        k                    = k + 1;
+    }
+}
+
+# the family's stage binds no rule buffer: the map fits its window
+pub val TABLE: bool = false;
+
+# the words of the rule buffer a rule needs, none
+pub fun table_words(r: *Rule) usize {
+    ret 0;
+}
+
+# pack a rule into the rule buffer it has none of
+pub fun pack_table(r: *Rule, w: *u32) {}
+
+# the colour a live cell is drawn in: the view's solid colour, the family
+# having no palette of its own
+pub fun colour(r: *Rule, state: u32) opt[u32] {
+    ret opt[u32].none{};
+}
+
+# the family's step stage, as SPIR-V
+# ---
+# len: receives its length in bytes
+# ret: its first byte
+pub fun stage(len: *usize) *u8 {
+    @len = $length_of(STAGE);
+    ret ?STAGE[0];
+}
+
+# rule strings that exercise the family, for the tests that run every family:
+# tlife, a B0 rule without S-max that strobes, one with S-max that runs in the
+# COMPLEMENT form, then as a MAP string Life with a birth on two live
+# neighbours in the north-west corner and not on its rotations, last so the
+# world lives on
+pub val SAMPLE_COUNT: usize = 4;
+
+# the sample rule string i
+pub fun sample(i: usize) str {
+    if (i == 1) { ret "B0124-k/S1c25"; }
+    if (i == 2) { ret "B0123478/S012346-a78"; }
+    if (i == 3) { ret "MAPARYXfhZofugWaH7oaIDogBZofuhogOiAaIDogIAAgAAWaH7oaIDogGiA6ICAAIAA6IDogIAAgACAAIAAAAAAAA"; }
+    ret "B3/S2-i34q";
+}
+
+test shapes__each_count_s_letters_split_its_arrangements_between_them {
+    var n: u32 = 1;
+    for (n < 8) {
+        var seen: Rule;
+        mem.zero[u32](?seen.map[0], window.MAP_WORDS::usize);
+        var l: u32 = 0;
+        for (l < LETTER_COUNT[n::usize]) {
+            if (count(shape(n, l)) != n || (shape(n, l) & CENTRE) != 0) { ret 1; }
+            var one: Rule;
+            mem.zero[u32](?one.map[0], window.MAP_WORDS::usize);
+            put_all(?one, shape(n, l), 1);
+            var x: u32 = 0;
+            for (x < NEIGHBOURHOODS) {
+                if (at(?one, x) != 0) {
+                    if (at(?seen, x) != 0) { ret 2; }
+                    put(?seen, x, 1);
+                }
+                x = x + 1;
+            }
+            l = l + 1;
+        }
+        var x: u32 = 0;
+        for (x < NEIGHBOURHOODS) {
+            if (at(?seen, x) != ((x & CENTRE) == 0 && count(x) == n)::u32) { ret 3; }
+            x = x + 1;
+        }
+        n = n + 1;
+    }
+    ret 0;
+}
+
+test parse__reads_golly_s_map_for_life_as_b3_s23 {
+    val map: res[Rule, str] = parse("MAPARYXfhZofugWaH7oaIDogBZofuhogOiAaIDogIAAgAAWaH7oaIDogGiA6ICAAIAAaIDogIAAgACAAIAAAAAAAA");
+    val bs:  res[Rule, str] = parse("B3/S23");
+    if (sel map.err) { ret 1; }
+    if (sel bs.err)  { ret 1; }
+    var life: Rule = map.ok;
+    if (!same_rule(?life, ?bs.ok)) { ret 2; }
+    val c: Caps = caps(?life);
+    if (!c.life_like || !c.isotropic || !c.hashlife || c.b0) { ret 3; }
+    var buf: [FORMAT_MAX + 1]u8;
+    if (!string.str_equals(format(?life, ?buf[0]), "B3/S23")) { ret 4; }
+    ret 0;
+}
+
+test format__writes_golly_s_canonical_form {
+    var buf: [FORMAT_MAX + 1]u8;
+    val ins: [6]str = [6]str{"B3/S2-i34q", "b2-A/s12", "B2acekin/S", "B2aceik/S4eaicjkq", "B0124-k/S1c25", "MAPARYXfhZofugWaH7oaIDogBZofuhogOiAaIDogIAAgAAWaH7oaIDogGiA6ICAAIAA6IDogIAAgACAAIAAAAAAAA=="};
+    val out: [6]str = [6]str{"B3/S2-i34q", "B2-a/S12", "B2/S", "B2-n/S4aceijkq", "B0124-k/S1c25", "MAPARYXfhZofugWaH7oaIDogBZofuhogOiAaIDogIAAgAAWaH7oaIDogGiA6ICAAIAA6IDogIAAgACAAIAAAAAAAA"};
+    var i:   usize  = 0;
+    for (i < 6) {
+        val r: res[Rule, str] = parse(ins[i]);
+        if (sel r.err) { ret 1; }
+        var got: Rule = r.ok;
+        if (!string.str_equals(format(?got, ?buf[0]), out[i])) { ret 2; }
+        val back: res[Rule, str] = parse(?buf[0]);
+        if (sel back.err)               { ret 3; }
+        if (!same_rule(?back.ok, ?got)) { ret 3; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test next_of__tells_arrangements_of_a_count_apart {
+    # just friends: two live neighbours side by side along an edge birth
+    # nothing, two across the cell do
+    val jf: res[Rule, str] = parse("B2-a/S12");
+    if (sel jf.err) { ret 1; }
+    var r:    Rule   = jf.ok;
+    var side: [9]u32 = [9]u32{0, 1, 1, 0, 0, 0, 0, 0, 0};
+    var over: [9]u32 = [9]u32{0, 1, 0, 0, 0, 0, 0, 1, 0};
+    if (next_of(?r, ?side[0]) != 0 || next_of(?r, ?over[0]) != 1) { ret 2; }
+    # the MAP sample births on its north-west pair and on no rotation of it
+    val m: res[Rule, str] = parse(sample(3));
+    if (sel m.err) { ret 3; }
+    var mr: Rule   = m.ok;
+    var nw: [9]u32 = [9]u32{1, 1, 0, 0, 0, 0, 0, 0, 0};
+    var se: [9]u32 = [9]u32{0, 0, 0, 0, 0, 0, 0, 1, 1};
+    if (next_of(?mr, ?nw[0]) != 1 || next_of(?mr, ?se[0]) != 0 || caps(?mr).isotropic) { ret 4; }
+    # a rule that births on 0 runs strobing without S-max and complemented with it
+    val st: res[Rule, str] = parse(sample(1));
+    val cp: res[Rule, str] = parse(sample(2));
+    if (sel st.err) { ret 5; }
+    if (sel cp.err) { ret 5; }
+    var sr: Rule = st.ok;
+    var cr: Rule = cp.ok;
+    if (form(?sr) != word.STROBE || !caps(?sr).b0 || caps(?sr).hashlife) { ret 6; }
+    if (form(?cr) != word.COMPLEMENT || caps(?cr).b0)                    { ret 7; }
+    ret 0;
+}
