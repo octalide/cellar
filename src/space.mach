@@ -21,9 +21,9 @@
 # and asked for by no live neighbour is freed. the mask has a bit per neighbour,
 # set where a live cell lies near that side, so a sparse world keeps only the
 # chunks it can spread into. it works from a census, per slot the live count,
-# whether anything is warm, the incarnation the count was taken of and the mask,
-# which the CPU writes as it steps, asking for every neighbour, and the GPU
-# writes once a frame.
+# whether anything is warm, the incarnation the count was taken of, the mask,
+# and the extent of the live cells, which the CPU writes as it steps, asking
+# for every neighbour, and the GPU writes once a frame.
 
 use cellar.layout;
 use allo: std.allocator;
@@ -33,6 +33,7 @@ use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 
@@ -42,8 +43,8 @@ pub val SIDE: i64 = layout.SIDE::i64;
 pub val CELLS: usize = layout.CELLS::usize;
 # page-table words per slot
 pub val ENTRY: usize = layout.ENTRY::usize;
-# census words per slot: live count, warm, incarnation, neighbour mask
-pub val CENSUS: usize = 4;
+# census words per slot: live count, warm, incarnation, neighbour mask, extent
+pub val CENSUS: usize = 5;
 # a mask asking for all eight neighbours, its bits laid out as the entry's words
 pub val MASK_ALL: u32 = 0x1ef;
 # a neighbour that does not exist
@@ -77,7 +78,8 @@ pub val DIRTY_ZERO: u8 = 4;
 # table:   the page table, cap * ENTRY words
 # cells:   the front cells, cap * CELLS
 # back:    the back cells, cap * CELLS, or nil when the GPU steps
-# census:  per slot live count, warm, incarnation and a pad, from the last step
+# census:  per slot live count, warm, incarnation, mask and extent, from the
+#          last step
 # dirty:   per slot DIRTY_ENTRY and DIRTY_CELLS, for a mirror to upload
 # frees:   free slots below hi
 # nfree:   how many frees holds
@@ -477,6 +479,43 @@ pub fun settle(sp: *Space, census: *u32, n: usize, frees: bool) bool {
     ret ok;
 }
 
+# a rectangle of cells, from (x0, y0) up to but not including (x1, y1)
+pub rec Box {
+    x0: i64;
+    y0: i64;
+    x1: i64;
+    y1: i64;
+}
+
+# the smallest box holding every live cell the census counted
+# ---
+# sp:  the pool
+# ret: the box, or none when the census counted no live cell
+pub fun bounds(sp: *Space) opt[Box] {
+    var b:   Box   = Box{x0: 0, y0: 0, x1: 0, y1: 0};
+    var any: bool  = false;
+    var s:   usize = 0;
+    for (s < sp.hi) {
+        val c: *u32 = ?sp.census[s * CENSUS];
+        if (c[0] != 0) {
+            val ox: i64 = slot_x(sp, s) * SIDE;
+            val oy: i64 = slot_y(sp, s) * SIDE;
+            val x0: i64 = ox + (c[4] & 63)::i64;
+            val y0: i64 = oy + ((c[4] >> layout.EXTENT_Y0) & 63)::i64;
+            val x1: i64 = ox + ((c[4] >> layout.EXTENT_X1) & 63)::i64 + 1;
+            val y1: i64 = oy + ((c[4] >> layout.EXTENT_Y1) & 63)::i64 + 1;
+            if (!any || x0 < b.x0) { b.x0 = x0; }
+            if (!any || y0 < b.y0) { b.y0 = y0; }
+            if (!any || x1 > b.x1) { b.x1 = x1; }
+            if (!any || y1 > b.y1) { b.y1 = y1; }
+            any = true;
+        }
+        s = s + 1;
+    }
+    if (!any) { ret opt[Box].none{}; }
+    ret opt[Box].some{b};
+}
+
 # the live cells the census counted
 pub fun population(sp: *Space) usize {
     var n: usize = 0;
@@ -492,10 +531,22 @@ pub fun population(sp: *Space) usize {
 pub fun recount(sp: *Space, s: usize) {
     var live: u32   = 0;
     var warm: u32   = 0;
+    var x0:   u32   = 63;
+    var y0:   u32   = 63;
+    var x1:   u32   = 0;
+    var y1:   u32   = 0;
     val c:    *u32  = ?sp.cells[s * CELLS];
     var i:    usize = 0;
     for (i < CELLS) {
-        if (c[i] >= layout.LIVE)            { live = live + 1; }
+        if (c[i] >= layout.LIVE) {
+            live = live + 1;
+            val x: u32 = (i & 63)::u32;
+            val y: u32 = (i >> 6)::u32;
+            if (x < x0) { x0 = x; }
+            if (y < y0) { y0 = y; }
+            if (x > x1) { x1 = x; }
+            if (y > y1) { y1 = y; }
+        }
         if ((c[i] & layout.HEAT_MASK) != 0) { warm = 1; }
         i = i + 1;
     }
@@ -503,7 +554,11 @@ pub fun recount(sp: *Space, s: usize) {
     sp.census[s * CENSUS + 1] = warm;
     sp.census[s * CENSUS + 2] = incarnation(sp, s);
     sp.census[s * CENSUS + 3] = 0;
-    if (live != 0) { sp.census[s * CENSUS + 3] = MASK_ALL; }
+    sp.census[s * CENSUS + 4] = 0;
+    if (live != 0) {
+        sp.census[s * CENSUS + 3] = MASK_ALL;
+        sp.census[s * CENSUS + 4] = layout.extent(x0, y0, x1, y1);
+    }
 }
 
 test alloc__links_neighbours_both_ways_and_release_unlinks {
