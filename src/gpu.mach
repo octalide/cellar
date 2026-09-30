@@ -122,6 +122,7 @@ pub rec Look {
 # edits:  the edit count then
 # cap:    slots the readback covers
 # hi:     slots the census counted
+# gen:    the generation the world had
 rec Snap {
     id:     u32;
     spread: u64;
@@ -129,6 +130,7 @@ rec Snap {
     edits:  u64;
     cap:    usize;
     hi:     usize;
+    gen:    u64;
 }
 
 # a painted cell waiting to be uploaded
@@ -231,9 +233,9 @@ pub rec Gpu {
     head:     [96]u32;
 }
 
-# the census id's four words, then a packed word and a mask per slot
+# the census id's four words, then a packed word, a mask and a box per slot
 fun status_bytes(cap: usize) usize {
-    ret 16 + cap * 8;
+    ret 16 + cap * 12;
 }
 
 # a packed census word's incarnation bits
@@ -500,6 +502,15 @@ pub fun budget(g: *Gpu, radius: usize) usize {
     ret n::usize;
 }
 
+# the census a collect settled the pool from
+# ---
+# fresh: a census landed
+# gen:   the generation it counted
+pub rec Landed {
+    fresh: bool;
+    gen:   u64;
+}
+
 # settle the host's pool from the newest census that has landed
 #
 # call once a frame after the frame begins and before anything is recorded, so
@@ -507,8 +518,10 @@ pub fun budget(g: *Gpu, radius: usize) usize {
 # ---
 # g:   the GPU side
 # sp:  the host's pool
+# at:  what landed, if anything
 # ret: false when the pool could not hold a chunk the world grew into
-pub fun collect(g: *Gpu, sp: *space.Space) bool {
+pub fun collect(g: *Gpu, sp: *space.Space, at: *Landed) bool {
+    at.fresh = false;
     if (!g.stepping || g.p.cap == 0) { ret true; }
     val len: usize = status_bytes(g.p.cap);
     if (!gfx.renderer_readback_take(g.r, ?g.p.rb, g.p.got::*u8, len)) { ret true; }
@@ -522,17 +535,20 @@ pub fun collect(g: *Gpu, sp: *space.Space) bool {
     # makes more than the pool holds, so bits that agree name the same chunk
     var s: usize = 0;
     for (s < n) {
-        val w:   u32  = g.p.got[4 + s * 2];
+        val w:   u32  = g.p.got[4 + s * 3];
         val c:   *u32 = ?g.p.landed[s * space.CENSUS];
         val inc: u32  = space.incarnation(sp, s);
         c[0] = w & 0x1fff;
         c[1] = (w >> 13) & 1;
         c[2] = 0;
         if (inc != 0 && (w >> 14) == (inc & TAG)) { c[2] = inc; }
-        c[3] = g.p.got[5 + s * 2];
+        c[3] = g.p.got[5 + s * 3];
+        c[4] = g.p.got[6 + s * 3];
         s    = s + 1;
     }
     val ok: bool = space.settle(sp, g.p.landed, n, snap.edits == g.edits);
+    at.fresh = true;
+    at.gen   = snap.gen;
     # a census the pool could not be settled from leaves the limit where it was
     if (ok && snap.spread + REACH > g.limit) { g.limit = snap.spread + REACH; }
     ret ok;
@@ -846,10 +862,11 @@ fun write_head(g: *Gpu, k: *kernel.Kernel) {
 # g:     the GPU side
 # sp:    the host's pool
 # k:     the rule
+# gen:   the world's generation before the frame
 # steps: generations wanted; fewer are recorded when the budget is short
 # look:  the camera and colours for the draw
 # ret:   the generations recorded, or why recording failed
-pub fun frame(g: *Gpu, sp: *space.Space, k: *kernel.Kernel, steps: usize, look: *Look) res[usize, gfx.Error] {
+pub fun frame(g: *Gpu, sp: *space.Space, k: *kernel.Kernel, gen: u64, steps: usize, look: *Look) res[usize, gfx.Error] {
     val e14: err[gfx.Error] = flush(g, sp);
     if (sel e14.err) { ret res[usize, gfx.Error].err{e14.err}; }
     val e15: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.view, 0, look::*u8, LOOK * 4);
@@ -906,6 +923,7 @@ pub fun frame(g: *Gpu, sp: *space.Space, k: *kernel.Kernel, steps: usize, look: 
     snap.edits  = g.edits;
     snap.cap    = g.p.cap;
     snap.hi     = g.hi;
+    snap.gen    = gen + n::u64;
     ret res[usize, gfx.Error].ok{n};
 }
 

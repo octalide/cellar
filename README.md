@@ -43,7 +43,7 @@ Built-in kernels: Conway's Life (`B3/S23`), HighLife (`B36/S23`), Seeds
 | `F12`                  | screenshot                              |
 | `Esc`                  | close the key reference, or quit        |
 
-A readout of the generation, population, rule and speed sits in the top-left
+A readout of the generation, population, bounding box size, rule and speed sits in the top-left
 corner, and the side panel groups every control by task:
 
 - **run**: play, step, speed, uncapped stepping, randomize and clear, and the
@@ -53,7 +53,8 @@ corner, and the side panel groups every control by task:
 - **rule**: presets, the rule in B/S notation, radius, a clickable weight grid,
   and birth and survive toggles over the reachable sums
 - **view**: colour mode (a solid colour from a set of swatches, fading trails,
-  or colour by age), grid lines, and the interface size from 100 to 200 percent
+  or colour by age), grid lines, a bounding box outline around the live cells, and the interface size from 100 to 200 percent
+- **stats**: a graph of the population over recent generations
 - **files**: saving and loading the world and the custom pattern, and
   screenshots
 

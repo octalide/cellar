@@ -13,6 +13,7 @@ use gfx: boom.graphics;
 use boom.window;
 use cellar.cpu;
 use cellar.gpu;
+use cellar.history;
 use cellar.kernel;
 use cellar.space;
 use cellar.team;
@@ -64,6 +65,7 @@ pub rec Edit {
 # gpu:        the GPU side once attached, else nil
 # pending:    generations asked of the GPU and not yet recorded
 # full:       the world outgrew the pool, and stepping stopped rather than go wrong
+# history:    the population over recent generations
 # generation: completed steps since the last clear or randomize
 # running:    1 while auto-stepping, else 0
 # preset:     index of the active kernel preset
@@ -76,6 +78,7 @@ pub rec Sim {
     gpu:        *gpu.Gpu;
     pending:    usize;
     full:       bool;
+    history:    history.Ring;
     generation: u64;
     running:    u8;
     preset:     usize;
@@ -91,12 +94,13 @@ pub fun init(s: *Sim, a: *allo.Allocator) err[allo.Error] {
     val e: err[allo.Error] = space.init(?s.space, a, true);
     if (sel e.err) { ret e; }
     team.start(?s.team);
-    s.kernel     = kernel.preset(0);
-    s.preset     = 0;
-    s.rng        = rand.init();
-    s.gpu        = nil;
-    s.pending    = 0;
-    s.full       = false;
+    s.kernel  = kernel.preset(0);
+    s.preset  = 0;
+    s.rng     = rand.init();
+    s.gpu     = nil;
+    s.pending = 0;
+    s.full    = false;
+    history.clear(?s.history);
     s.generation = 0;
     s.running    = 0;
     s.edit.open  = false;
@@ -141,6 +145,12 @@ pub fun step(s: *Sim) {
     if (s.full)                                  { ret; }
     if (!cpu.step(?s.space, ?s.kernel, ?s.team)) { overflow(s); }
     s.generation = s.generation + 1;
+    sample(s);
+}
+
+# record the population at the current generation
+fun sample(s: *Sim) {
+    history.push(?s.history, s.generation, space.population(?s.space));
 }
 
 # stop for good once a chunk the world needs could not be made: a pattern
@@ -157,8 +167,10 @@ fun overflow(s: *Sim) {
 # ---
 # s: simulation
 pub fun collect(s: *Sim) {
-    if (s.gpu == nil)                  { ret; }
-    if (!gpu.collect(s.gpu, ?s.space)) { overflow(s); }
+    if (s.gpu == nil) { ret; }
+    var at: gpu.Landed;
+    if (!gpu.collect(s.gpu, ?s.space, ?at)) { overflow(s); }
+    if (at.fresh)                           { history.push(?s.history, at.gen, space.population(?s.space)); }
 }
 
 # record the frame's generations on the GPU
@@ -175,7 +187,7 @@ pub fun record(s: *Sim, uncapped: bool, look: *gpu.Look) err[gfx.Error] {
     val fast: bool  = uncapped && s.running != 0 && on_gpu(s);
     if (fast)       { want = gpu.stride(s.gpu); }
     if (!on_gpu(s)) { want = 0; }
-    val done: res[usize, gfx.Error] = gpu.frame(s.gpu, ?s.space, ?s.kernel, want, look);
+    val done: res[usize, gfx.Error] = gpu.frame(s.gpu, ?s.space, ?s.kernel, s.generation, want, look);
     if (sel done.err) { ret err[gfx.Error].err{done.err}; }
     s.generation = s.generation + done.ok::u64;
     if (fast)                 { gpu.tune(s.gpu, want, done.ok); }
@@ -199,6 +211,7 @@ pub fun sync(s: *Sim) err[gfx.Error] {
 # s: simulation
 pub fun clear(s: *Sim) {
     space.reset(?s.space);
+    history.clear(?s.history);
     s.generation = 0;
     s.pending    = 0;
     s.full       = false;
@@ -239,6 +252,7 @@ pub fun fill_end(s: *Sim) bool {
     val ok: bool = space.settle(sp, sp.census, sp.hi, false);
     if (s.gpu != nil) { gpu.note_bulk(s.gpu); }
     if (!ok)          { overflow(s); }
+    sample(s);
     ret ok;
 }
 
@@ -437,6 +451,7 @@ pub fun edit_end(s: *Sim) bool {
                 }
                 cy = cy + 1;
             }
+            sample(s);
         }
         if (s.gpu != nil) { gpu.note_edit(s.gpu); }
         ret !e.lost;
@@ -449,6 +464,7 @@ pub fun edit_end(s: *Sim) bool {
     ok = space.settle(sp, sp.census, sp.hi, false);
     if (s.gpu != nil) { gpu.note_edit(s.gpu); }
     if (!ok)          { overflow(s); }
+    sample(s);
     ret ok && !e.lost;
 }
 
@@ -491,6 +507,15 @@ pub fun population(s: *Sim) usize {
     ret space.population(?s.space);
 }
 
+# the bounding box of the live cells, as of the last step or census
+# ---
+# s:   simulation
+# out: the inclusive cell bounds, written only when there are live cells
+# ret: false when nothing is alive
+pub fun bounds(s: *Sim, out: *space.Box) bool {
+    ret space.bounds(?s.space, out);
+}
+
 # flip between running and paused
 # ---
 # s: simulation
@@ -513,6 +538,11 @@ test step__blinker_oscillates_with_period_two {
     step(?s);
     if (!alive(?s, 0, -1) || !alive(?s, 0, 0) || !alive(?s, 0, 1)) { ret 2; }
     if (alive(?s, -1, 0))                                          { ret 3; }
+    var bb: space.Box;
+    if (!bounds(?s, ?bb))                                                         { ret 6; }
+    if (bb.x0 != 0 || bb.x1 != 0 || bb.y0 != -1 || bb.y1 != 1)                    { ret 7; }
+    if (history.count(?s.history) != 2)                                           { ret 8; }
+    if (history.at(?s.history, 1).gen != 1 || history.at(?s.history, 1).pop != 3) { ret 9; }
 
     step(?s);
     if (!alive(?s, -1, 0) || !alive(?s, 1, 0)) { ret 4; }

@@ -21,8 +21,8 @@
 # and asked for by no live neighbour is freed. the mask has a bit per neighbour,
 # set where a live cell lies near that side, so a sparse world keeps only the
 # chunks it can spread into. it works from a census, per slot the live count,
-# whether anything is warm, the incarnation the count was taken of and the mask,
-# which the CPU writes as it steps, asking for every neighbour, and the GPU
+# whether anything is warm, the incarnation the count was taken of, the mask and
+# the bounding box of the live cells, which the CPU writes as it steps, asking for every neighbour, and the GPU
 # writes once a frame.
 
 use cellar.layout;
@@ -42,8 +42,8 @@ pub val SIDE: i64 = layout.SIDE::i64;
 pub val CELLS: usize = layout.CELLS::usize;
 # page-table words per slot
 pub val ENTRY: usize = layout.ENTRY::usize;
-# census words per slot: live count, warm, incarnation, neighbour mask
-pub val CENSUS: usize = 4;
+# census words per slot: live count, warm, incarnation, neighbour mask, box
+pub val CENSUS: usize = 5;
 # a mask asking for all eight neighbours, its bits laid out as the entry's words
 pub val MASK_ALL: u32 = 0x1ef;
 # a neighbour that does not exist
@@ -477,6 +477,48 @@ pub fun settle(sp: *Space, census: *u32, n: usize, frees: bool) bool {
     ret ok;
 }
 
+# a chunk's live cells' bounding box, in cells local to the chunk, packed as
+# x0, y0, x1, y1 in six bits each; zero while the chunk holds nothing alive
+pub fun pack_box(x0: u32, y0: u32, x1: u32, y1: u32) u32 {
+    ret x0 | (y0 << 6) | (x1 << 12) | (y1 << 18);
+}
+
+# the smallest rectangle holding every live cell the census counted
+pub rec Box {
+    x0: i64;
+    y0: i64;
+    x1: i64;
+    y1: i64;
+}
+
+# the bounding box of the live cells, as of the last step or census
+# ---
+# sp:  the pool
+# out: the inclusive cell bounds, written only when there are live cells
+# ret: false when nothing is alive
+pub fun bounds(sp: *Space, out: *Box) bool {
+    var found: bool  = false;
+    var s:     usize = 0;
+    for (s < sp.hi) {
+        val c: *u32 = ?sp.census[s * CENSUS];
+        if (used(sp, s) && c[0] != 0 && c[2] == incarnation(sp, s)) {
+            val ox: i64 = slot_x(sp, s) * SIDE;
+            val oy: i64 = slot_y(sp, s) * SIDE;
+            val x0: i64 = ox + (c[4] & 63)::i64;
+            val y0: i64 = oy + ((c[4] >> 6) & 63)::i64;
+            val x1: i64 = ox + ((c[4] >> 12) & 63)::i64;
+            val y1: i64 = oy + ((c[4] >> 18) & 63)::i64;
+            if (!found || x0 < out.x0) { out.x0 = x0; }
+            if (!found || y0 < out.y0) { out.y0 = y0; }
+            if (!found || x1 > out.x1) { out.x1 = x1; }
+            if (!found || y1 > out.y1) { out.y1 = y1; }
+            found = true;
+        }
+        s = s + 1;
+    }
+    ret found;
+}
+
 # the live cells the census counted
 pub fun population(sp: *Space) usize {
     var n: usize = 0;
@@ -492,10 +534,22 @@ pub fun population(sp: *Space) usize {
 pub fun recount(sp: *Space, s: usize) {
     var live: u32   = 0;
     var warm: u32   = 0;
+    var bx0:  u32   = 63;
+    var by0:  u32   = 63;
+    var bx1:  u32   = 0;
+    var by1:  u32   = 0;
     val c:    *u32  = ?sp.cells[s * CELLS];
     var i:    usize = 0;
     for (i < CELLS) {
-        if (c[i] >= layout.LIVE)            { live = live + 1; }
+        if (c[i] >= layout.LIVE) {
+            val x: u32 = (i & 63)::u32;
+            val y: u32 = (i >> 6)::u32;
+            live = live + 1;
+            if (x < bx0) { bx0 = x; }
+            if (y < by0) { by0 = y; }
+            if (x > bx1) { bx1 = x; }
+            if (y > by1) { by1 = y; }
+        }
         if ((c[i] & layout.HEAT_MASK) != 0) { warm = 1; }
         i = i + 1;
     }
@@ -503,7 +557,11 @@ pub fun recount(sp: *Space, s: usize) {
     sp.census[s * CENSUS + 1] = warm;
     sp.census[s * CENSUS + 2] = incarnation(sp, s);
     sp.census[s * CENSUS + 3] = 0;
-    if (live != 0) { sp.census[s * CENSUS + 3] = MASK_ALL; }
+    sp.census[s * CENSUS + 4] = 0;
+    if (live != 0) {
+        sp.census[s * CENSUS + 3] = MASK_ALL;
+        sp.census[s * CENSUS + 4] = pack_box(bx0, by0, bx1, by1);
+    }
 }
 
 test alloc__links_neighbours_both_ways_and_release_unlinks {
