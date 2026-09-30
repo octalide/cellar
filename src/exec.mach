@@ -10,10 +10,17 @@
 # takes it. an edit while running is part of the run and leaves it alone, but
 # clear, randomize, and a load or open of a world begin a new world, so they
 # drop it paused and retake it from the new world running.
+#
+# and it keeps the journal undo and redo walk (cellar.journal, which says what
+# is recorded and how running and redo behave): each recorded command runs
+# inside a step, and undo and redo leave the world paused as the start.
 
 use cellar.app;
 use cellar.command;
 use cellar.format;
+use cellar.formats;
+use cellar.identify.worker;
+use cellar.journal;
 use cellar.pattern;
 use cellar.persist;
 use cellar.region;
@@ -25,7 +32,10 @@ use cellar.space;
 use cellar.world;
 use allo: std.allocator;
 use std.allocator.page;
+use std.collections.vector;
 use fs: std.filesystem;
+use std.sync.atomic;
+use stext: std.text.string;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -122,13 +132,27 @@ fun reset(a: *app.App, s: *sim.Sim) {
     if (a.start.held) { sim.restore(s, ?a.start); }
 }
 
+# put a new custom pattern in place, the journal keeping the one it replaces
+fun replace_custom(a: *app.App, p: pattern.Pattern) {
+    journal.keep_custom(?a.log, a.custom);
+    a.custom = p;
+}
+
 # load a file into the custom pattern and select it
 fun load_pattern(a: *app.App, d: *Deps, path: str) {
-    val done: err[persist.Error] = persist.load_pattern(d.a, ?a.custom, path);
+    var p:    pattern.Pattern;
+    val made: err[allo.Error] = pattern.init(?p, a.alloc, 0, 0, pattern.name(?a.custom));
+    if (sel made.err) {
+        app.say(a, "out of memory");
+        ret;
+    }
+    val done: err[persist.Error] = persist.load_pattern(d.a, ?p, path);
     if (sel done.err) {
+        pattern.dnit(?p);
         app.say_why(a, base(path), persist.error_message(done.err));
         ret;
     }
+    replace_custom(a, p);
     a.pattern_sel = app.CUSTOM;
     app.say_why(a, base(path), "loaded as the custom pattern");
 }
@@ -155,9 +179,23 @@ fun open(a: *app.App, s: *sim.Sim, d: *Deps, path: str) Change {
     ret got;
 }
 
+# put a pattern on the clipboard as RLE, with its rule, for the frame to hand
+# the window
+fun clip(a: *app.App, d: *Deps, p: *pattern.Pattern) bool {
+    var f: format.Format;
+    if (!formats.by_id("rle", ?f)) { ret false; }
+    vector.clear[u8](?a.clip);
+    val enc: err[persist.Error] = persist.encode_pattern(d.a, ?f, p, ?a.clip);
+    if (sel enc.err) { ret false; }
+    val end: res[usize, allo.Error] = vector.push[u8](?a.clip, 0);
+    if (sel end.err) { ret false; }
+    a.clip_ready = true;
+    ret true;
+}
+
 # read the selection into a new custom pattern, cutting it with cut, and make
-# that the stamp, laid down as it was read
-fun take(a: *app.App, s: *sim.Sim, b: space.Box, cut: bool) {
+# that the stamp, laid down as it was read, and put it on the clipboard
+fun take(a: *app.App, s: *sim.Sim, d: *Deps, b: space.Box, cut: bool) {
     var p:    pattern.Pattern;
     val made: err[allo.Error] = pattern.init(?p, a.alloc, 0, 0, "selection");
     if (sel made.err) {
@@ -175,13 +213,58 @@ fun take(a: *app.App, s: *sim.Sim, b: space.Box, cut: bool) {
         app.say(a, "the selection could not be copied");
         ret;
     }
-    pattern.dnit(?a.custom);
-    a.custom      = p;
+    replace_custom(a, p);
     a.pattern_sel = app.CUSTOM;
     a.orient      = 0;
     a.tool        = app.TOOL_STAMP;
-    if (cut) { app.say(a, "selection cut to the stamp"); }
-    or       { app.say(a, "selection copied to the stamp"); }
+    var said: str = "selection copied to the stamp";
+    if (cut) { said = "selection cut to the stamp"; }
+    app.say(a, said);
+    if (clip(a, d, ?a.custom)) { app.say_also(a, "and to the clipboard as RLE"); }
+    or                         { app.say_also(a, "the clipboard could not take it"); }
+}
+
+# read clipboard text as a pattern and make it the stamp, taking its rule when
+# asked. the stamp only changes when the whole text is a pattern that fits
+fun paste(a: *app.App, s: *sim.Sim, d: *Deps, c: *command.Paste) Change {
+    var p:    pattern.Pattern;
+    val made: err[allo.Error] = pattern.init(?p, a.alloc, 0, 0, "clipboard");
+    if (sel made.err) {
+        app.say(a, "out of memory");
+        ret Change.none{};
+    }
+    val got: err[persist.Error] = persist.pattern_from(d.a, ?p, c.text.data, c.text.len);
+    if (sel got.err) {
+        pattern.dnit(?p);
+        if (sel got.err.format) {
+            if (sel got.err.format.malformed) {
+                app.say(a, "the clipboard holds no pattern cellar can read");
+                ret Change.none{};
+            }
+        }
+        app.say_why(a, "paste", persist.error_message(got.err));
+        ret Change.none{};
+    }
+    replace_custom(a, p);
+    a.pattern_sel = app.CUSTOM;
+    a.orient      = 0;
+    a.tool        = app.TOOL_STAMP;
+    app.say(a, "pasted to the stamp");
+    val named: str = pattern.rule(?a.custom);
+    if (named[0] == 0) { ret Change.none{}; }
+    val k: res[rule.Rule, str] = rule.parse(named);
+    if (sel k.err) {
+        app.say_also(a, "its rule is not one cellar can run, so the current rule is kept");
+        ret Change.none{};
+    }
+    if (rule.same(?s.rule, ?k.ok)) { ret Change.none{}; }
+    if (!c.rule) {
+        app.say_also(a, "its rule was not taken; Ctrl+Shift+V takes it");
+        ret Change.none{};
+    }
+    sim.set_rule(s, k.ok);
+    app.say_also(a, "its rule was taken");
+    ret Change.edit{};
 }
 
 # shrink the selection to the box its live cells span, dropping it when none is alive
@@ -200,30 +283,88 @@ fun shrink(a: *app.App, s: *sim.Sim, b: space.Box) {
     a.area     = got.some;
 }
 
+# start classifying the selection's pattern under the world's rule, off the frame
+fun identify_area(a: *app.App, s: *sim.Sim, b: space.Box) {
+    var p:    pattern.Pattern;
+    val made: err[allo.Error] = pattern.init(?p, a.alloc, 0, 0, "selection");
+    if (sel made.err) {
+        app.say(a, "out of memory");
+        ret;
+    }
+    fin { pattern.dnit(?p); }
+    if (!region.copy(s, b, ?p)) {
+        app.say(a, "the selection could not be read");
+        ret;
+    }
+    app.identify_start(a, s.rule, ?p);
+}
+
 # apply an operation on a rectangle
-fun area(c: *command.Area, a: *app.App, s: *sim.Sim) {
+fun area(c: *command.Area, a: *app.App, s: *sim.Sim, d: *Deps) {
     val b:  space.Box = c.box;
     var ok: bool      = true;
-    if (c.op == command.AREA_COPY)          { take(a, s, b, false); }
-    if (c.op == command.AREA_CUT)           { take(a, s, b, true); }
+    if (c.op == command.AREA_COPY)          { take(a, s, d, b, false); }
+    if (c.op == command.AREA_CUT)           { take(a, s, d, b, true); }
     if (c.op == command.AREA_CLEAR)         { ok = region.clear(s, b); }
     if (c.op == command.AREA_CLEAR_OUTSIDE) { ok = region.clear_outside(s, b); }
     if (c.op == command.AREA_FILL)          { ok = region.fill(s, b, sim.DEFAULT_DENSITY); }
     if (c.op == command.AREA_INVERT)        { ok = region.invert(s, b); }
     if (c.op == command.AREA_SHRINK)        { shrink(a, s, b); }
+    if (c.op == command.AREA_IDENTIFY)      { identify_area(a, s, b); }
     if (!ok)                                { app.say(a, "the selection could not be changed"); }
+}
+
+# no journal step
+val UNRECORDED: u8 = 255;
+
+# the kind of journal step a command runs in, or UNRECORDED
+fun recorded(c: *command.Command) u8 {
+    if (sel c.toggle || sel c.step) { ret journal.KIND_RUN; }
+    if (sel c.paint || sel c.line)  { ret journal.KIND_STROKE; }
+    if (sel c.area) {
+        # shrink and identify only read the world
+        if (c.area.op == command.AREA_SHRINK || c.area.op == command.AREA_IDENTIFY) { ret UNRECORDED; }
+        ret journal.KIND_EDIT;
+    }
+    if (sel c.clear || sel c.randomize || sel c.stamp || sel c.rule || sel c.reset)        { ret journal.KIND_EDIT; }
+    if (sel c.load_world || sel c.load_pattern || sel c.open || sel c.paste || sel c.drop) { ret journal.KIND_EDIT; }
+    ret UNRECORDED;
+}
+
+# undo or redo, leaving the world paused as it now stands, which becomes the start
+fun back(a: *app.App, s: *sim.Sim, undo: bool) {
+    var went: journal.Went = journal.Went.none{};
+    if (undo) { went = journal.undo(?a.log, ?a.custom); }
+    or        { went = journal.redo(?a.log, ?a.custom); }
+    if (sel went.none) {
+        if (undo) { app.say(a, "nothing to undo"); }
+        or        { app.say(a, "nothing to redo"); }
+        ret;
+    }
+    if (sel went.lost)           { app.say(a, "the world could not be put back, so the history was cleared"); }
+    or (journal.dropped(?a.log)) { app.say(a, "the history outgrew its limit and was cleared"); }
+    snapshot.drop(?a.start);
 }
 
 # apply one command
 fun apply(c: *command.Command, a: *app.App, s: *sim.Sim, d: *Deps) {
+    if (sel c.undo || sel c.redo) {
+        back(a, s, sel c.undo);
+        ret;
+    }
     val paused: bool = !world.running(s);
+    # while running, everything recorded joins the run
+    val kind: u8 = recorded(c);
+    if (kind != UNRECORDED && !paused)                                             { journal.begin(?a.log, journal.KIND_RUN, true); }
+    or (kind != UNRECORDED)                                                        { journal.begin(?a.log, kind, kind == journal.KIND_RUN || sel c.line); }
     if ((sel c.toggle || sel c.step) && paused && !world.full(s) && !a.start.held) { take_start(a, s); }
     var change: Change = Change.none{};
     if (sel c.paint || sel c.line || sel c.stamp || sel c.rule) { change = Change.edit{}; }
     if (sel c.clear || sel c.randomize)                         { change = Change.fresh{}; }
-    # copy and shrink only read the world
+    # copy, shrink and identify only read the world
     if (sel c.area) {
-        if (c.area.op != command.AREA_COPY && c.area.op != command.AREA_SHRINK) { change = Change.edit{}; }
+        val op: u8 = c.area.op;
+        if (op != command.AREA_COPY && op != command.AREA_SHRINK && op != command.AREA_IDENTIFY) { change = Change.edit{}; }
     }
 
     if (sel c.toggle)     { world.toggle(s); }
@@ -234,7 +375,7 @@ fun apply(c: *command.Command, a: *app.App, s: *sim.Sim, d: *Deps) {
     if (sel c.line)       { world.line(s, c.line.x0, c.line.y0, c.line.x1, c.line.y1, c.line.v); }
     if (sel c.stamp)      { world.stamp(s, ?c.stamp.p, c.stamp.x, c.stamp.y); }
     if (sel c.rule)       { sim.set_rule(s, c.rule); }
-    if (sel c.area)       { area(?c.area, a, s); }
+    if (sel c.area)       { area(?c.area, a, s, d); }
     if (sel c.reset)      { reset(a, s); }
     if (sel c.save_world) { save_world(a, s, d, command.path(?c.save_world)); }
     if (sel c.load_world) { change = load_world(a, s, d, command.path(?c.load_world)); }
@@ -244,9 +385,17 @@ fun apply(c: *command.Command, a: *app.App, s: *sim.Sim, d: *Deps) {
     }
     if (sel c.load_pattern) { load_pattern(a, d, command.path(?c.load_pattern)); }
     if (sel c.open)         { change = open(a, s, d, command.path(?c.open)); }
+    if (sel c.paste)        { change = paste(a, s, d, ?c.paste); }
+    if (sel c.drop) {
+        change = open(a, s, d, command.path(?c.drop.file));
+        if (c.drop.ignored > 0) { app.say_also(a, "the other dropped files were ignored"); }
+    }
 
     if (sel change.fresh && !paused)                     { take_start(a, s); }
     or (sel change.fresh || (sel change.edit && paused)) { snapshot.drop(?a.start); }
+
+    if (kind != UNRECORDED)      { journal.end(?a.log); }
+    if (journal.dropped(?a.log)) { app.say(a, "that change is too large to undo, so the history was cleared"); }
 }
 
 # apply every waiting command in order and empty the queue
@@ -255,6 +404,7 @@ fun apply(c: *command.Command, a: *app.App, s: *sim.Sim, d: *Deps) {
 # s: the simulation, locked by the caller and not yet recorded into
 # d: what the commands need
 pub fun run(a: *app.App, s: *sim.Sim, d: *Deps) {
+    journal.bind(?a.log, s);
     var i: usize = 0;
     for (i < a.queue.items.len) {
         apply(?a.queue.items.data[i], a, s, d);
@@ -407,6 +557,80 @@ test run__opens_a_pattern_with_its_rule_and_leaves_the_world_when_a_file_fails {
     ret 0;
 }
 
+# clipboard text as the window hands it over, a copy the test's allocator never refuses
+#[testing]
+fun clipboard(ap: *app.App, text: str) str {
+    val r: res[str, allo.Error] = stext.str_dup(ap.alloc, text);
+    if (sel r.ok) { ret r.ok; }
+    ret nil;
+}
+
+test run__pastes_a_pattern_as_the_stamp_and_a_copy_pastes_back_exactly {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    var ap: app.App;
+    app.init(?ap);
+    val shown: err[format.Error] = app.attach(?ap, ?a);
+    if (sel shown.err) { ret 1; }
+    var d:    Deps      = Deps{a: ?a};
+    var life: rule.Rule = rule.preset_rule(0);
+    var high: rule.Rule = rule.preset_rule(1);
+
+    # a glider under HighLife, as LifeWiki gives it, pastes as the stamp and keeps the rule
+    val glider: str = "#N Glider\nx = 3, y = 3, rule = B36/S23\nbob$2bo$3o!\n";
+    app.paste(?ap, clipboard(?ap, glider), false);
+    run(?ap, ?s, ?d);
+    if (ap.pattern_sel != app.CUSTOM || ap.tool != app.TOOL_STAMP)                  { ret 2; }
+    if (ap.custom.w != 3 || ap.custom.h != 3 || pattern.get(?ap.custom, 1, 0) != 1) { ret 3; }
+    if (pattern.get(?ap.custom, 0, 0) != 0 || pattern.get(?ap.custom, 2, 1) != 1)   { ret 4; }
+    if (!rule.same(?s.rule, ?life) || sim.population(?s) != 0)                      { ret 5; }
+    # asked to, it takes the rule too
+    app.paste(?ap, clipboard(?ap, glider), true);
+    run(?ap, ?s, ?d);
+    if (!rule.same(?s.rule, ?high)) { ret 6; }
+
+    # text that is no pattern, and an empty clipboard, leave the stamp and say so
+    app.paste(?ap, clipboard(?ap, "remember to buy milk\n"), true);
+    run(?ap, ?s, ?d);
+    if (!string.str_equals(ap.toast, "the clipboard holds no pattern cellar can read")) { ret 7; }
+    if (ap.custom.w != 3 || !rule.same(?s.rule, ?high))                                 { ret 8; }
+    app.paste(?ap, clipboard(?ap, ""), false);
+    if (ap.queue.items.len != 0 || !string.str_equals(ap.toast, "the clipboard holds no text")) { ret 9; }
+
+    # a copied selection, empty margins and all, is RLE on the clipboard that
+    # pastes back as the same cells in the same box
+    world.paint(?s, 3, 4, 1);
+    world.paint(?s, 5, 4, 1);
+    world.paint(?s, 4, 6, 1);
+    app.select(?ap, 2, 3, 7, 8);
+    app.area(?ap, command.AREA_COPY);
+    run(?ap, ?s, ?d);
+    if (!ap.clip_ready || !string.str_starts_with(ap.clip.data::str, "#N selection")) { ret 10; }
+    var copied: pattern.Pattern;
+    val kept:   err[allo.Error] = pattern.clone(?copied, ?a, ?ap.custom);
+    if (sel kept.err) { ret 1; }
+    pattern.clear(?ap.custom);
+    app.paste(?ap, clipboard(?ap, ap.clip.data::str), false);
+    run(?ap, ?s, ?d);
+    if (ap.custom.w != 6 || ap.custom.h != 6)                                               { ret 11; }
+    if (ap.custom.w != copied.w || ap.custom.h != copied.h || ap.custom.x != copied.x)      { ret 12; }
+    if (ap.custom.y != copied.y || !string.str_equals(pattern.rule(?ap.custom), "B36/S23")) { ret 13; }
+    var i: usize = 0;
+    for (i < copied.w * copied.h) {
+        if (ap.custom.cells[i] != copied.cells[i]) { ret 14; }
+        i = i + 1;
+    }
+    if (pattern.get(?ap.custom, 1, 1) != 1 || pattern.get(?ap.custom, 2, 3) != 1) { ret 15; }
+
+    pattern.dnit(?copied);
+    app.dnit(?ap);
+    sim.dnit(?s);
+    ret 0;
+}
+
 test run__applies_every_command_however_many_a_frame_holds {
     var a: allo.Allocator;
     page.make(?a);
@@ -483,6 +707,153 @@ test run__reset_returns_to_where_play_started_and_a_paused_edit_moves_it {
     if (!sim.alive(?s, 0, -1) || !sim.alive(?s, 10, 10) || sim.alive(?s, 20, 20)) { ret 7; }
     if (sim.population(?s) != 4)                                                  { ret 8; }
 
+    app.dnit(?ap);
+    sim.dnit(?s);
+    ret 0;
+}
+
+test run__undo_and_redo_walk_the_changes_across_a_rule_change_and_a_new_change_clears_redo {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    var ap: app.App;
+    app.init(?ap);
+    val shown: err[format.Error] = app.attach(?ap, ?a);
+    if (sel shown.err) { ret 1; }
+    var d:    Deps;
+    var life: rule.Rule = rule.preset_rule(0);
+    # Brian's Brain, of another family, so the change re-encodes every cell
+    var high: rule.Rule = rule.preset_rule(4);
+
+    # a stroke, a rule change and a second stroke are three steps
+    app.submit(?ap, command.Command.paint{command.Paint{x: 1, y: 1, v: 1}});
+    app.submit(?ap, command.Command.line{command.Line{x0: 1, y0: 1, x1: 4, y1: 1, v: 1}});
+    run(?ap, ?s, ?d);
+    val word: u32 = sim.cell(?s, 4, 1);
+    app.submit(?ap, command.Command.rule{high});
+    app.submit(?ap, command.Command.paint{command.Paint{x: 200, y: 200, v: 1}});
+    app.submit(?ap, command.Command.undo{});
+    run(?ap, ?s, ?d);
+    if (sim.alive(?s, 200, 200) || !sim.alive(?s, 4, 1) || !rule.same(?s.rule, ?high)) { ret 2; }
+    app.submit(?ap, command.Command.undo{});
+    run(?ap, ?s, ?d);
+    if (!rule.same(?s.rule, ?life) || sim.population(?s) != 4 || sim.cell(?s, 4, 1) != word) { ret 3; }
+    app.submit(?ap, command.Command.undo{});
+    app.submit(?ap, command.Command.undo{});
+    run(?ap, ?s, ?d);
+    if (sim.population(?s) != 0 || !string.str_equals(ap.toast, "nothing to undo")) { ret 4; }
+
+    app.submit(?ap, command.Command.redo{});
+    app.submit(?ap, command.Command.redo{});
+    run(?ap, ?s, ?d);
+    if (!rule.same(?s.rule, ?high) || sim.population(?s) != 4) { ret 5; }
+    app.submit(?ap, command.Command.redo{});
+    run(?ap, ?s, ?d);
+    if (!sim.alive(?s, 200, 200) || journal.redoable(?ap.log) != 0) { ret 6; }
+
+    # undo back over the rule change, and a new change drops what could be redone
+    app.submit(?ap, command.Command.undo{});
+    app.submit(?ap, command.Command.undo{});
+    app.submit(?ap, command.Command.paint{command.Paint{x: -50, y: 9, v: 1}});
+    app.submit(?ap, command.Command.redo{});
+    run(?ap, ?s, ?d);
+    if (!rule.same(?s.rule, ?life) || !sim.alive(?s, -50, 9) || sim.alive(?s, 200, 200)) { ret 7; }
+    if (!string.str_equals(ap.toast, "nothing to redo"))                                 { ret 8; }
+
+    app.dnit(?ap);
+    sim.dnit(?s);
+    ret 0;
+}
+
+test run__undo_takes_back_a_paste_with_its_rule_and_a_dropped_file {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    var ap: app.App;
+    app.init(?ap);
+    val shown: err[format.Error] = app.attach(?ap, ?a);
+    if (sel shown.err) { ret 1; }
+    var d:   Deps            = Deps{a: ?a};
+    val dir: err[fs.FsError] = persist.make_parent(?a, "out/test/undo-drop/x");
+    if (sel dir.err) { ret 1; }
+    val rle: str = "x = 3, y = 1, rule = B36/S23\n3o!\n";
+    fs.write_bytes("out/test/undo-drop/row.rle", rle, string.str_len(rle), persist.FILE_MODE);
+    var life: rule.Rule = rule.preset_rule(0);
+    var high: rule.Rule = rule.preset_rule(1);
+    world.paint(?s, 50, 50, 1);
+    val word: u32 = sim.cell(?s, 50, 50);
+
+    # a glider pasted taking HighLife is one step, and the dropped row another
+    app.paste(?ap, clipboard(?ap, "x = 3, y = 3, rule = B36/S23\nbo$2bo$3o!\n"), true);
+    run(?ap, ?s, ?d);
+    if (ap.custom.w != 3 || !rule.same(?s.rule, ?high)) { ret 2; }
+    var names: [1]str;
+    names[0] = "out/test/undo-drop/row.rle";
+    app.drop(?ap, ?names[0], 1);
+    run(?ap, ?s, ?d);
+    if (sim.population(?s) != 4) { ret 3; }
+
+    app.submit(?ap, command.Command.undo{});
+    run(?ap, ?s, ?d);
+    if (sim.population(?s) != 1 || sim.cell(?s, 50, 50) != word || ap.custom.w != 3) { ret 4; }
+    app.submit(?ap, command.Command.undo{});
+    run(?ap, ?s, ?d);
+    if (!rule.same(?s.rule, ?life) || ap.custom.w != 16 || !string.str_equals(pattern.name(?ap.custom), "custom")) { ret 5; }
+    app.submit(?ap, command.Command.redo{});
+    app.submit(?ap, command.Command.redo{});
+    run(?ap, ?s, ?d);
+    if (!rule.same(?s.rule, ?high) || ap.custom.w != 3 || sim.population(?s) != 4) { ret 6; }
+
+    fs.remove_file("out/test/undo-drop/row.rle");
+    app.dnit(?ap);
+    sim.dnit(?s);
+    ret 0;
+}
+
+test run__identifies_a_selection_off_the_frame_and_a_second_replaces_the_first {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    var ap: app.App;
+    app.init(?ap);
+    val shown: err[format.Error] = app.attach(?ap, ?a);
+    if (sel shown.err) { ret 1; }
+    var d: Deps = Deps{a: ?a};
+
+    # an R-pentomino, under limits so wide it runs for a long while, and a blinker
+    world.paint(?s, 1, 0, 1);
+    world.paint(?s, 2, 0, 1);
+    world.paint(?s, 0, 1, 1);
+    world.paint(?s, 1, 1, 1);
+    world.paint(?s, 1, 2, 1);
+    world.paint(?s, 40, 40, 1);
+    world.paint(?s, 41, 40, 1);
+    world.paint(?s, 42, 40, 1);
+    ap.id_limits.gens = 100000;
+    ap.id_limits.side = 2048;
+    app.select(?ap, 0, 0, 2, 2);
+    app.area(?ap, command.AREA_IDENTIFY);
+    run(?ap, ?s, ?d);
+    # run returned with the classification still going, and only read the world
+    if (!worker.running(?ap.identifier) || atomic.load(?ap.identifier.done) != 0) { ret 2; }
+    if (ap.toast != app.IDENTIFYING || sim.population(?s) != 8)                   { ret 3; }
+    app.identify_poll(?ap);
+    if (ap.toast != app.IDENTIFYING) { ret 4; }
+
+    # a second Identify cancels the first and its result is the one flashed
+    app.select(?ap, 40, 40, 42, 40);
+    app.area(?ap, command.AREA_IDENTIFY);
+    run(?ap, ?s, ?d);
+    worker.wait(?ap.identifier);
+    app.identify_poll(?ap);
+    if (worker.running(?ap.identifier))                                          { ret 5; }
+    if (!string.str_equals(ap.toast, "selection: a period 2 oscillator, xp2_7")) { ret 6; }
     app.dnit(?ap);
     sim.dnit(?s);
     ret 0;

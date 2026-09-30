@@ -11,7 +11,9 @@
 # cells hold, 2 when left out), generation, pan_x and pan_y (the view's
 # centre), zoom and mode (the colour mode by name). a file naming no family
 # names a weighted rule. a key a file leaves out keeps what the reader already
-# had.
+# had. the cells are kept as the pool holds them, which under a rule that births
+# on 0 is the world's complement at some generations (cellar.rules.weighted),
+# and the rule and generation beside them say which.
 # a "cellar 3" file is read the same, its rule B/S notation and its kernel key
 # the whole weighted kernel, preferred to the rule beside it. a "cellar 2" file
 # is the same without the header, and a file in the custom pattern format, what
@@ -287,17 +289,6 @@ fun write_header(buf: *u8, s: *sim.Sim, v: *View) usize {
     ret text.buf_str(buf, off, "\n\n");
 }
 
-# whether a chunk's cells hold any state but 0, a dying one included, so the
-# chunk is worth writing
-fun holds_state(r: *rule.Rule, c: *u32) bool {
-    var i: usize = 0;
-    for (i < space.CELLS) {
-        if (rule.state(r, c[i]) != 0) { ret true; }
-        i = i + 1;
-    }
-    ret false;
-}
-
 # serialize the world's chunks that hold a state, its rule, its generation and
 # the view to path
 #
@@ -320,7 +311,7 @@ pub fun save_world(a: *allo.Allocator, s: *sim.Sim, v: *View, path: str) err[Err
     var live: usize        = 0;
     var sl:   usize        = 0;
     for (sl < sp.hi) {
-        if (space.used(sp, sl) && holds_state(r, ?sp.cells[sl * space.CELLS])) { live = live + 1; }
+        if (sim.holds_state(s, sl)) { live = live + 1; }
         sl = sl + 1;
     }
     val cap: usize                = HEAD_MAX + live * (HEADER_MAX + 64 * (64 * w + 1));
@@ -330,7 +321,7 @@ pub fun save_world(a: *allo.Allocator, s: *sim.Sim, v: *View, path: str) err[Err
     var off: usize = write_header(buf, s, v);
     sl = 0;
     for (sl < sp.hi) {
-        if (space.used(sp, sl) && holds_state(r, ?sp.cells[sl * space.CELLS])) {
+        if (sim.holds_state(s, sl)) {
             off      = buf_i64(buf, off, space.slot_x(sp, sl));
             buf[off] = ' ';
             off      = buf_i64(buf, off + 1, space.slot_y(sp, sl));
@@ -610,23 +601,41 @@ fun from_format(e: format.Error) Error {
     ret Error.format{e};
 }
 
-# read a pattern file's bytes into p through the format registry
+# read a pattern's bytes into p through the format registry
 #
-# the whole file is validated before p changes, so a refusal leaves p as it was.
+# the whole input is validated before p changes, so a refusal leaves p as it was.
 # ---
 # a:    allocator for the decoder's scratch
 # f:    the format to read it as
-# data: the file contents
+# data: the bytes
+# n:    how many
 # p:    pattern to populate
 # ret:  ok, or why the bytes were refused
-fun read_pattern(a: *allo.Allocator, f: *format.Format, data: *Vector[u8], p: *pattern.Pattern) err[Error] {
+fun read_pattern(a: *allo.Allocator, f: *format.Format, data: *u8, n: usize, p: *pattern.Pattern) err[Error] {
     var ps:   adapt.PatternSink;
     var info: format.Info;
     format.info_init(?info, a);
-    val r: err[format.Error] = formats.load(a, f, data.data, data.len, adapt.pattern_sink(?ps, p), ?info);
+    val r: err[format.Error] = formats.load(a, f, data, n, adapt.pattern_sink(?ps, p), ?info);
     format.info_dnit(?info);
     if (sel r.err) { ret err[Error].err{from_format(r.err)}; }
     ret err[Error].ok{};
+}
+
+# read a pattern in any registered format from bytes, such as the clipboard's
+#
+# the format is detected from the bytes, and the whole input is validated first,
+# so a refusal leaves p as it was. a pattern too large to hold is refused before
+# anything is allocated for it.
+# ---
+# a:    allocator for the decoder's scratch
+# p:    pattern to populate, keeping its name unless the bytes name one
+# data: the bytes
+# n:    how many
+# ret:  ok, or why the bytes were refused; malformed when no format reads them
+pub fun pattern_from(a: *allo.Allocator, p: *pattern.Pattern, data: *u8, n: usize) err[Error] {
+    var f: format.Format;
+    if (!formats.by_bytes(data, n, ?f)) { ret err[Error].err{Error.format{format.Error.malformed{}}}; }
+    ret read_pattern(a, ?f, data, n, p);
 }
 
 # read path and replace the world with what it holds
@@ -707,7 +716,7 @@ fun world_from(a: *allo.Allocator, s: *sim.Sim, v: *View, data: *Vector[u8]) res
     var tmp:  pattern.Pattern;
     val made: err[allo.Error] = pattern.init(?tmp, a, 0, 0, "");
     if (sel made.err) { ret res[Loaded, Error].err{Error.alloc{made.err}}; }
-    val read: err[Error] = read_pattern(a, ?old, data, ?tmp);
+    val read: err[Error] = read_pattern(a, ?old, data.data, data.len, ?tmp);
     if (sel read.err) {
         pattern.dnit(?tmp);
         ret res[Loaded, Error].err{read.err};
@@ -807,6 +816,28 @@ fun describe(a: *allo.Allocator, p: *pattern.Pattern, info: *format.Info) err[al
     ret format.set_str(a, ?info.comments, pattern.comments(p));
 }
 
+# encode a pattern, with its name, rule and comments where the format keeps them
+# ---
+# a:   allocator for the encoder's scratch
+# f:   the format to write
+# p:   pattern to encode, placed at its own x and y
+# out: receives the bytes, appended
+# ret: ok, or why the pattern could not be encoded
+pub fun encode_pattern(a: *allo.Allocator, f: *format.Format, p: *pattern.Pattern, out: *Vector[u8]) err[Error] {
+    var info: format.Info;
+    format.info_init(?info, a);
+    val told: err[allo.Error] = describe(a, p, ?info);
+    if (sel told.err) {
+        format.info_dnit(?info);
+        ret err[Error].err{Error.alloc{told.err}};
+    }
+    var src: adapt.PatternSource;
+    val enc: err[format.Error] = formats.save(a, f, adapt.pattern_source(?src, p), ?info, out);
+    format.info_dnit(?info);
+    if (sel enc.err) { ret err[Error].err{from_format(enc.err)}; }
+    ret err[Error].ok{};
+}
+
 # serialize a pattern to path in the format its extension names
 # ---
 # a:    allocator backing the transient buffer
@@ -817,20 +848,11 @@ fun describe(a: *allo.Allocator, p: *pattern.Pattern, info: *format.Info) err[al
 pub fun save_pattern(a: *allo.Allocator, p: *pattern.Pattern, path: str) err[Error] {
     var f: format.Format;
     if (!formats.by_path(path, ?f)) { ret err[Error].err{Error.format{format.Error.unsupported{}}}; }
-    var info: format.Info;
-    format.info_init(?info, a);
-    val told: err[allo.Error] = describe(a, p, ?info);
-    if (sel told.err) {
-        format.info_dnit(?info);
-        ret err[Error].err{Error.alloc{told.err}};
-    }
-    var src: adapt.PatternSource;
-    var out: Vector[u8]        = vector.init[u8](a);
-    val enc: err[format.Error] = formats.save(a, ?f, adapt.pattern_source(?src, p), ?info, ?out);
-    format.info_dnit(?info);
+    var out: Vector[u8] = vector.init[u8](a);
+    val enc: err[Error] = encode_pattern(a, ?f, p, ?out);
     if (sel enc.err) {
         vector.dnit[u8](?out);
-        ret err[Error].err{from_format(enc.err)};
+        ret enc;
     }
     val made: err[fs.FsError] = make_parent(a, path);
     if (sel made.err) {
@@ -911,12 +933,7 @@ pub fun load_pattern(a: *allo.Allocator, p: *pattern.Pattern, path: str) err[Err
     val rr: res[Vector[u8], fs.FsError] = fs.read_bytes(a, path);
     if (sel rr.err) { ret err[Error].err{Error.fs{rr.err}}; }
     var data: Vector[u8] = rr.ok;
-    var f:    format.Format;
-    if (!formats.by_bytes(data.data, data.len, ?f)) {
-        vector.dnit[u8](?data);
-        ret err[Error].err{Error.format{format.Error.malformed{}}};
-    }
-    val r: err[Error] = read_pattern(a, ?f, ?data, p);
+    val r:    err[Error] = pattern_from(a, p, data.data, data.len);
     vector.dnit[u8](?data);
     ret r;
 }
@@ -1028,6 +1045,8 @@ test load_world__round_trips_a_generations_world_and_its_dying_cells {
     block(?s, 0, 0);
     # a lone cell starts dying, leaving its chunk with no live cell at all
     sim.paint(?s, 1000, 1000, 1);
+    # and one beside the block dies outside the live cells' box
+    sim.paint(?s, 20, 20, 1);
     sim.step(?s);
     var v: View = View{pan_x: 0.0, pan_y: 0.0, zoom: 1.0, mode: render.MODE_HEAT};
 
@@ -1042,6 +1061,7 @@ test load_world__round_trips_a_generations_world_and_its_dying_cells {
     if (sel loaded.err)                                     { ret 4; }
     if (loaded.ok.foreign || !rule.same(?t.rule, ?s.rule))  { ret 5; }
     if (rule.state(?t.rule, sim.cell(?t, 1000, 1000)) != 2) { ret 6; }
+    if (rule.state(?t.rule, sim.cell(?t, 20, 20)) != 2)     { ret 6; }
     var y: i64 = -2;
     for (y < 4) {
         var x: i64 = -2;

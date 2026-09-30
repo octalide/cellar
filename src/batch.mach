@@ -24,6 +24,7 @@ use fs: std.filesystem;
 use std.io.writer;
 use std.types.bool.bool;
 use std.types.bool.false;
+use std.types.bool.true;
 use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
@@ -449,5 +450,85 @@ test encode__writes_what_the_app_holds_after_the_same_steps {
     if (seen == 0 || seen != sim.population(?app)) { ret 14; }
     pattern.dnit(?p);
     sim.dnit(?app);
+    ret 0;
+}
+
+# whether every cell in a state but 0 in a holds the same state in b, and how
+# many there are
+#[testing]
+fun states_in(a: *sim.Sim, b: *sim.Sim, n: *usize) bool {
+    val sp: *space.Space = ?a.space;
+    var sl: usize        = 0;
+    for (sl < sp.hi) {
+        if (space.used(sp, sl)) {
+            val ox: i64   = space.slot_x(sp, sl) * space.SIDE;
+            val oy: i64   = space.slot_y(sp, sl) * space.SIDE;
+            var i:  usize = 0;
+            for (i < space.CELLS) {
+                val v: u32 = rule.state(?a.rule, sp.cells[sl * space.CELLS + i]);
+                if (v != 0) {
+                    val x: i64 = ox + (i % space.SIDE::usize)::i64;
+                    val y: i64 = oy + (i / space.SIDE::usize)::i64;
+                    if (rule.state(?b.rule, sim.cell(b, x, y)) != v) { ret false; }
+                    @n = @n + 1;
+                }
+                i = i + 1;
+            }
+        }
+        sl = sl + 1;
+    }
+    ret true;
+}
+
+test encode__writes_every_dying_cell_of_a_generations_world {
+    var a: allo.Allocator;
+    page.make(?a);
+    var b:  Batch;
+    val ob: err[Error] = open(?b, ?a);
+    if (sel ob.err) { ret 1; }
+    sim.set_rule(?b.s, rule.preset_rule(4));
+    # a block dies into a ring of births, a lone cell beside it dies outside
+    # the live box, and a far one leaves a chunk with no live cell at all
+    sim.paint(?b.s, 0, 0, 1);
+    sim.paint(?b.s, 1, 0, 1);
+    sim.paint(?b.s, 0, 1, 1);
+    sim.paint(?b.s, 1, 1, 1);
+    sim.paint(?b.s, 20, 20, 1);
+    sim.paint(?b.s, 1000, 1000, 1);
+    val sb: err[Error] = step(?b, 1);
+    if (sel sb.err)                                             { ret 2; }
+    if (rule.state(?b.s.rule, sim.cell(?b.s, 20, 20)) != 2)     { ret 3; }
+    if (rule.state(?b.s.rule, sim.cell(?b.s, 1000, 1000)) != 2) { ret 4; }
+
+    val ids: [2]str = [2]str{"rle", "macrocell"};
+    var k:   usize  = 0;
+    for (k < 2) {
+        var f: format.Format;
+        if (!formats.by_id(ids[k], ?f)) { ret 5; }
+        var out: Vector[u8] = vector.init[u8](?a);
+        val eb:  err[Error] = encode(?b, ?f, ?out);
+        if (sel eb.err) { ret 6; }
+
+        var t:  sim.Sim;
+        val mt: err[allo.Error] = sim.init(?t, ?a);
+        if (sel mt.err) { ret 7; }
+        sim.set_rule(?t, rule.preset_rule(4));
+        var info: format.Info;
+        format.info_init(?info, ?a);
+        var ws:   adapt.WorldSink;
+        val back: err[format.Error] = formats.load(?a, ?f, out.data, out.len, adapt.world_sink(?ws, ?t, 0, 0), ?info);
+        format.info_dnit(?info);
+        vector.dnit[u8](?out);
+        if (sel back.err) { ret 8; }
+
+        # every cell in a state but 0 lies in both worlds, in the same state
+        var n: usize = 0;
+        var m: usize = 0;
+        if (!states_in(?b.s, ?t, ?n) || !states_in(?t, ?b.s, ?m)) { ret 9; }
+        if (n == 0 || n != m)                                     { ret 10; }
+        sim.dnit(?t);
+        k = k + 1;
+    }
+    close(?b);
     ret 0;
 }

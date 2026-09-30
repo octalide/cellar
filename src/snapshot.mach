@@ -3,7 +3,12 @@
 # only chunks holding a live or warm cell are kept, each as its coordinates and
 # its cells whole, so a snapshot costs what the world's front cells do and
 # never a dense grid of its extent. the simulation fills one from its pool
-# (sim.take) and replays one through its fill path (sim.restore).
+# (sim.take) and replays one through its fill path (sim.restore). one can also
+# be built a chunk at a time (add), which the undo journal keeps its chunk
+# before-images in. the cells are kept as the pool holds them, the world's
+# complement at the generations a rule that births on 0 holds it so, which the
+# rule and generation kept beside them say, so a restore resumes in the same
+# phase.
 
 use cellar.rule;
 use cellar.space;
@@ -71,15 +76,39 @@ pub fun dnit(sn: *Snapshot) {
     drop(sn);
 }
 
-# whether a slot in use holds a cell that is not the quiescent background
-fun holds(sp: *space.Space, s: usize) bool {
-    val c: *u32  = ?sp.cells[s * space.CELLS];
+# whether a chunk's cells hold one that is not the quiescent background
+pub fun any(c: *u32) bool {
     var i: usize = 0;
     for (i < space.CELLS) {
         if (c[i] != 0) { ret true; }
         i = i + 1;
     }
     ret false;
+}
+
+# whether a slot in use holds a cell that is not the quiescent background
+fun holds(sp: *space.Space, s: usize) bool {
+    ret any(?sp.cells[s * space.CELLS]);
+}
+
+# the bytes the buffers take
+pub fun bytes(sn: *Snapshot) usize {
+    ret sn.cap * (2 * 8 + space.CELLS * 4);
+}
+
+# the index of the chunk at (cx, cy), or n when none is held
+pub fun find(sn: *Snapshot, cx: i64, cy: i64) usize {
+    var i: usize = 0;
+    for (i < sn.n) {
+        if (sn.at[i * 2] == cx && sn.at[i * 2 + 1] == cy) { ret i; }
+        i = i + 1;
+    }
+    ret sn.n;
+}
+
+# the cells of held chunk i
+pub fun cells_of(sn: *Snapshot, i: usize) *u32 {
+    ret ?sn.cells[i * space.CELLS];
 }
 
 # buffers for exactly n chunks, reused when they are big enough and not more
@@ -98,6 +127,52 @@ fun fit(sn: *Snapshot, n: usize) err[allo.Error] {
     sn.at    = at.ok;
     sn.cells = cells.ok;
     sn.cap   = n;
+    ret err[allo.Error].ok{};
+}
+
+# start a copy built a chunk at a time with add, holding no chunks yet
+# ---
+# sn:         the snapshot, whose previous copy is dropped
+# generation: the world's generation
+# r:          the rule
+pub fun open(sn: *Snapshot, generation: u64, r: *rule.Rule) {
+    sn.n          = 0;
+    sn.generation = generation;
+    sn.rule       = @r;
+    sn.held       = true;
+}
+
+# append one chunk's cells to a held copy, growing the buffers by doubling
+# ---
+# sn:    the snapshot, held
+# cx:    the chunk's column
+# cy:    the chunk's row
+# cells: space.CELLS cells, row-major
+# ret:   ok, or the allocator's refusal, which leaves the copy as it was
+pub fun add(sn: *Snapshot, cx: i64, cy: i64, cells: *u32) err[allo.Error] {
+    if (sn.n == sn.cap) {
+        var cap: usize = sn.cap * 2;
+        if (cap == 0) { cap = 1; }
+        val at: res[*i64, allo.Error] = allo.allocate[i64](sn.a, cap * 2);
+        if (sel at.err) { ret err[allo.Error].err{at.err}; }
+        val cs: res[*u32, allo.Error] = allo.allocate[u32](sn.a, cap * space.CELLS);
+        if (sel cs.err) {
+            allo.deallocate[i64](sn.a, at.ok, cap * 2);
+            ret err[allo.Error].err{cs.err};
+        }
+        if (sn.n != 0) {
+            mem.copy[i64](at.ok, sn.at, sn.n * 2);
+            mem.copy[u32](cs.ok, sn.cells, sn.n * space.CELLS);
+        }
+        release(sn);
+        sn.at    = at.ok;
+        sn.cells = cs.ok;
+        sn.cap   = cap;
+    }
+    sn.at[sn.n * 2]     = cx;
+    sn.at[sn.n * 2 + 1] = cy;
+    mem.copy[u32](?sn.cells[sn.n * space.CELLS], cells, space.CELLS);
+    sn.n = sn.n + 1;
     ret err[allo.Error].ok{};
 }
 

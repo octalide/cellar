@@ -5,9 +5,13 @@
 
 use cellar.command;
 use cellar.format;
+use cellar.identify;
+use cellar.identify.worker;
+use cellar.journal;
 use cellar.library;
 use cellar.pattern;
 use cellar.render;
+use cellar.rule;
 use cellar.ruletext;
 use cellar.saves;
 use cellar.snapshot;
@@ -16,6 +20,8 @@ use cellar.text;
 use cellar.theme;
 use cellar.ui;
 use allo: std.allocator;
+use std.collections.vector;
+use std.collections.vector.Vector;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -23,6 +29,7 @@ use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
+use std.types.string;
 use std.types.string.str;
 
 # number of colour modes (kept in step with render.MODE_*)
@@ -113,6 +120,11 @@ pub val ZOOM_MAX: f32 = 16.0;
 # alloc:       allocator behind the patterns and the queue, once attach has run
 # queue:       edits to the world, applied at the start of the next frame
 # start:       the world reset returns to, once attach has run
+# log:         the changes undo and redo walk, once attach has run
+# clip:        text the frame is to put on the clipboard, once attach has run
+# clip_ready:  clip holds text not yet put on the clipboard
+# identifier:  classifies a selection off the frame
+# id_limits:   the limits a selection is classified under
 pub rec App {
     speed:       f32;
     mode:        usize;
@@ -165,7 +177,15 @@ pub rec App {
     alloc:       *allo.Allocator;
     queue:       command.Queue;
     start:       snapshot.Snapshot;
+    log:         journal.Journal;
+    clip:        Vector[u8];
+    clip_ready:  bool;
+    identifier:  worker.Worker;
+    id_limits:   identify.Limits;
 }
+
+# the message shown while a selection is being identified
+pub val IDENTIFYING: str = "identifying...";
 
 # the randomize area's side length (cells) for a bounds-table index
 # ---
@@ -241,6 +261,31 @@ pub fun say_why(a: *App, what: str, why: str) {
     say(a, ?a.said[0]);
 }
 
+# add to the message being flashed, as "message; more"
+pub fun say_also(a: *App, more: str) {
+    var was: [256]u8;
+    var o:   usize = 0;
+    for (a.toast[o] != 0 && o < 255) {
+        was[o] = a.toast[o];
+        o      = o + 1;
+    }
+    was[o] = 0;
+    o      = 0;
+    for (was[o] != 0 && o < 200) {
+        a.said[o] = was[o];
+        o         = o + 1;
+    }
+    o = text.buf_str(?a.said[0], o, "; ");
+    var i: usize = 0;
+    for (more[i] != 0 && o < 254) {
+        a.said[o] = more[i];
+        o         = o + 1;
+        i         = i + 1;
+    }
+    a.said[o] = 0;
+    say(a, ?a.said[0]);
+}
+
 # flash the full pool once per fill, and rearm when the world is cleared
 pub fun note_full(a: *App, full: bool) {
     if (!full) {
@@ -263,6 +308,9 @@ pub fun attach(a: *App, alloc: *allo.Allocator) err[format.Error] {
     command.init(?a.queue, alloc);
     saves.init(?a.saves, alloc);
     snapshot.init(?a.start, alloc);
+    journal.init(?a.log, alloc);
+    a.clip       = vector.init[u8](alloc);
+    a.clip_ready = false;
     val l: err[format.Error] = library.init(?a.library, alloc);
     if (sel l.err) { ret l; }
     val p: err[allo.Error] = pattern.init(?a.picked, alloc, 0, 0, "");
@@ -281,6 +329,9 @@ pub fun dnit(a: *App) {
     command.dnit(?a.queue);
     saves.dnit(?a.saves);
     snapshot.dnit(?a.start);
+    journal.dnit(?a.log);
+    vector.dnit[u8](?a.clip);
+    worker.cancel(?a.identifier);
 }
 
 # choose a library pattern to stamp and browse its category, or the custom pattern
@@ -355,6 +406,33 @@ pub fun stamp(a: *App, p: *pattern.Pattern, o: u8, x: i64, y: i64) {
         ret;
     }
     submit(a, command.Command.stamp{s});
+}
+
+# ask to paste clipboard text as the stamp
+# ---
+# a:    application state
+# text: the clipboard's text, a copy from a.alloc that this takes ownership of
+# rule: also take the pattern's rule
+pub fun paste(a: *App, text: str, rule: bool) {
+    val n: usize              = string.str_len(text);
+    var o: string.OwnedString = string.owned_adopt(a.alloc, text, n, n + 1);
+    if (n == 0) {
+        string.owned_release(?o);
+        say(a, "the clipboard holds no text");
+        ret;
+    }
+    submit(a, command.Command.paste{command.Paste{text: o, rule: rule}});
+}
+
+# ask to open the first of the files dropped on the window
+# ---
+# a:     application state
+# paths: the dropped paths, borrowed for the call
+# count: how many
+pub fun drop(a: *App, paths: *str, count: usize) {
+    if (count == 0) { ret; }
+    val f: opt[command.File] = file(a, paths[0]);
+    if (sel f.some) { submit(a, command.Command.drop{command.Drop{file: f.some, ignored: count - 1}}); }
 }
 
 # select the rectangle with corner cells (x0, y0) and (x1, y1), both inside it
@@ -436,6 +514,41 @@ pub fun init(a: *App) {
     a.selected = false;
     a.dragging = false;
     a.alloc    = nil;
+    worker.init(?a.identifier);
+    a.id_limits = identify.limits();
+}
+
+# classify a pattern off the frame under a rule, replacing a classification
+# still running, and say so while it runs
+# ---
+# a: application state
+# r: the rule
+# p: the pattern, which the worker copies, so the caller keeps it
+pub fun identify_start(a: *App, r: rule.Rule, p: *pattern.Pattern) {
+    if (!worker.start(?a.identifier, r, p, a.id_limits)) {
+        say(a, "the selection could not be identified: out of memory or threads");
+        ret;
+    }
+    say(a, IDENTIFYING);
+}
+
+# flash a finished classification, keeping the running message up until then;
+# the frame calls this once a frame
+pub fun identify_poll(a: *App) {
+    val c: worker.Collected = worker.collect(?a.identifier);
+    if (sel c.idle) {
+        if (worker.running(?a.identifier) && a.toast == IDENTIFYING) { a.toast_t = TOAST_TICKS; }
+        ret;
+    }
+    if (sel c.failed) {
+        say(a, "out of memory");
+        ret;
+    }
+    if (sel c.ready) {
+        var r:    identify.Result = c.ready;
+        var line: [641]u8;
+        say_why(a, "selection", identify.describe(?r, ?line[0]));
+    }
 }
 
 test zoom_min__keeps_a_pixel_within_a_chunks_neighbours {

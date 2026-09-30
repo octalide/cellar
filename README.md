@@ -37,33 +37,43 @@ dropped.
 
 ## Controls
 
-| input                  | action                                  |
-|------------------------|-----------------------------------------|
-| `space`                | play / pause                            |
-| `S`                    | single step                             |
-| `R`                    | randomize                               |
-| `C`                    | clear                                   |
-| `Backspace`            | reset to where play started             |
-| `D`, `E`, `T`, `V`     | draw, erase, stamp or select tool       |
-| `Z`, `X`               | rotate the stamp, flip the stamp        |
-| left mouse             | use the tool; drag to select            |
-| `Ctrl+C`, `Ctrl+X`     | copy or cut the selection to the stamp  |
-| `Delete`               | clear the selection                     |
-| `Shift+Delete`         | clear outside the selection             |
-| `Ctrl+R`               | fill the selection at random            |
-| `I`                    | invert the selection                    |
-| `B`                    | shrink the selection to its live cells  |
-| right or middle mouse  | drag to pan                             |
-| scroll                 | zoom toward the cursor                  |
-| arrow keys             | pan                                     |
-| `F`                    | frame the randomize area                |
-| `M`                    | next colour mode                        |
-| `G`                    | grid lines                              |
-| `Tab`                  | hide / show the panel                   |
-| `H`, `F1`              | key reference                           |
-| `F11`                  | toggle borderless fullscreen            |
-| `F12`                  | screenshot                              |
-| `Esc`                  | close the reference, deselect, or quit  |
+| input                    | action                                                           |
+|--------------------------|------------------------------------------------------------------|
+| `space`                  | play / pause                                                     |
+| `S`                      | single step                                                      |
+| `R`                      | randomize                                                        |
+| `C`                      | clear                                                            |
+| `Backspace`              | reset to where play started                                      |
+| `Ctrl+Z`                 | undo                                                             |
+| `Ctrl+Shift+Z`, `Ctrl+Y` | redo                                                             |
+| `D`, `E`, `T`, `V`       | draw, erase, stamp or select tool                                |
+| `Z`, `X`                 | rotate the stamp, flip the stamp                                 |
+| left mouse               | use the tool; drag to select                                     |
+| `Ctrl+C`, `Ctrl+X`       | copy or cut the selection to the stamp and the clipboard, as RLE |
+| `Ctrl+V`                 | paste a pattern as the stamp, keeping the current rule           |
+| `Ctrl+Shift+V`           | paste a pattern as the stamp, taking its rule                    |
+| `Delete`                 | clear the selection                                              |
+| `Shift+Delete`           | clear outside the selection                                      |
+| `Ctrl+R`                 | fill the selection at random                                     |
+| `I`                      | invert the selection                                             |
+| `B`                      | shrink the selection to its live cells                           |
+| right or middle mouse    | drag to pan                                                      |
+| scroll                   | zoom toward the cursor                                           |
+| arrow keys               | pan                                                              |
+| `F`                      | frame the randomize area                                         |
+| `M`                      | next colour mode                                                 |
+| `G`                      | grid lines                                                       |
+| `Tab`                    | hide / show the panel                                            |
+| `H`, `F1`                | key reference                                                    |
+| `F11`                    | toggle borderless fullscreen                                     |
+| `F12`                    | screenshot                                                       |
+| `Esc`                    | close the reference, deselect, or quit                           |
+
+Undo steps back through strokes, stamps, selection operations, pastes, rule
+changes, clears, randomizes, resets, loads and dropped files, with as many steps as 256 MiB of
+before-images holds. A stretch of play is one step too: undoing it returns to
+where play started, and undo or redo while running pauses first. Any new
+change clears what could be redone.
 
 A readout of the generation, population, rule and speed sits in the top-left
 corner, and the side panel groups every control by task:
@@ -98,6 +108,12 @@ origin and framed, taking its rule when cellar can run it. A file that cannot be
 read, or a pattern too large for the world to hold, leaves the world as it was
 and says why. Options may come before or after the file, and `--` ends
 them, so `cellar -- -x.rle` opens a file whose name starts with a dash.
+
+A file dropped on the window opens the same way, a pattern stamped onto the
+world as it stands. When several are dropped the first opens and the rest are
+left alone. `Ctrl+V` reads any of those pattern formats from the clipboard as
+the stamp, and `Ctrl+C` puts a copied selection on the clipboard as RLE with
+its rule, ready to paste into LifeWiki or Golly.
 
 `cellar --capture shot.png` draws a second of frames, saves the last one and
 exits, leaving the saved settings alone.
