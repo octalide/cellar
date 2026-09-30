@@ -1,17 +1,21 @@
 # text serialization of a world or a pattern to disk
 #
-# a pattern is a header line "<w> <h>\n" followed by h lines of w characters,
-# '1' for a live cell and '0' for a dead one. a world is sparse: a first line
-# "cellar 2", then for every chunk holding a live cell a line "<cx> <cy>" with
-# its signed chunk coordinates and 64 lines of 64 cells. a world file in the
+# a world file is sparse. its first line is "cellar 3", then a header of
+# "<key> <value>" lines ended by a blank line, then for every chunk holding a
+# live cell a line "<cx> <cy>" with its signed chunk coordinates and 64 lines of
+# 64 cells, '1' live and '0' dead. a reader skips header keys it does not know,
+# so a newer file's fields do not stop an older cellar from reading its cells.
+# a "cellar 2" file is the same without the header, and a file in the custom
 # pattern format, what every world was saved as before the world became
-# unbounded, still loads, centred on the origin. both are deliberately trivial
-# to read and write. saves create the file's directory first.
+# unbounded, loads centred on the origin. patterns are saved and loaded through
+# the format registry, see cellar.formats. saves create the file's directory
+# first.
 
 use gfx: boom.graphics;
 use cellar.format;
 use cellar.formats;
 use cellar.formats.adapt;
+use cellar.paths;
 use cellar.pattern;
 use cellar.sim;
 use cellar.space;
@@ -30,6 +34,7 @@ use std.types.bool.true;
 use std.types.error.err;
 use std.types.result.res;
 use std.types.size.usize;
+use std.types.string;
 use std.types.string.str;
 
 # directory tests write their files under
@@ -42,8 +47,12 @@ pub val DIR_MODE: i32 = 0o755;
 pub val FILE_MODE: i32 = 0o644;
 # bytes reserved for a chunk's header when sizing a buffer
 val HEADER_MAX: usize = 32;
-# the first line of a sparse world file
-val MAGIC: str = "cellar 2";
+# the first line of a world file, less its version digit
+val MAGIC: str = "cellar ";
+# the version save_world writes
+val VERSION: u8 = '3';
+# the oldest sparse version load_world reads
+val OLDEST: u8 = '2';
 # bytes of one chunk record past its coordinate line
 val CHUNK_TEXT: usize = 64 * 65;
 
@@ -53,7 +62,7 @@ val CHUNK_TEXT: usize = 64 * 65;
 # fs:         the file or its directory could not be read or written
 # dimensions: the header declares a size of zero or beyond the limit
 # truncated:  the body holds fewer cells than the header declares
-# version:    a settings file written by another format version
+# version:    a settings or world file written by another format version
 # gpu:        the GPU's cells could not be read back
 # format:     a pattern file the registry refused, see cellar.format.Error
 pub tag Error: u8 {
@@ -197,9 +206,12 @@ pub fun save_world(a: *allo.Allocator, s: *sim.Sim, path: str) err[Error] {
     if (sel rb.err) { ret err[Error].err{Error.alloc{rb.err}}; }
     val buf: *u8   = rb.ok;
     var off: usize = text.buf_str(buf, 0, MAGIC);
-    buf[off] = '\n';
-    off      = off + 1;
-    sl       = 0;
+    buf[off]     = VERSION;
+    buf[off + 1] = '\n';
+    # no header fields yet, so the blank line that ends the header follows at once
+    buf[off + 2] = '\n';
+    off          = off + 3;
+    sl           = 0;
     for (sl < sp.hi) {
         if (space.used(sp, sl) && sp.census[sl * space.CENSUS] != 0) {
             off      = buf_i64(buf, off, space.slot_x(sp, sl));
@@ -252,25 +264,62 @@ fun parse_i64(b: *Vector[u8], off: usize, out: *i64) usize {
     ret o;
 }
 
-# whether the file starts with the sparse world's first line
-fun is_sparse(b: *Vector[u8]) bool {
+# the offset just past the line starting at p, or the length when it is the last
+fun next_line(b: *Vector[u8], p: usize) usize {
+    var o: usize = p;
+    for (o < b.len && b.data[o] != '\n') { o = o + 1; }
+    if (o < b.len) { ret o + 1; }
+    ret o;
+}
+
+# the version digit of a world file's first line, or 0 when the file is not one
+fun world_version(b: *Vector[u8]) u8 {
     var i: usize = 0;
     for (MAGIC[i] != 0) {
-        if (text.byte_at(b.data, b.len, i) != MAGIC[i]) { ret false; }
+        if (text.byte_at(b.data, b.len, i) != MAGIC[i]) { ret 0; }
         i = i + 1;
     }
-    ret true;
+    val v: u8 = text.byte_at(b.data, b.len, i);
+    val e: u8 = text.byte_at(b.data, b.len, i + 1);
+    if (v < '0' || v > '9' || (e != 0 && e != '\n' && e != '\r')) { ret 0; }
+    ret v;
+}
+
+# step over a world file's header, from its first field to the blank line that ends it
+#
+# every field is a line "<key> <value>" whose key starts with a letter. none is
+# read yet, and one this version does not know is skipped.
+# ---
+# b:   the file contents
+# p:   the offset just past the first line
+# out: receives the offset of the first chunk record
+# ret: ok, truncated when the header never ends, or malformed for a line that is not a field
+fun skip_header(b: *Vector[u8], p: usize, out: *usize) err[Error] {
+    var o: usize = p;
+    for (true) {
+        if (o >= b.len) { ret err[Error].err{Error.truncated{}}; }
+        var e: usize = o;
+        for (e < b.len && (b.data[e] == ' ' || b.data[e] == '\t' || b.data[e] == '\r')) { e = e + 1; }
+        if (e >= b.len || b.data[e] == '\n') {
+            @out = next_line(b, o);
+            ret err[Error].ok{};
+        }
+        val k: u8 = b.data[o] | 0x20;
+        if (k < 'a' || k > 'z') { ret err[Error].err{Error.format{format.Error.malformed{}}}; }
+        o = next_line(b, o);
+    }
+    ret err[Error].ok{};
 }
 
 # the chunk records of a sparse world, as coordinates and 0/1 cells
 # ---
 # b:     the file contents
+# start: the offset of the first record
 # at:    receives each chunk's coordinates, two per chunk
 # cells: receives each chunk's space.CELLS cells
 # ret:   ok, or why the file was refused
-fun parse_sparse(b: *Vector[u8], at: *Vector[i64], cells: *Vector[u8]) err[Error] {
-    var p: usize = 0;
-    for (p < b.len && b.data[p] != '\n') { p = p + 1; }
+fun parse_sparse(b: *Vector[u8], start: usize, at: *Vector[i64], cells: *Vector[u8]) err[Error] {
+    var p: usize = start;
     for (true) {
         for (p < b.len && (b.data[p] == '\n' || b.data[p] == '\r' || b.data[p] == ' ')) { p = p + 1; }
         if (p >= b.len) { brk; }
@@ -341,10 +390,23 @@ pub fun load_world(a: *allo.Allocator, s: *sim.Sim, path: str) err[Error] {
     if (sel rr.err) { ret err[Error].err{Error.fs{rr.err}}; }
     var data: Vector[u8] = rr.ok;
 
-    if (is_sparse(?data)) {
+    val v: u8 = world_version(?data);
+    if (v != 0) {
+        var start: usize = next_line(?data, 0);
+        if (v < OLDEST || v > VERSION) {
+            vector.dnit[u8](?data);
+            ret err[Error].err{Error.version{}};
+        }
+        if (v >= '3') {
+            val head: err[Error] = skip_header(?data, start, ?start);
+            if (sel head.err) {
+                vector.dnit[u8](?data);
+                ret head;
+            }
+        }
         var at:     Vector[i64] = vector.init[i64](a);
         var cells:  Vector[u8]  = vector.init[u8](a);
-        val parsed: err[Error]  = parse_sparse(?data, ?at, ?cells);
+        val parsed: err[Error]  = parse_sparse(?data, start, ?at, ?cells);
         vector.dnit[u8](?data);
         if (sel parsed.ok) {
             sim.fill_begin(s);
@@ -401,19 +463,32 @@ pub fun load_world(a: *allo.Allocator, s: *sim.Sim, path: str) err[Error] {
     ret err[Error].ok{};
 }
 
-# serialize a pattern to path in cellar's custom pattern format
-#
-# the file holds dead and live cells only, so every nonzero state is written live.
+# copy a pattern's name, rule and comments into an Info
+fun describe(a: *allo.Allocator, p: *pattern.Pattern, info: *format.Info) err[allo.Error] {
+    val n: err[allo.Error] = format.set_str(a, ?info.name, pattern.name(p));
+    if (sel n.err) { ret n; }
+    val r: err[allo.Error] = format.set_str(a, ?info.rule, pattern.rule(p));
+    if (sel r.err) { ret r; }
+    ret format.set_str(a, ?info.comments, pattern.comments(p));
+}
+
+# serialize a pattern to path in the format its extension names
 # ---
 # a:    allocator backing the transient buffer
-# p:    pattern to save
+# p:    pattern to save, with its name, rule and comments where the format keeps them
 # path: destination file path
-# ret:  ok, or why the file was not written
+# ret:  ok, or why the file was not written; unsupported when no format that
+#       writes owns the extension
 pub fun save_pattern(a: *allo.Allocator, p: *pattern.Pattern, path: str) err[Error] {
     var f: format.Format;
-    if (!formats.by_id("custom", ?f)) { ret err[Error].err{Error.format{format.Error.unsupported{}}}; }
+    if (!formats.by_path(path, ?f)) { ret err[Error].err{Error.format{format.Error.unsupported{}}}; }
     var info: format.Info;
     format.info_init(?info, a);
+    val told: err[allo.Error] = describe(a, p, ?info);
+    if (sel told.err) {
+        format.info_dnit(?info);
+        ret err[Error].err{Error.alloc{told.err}};
+    }
     var src: adapt.PatternSource;
     var out: Vector[u8]        = vector.init[u8](a);
     val enc: err[format.Error] = formats.save(a, ?f, adapt.pattern_source(?src, p), ?info, ?out);
@@ -430,6 +505,61 @@ pub fun save_pattern(a: *allo.Allocator, p: *pattern.Pattern, path: str) err[Err
     val wrote: err[fs.FsError] = fs.write_bytes(path, out.data, out.len, FILE_MODE);
     vector.dnit[u8](?out);
     if (sel wrote.err) { ret err[Error].err{Error.fs{wrote.err}}; }
+    ret err[Error].ok{};
+}
+
+# whether a file is there, taking a failed look as no
+fun present(path: str) bool {
+    val r: res[bool, io_error.Error] = fs.is_file(path);
+    ret sel r.ok && r.ok;
+}
+
+# load a pattern from one file into p and save it to another
+fun copy_pattern(a: *allo.Allocator, p: *pattern.Pattern, from: str, to: str) err[Error] {
+    val r: err[Error] = load_pattern(a, p, from);
+    if (sel r.err) { ret r; }
+    ret save_pattern(a, p, to);
+}
+
+# bring the custom pattern kept as legacy over to path, in the format path names
+fun convert(a: *allo.Allocator, legacy: str, path: str) err[Error] {
+    var tmp:  pattern.Pattern;
+    val made: err[allo.Error] = pattern.init(?tmp, a, 0, 0, "");
+    if (sel made.err) { ret err[Error].err{Error.alloc{made.err}}; }
+    val r: err[Error] = copy_pattern(a, ?tmp, legacy, path);
+    pattern.dnit(?tmp);
+    if (sel r.err) { ret r; }
+    val gone: err[io_error.Error] = fs.remove_file(legacy);
+    if (sel gone.err) { ret err[Error].err{Error.fs{fs.FsError.io{gone.err}}}; }
+    ret err[Error].ok{};
+}
+
+# move the world and custom pattern files 0.3.0 and earlier saved as .cells to
+# their current names, paths.WORLD and paths.CUSTOM
+#
+# LifeWiki's plaintext owns .cells, so the old names would read as plaintext. a
+# world keeps its bytes, since load_world reads every older world file, and is
+# renamed. the custom pattern was cellar's own 0/1 text, so it is read and
+# written again in the format paths.CUSTOM names, and the old file is removed
+# only once the new one is written. nothing is moved over a file already at its
+# new name.
+# ---
+# a:   allocator for the conversion
+# p:   the resolved data directory
+# ret: ok, or why a file could not be brought across, when it is left where it was
+pub fun migrate(a: *allo.Allocator, p: *paths.Paths) err[Error] {
+    if (!p.ok) { ret err[Error].ok{}; }
+    var from: [1088]u8;
+    var to:   [1088]u8;
+    paths.file(p, paths.LEGACY_WORLD, ?from[0]);
+    paths.file(p, paths.WORLD, ?to[0]);
+    if (present(?from[0]) && !present(?to[0])) {
+        val moved: err[io_error.Error] = fs.rename(?from[0], ?to[0]);
+        if (sel moved.err) { ret err[Error].err{Error.fs{fs.FsError.io{moved.err}}}; }
+    }
+    paths.file(p, paths.LEGACY_CUSTOM, ?from[0]);
+    paths.file(p, paths.CUSTOM, ?to[0]);
+    if (present(?from[0]) && !present(?to[0])) { ret convert(a, ?from[0], ?to[0]); }
     ret err[Error].ok{};
 }
 
@@ -467,9 +597,14 @@ test load_world__round_trips_a_sparse_world {
     sim.paint(?s, -5, 3, 1);
     sim.paint(?s, 100000, -70000, 1);
 
-    val path:  str        = "out/test/test_world.cells";
+    val path:  str        = "out/test/test_world.cellar";
     val saved: err[Error] = save_world(?a, ?s, path);
     if (sel saved.err) { ret 2; }
+    val rr: res[Vector[u8], fs.FsError] = fs.read_bytes(?a, path);
+    if (sel rr.err) { ret 8; }
+    var head: Vector[u8] = rr.ok;
+    if (world_version(?head) != '3' || head.data[8] != '\n' || head.data[9] != '\n') { ret 9; }
+    vector.dnit[u8](?head);
 
     var t:     sim.Sim;
     val made2: err[allo.Error] = sim.init(?t, ?a);
@@ -494,7 +629,7 @@ test load_world__loads_an_old_dense_file_centred {
 
     # a 4 x 2 world from before the world was unbounded
     var body: [14]u8          = [14]u8{'4', ' ', '2', '\n', '1', '0', '0', '0', '\n', '0', '0', '0', '1', '\n'};
-    val path: str             = "out/test/test_old.cells";
+    val path: str             = "out/test/test_old.cellar";
     val dir:  err[fs.FsError] = fs.create_dir_all(?a, TEST_DIR, DIR_MODE);
     if (sel dir.err) { ret 1; }
     val wrote: err[fs.FsError] = fs.write_bytes(path, ?body[0], 14, FILE_MODE);
@@ -523,7 +658,7 @@ test load_pattern__round_trips {
     pattern.set(?p, 4, 2, 1);
     pattern.set(?p, 2, 1, 1);
 
-    val path:   str        = "out/test/test_pattern.cells";
+    val path:   str        = "out/test/test_pattern.rle";
     val saved4: err[Error] = save_pattern(?a, ?p, path);
     if (sel saved4.err) { ret 1; }
 
@@ -558,7 +693,7 @@ test load_pattern__reads_by_length_past_an_embedded_nul {
 
     # a NUL inside the body ended the old NUL-terminated read early
     var body: [9]u8           = [9]u8{'3', ' ', '1', '\n', '1', 0, '0', '1', '\n'};
-    val path: str             = "out/test/test_nul.cells";
+    val path: str             = "out/test/test_nul.pattern";
     val dir:  err[fs.FsError] = fs.create_dir_all(a, TEST_DIR, DIR_MODE);
     if (sel dir.err) { ret 2; }
     val wrote: err[fs.FsError] = fs.write_bytes(path, ?body[0], 9, FILE_MODE);
@@ -588,7 +723,7 @@ test load_world__short_body_leaves_the_world_intact {
 
     # declares 3x3 but carries four cells
     var body: [9]u8           = [9]u8{'3', ' ', '3', '\n', '1', '1', '0', '1', '\n'};
-    val path: str             = "out/test/test_short.cells";
+    val path: str             = "out/test/test_short.cellar";
     val dir:  err[fs.FsError] = fs.create_dir_all(?a, TEST_DIR, DIR_MODE);
     if (sel dir.err) { ret 2; }
     val wrote: err[fs.FsError] = fs.write_bytes(path, ?body[0], 9, FILE_MODE);
@@ -610,7 +745,7 @@ test load_pattern__loads_an_rle_file_and_refuses_unknown_text {
 
     val dir: err[fs.FsError] = fs.create_dir_all(?a, TEST_DIR, DIR_MODE);
     if (sel dir.err) { ret 1; }
-    val path:  str             = "out/test/test_rle.cells";
+    val path:  str             = "out/test/test_rle.pattern";
     val rle:   str             = "x = 3, y = 3, rule = B3/S23\nbob$2bo$3o!\n";
     val wrote: err[fs.FsError] = fs.write_bytes(path, rle::*u8, 40, FILE_MODE);
     if (sel wrote.err) { ret 2; }
@@ -630,5 +765,139 @@ test load_pattern__loads_an_rle_file_and_refuses_unknown_text {
     fs.remove_file(path);
     if (!sel bad.err || p.w != 3) { ret 7; }
     pattern.dnit(?p);
+    ret 0;
+}
+
+# write bytes to a test file
+#[testing]
+fun put_file(a: *allo.Allocator, path: str, body: str) bool {
+    val dir: err[fs.FsError] = fs.create_dir_all(a, TEST_DIR, DIR_MODE);
+    if (sel dir.err) { ret false; }
+    val wrote: err[fs.FsError] = fs.write_bytes(path, body::*u8, string.str_len(body), FILE_MODE);
+    ret !(sel wrote.err);
+}
+
+# a chunk record at (cx, cy) whose first row starts with the given cells
+#[testing]
+fun chunk_text(out: *Vector[u8], rec_line: str, first: str) {
+    var i: usize = 0;
+    for (rec_line[i] != 0) {
+        vector.push[u8](out, rec_line[i]);
+        i = i + 1;
+    }
+    var k: usize = 0;
+    for (k < space.CELLS) {
+        var c: u8 = '0';
+        if (k < string.str_len(first)) { c = first[k]; }
+        vector.push[u8](out, c);
+        if (k % 64 == 63) { vector.push[u8](out, '\n'); }
+        k = k + 1;
+    }
+}
+
+# load a world file of a header and one chunk at (-1, 2) whose first row starts "101"
+#[testing]
+fun load_versioned(a: *allo.Allocator, s: *sim.Sim, path: str, head: str) err[Error] {
+    var body: Vector[u8] = vector.init[u8](a);
+    var i:    usize      = 0;
+    for (head[i] != 0) {
+        vector.push[u8](?body, head[i]);
+        i = i + 1;
+    }
+    chunk_text(?body, "-1 2\n", "101");
+    vector.push[u8](?body, 0);
+    val dir: err[fs.FsError] = fs.create_dir_all(a, TEST_DIR, DIR_MODE);
+    if (sel dir.err) { ret err[Error].err{Error.fs{dir.err}}; }
+    val wrote: err[fs.FsError] = fs.write_bytes(path, body.data, body.len - 1, FILE_MODE);
+    vector.dnit[u8](?body);
+    if (sel wrote.err) { ret err[Error].err{Error.fs{wrote.err}}; }
+    val r: err[Error] = load_world(a, s, path);
+    fs.remove_file(path);
+    ret r;
+}
+
+test load_world__reads_cellar_2_and_skips_unknown_cellar_3_fields {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+
+    # a 0.3.0 world
+    val two: err[Error] = load_versioned(?a, ?s, "out/test/test_v2.cellar", "cellar 2\n");
+    if (sel two.err)                                         { ret 2; }
+    if (sim.population(?s) != 2 || !sim.alive(?s, -64, 128)) { ret 3; }
+    if (!sim.alive(?s, -62, 128) || sim.alive(?s, -63, 128)) { ret 4; }
+
+    # fields a later version adds are skipped
+    val three: err[Error] = load_versioned(?a, ?s, "out/test/test_v3.cellar", "cellar 3\r\nrule B36/S23\ngeneration 12\n\r\n");
+    if (sel three.err)                                       { ret 5; }
+    if (sim.population(?s) != 2 || !sim.alive(?s, -64, 128)) { ret 6; }
+
+    # a version from the future, and a header that never ends, are refused untouched
+    val four: err[Error] = load_versioned(?a, ?s, "out/test/test_v4.cellar", "cellar 4\n\n");
+    if (!sel four.err)         { ret 7; }
+    if (!sel four.err.version) { ret 7; }
+    val open: err[Error] = load_versioned(?a, ?s, "out/test/test_v3_open.cellar", "cellar 3\nrule B3/S23\n");
+    if (!sel open.err)           { ret 8; }
+    if (sim.population(?s) != 2) { ret 9; }
+    sim.dnit(?s);
+    ret 0;
+}
+
+test migrate__moves_0_3_0_saves_off_cells {
+    var a: allo.Allocator;
+    page.make(?a);
+    var p: paths.Paths;
+    p.ok                                                  = true;
+    p.dir[text.buf_str(?p.dir[0], 0, "out/test/migrate")] = 0;
+    val dir: err[fs.FsError] = fs.create_dir_all(?a, paths.dir(?p), DIR_MODE);
+    if (sel dir.err) { ret 1; }
+    var ow: [1088]u8;
+    var oc: [1088]u8;
+    var nw: [1088]u8;
+    var nc: [1088]u8;
+    paths.file(?p, paths.LEGACY_WORLD, ?ow[0]);
+    paths.file(?p, paths.LEGACY_CUSTOM, ?oc[0]);
+    paths.file(?p, paths.WORLD, ?nw[0]);
+    paths.file(?p, paths.CUSTOM, ?nc[0]);
+    fs.remove_file(?nw[0]);
+    fs.remove_file(?nc[0]);
+    if (!put_file(?a, ?ow[0], "2 1\n11\n"))       { ret 2; }
+    if (!put_file(?a, ?oc[0], "3 2\n010\n001\n")) { ret 3; }
+
+    val moved: err[Error] = migrate(?a, ?p);
+    if (sel moved.err)                      { ret 4; }
+    if (present(?ow[0]) || present(?oc[0])) { ret 5; }
+
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 6; }
+    val world: err[Error] = load_world(?a, ?s, ?nw[0]);
+    if (sel world.err)           { ret 7; }
+    if (sim.population(?s) != 2) { ret 7; }
+
+    var q:     pattern.Pattern;
+    val made2: err[allo.Error] = pattern.init(?q, ?a, 1, 1, "custom");
+    if (sel made2.err) { ret 8; }
+    var f:  format.Format;
+    val rr: res[Vector[u8], fs.FsError] = fs.read_bytes(?a, ?nc[0]);
+    if (sel rr.err) { ret 9; }
+    var data: Vector[u8] = rr.ok;
+    if (!formats.by_bytes(data.data, data.len, ?f) || !string.str_equals(f.id, "rle")) { ret 10; }
+    vector.dnit[u8](?data);
+    val custom: err[Error] = load_pattern(?a, ?q, ?nc[0]);
+    if (sel custom.err)                                                                         { ret 11; }
+    if (q.w != 3 || q.h != 2)                                                                   { ret 11; }
+    if (pattern.get(?q, 1, 0) != 1 || pattern.get(?q, 2, 1) != 1 || pattern.get(?q, 0, 0) != 0) { ret 12; }
+    if (!string.str_equals(pattern.name(?q), "custom"))                                         { ret 13; }
+
+    # a second run finds nothing left to move
+    val again: err[Error] = migrate(?a, ?p);
+    if (sel again.err) { ret 14; }
+    fs.remove_file(?nw[0]);
+    fs.remove_file(?nc[0]);
+    pattern.dnit(?q);
+    sim.dnit(?s);
     ret 0;
 }
