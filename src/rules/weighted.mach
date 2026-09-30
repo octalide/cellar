@@ -626,14 +626,16 @@ val RUN_ITEM: usize = 10;
 # the most bytes a set's run list takes: an item for at most every other sum
 val RUNS_MAX: usize = (COUNTS + 1) / 2 * RUN_ITEM;
 
-# append a set's sums in HROT form: values and a-b runs, comma separated
+# append a set's sums in HROT form: values and a-b runs, separated by sep
 # ---
 # buf:   the buffer
 # off:   where to append
 # m:     the set
 # limit: the offset the list must end by; one that would not ends in "..."
+# sep:   the separator, "," or ", "
 # ret:   the offset after it
-fun buf_runs(buf: *u8, off: usize, m: *Sums, limit: usize) usize {
+fun buf_runs(buf: *u8, off: usize, m: *Sums, limit: usize, sep: str) usize {
+    val item:  usize = RUN_ITEM - 1 + string.str_len(sep);
     var o:     usize = off;
     var n:     usize = 0;
     var first: bool  = true;
@@ -641,8 +643,8 @@ fun buf_runs(buf: *u8, off: usize, m: *Sums, limit: usize) usize {
         if (has(m, n) != 0) {
             var e: usize = n;
             for (e + 1 < COUNTS && has(m, e + 1) != 0) { e = e + 1; }
-            if (o + RUN_ITEM + 3 > limit) { ret text.buf_str(buf, o, "..."); }
-            if (!first)                   { o = text.buf_str(buf, o, ","); }
+            if (o + item + 3 > limit) { ret text.buf_str(buf, o, "..."); }
+            if (!first)               { o = text.buf_str(buf, o, sep); }
             o = text.buf_u64(buf, o, n::u64);
             if (e > n) {
                 o = text.buf_str(buf, o, "-");
@@ -654,6 +656,64 @@ fun buf_runs(buf: *u8, off: usize, m: *Sums, limit: usize) usize {
         n = n + 1;
     }
     ret o;
+}
+
+# the most bytes list writes, less its NUL: an item and its ", " for at most
+# every other sum, and room left for the "..." buf_runs would never need
+pub val LIST_MAX: usize = (COUNTS + 1) / 2 * (RUN_ITEM + 1) + 3;
+
+# write a set as the sum list the rule editor shows, values and a-b runs
+# separated by ", " like "34-45, 58", which list_parse reads back
+# ---
+# m:   the set
+# buf: at least LIST_MAX + 1 bytes
+# ret: buf
+pub fun list(m: *Sums, buf: *u8) str {
+    val o: usize = buf_runs(buf, 0, m, LIST_MAX, ", ");
+    buf[o] = 0;
+    ret buf;
+}
+
+# step past spaces
+fun blanks(s: str, i: *usize) {
+    for (s[@i] == ' ') { @i = @i + 1; }
+}
+
+# read a sum list, values and a-b runs separated by commas with spaces
+# anywhere between them, as list writes it; an empty list is the empty set
+# ---
+# s:    NUL-terminated text
+# most: the greatest sum the kernel reaches, at most SUM_MAX
+# ret:  the set, or what is wrong with s
+pub fun list_parse(s: str, most: usize) res[Sums, str] {
+    var m: Sums;
+    var i: usize = 0;
+    blanks(s, ?i);
+    if (s[i] == 0) { ret res[Sums, str].ok{m}; }
+    for {
+        var lo: usize = 0;
+        if (!count_at(s, ?i, ?lo)) { ret res[Sums, str].err{"a sum list holds sums and ranges, like 34-45, 58"}; }
+        var hi: usize = lo;
+        blanks(s, ?i);
+        if (s[i] == '-') {
+            i = i + 1;
+            blanks(s, ?i);
+            if (!count_at(s, ?i, ?hi)) { ret res[Sums, str].err{"a range needs a sum after -"}; }
+            blanks(s, ?i);
+        }
+        if (lo > hi)   { ret res[Sums, str].err{"a range runs from high to low"}; }
+        if (hi > most) { ret res[Sums, str].err{"a sum is above the most the kernel reaches"}; }
+        var n: usize = lo;
+        for (n <= hi) {
+            set(?m, n);
+            n = n + 1;
+        }
+        if (s[i] == 0)   { ret res[Sums, str].ok{m}; }
+        if (s[i] != ',') { ret res[Sums, str].err{"sums are separated by commas"}; }
+        i = i + 1;
+        blanks(s, ?i);
+    }
+    ret res[Sums, str].ok{m};
 }
 
 # the one run a count list holds, as lo and hi; ret false for none or several
@@ -716,9 +776,9 @@ fun range_format(k: *Kernel, buf: *u8) bool {
     }
     or {
         o = text.buf_str(buf, o, ",C0,S");
-        o = buf_runs(buf, o, ?k.survive, FORMAT_MAX);
+        o = buf_runs(buf, o, ?k.survive, FORMAT_MAX, ",");
         o = text.buf_str(buf, o, ",B");
-        o = buf_runs(buf, o, ?k.birth, FORMAT_MAX);
+        o = buf_runs(buf, o, ?k.birth, FORMAT_MAX, ",");
         if (n != 'M') {
             o      = text.buf_str(buf, o, ",N");
             buf[o] = n;
@@ -788,9 +848,9 @@ val DISPLAY_MAX: usize = 199;
 pub fun display(k: *Kernel, buf: *u8) str {
     if (!any_above(?k.birth, 8) && !any_above(?k.survive, 8)) { ret notation(k, buf); }
     var o: usize = text.buf_str(buf, 0, "B");
-    o      = buf_runs(buf, o, ?k.birth, DISPLAY_MAX / 2);
+    o      = buf_runs(buf, o, ?k.birth, DISPLAY_MAX / 2, ",");
     o      = text.buf_str(buf, o, "/S");
-    o      = buf_runs(buf, o, ?k.survive, DISPLAY_MAX);
+    o      = buf_runs(buf, o, ?k.survive, DISPLAY_MAX, ",");
     buf[o] = 0;
     ret buf;
 }
@@ -868,9 +928,9 @@ pub val STRUCTURE_MAX: usize = 16 + 2 * RUNS_MAX + FOOTPRINT * 12;
 pub fun structure(k: *Kernel, buf: *u8) str {
     var o: usize = text.buf_u64(buf, 0, k.radius::u64);
     o = text.buf_str(buf, o, " B");
-    o = buf_runs(buf, o, ?k.birth, STRUCTURE_MAX);
+    o = buf_runs(buf, o, ?k.birth, STRUCTURE_MAX, ",");
     o = text.buf_str(buf, o, " S");
-    o = buf_runs(buf, o, ?k.survive, STRUCTURE_MAX);
+    o = buf_runs(buf, o, ?k.survive, STRUCTURE_MAX, ",");
     var i: usize = 0;
     for (i < cells(k)) {
         buf[o] = ' ';
@@ -1967,6 +2027,44 @@ test display__names_wide_sets_as_runs_and_stops_short {
     val d: str = display(?wide, ?b[0]);
     if (string.str_len(d) > DISPLAY_MAX) { ret 3; }
     if (d[string.str_len(d) - 1] != '.') { ret 3; }
+    ret 0;
+}
+
+test list__writes_what_list_parse_reads {
+    var b: [LIST_MAX + 1]u8;
+    val r: res[Sums, str] = list_parse(" 34 - 45,58 ", 100);
+    if (!sel r.ok)                                                                                                       { ret 1; }
+    if (!string.str_equals(list(?r.ok, ?b[0]), "34-45, 58"))                                                             { ret 2; }
+    if (has(?r.ok, 33) != 0 || has(?r.ok, 34) == 0 || has(?r.ok, 45) == 0 || has(?r.ok, 46) != 0 || has(?r.ok, 58) == 0) { ret 3; }
+    val e: res[Sums, str] = list_parse("", 8);
+    if (!sel e.ok)                                  { ret 4; }
+    if (any_above(?e.ok, 0) || has(?e.ok, 0) != 0)  { ret 4; }
+    if (!string.str_equals(list(?e.ok, ?b[0]), "")) { ret 4; }
+    # every other sum of the widest footprint, the longest list, is written whole
+    var wide: Sums;
+    var n:    usize = 0;
+    for (n <= 1088) {
+        set(?wide, n);
+        n = n + 2;
+    }
+    val w: str = list(?wide, ?b[0]);
+    if (string.str_len(w) > LIST_MAX) { ret 5; }
+    val back: res[Sums, str] = list_parse(w, 1088);
+    if (!sel back.ok)                { ret 6; }
+    if (!same_sums(?back.ok, ?wide)) { ret 6; }
+    var bad: [6]str;
+    bad[0] = "45-34";
+    bad[1] = "3-";
+    bad[2] = "3,,4";
+    bad[3] = "101";
+    bad[4] = "3 4";
+    bad[5] = "3,";
+    var i: usize = 0;
+    for (i < 6) {
+        val x: res[Sums, str] = list_parse(bad[i], 100);
+        if (!sel x.err) { ret 10 + i::i32; }
+        i = i + 1;
+    }
     ret 0;
 }
 
