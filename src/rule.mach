@@ -24,7 +24,14 @@
 #   SAMPLE_COUNT, sample(i) str      rule strings the per-family tests run
 #
 # and a case of Rule and a line in each function below. a function that finds
-# no case for its rule panics, since every case is handled above it. word zero is always
+# no case for its rule panics, since every case is handled above it, and the
+# test that runs every function over every family's samples finds a missed line.
+#
+# changing a world's rule to one of another family re-encodes its cells: each
+# word becomes the new family's word for the state the old family reads in it,
+# word(new, state(old, c)), a state the new family lacks becoming state 1.
+# sim.set_rule must do this once a second family exists; while there is one,
+# the words already read alike. word zero is always
 # the quiescent background (see cellar.layout). a family whose rule does not
 # fit layout.RULE words, a rule table, needs a rule buffer of its own bound to
 # its stage, which boom's four storage bindings leave no room for yet.
@@ -35,6 +42,7 @@ use cellar.space;
 use std.system.panic;
 use std.types.bool.bool;
 use std.types.bool.false;
+use std.types.bool.true;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
@@ -325,5 +333,72 @@ test match_preset__names_a_preset_rule_and_nothing_else {
     val n: opt[usize] = match_preset(?r);
     if (sel n.some)                              { ret 2; }
     if (!string.str_equals(label(?r), "custom")) { ret 3; }
+    ret 0;
+}
+
+test dispatch__every_function_handles_every_family {
+    var own: [4096]u32;
+    var out: [4096]u32;
+    var buf: [1101]u8;
+    var win: [112]u32;
+    var f:   usize = 0;
+    for (f < FAMILIES) {
+        val named: opt[usize] = family_named(family_id(f));
+        if (sel named.none)  { ret 1; }
+        if (named.some != f) { ret 1; }
+        var len: usize = 0;
+        if (stage(f, ?len) == nil || len == 0) { ret 2; }
+        var n: usize = 0;
+        for (n < sample_count(f)) {
+            val got: res[Rule, str] = parse_as(f, sample(f, n));
+            if (sel got.err) { ret 3; }
+            var r: Rule = got.ok;
+            if (family_of(?r) != f || !same(?r, ?r)) { ret 4; }
+            val back: res[Rule, str] = parse_as(f, format(?r, ?buf[0]));
+            if (sel back.err)                 { ret 5; }
+            if (!same(?back.ok, ?r))          { ret 5; }
+            if (display(?r, ?buf[0])[0] == 0) { ret 6; }
+            # word 0 is the quiescent background, and every state survives a round trip
+            if (states(?r) < 2 || word(?r, 0) != 0 || state(?r, 0) != 0) { ret 7; }
+            var st: u32 = 0;
+            for (st < states(?r)) {
+                if (state(?r, word(?r, st)) != st) { ret 8; }
+                st = st + 1;
+            }
+            val sn: layout.Sense = sense(?r);
+            if (layout.live(0, sn.live_mask, sn.live_lo, sn.live_hi) != 0) { ret 9; }
+            if (radius(?r) == 0)                                           { ret 10; }
+            val c: Caps = caps(?r);
+            pack(?r, ?win[0]);
+            label(?r);
+            match_preset(?r);
+            # a busy step of an empty chunk alone leaves it empty unless the rule births on 0
+            var i: usize = 0;
+            for (i < 4096) {
+                own[i] = 0;
+                out[i] = 1;
+                i      = i + 1;
+            }
+            var b: space.Block;
+            var k: usize = 0;
+            for (k < 9) {
+                b.nb[k] = nil;
+                k       = k + 1;
+            }
+            b.nb[4] = ?own[0];
+            b.out   = ?out[0];
+            b.busy  = true;
+            var t: space.Tally = space.tally(sn);
+            step_chunk(?r, ?b, ?t);
+            i = 0;
+            for (!c.b0 && i < 4096) {
+                if (out[i] != 0) { ret 11; }
+                i = i + 1;
+            }
+            if (!c.b0 && t.live != 0) { ret 12; }
+            n = n + 1;
+        }
+        f = f + 1;
+    }
     ret 0;
 }
