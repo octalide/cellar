@@ -31,6 +31,8 @@ use gm:  boom.math;
 use cellar.kernel;
 use cellar.space;
 use allo: std.allocator;
+use std.chrono.time;
+use std.chrono.time.Instant;
 use std.collections.vector;
 use std.collections.vector.Vector;
 use mem: std.memory;
@@ -63,8 +65,14 @@ pub val SHADES: usize = 256;
 # generations one frame may record, leaving storage binding sets for the
 # census and the draw
 pub val MAX_STEPS: usize = 240;
-# cells a census that saw every live chunk surrounded leaves room to spread
-val REACH: u64 = 64;
+# cells a census that gave every live chunk the neighbours its cells lean towards
+# leaves room to spread: the census asks for a side when a live cell lies within
+# this many cells of it, and a cell further off cannot reach past it sooner
+val REACH: u64 = 32;
+# a frame this many microseconds apart from the last has missed its budget
+val SLOW_US: u64 = 24000;
+# generations the first uncapped frame asks for, before pacing has adapted it
+val FIRST_PACE: usize = 16;
 # censuses in flight a frame can look back over
 val RING: usize = 8;
 # dirty entries or chunks past which one stalled upload beats many recorded ones
@@ -184,6 +192,9 @@ rec Pool {
 # writes:   painted cells to upload
 # zeros:    slots to clear this frame
 # stamped:  slots whose stamps to set current this frame
+# pace:     generations the next uncapped frame asks for
+# last:     when the last uncapped frame was recorded
+# timed:    last holds an uncapped frame
 # head:     the meta header staged for upload
 pub rec Gpu {
     a:        *allo.Allocator;
@@ -213,12 +224,15 @@ pub rec Gpu {
     writes:   Vector[Write];
     zeros:    Vector[u32];
     stamped:  Vector[u32];
+    pace:     usize;
+    last:     Instant;
+    timed:    bool;
     head:     [96]u32;
 }
 
-# the census id's four words, then one packed word per slot
+# the census id's four words, then a packed word and a mask per slot
 fun status_bytes(cap: usize) usize {
-    ret 16 + cap * 4;
+    ret 16 + cap * 8;
 }
 
 # a packed census word's incarnation bits
@@ -349,6 +363,8 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     g.writes   = vector.init[Write](a);
     g.zeros    = vector.init[u32](a);
     g.stamped  = vector.init[u32](a);
+    g.pace     = FIRST_PACE;
+    g.timed    = false;
     # stamps start at zero, which neither of the first two serials matches
     g.serial = 2;
 
@@ -433,6 +449,44 @@ pub fun note_write(g: *Gpu, sp: *space.Space, s: usize, i: usize) {
     vector.push[u32](?g.stamped, s::u32);
 }
 
+# the generations an uncapped frame should ask for: as many as kept the frames
+# smooth so far, which the budget then limits
+pub fun stride(g: *Gpu) usize {
+    ret g.pace;
+}
+
+# adapt the stride to how the frames are running, once per uncapped frame
+#
+# a frame that arrives late after the last shrinks the stride, and one on time
+# that used everything it asked for grows it, so the GPU steps as many
+# generations as the frame budget holds
+# ---
+# g:     the GPU side
+# asked: generations the frame asked for
+# done:  generations it recorded
+pub fun tune(g: *Gpu, asked: usize, done: usize) {
+    val now: time.InstantClock = time.instant();
+    if (sel now.err) { ret; }
+    if (g.timed) {
+        val us: u64 = (time.instant_sub(now.ok, g.last) / 1000)::u64;
+        if (us > SLOW_US) {
+            g.pace = g.pace - g.pace / 4;
+            if (g.pace == 0) { g.pace = 1; }
+        }
+        or (done >= asked) {
+            g.pace = g.pace + g.pace / 8 + 1;
+            if (g.pace > MAX_STEPS) { g.pace = MAX_STEPS; }
+        }
+    }
+    g.last  = now.ok;
+    g.timed = true;
+}
+
+# forget the last uncapped frame's time, once stepping is no longer uncapped
+pub fun rest(g: *Gpu) {
+    g.timed = false;
+}
+
 # how many generations may be recorded before the next census lands
 # ---
 # g:      the GPU side
@@ -467,14 +521,14 @@ pub fun collect(g: *Gpu, sp: *space.Space) bool {
     # makes more than the pool holds, so bits that agree name the same chunk
     var s: usize = 0;
     for (s < n) {
-        val w:   u32  = g.p.got[4 + s];
+        val w:   u32  = g.p.got[4 + s * 2];
         val c:   *u32 = ?g.p.landed[s * space.CENSUS];
         val inc: u32  = space.incarnation(sp, s);
         c[0] = w & 0x1fff;
         c[1] = (w >> 13) & 1;
         c[2] = 0;
         if (inc != 0 && (w >> 14) == (inc & TAG)) { c[2] = inc; }
-        c[3] = 0;
+        c[3] = g.p.got[5 + s * 2];
         s    = s + 1;
     }
     val ok: bool = space.settle(sp, g.p.landed, n, snap.edits == g.edits);
