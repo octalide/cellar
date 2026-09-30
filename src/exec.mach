@@ -6,6 +6,7 @@
 
 use cellar.app;
 use cellar.command;
+use cellar.kernel;
 use cellar.paths;
 use cellar.pattern;
 use cellar.persist;
@@ -19,6 +20,7 @@ use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
+use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 
@@ -38,6 +40,46 @@ fun report(a: *app.App, ok: str, e: err[persist.Error]) {
         ret;
     }
     app.say(a, ok);
+}
+
+# the view a world file keeps, as the app holds it
+fun view_of(a: *app.App) persist.View {
+    ret persist.View{pan_x: a.pan_x, pan_y: a.pan_y, zoom: a.zoom, mode: a.mode::u8};
+}
+
+# show a world file's view, its zoom brought within the app's limits
+fun take_view(a: *app.App, v: *persist.View) {
+    a.pan_x = v.pan_x;
+    a.pan_y = v.pan_y;
+    a.zoom  = app.clamp_zoom(v.zoom);
+    a.mode  = v.mode::usize;
+}
+
+# save the world with the view, saying when its rule had to be left out
+fun save_world(a: *app.App, s: *sim.Sim, d: *Deps, path: str) {
+    var v:    persist.View       = view_of(a);
+    val done: err[persist.Error] = persist.save_world(d.a, s, ?v, path);
+    if (sel done.ok && !kernel.life_like(?s.kernel)) {
+        app.say(a, "world saved without its rule, which has no notation yet");
+        ret;
+    }
+    report(a, "world saved", done);
+}
+
+# load the world and the view it was saved with, saying when its rule could not be taken
+fun load_world(a: *app.App, s: *sim.Sim, d: *Deps, path: str) {
+    var v:    persist.View                       = view_of(a);
+    val done: res[persist.Loaded, persist.Error] = persist.load_world(d.a, s, ?v, path);
+    if (sel done.err) {
+        app.say(a, persist.error_message(done.err));
+        ret;
+    }
+    take_view(a, ?v);
+    if (done.ok.foreign) {
+        app.say(a, "world loaded, but its rule is not one cellar can run; the current rule is kept");
+        ret;
+    }
+    app.say(a, "world loaded");
 }
 
 # the file a command reads or writes, or false when no directory is known
@@ -62,12 +104,8 @@ fun apply(c: *command.Command, a: *app.App, s: *sim.Sim, d: *Deps) {
     if (sel c.rule)      { s.kernel = c.rule; }
 
     var path: [1088]u8;
-    if (sel c.save_world && file(d, paths.WORLD, ?path[0], a)) {
-        report(a, "world saved", persist.save_world(d.a, s, ?path[0]));
-    }
-    if (sel c.load_world && file(d, paths.WORLD, ?path[0], a)) {
-        report(a, "world loaded", persist.load_world(d.a, s, ?path[0]));
-    }
+    if (sel c.save_world && file(d, paths.WORLD, ?path[0], a)) { save_world(a, s, d, ?path[0]); }
+    if (sel c.load_world && file(d, paths.WORLD, ?path[0], a)) { load_world(a, s, d, ?path[0]); }
     if (sel c.save_pattern && file(d, paths.CUSTOM, ?path[0], a)) {
         report(a, "custom pattern saved", persist.save_pattern(d.a, ?a.custom, ?path[0]));
     }
@@ -110,6 +148,8 @@ test run__applies_in_order_and_a_save_sees_the_edits_before_it {
     app.submit(?ap, command.Command.line{command.Line{x0: 10, y0: 10, x1: 14, y1: 10, v: 1}});
     # the glider's five cells, stamped well clear of the rest
     app.stamp(?ap, ?ap.library[0], 0, 100, 100);
+    ap.pan_x = -40.5;
+    ap.zoom  = 99.0;
     app.submit(?ap, command.Command.save_world{});
     app.submit(?ap, command.Command.clear{});
     if (ap.queue.items.len != 5) { ret 2; }
@@ -117,10 +157,13 @@ test run__applies_in_order_and_a_save_sees_the_edits_before_it {
     if (ap.queue.items.len != 0) { ret 3; }
     if (sim.population(?s) != 0) { ret 4; }
 
+    ap.pan_x = 0.0;
     app.submit(?ap, command.Command.load_world{});
     run(?ap, ?s, ?d);
     if (sim.population(?s) != 11)                       { ret 5; }
     if (!sim.alive(?s, 1, 2) || !sim.alive(?s, 14, 10)) { ret 6; }
+    # the view comes back with it, its zoom within the app's limits
+    if (ap.pan_x != -40.5 || ap.zoom != app.ZOOM_MAX) { ret 7; }
 
     var path: [1088]u8;
     fs.remove_file(paths.file(?p, paths.WORLD, ?path[0]));

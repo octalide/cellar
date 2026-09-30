@@ -5,6 +5,9 @@
 # live cell a line "<cx> <cy>" with its signed chunk coordinates and 64 lines of
 # 64 cells, '1' live and '0' dead. a reader skips header keys it does not know,
 # so a newer file's fields do not stop an older cellar from reading its cells.
+# the keys are rule (B/S notation, written only for a rule it expresses whole),
+# generation, pan_x and pan_y (the view's centre), zoom and mode (the colour
+# mode by name). a key a file leaves out keeps what the reader already had.
 # a "cellar 2" file is the same without the header, and a file in the custom
 # pattern format, what every world was saved as before the world became
 # unbounded, loads centred on the origin. patterns are saved and loaded through
@@ -15,8 +18,10 @@ use gfx: boom.graphics;
 use cellar.format;
 use cellar.formats;
 use cellar.formats.adapt;
+use cellar.kernel;
 use cellar.paths;
 use cellar.pattern;
+use cellar.render;
 use cellar.sim;
 use cellar.space;
 use cellar.text;
@@ -28,10 +33,12 @@ use std.collections.vector.Vector;
 use fs:       std.filesystem;
 use io_error: std.io.error;
 use mem:      std.memory;
+use std.text.parse;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string;
@@ -55,6 +62,30 @@ val VERSION: u8 = '3';
 val OLDEST: u8 = '2';
 # bytes of one chunk record past its coordinate line
 val CHUNK_TEXT: usize = 64 * 65;
+# bytes reserved for a world file's first line and header
+val HEAD_MAX: usize = 512;
+# the longest header value read, less its NUL
+val VALUE_MAX: usize = 255;
+
+# how a world is being viewed, which a world file keeps beside its cells
+# ---
+# pan_x: world column at the view's centre
+# pan_y: world row at the view's centre
+# zoom:  zoom multiplier, render.BASE_PPC pixels per cell at 1
+# mode:  colour mode, a render.MODE_*
+pub rec View {
+    pan_x: f64;
+    pan_y: f64;
+    zoom:  f32;
+    mode:  u8;
+}
+
+# what a world load did beyond replacing the cells
+# ---
+# foreign: the file names a rule this cellar cannot run, so the rule was left as it was
+pub rec Loaded {
+    foreign: bool;
+}
 
 # why a save or load did not complete
 # ---
@@ -177,15 +208,63 @@ fun buf_i64(buf: *u8, off: usize, v: i64) usize {
     ret text.buf_u64(buf, off, v::u64);
 }
 
-# serialize the world's live chunks to path
+# the name a colour mode is saved as
+fun mode_name(m: u8) str {
+    if (m == render.MODE_HEAT) { ret "heat"; }
+    if (m == render.MODE_AGE)  { ret "age"; }
+    ret "solid";
+}
+
+# the colour mode a saved name stands for, or none for a name this version does not know
+fun mode_of(name: str) opt[u8] {
+    if (string.str_equals(name, "solid")) { ret opt[u8].some{render.MODE_SOLID}; }
+    if (string.str_equals(name, "heat"))  { ret opt[u8].some{render.MODE_HEAT}; }
+    if (string.str_equals(name, "age"))   { ret opt[u8].some{render.MODE_AGE}; }
+    ret opt[u8].none{};
+}
+
+# write the first line and the header of a world file into buf
+# ---
+# buf: at least HEAD_MAX bytes
+# s:   simulation whose rule and generation are written
+# v:   the view to keep with it
+# ret: the offset just past the blank line that ends the header
+fun write_header(buf: *u8, s: *sim.Sim, v: *View) usize {
+    var off: usize = text.buf_str(buf, 0, MAGIC);
+    buf[off] = VERSION;
+    off      = off + 1;
+    buf[off] = '\n';
+    off      = off + 1;
+    if (kernel.life_like(?s.kernel)) {
+        var rb: [200]u8;
+        off = text.buf_str(buf, off, "rule ");
+        off = text.buf_str(buf, off, kernel.notation(?s.kernel, ?rb[0]));
+        off = text.buf_str(buf, off, "\n");
+    }
+    off = text.buf_str(buf, off, "generation ");
+    off = text.buf_u64(buf, off, s.generation);
+    off = text.buf_str(buf, off, "\npan_x ");
+    off = text.buf_f64(buf, off, v.pan_x);
+    off = text.buf_str(buf, off, "\npan_y ");
+    off = text.buf_f64(buf, off, v.pan_y);
+    off = text.buf_str(buf, off, "\nzoom ");
+    off = text.buf_f64(buf, off, v.zoom::f64);
+    off = text.buf_str(buf, off, "\nmode ");
+    off = text.buf_str(buf, off, mode_name(v.mode));
+    ret text.buf_str(buf, off, "\n\n");
+}
+
+# serialize the world's live chunks, its rule, its generation and the view to path
 #
-# on the GPU the cells are read back first, a stall.
+# on the GPU the cells are read back first, a stall. a rule that is not
+# kernel.life_like has no notation yet, so it is left out.
 # ---
 # a:    allocator backing the transient buffer
 # s:    simulation whose world is saved
+# v:    the view to keep with it
 # path: destination file path
 # ret:  ok, or why the file was not written
-pub fun save_world(a: *allo.Allocator, s: *sim.Sim, path: str) err[Error] {
+pub fun save_world(a: *allo.Allocator, s: *sim.Sim, v: *View, path: str) err[Error] {
     val synced: err[gfx.Error] = sim.sync(s);
     if (sel synced.err) { ret err[Error].err{Error.gpu{}}; }
     val made: err[fs.FsError] = make_parent(a, path);
@@ -201,17 +280,12 @@ pub fun save_world(a: *allo.Allocator, s: *sim.Sim, path: str) err[Error] {
         }
         sl = sl + 1;
     }
-    val cap: usize                = HEADER_MAX + live * (HEADER_MAX + CHUNK_TEXT);
+    val cap: usize                = HEAD_MAX + live * (HEADER_MAX + CHUNK_TEXT);
     val rb:  res[*u8, allo.Error] = allo.allocate[u8](a, cap);
     if (sel rb.err) { ret err[Error].err{Error.alloc{rb.err}}; }
     val buf: *u8   = rb.ok;
-    var off: usize = text.buf_str(buf, 0, MAGIC);
-    buf[off]     = VERSION;
-    buf[off + 1] = '\n';
-    # no header fields yet, so the blank line that ends the header follows at once
-    buf[off + 2] = '\n';
-    off          = off + 3;
-    sl           = 0;
+    var off: usize = write_header(buf, s, v);
+    sl = 0;
     for (sl < sp.hi) {
         if (space.used(sp, sl) && sp.census[sl * space.CENSUS] != 0) {
             off      = buf_i64(buf, off, space.slot_x(sp, sl));
@@ -285,17 +359,82 @@ fun world_version(b: *Vector[u8]) u8 {
     ret v;
 }
 
-# step over a world file's header, from its first field to the blank line that ends it
+# what a world file's header says, each field only where the file names it
+# ---
+# ruled:      the file names a rule
+# rule:       the rule it names, when kernel.parse reads it
+# generation: the generation, 0 when the file names none
+# view:       the view, starting as the reader's own
+rec Head {
+    ruled:      bool;
+    rule:       opt[kernel.Kernel];
+    generation: u64;
+    view:       View;
+}
+
+# whether a float is neither infinite nor NaN
+fun finite(v: f64) bool {
+    ret v - v == 0.0;
+}
+
+# read a header value as a finite float
+fun value_f64(v: str, out: *f64) bool {
+    val r: res[f64, parse.ParseError] = parse.parse_f64_exact(v);
+    if (sel r.err)     { ret false; }
+    if (!finite(r.ok)) { ret false; }
+    @out = r.ok;
+    ret true;
+}
+
+# take one header field into h
+# ---
+# key: the field's key
+# v:   its value, NUL-terminated
+# h:   the header read so far
+# ret: false when a key this version reads holds a value it cannot
+fun field(key: str, v: str, h: *Head) bool {
+    if (string.str_equals(key, "rule")) {
+        h.ruled = true;
+        h.rule  = kernel.parse(v);
+        ret true;
+    }
+    if (string.str_equals(key, "generation")) {
+        val r: res[u64, parse.ParseError] = parse.parse_u64_exact(v, 10);
+        if (sel r.err) { ret false; }
+        h.generation = r.ok;
+        ret true;
+    }
+    if (string.str_equals(key, "pan_x")) { ret value_f64(v, ?h.view.pan_x); }
+    if (string.str_equals(key, "pan_y")) { ret value_f64(v, ?h.view.pan_y); }
+    if (string.str_equals(key, "zoom")) {
+        var z: f64 = 0.0;
+        if (!value_f64(v, ?z) || z <= 0.0) { ret false; }
+        h.view.zoom = z::f32;
+        ret true;
+    }
+    if (string.str_equals(key, "mode")) {
+        # a mode a later version adds is skipped like an unknown key
+        val m: opt[u8] = mode_of(v);
+        if (sel m.some) { h.view.mode = m.some; }
+        ret true;
+    }
+    ret true;
+}
+
+# read a world file's header, from its first field to the blank line that ends it
 #
-# every field is a line "<key> <value>" whose key starts with a letter. none is
-# read yet, and one this version does not know is skipped.
+# every field is a line "<key> <value>" whose key starts with a letter. a key
+# this version does not know is skipped.
 # ---
 # b:   the file contents
 # p:   the offset just past the first line
 # out: receives the offset of the first chunk record
-# ret: ok, truncated when the header never ends, or malformed for a line that is not a field
-fun skip_header(b: *Vector[u8], p: usize, out: *usize) err[Error] {
-    var o: usize = p;
+# h:   receives the fields the header names
+# ret: ok, truncated when the header never ends, or malformed for a line that
+#      is not a field or a field whose value cannot be read
+fun read_header(b: *Vector[u8], p: usize, out: *usize, h: *Head) err[Error] {
+    val bad: err[Error] = err[Error].err{Error.format{format.Error.malformed{}}};
+    var o:   usize      = p;
     for (true) {
         if (o >= b.len) { ret err[Error].err{Error.truncated{}}; }
         var e: usize = o;
@@ -305,7 +444,29 @@ fun skip_header(b: *Vector[u8], p: usize, out: *usize) err[Error] {
             ret err[Error].ok{};
         }
         val k: u8 = b.data[o] | 0x20;
-        if (k < 'a' || k > 'z') { ret err[Error].err{Error.format{format.Error.malformed{}}}; }
+        if (k < 'a' || k > 'z') { ret bad; }
+        var key: [32]u8;
+        var n:   usize = 0;
+        e = o;
+        for (e < b.len && b.data[e] != ' ' && b.data[e] != '\t' && b.data[e] != '\r' && b.data[e] != '\n') {
+            if (n < 31) { key[n] = b.data[e]; }
+            n = n + 1;
+            e = e + 1;
+        }
+        # no key this version reads is that long
+        if (n > 31) { n = 0; }
+        key[n] = 0;
+        for (e < b.len && (b.data[e] == ' ' || b.data[e] == '\t')) { e = e + 1; }
+        var end: usize = e;
+        for (end < b.len && b.data[end] != '\n') { end = end + 1; }
+        for (end > e && (b.data[end - 1] == ' ' || b.data[end - 1] == '\t' || b.data[end - 1] == '\r')) { end = end - 1; }
+        var value: [256]u8;
+        var len:   usize = end - e;
+        # a value too long for any field this version reads is read as none at all
+        if (len > VALUE_MAX) { len = 0; }
+        mem.raw_copy(?value[0], ?b.data[e], len);
+        value[len] = 0;
+        if (n > 0 && !field(?key[0], ?value[0], h)) { ret bad; }
         o = next_line(b, o);
     }
     ret err[Error].ok{};
@@ -378,30 +539,38 @@ fun read_pattern(a: *allo.Allocator, f: *format.Format, data: *Vector[u8], p: *p
 
 # read path and replace the world with what it holds
 #
-# the whole file is parsed before the world changes, so a refusal leaves the
-# world as it was.
+# the whole file is parsed before the world or the view changes, so a refusal
+# leaves both as they were. the file's rule replaces the simulation's when
+# kernel.parse reads it, and is otherwise left for the caller to report. the
+# generation is the file's, or 0 when it names none.
 # ---
 # a:    allocator for the read and parse buffers
 # s:    simulation to populate
+# v:    the view, taking the fields the file names and keeping the rest
 # path: source file path
-# ret:  ok, or why the world was not loaded
-pub fun load_world(a: *allo.Allocator, s: *sim.Sim, path: str) err[Error] {
+# ret:  what the load did beyond the cells, or why the world was not loaded
+pub fun load_world(a: *allo.Allocator, s: *sim.Sim, v: *View, path: str) res[Loaded, Error] {
     val rr: res[Vector[u8], fs.FsError] = fs.read_bytes(a, path);
-    if (sel rr.err) { ret err[Error].err{Error.fs{rr.err}}; }
+    if (sel rr.err) { ret res[Loaded, Error].err{Error.fs{rr.err}}; }
     var data: Vector[u8] = rr.ok;
 
-    val v: u8 = world_version(?data);
-    if (v != 0) {
+    val ver: u8 = world_version(?data);
+    if (ver != 0) {
         var start: usize = next_line(?data, 0);
-        if (v < OLDEST || v > VERSION) {
+        if (ver < OLDEST || ver > VERSION) {
             vector.dnit[u8](?data);
-            ret err[Error].err{Error.version{}};
+            ret res[Loaded, Error].err{Error.version{}};
         }
-        if (v >= '3') {
-            val head: err[Error] = skip_header(?data, start, ?start);
+        var h: Head;
+        h.ruled      = false;
+        h.rule       = opt[kernel.Kernel].none{};
+        h.generation = 0;
+        h.view       = @v;
+        if (ver >= '3') {
+            val head: err[Error] = read_header(?data, start, ?start, ?h);
             if (sel head.err) {
                 vector.dnit[u8](?data);
-                ret head;
+                ret res[Loaded, Error].err{head.err};
             }
         }
         var at:     Vector[i64] = vector.init[i64](a);
@@ -422,29 +591,33 @@ pub fun load_world(a: *allo.Allocator, s: *sim.Sim, path: str) err[Error] {
                 k = k + 1;
             }
             sim.fill_end(s);
+            s.generation = h.generation;
+            if (sel h.rule.some) { s.kernel = h.rule.some; }
+            @v = h.view;
         }
         vector.dnit[i64](?at);
         vector.dnit[u8](?cells);
-        ret parsed;
+        if (sel parsed.err) { ret res[Loaded, Error].err{parsed.err}; }
+        ret res[Loaded, Error].ok{Loaded{foreign: h.ruled && sel h.rule.none}};
     }
 
     # an old dense world is a custom pattern, centred on the origin
     var old: format.Format;
     if (!formats.by_id("custom", ?old)) {
         vector.dnit[u8](?data);
-        ret err[Error].err{Error.format{format.Error.unsupported{}}};
+        ret res[Loaded, Error].err{Error.format{format.Error.unsupported{}}};
     }
     var tmp:  pattern.Pattern;
     val made: err[allo.Error] = pattern.init(?tmp, a, 0, 0, "");
     if (sel made.err) {
         vector.dnit[u8](?data);
-        ret err[Error].err{Error.alloc{made.err}};
+        ret res[Loaded, Error].err{Error.alloc{made.err}};
     }
     val read: err[Error] = read_pattern(a, ?old, ?data, ?tmp);
     vector.dnit[u8](?data);
     if (sel read.err) {
         pattern.dnit(?tmp);
-        ret read;
+        ret res[Loaded, Error].err{read.err};
     }
     val ox: i64 = 0 - (tmp.w / 2)::i64;
     val oy: i64 = 0 - (tmp.h / 2)::i64;
@@ -460,7 +633,7 @@ pub fun load_world(a: *allo.Allocator, s: *sim.Sim, path: str) err[Error] {
     }
     sim.fill_end(s);
     pattern.dnit(?tmp);
-    ret err[Error].ok{};
+    ret res[Loaded, Error].ok{Loaded{foreign: false}};
 }
 
 # copy a pattern's name, rule and comments into an Info
@@ -586,38 +759,67 @@ pub fun load_pattern(a: *allo.Allocator, p: *pattern.Pattern, path: str) err[Err
     ret r;
 }
 
-test load_world__round_trips_a_sparse_world {
+# a live 2x2 block with its corner at (x, y), still under Life and HighLife alike
+#[testing]
+fun block(s: *sim.Sim, x: i64, y: i64) {
+    sim.paint(s, x, y, 1);
+    sim.paint(s, x + 1, y, 1);
+    sim.paint(s, x, y + 1, 1);
+    sim.paint(s, x + 1, y + 1, 1);
+}
+
+test load_world__round_trips_a_highlife_world_its_generation_and_view {
     var a: allo.Allocator;
     page.make(?a);
 
     var s:    sim.Sim;
     val made: err[allo.Error] = sim.init(?s, ?a);
     if (sel made.err) { ret 1; }
-    sim.paint(?s, 0, 0, 1);
-    sim.paint(?s, -5, 3, 1);
-    sim.paint(?s, 100000, -70000, 1);
+    s.kernel = kernel.highlife();
+    block(?s, 0, 0);
+    block(?s, 100000, -70000);
+    var i: usize = 0;
+    for (i < 4) {
+        sim.step(?s);
+        i = i + 1;
+    }
+    # two rows of three give the cell between them six neighbours, born under
+    # HighLife's B6 and not under Life
+    var x: i64 = 49;
+    for (x < 52) {
+        sim.paint(?s, x, 49, 1);
+        sim.paint(?s, x, 51, 1);
+        x = x + 1;
+    }
+    var v: View = View{pan_x: -12345.678901234567, pan_y: 0.1, zoom: 2.5, mode: render.MODE_HEAT};
 
     val path:  str        = "out/test/test_world.cellar";
-    val saved: err[Error] = save_world(?a, ?s, path);
+    val saved: err[Error] = save_world(?a, ?s, ?v, path);
     if (sel saved.err) { ret 2; }
-    val rr: res[Vector[u8], fs.FsError] = fs.read_bytes(?a, path);
-    if (sel rr.err) { ret 8; }
-    var head: Vector[u8] = rr.ok;
-    if (world_version(?head) != '3' || head.data[8] != '\n' || head.data[9] != '\n') { ret 9; }
-    vector.dnit[u8](?head);
 
+    # loaded while Life is active, into another view
     var t:     sim.Sim;
     val made2: err[allo.Error] = sim.init(?t, ?a);
     if (sel made2.err) { ret 3; }
     sim.paint(?t, 7, 7, 1);
-    val loaded: err[Error] = load_world(?a, ?t, path);
-    if (sel loaded.err) { ret 4; }
-
-    if (sim.population(?t) != 3)                               { ret 5; }
-    if (!sim.alive(?t, 0, 0) || !sim.alive(?t, -5, 3))         { ret 6; }
-    if (!sim.alive(?t, 100000, -70000) || sim.alive(?t, 7, 7)) { ret 7; }
-
+    var w:      View               = View{pan_x: 3.0, pan_y: 4.0, zoom: 1.0, mode: render.MODE_SOLID};
+    val loaded: res[Loaded, Error] = load_world(?a, ?t, ?w, path);
     fs.remove_file(path);
+    if (sel loaded.err)    { ret 4; }
+    if (loaded.ok.foreign) { ret 4; }
+
+    if (sim.population(?t) != 14)                               { ret 5; }
+    if (!sim.alive(?t, 0, 0) || !sim.alive(?t, 100001, -69999)) { ret 6; }
+    if (sim.alive(?t, 7, 7))                                    { ret 7; }
+    var hl: kernel.Kernel = kernel.highlife();
+    if (!kernel.same_rule(?t.kernel, ?hl) || t.generation != 4)       { ret 8; }
+    if (w.pan_x != v.pan_x || w.pan_y != v.pan_y || w.zoom != v.zoom) { ret 9; }
+    if (w.mode != render.MODE_HEAT)                                   { ret 10; }
+
+    # it runs as HighLife from the saved generation
+    sim.step(?t);
+    if (t.generation != 5 || !sim.alive(?t, 50, 50)) { ret 11; }
+
     sim.dnit(?s);
     sim.dnit(?t);
     ret 0;
@@ -638,7 +840,8 @@ test load_world__loads_an_old_dense_file_centred {
     var s:    sim.Sim;
     val made: err[allo.Error] = sim.init(?s, ?a);
     if (sel made.err) { ret 3; }
-    val loaded: err[Error] = load_world(?a, ?s, path);
+    var v:      View               = View{pan_x: 0.0, pan_y: 0.0, zoom: 1.0, mode: 0};
+    val loaded: res[Loaded, Error] = load_world(?a, ?s, ?v, path);
     fs.remove_file(path);
     if (sel loaded.err)                                 { ret 4; }
     if (sim.population(?s) != 2)                        { ret 5; }
@@ -729,7 +932,8 @@ test load_world__short_body_leaves_the_world_intact {
     val wrote: err[fs.FsError] = fs.write_bytes(path, ?body[0], 9, FILE_MODE);
     if (sel wrote.err) { ret 3; }
 
-    val loaded: err[Error] = load_world(?a, ?s, path);
+    var v:      View               = View{pan_x: 0.0, pan_y: 0.0, zoom: 1.0, mode: 0};
+    val loaded: res[Loaded, Error] = load_world(?a, ?s, ?v, path);
     fs.remove_file(path);
     if (!sel loaded.err)           { ret 4; }
     if (!sel loaded.err.truncated) { ret 5; }
@@ -797,7 +1001,7 @@ fun chunk_text(out: *Vector[u8], rec_line: str, first: str) {
 
 # load a world file of a header and one chunk at (-1, 2) whose first row starts "101"
 #[testing]
-fun load_versioned(a: *allo.Allocator, s: *sim.Sim, path: str, head: str) err[Error] {
+fun load_versioned(a: *allo.Allocator, s: *sim.Sim, v: *View, path: str, head: str) res[Loaded, Error] {
     var body: Vector[u8] = vector.init[u8](a);
     var i:    usize      = 0;
     for (head[i] != 0) {
@@ -807,40 +1011,60 @@ fun load_versioned(a: *allo.Allocator, s: *sim.Sim, path: str, head: str) err[Er
     chunk_text(?body, "-1 2\n", "101");
     vector.push[u8](?body, 0);
     val dir: err[fs.FsError] = fs.create_dir_all(a, TEST_DIR, DIR_MODE);
-    if (sel dir.err) { ret err[Error].err{Error.fs{dir.err}}; }
+    if (sel dir.err) { ret res[Loaded, Error].err{Error.fs{dir.err}}; }
     val wrote: err[fs.FsError] = fs.write_bytes(path, body.data, body.len - 1, FILE_MODE);
     vector.dnit[u8](?body);
-    if (sel wrote.err) { ret err[Error].err{Error.fs{wrote.err}}; }
-    val r: err[Error] = load_world(a, s, path);
+    if (sel wrote.err) { ret res[Loaded, Error].err{Error.fs{wrote.err}}; }
+    val r: res[Loaded, Error] = load_world(a, s, v, path);
     fs.remove_file(path);
     ret r;
 }
 
-test load_world__reads_cellar_2_and_skips_unknown_cellar_3_fields {
+test load_world__reads_cellar_2_and_every_cellar_3_header {
     var a: allo.Allocator;
     page.make(?a);
     var s:    sim.Sim;
     val made: err[allo.Error] = sim.init(?s, ?a);
     if (sel made.err) { ret 1; }
+    var v:  View          = View{pan_x: 1.5, pan_y: -2.5, zoom: 3.0, mode: render.MODE_AGE};
+    var lf: kernel.Kernel = kernel.life();
+    var hl: kernel.Kernel = kernel.highlife();
 
     # a 0.3.0 world
-    val two: err[Error] = load_versioned(?a, ?s, "out/test/test_v2.cellar", "cellar 2\n");
+    val two: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v2.cellar", "cellar 2\n");
     if (sel two.err)                                         { ret 2; }
     if (sim.population(?s) != 2 || !sim.alive(?s, -64, 128)) { ret 3; }
     if (!sim.alive(?s, -62, 128) || sim.alive(?s, -63, 128)) { ret 4; }
 
-    # fields a later version adds are skipped
-    val three: err[Error] = load_versioned(?a, ?s, "out/test/test_v3.cellar", "cellar 3\r\nrule B36/S23\ngeneration 12\n\r\n");
-    if (sel three.err)                                       { ret 5; }
-    if (sim.population(?s) != 2 || !sim.alive(?s, -64, 128)) { ret 6; }
+    # a header with no keys loads the cells and leaves the rule and view alone
+    s.generation = 9;
+    val bare: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v3_bare.cellar", "cellar 3\n\n");
+    if (sel bare.err)                                                                    { ret 5; }
+    if (bare.ok.foreign || sim.population(?s) != 2 || s.generation != 0)                 { ret 5; }
+    if (!kernel.same_rule(?s.kernel, ?lf) || v.zoom != 3.0 || v.mode != render.MODE_AGE) { ret 5; }
 
-    # a version from the future, and a header that never ends, are refused untouched
-    val four: err[Error] = load_versioned(?a, ?s, "out/test/test_v4.cellar", "cellar 4\n\n");
-    if (!sel four.err)         { ret 7; }
-    if (!sel four.err.version) { ret 7; }
-    val open: err[Error] = load_versioned(?a, ?s, "out/test/test_v3_open.cellar", "cellar 3\nrule B3/S23\n");
-    if (!sel open.err)           { ret 8; }
-    if (sim.population(?s) != 2) { ret 9; }
+    # keys are read in any case of line ending, and keys a later version adds are skipped
+    val three: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v3.cellar", "cellar 3\r\nrule b36/s23\r\ngeneration 12\nlater stuff\nmode glow\npan_y 7.25\n\r\n");
+    if (sel three.err)                                                  { ret 6; }
+    if (three.ok.foreign || !sim.alive(?s, -64, 128))                   { ret 6; }
+    if (!kernel.same_rule(?s.kernel, ?hl) || s.generation != 12)        { ret 6; }
+    if (v.pan_y != 7.25 || v.pan_x != 1.5 || v.mode != render.MODE_AGE) { ret 6; }
+
+    # a rule cellar cannot run loads the world with the rule as it was
+    val odd: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v3_odd.cellar", "cellar 3\nrule B3/S23:T20,30\ngeneration 3\n\n");
+    if (sel odd.err)                                                               { ret 7; }
+    if (!odd.ok.foreign || !kernel.same_rule(?s.kernel, ?hl) || s.generation != 3) { ret 7; }
+
+    # a version from the future, a header that never ends, and a value that
+    # cannot be read, are refused untouched
+    val four: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v4.cellar", "cellar 4\n\n");
+    if (!sel four.err)         { ret 8; }
+    if (!sel four.err.version) { ret 8; }
+    val open: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v3_open.cellar", "cellar 3\nrule B3/S23\n");
+    if (!sel open.err) { ret 9; }
+    val nan: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v3_nan.cellar", "cellar 3\nzoom nan\n\n");
+    if (!sel nan.err)                                 { ret 10; }
+    if (sim.population(?s) != 2 || s.generation != 3) { ret 11; }
     sim.dnit(?s);
     ret 0;
 }
@@ -873,7 +1097,8 @@ test migrate__moves_0_3_0_saves_off_cells {
     var s:    sim.Sim;
     val made: err[allo.Error] = sim.init(?s, ?a);
     if (sel made.err) { ret 6; }
-    val world: err[Error] = load_world(?a, ?s, ?nw[0]);
+    var v:     View               = View{pan_x: 0.0, pan_y: 0.0, zoom: 1.0, mode: 0};
+    val world: res[Loaded, Error] = load_world(?a, ?s, ?v, ?nw[0]);
     if (sel world.err)           { ret 7; }
     if (sim.population(?s) != 2) { ret 7; }
 
