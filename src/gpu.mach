@@ -576,6 +576,54 @@ pub fun pull(g: *Gpu, sp: *space.Space) err[gfx.Error] {
     ret err[gfx.Error].ok{};
 }
 
+# read the GPU's cells of a run of slots into the host's staging cells, ahead
+# of an edit that writes the slots' cells whole
+#
+# a stall. a slot whose staging is newer than the GPU's keeps it. painted cells
+# not yet uploaded for the run's slots are applied to the staging and dropped,
+# since the edit uploads the slots whole and a late replay would undo it. call
+# outside a frame, or in one before frame has recorded anything.
+# ---
+# g:   the GPU side
+# sp:  the host's pool
+# lo:  first slot of the run
+# n:   slots in the run
+# ret: ok, or why the read failed
+pub fun pull_chunks(g: *Gpu, sp: *space.Space, lo: usize, n: usize) err[gfx.Error] {
+    if (!g.stepping) { ret err[gfx.Error].ok{}; }
+    var top: usize = lo + n;
+    if (g.hi < top)  { top = g.hi; }
+    if (sp.hi < top) { top = sp.hi; }
+    val newer: u8    = space.DIRTY_CELLS | space.DIRTY_ZERO;
+    var s:     usize = lo;
+    for (s < top) {
+        if ((sp.dirty[s] & newer) != 0) {
+            s = s + 1;
+            cnt;
+        }
+        var run: usize = 1;
+        for (s + run < top && (sp.dirty[s + run] & newer) == 0) { run = run + 1; }
+        val e: err[gfx.Error] = gfx.storage_buffer_read(g.d, ?g.p.cells[g.front], s * space.CELLS * 4,
+            (?sp.cells[s * space.CELLS])::*u8, run * space.CELLS * 4);
+        if (sel e.err) { ret e; }
+        s = s + run;
+    }
+    var keep: usize = 0;
+    var i:    usize = 0;
+    for (i < g.writes.len) {
+        val w:    Write = g.writes.data[i];
+        val slot: usize = w.at::usize / space.CELLS;
+        if (slot >= lo && slot < lo + n) { sp.cells[w.at::usize] = w.v; }
+        or {
+            g.writes.data[keep] = w;
+            keep                = keep + 1;
+        }
+        i = i + 1;
+    }
+    g.writes.len = keep;
+    ret err[gfx.Error].ok{};
+}
+
 # upload a run of whole chunks, stalled or recorded
 fun upload_cells(g: *Gpu, sp: *space.Space, s: usize, n: usize, stall: bool) err[gfx.Error] {
     val at:  usize = s * space.CELLS * 4;
