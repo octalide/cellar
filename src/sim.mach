@@ -134,19 +134,19 @@ pub fun attach(s: *Sim, g: *gpu.Gpu) {
 # ---
 # s: simulation
 pub fun step(s: *Sim) {
+    if (s.full) { ret; }
     if (on_gpu(s)) {
         if (s.pending < MAX_PENDING) { s.pending = s.pending + 1; }
         ret;
     }
-    if (s.full)                                  { ret; }
     if (!cpu.step(?s.space, ?s.kernel, ?s.team)) { overflow(s); }
     s.generation = s.generation + 1;
 }
 
-# stop for good once a chunk the world needs could not be made: a pattern
-# reaching past the pool would be stepped as if it met dead space
+# stop until the world is cleared once a chunk it needs could not be made: a
+# pattern reaching past the pool would be stepped as if it met dead space.
+# the simulation only holds the state, and the game layer reports it.
 fun overflow(s: *Sim) {
-    if (!s.full) { print.eprintln("the world outgrew its pool of chunks; stepping stopped"); }
     s.full    = true;
     s.running = 0;
     s.pending = 0;
@@ -172,9 +172,9 @@ pub fun collect(s: *Sim) {
 # ret:      ok, or why the frame could not be recorded
 pub fun record(s: *Sim, uncapped: bool, look: *gpu.Look) err[gfx.Error] {
     var want: usize = s.pending;
-    val fast: bool  = uncapped && s.running != 0 && on_gpu(s);
-    if (fast)       { want = gpu.stride(s.gpu); }
-    if (!on_gpu(s)) { want = 0; }
+    val fast: bool  = uncapped && s.running != 0 && on_gpu(s) && !s.full;
+    if (fast)                 { want = gpu.stride(s.gpu); }
+    if (!on_gpu(s) || s.full) { want = 0; }
     val done: res[usize, gfx.Error] = gpu.frame(s.gpu, ?s.space, ?s.kernel, want, look);
     if (sel done.err) { ret err[gfx.Error].err{done.err}; }
     s.generation = s.generation + done.ok::u64;
@@ -495,7 +495,33 @@ pub fun population(s: *Sim) usize {
 # ---
 # s: simulation
 pub fun toggle_running(s: *Sim) {
+    if (s.full) {
+        s.running = 0;
+        ret;
+    }
     s.running = 1 - s.running;
+}
+
+test overflow__gates_step_and_running_until_clear {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    Sim;
+    val made: err[allo.Error] = init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    paint(?s, 0, 0, 1);
+    toggle_running(?s);
+    if (s.running != 1) { ret 2; }
+    overflow(?s);
+    if (!s.full || s.running != 0) { ret 3; }
+    val gen: u64 = s.generation;
+    step(?s);
+    toggle_running(?s);
+    if (s.generation != gen || s.running != 0) { ret 4; }
+    clear(?s);
+    toggle_running(?s);
+    if (s.full || s.running != 1) { ret 5; }
+    dnit(?s);
+    ret 0;
 }
 
 test step__blinker_oscillates_with_period_two {
