@@ -30,6 +30,9 @@ use cellar.paths;
 use cellar.pattern;
 use cellar.render;
 use cellar.rule;
+use ruletable: cellar.rules.table;
+use cellar.rules.table.load;
+use cellar.rules.table.store;
 use cellar.rules.weighted;
 use cellar.sim;
 use cellar.space;
@@ -94,11 +97,14 @@ pub rec View {
 # ---
 # world:   it was a world file, which replaced the world, rather than a pattern stamped onto it
 # foreign: the file names a rule this cellar cannot run, so the rule was left as it was
-# box:     the cells a stamped pattern covers, none for a world or an empty pattern
+# box:     the cells a stamped pattern covers, none for a world, an empty pattern or a rule
+# stray:   it was a .rule file whose copy into the data directory failed, so
+#          its name resolves only for the rest of the session
 pub rec Opened {
     world:   bool;
     foreign: bool;
     box:     opt[space.Box];
+    stray:   bool;
 }
 
 # what a world load did beyond replacing the cells
@@ -126,6 +132,7 @@ pub tag Error: u8 {
     version;
     gpu;
     format: format.Error;
+    rule:   load.Fault;
 }
 
 # a one-line description of a persistence failure
@@ -139,6 +146,7 @@ pub fun error_message(e: Error) str {
     if (sel e.version)    { ret "version mismatch"; }
     if (sel e.gpu)        { ret "GPU read failed"; }
     if (sel e.format)     { ret format.error_message(e.format); }
+    if (sel e.rule)       { ret e.rule.why; }
     if (sel e.fs) {
         if (sel e.fs.io) { ret io_error.kind_name(e.fs.io.kind); }
     }
@@ -791,13 +799,16 @@ fun stamp_from(a: *allo.Allocator, s: *sim.Sim, data: *Vector[u8]) res[Opened, E
     }
     format.info_dnit(?info);
     if (sel r.err) { ret res[Opened, Error].err{from_format(r.err)}; }
-    ret res[Opened, Error].ok{Opened{world: false, foreign: foreign, box: box}};
+    ret res[Opened, Error].ok{Opened{world: false, foreign: foreign, box: box, stray: false}};
 }
 
 # open a file of any kind cellar reads, dispatching on its bytes
 #
 # a world file (its first line "cellar <version>") replaces the world and the
-# view, as load_world does. anything else is read as a pattern in the format the
+# view, as load_world does. a Golly .rule file (its first line "@RULE <name>")
+# becomes the world's rule, on the grid the world runs on, and is copied into
+# the data directory (cellar.rules.table.store). anything else is read as a
+# pattern in the format the
 # registry detects and stamped onto the world centred on the origin, its rule
 # replacing the simulation's when a rule family reads it. the whole file is
 # validated first, so a refusal leaves the world, the rule and the view as they
@@ -826,14 +837,35 @@ pub fun open_file(a: *allo.Allocator, s: *sim.Sim, v: *View, path: str) res[Open
 # data: the file's bytes
 # ret:  what the file was and did, or why nothing was loaded
 pub fun open_bytes(a: *allo.Allocator, s: *sim.Sim, v: *View, data: *Vector[u8]) res[Opened, Error] {
-    if (world_version(data) != 0) { ret opened_world(world_from(a, s, v, data)); }
+    if (world_version(data) != 0)       { ret opened_world(world_from(a, s, v, data)); }
+    if (rule_file(data.data, data.len)) { ret rule_from(s, data); }
     ret stamp_from(a, s, data);
+}
+
+# whether bytes are a Golly .rule file: the first line holding more than blanks
+# begins "@RULE"
+pub fun rule_file(p: *u8, n: usize) bool {
+    var i: usize = 0;
+    for (i < n && (p[i] == ' ' || p[i] == '\t' || p[i] == '\r' || p[i] == '\n')) { i = i + 1; }
+    ret n - i >= 5 && string.str_region_equals(?p[i], 0, 5, "@RULE");
+}
+
+# run a .rule file's rule on the world as it stands, on its grid, and copy the
+# file into the data directory, where a rule string naming it is looked up in
+# later sessions (cellar.rules.table.store)
+fun rule_from(s: *sim.Sim, data: *Vector[u8]) res[Opened, Error] {
+    val kept: res[u32, load.Fault] = store.intern(data.data, data.len);
+    if (sel kept.err) { ret res[Opened, Error].err{Error.rule{kept.err}}; }
+    val r:      rule.Rule = rule.Rule{kind: rule.Kind.table{ruletable.Rule{id: kept.ok}}, grid: s.rule.grid};
+    val stray:  bool      = !store.install(kept.ok, data.data, data.len);
+    val closed: bool      = !sim.set_rule(s, r);
+    ret res[Opened, Error].ok{Opened{world: false, foreign: closed, box: opt[space.Box].none{}, stray: stray}};
 }
 
 # a world load's outcome as an open's
 fun opened_world(w: res[Loaded, Error]) res[Opened, Error] {
     if (sel w.err) { ret res[Opened, Error].err{w.err}; }
-    ret res[Opened, Error].ok{Opened{world: true, foreign: w.ok.foreign, box: opt[space.Box].none{}}};
+    ret res[Opened, Error].ok{Opened{world: true, foreign: w.ok.foreign, box: opt[space.Box].none{}, stray: false}};
 }
 
 # copy a pattern's name, rule and comments into an Info
@@ -1488,5 +1520,69 @@ test load_world__reads_a_cellar_4_rule_by_its_family {
     val big: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v4_big.cellar", "cellar 4\nstates 300\n\n");
     if (!sel big.err) { ret 9; }
     sim.dnit(?s);
+    ret 0;
+}
+
+test open_file__runs_a_rule_file_and_installs_it_where_its_name_is_looked_up {
+    var a: allo.Allocator;
+    page.make(?a);
+    val data:  str             = "out/test/rule_open/data";
+    val away:  str             = "out/test/rule_open/away";
+    val made1: err[fs.FsError] = fs.create_dir_all(?a, data, DIR_MODE);
+    val made2: err[fs.FsError] = fs.create_dir_all(?a, away, DIR_MODE);
+    if (sel made1.err || sel made2.err) { ret 1; }
+    fs.remove_file("out/test/rule_open/data/Spin.rule");
+    store.search(data);
+
+    # a live cell turns to the next of three live states, and one beside a
+    # state 3 cell is born
+    val text: str             = "@RULE Spin\n@TABLE\nn_states:4\nneighborhood:vonNeumann\nsymmetries:rotate4\n1,a,b,c,d,2\n2,a,b,c,d,3\n3,a,b,c,d,1\n0,3,0,0,0,1\nvar a={0,1,2,3}\n";
+    val path: str             = "out/test/rule_open/away/Spin.rule";
+    val w1:   err[fs.FsError] = fs.write_bytes(path, text::*u8, string.str_len(text), FILE_MODE);
+    if (sel w1.err) { ret 2; }
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 3; }
+    var v: View = View{pan_x: 0.0, pan_y: 0.0, zoom: 1.0, mode: 0};
+
+    # variables must come before the transitions naming them, so the file is
+    # refused at the line that names one first, and the rule is kept
+    val bad: res[Opened, Error] = open_file(?a, ?s, ?v, path);
+    if (!sel bad.err || rule.family_of(?s.rule) != 0) { ret 4; }
+    if (sel bad.err) {
+        if (!sel bad.err.rule) { ret 5; }
+        if (sel bad.err.rule) {
+            if (bad.err.rule.line != 6) { ret 5; }
+        }
+    }
+
+    val good: str             = "@RULE Spin\n@TABLE\nn_states:4\nneighborhood:vonNeumann\nsymmetries:rotate4\nvar a={0,1,2,3}\nvar b=a\nvar c=a\nvar d=a\n1,a,b,c,d,2\n2,a,b,c,d,3\n3,a,b,c,d,1\n0,3,0,0,0,1\n";
+    val w2:   err[fs.FsError] = fs.write_bytes(path, good::*u8, string.str_len(good), FILE_MODE);
+    if (sel w2.err) { ret 6; }
+    val opened: res[Opened, Error] = open_file(?a, ?s, ?v, path);
+    if (sel opened.err)                                          { ret 7; }
+    if (opened.ok.world || opened.ok.foreign || opened.ok.stray) { ret 8; }
+    var buf: [rule.FORMAT_MAX + 1]u8;
+    if (rule.family_of(?s.rule) != 2 || !string.str_equals(rule.format(?s.rule, ?buf[0]), "Spin")) { ret 9; }
+
+    # the file was copied where its name is looked up, and the name gives the
+    # same rule back, as a pattern naming it takes it
+    if (!present("out/test/rule_open/data/Spin.rule")) { ret 10; }
+    val again: res[rule.Rule, str] = rule.parse("Spin");
+    if (sel again.err)                  { ret 11; }
+    if (!rule.same(?again.ok, ?s.rule)) { ret 11; }
+    sim.set_rule(?s, rule.preset_rule(0));
+    val rle: str             = "x = 2, y = 1, rule = Spin\nAC!\n";
+    val pat: str             = "out/test/rule_open/away/spin.rle";
+    val w3:  err[fs.FsError] = fs.write_bytes(pat, rle::*u8, string.str_len(rle), FILE_MODE);
+    if (sel w3.err) { ret 12; }
+    val stamped: res[Opened, Error] = open_file(?a, ?s, ?v, pat);
+    if (sel stamped.err || !rule.same(?again.ok, ?s.rule)) { ret 13; }
+    if (sel stamped.ok && stamped.ok.foreign)              { ret 13; }
+    if (sim.population(?s) != 2)                           { ret 14; }
+    sim.dnit(?s);
+    fs.remove_file(path);
+    fs.remove_file(pat);
+    fs.remove_file("out/test/rule_open/data/Spin.rule");
     ret 0;
 }
