@@ -3,8 +3,9 @@
 #
 # edits a copy of the simulation's rule and submits it as a command: a preset
 # quick-load for any family, and for a weighted kernel a radius stepper, a
-# clickable weight grid where each cell cycles its integer weight, and birth
-# and survive toggles over every reachable weighted sum.
+# clickable weight grid where each cell cycles its integer weight, from 0 up
+# to MAXW and then from -MAXW back up to 0, and birth and survive toggles over
+# every reachable weighted sum.
 
 use cellar.app;
 use cellar.command;
@@ -23,7 +24,7 @@ use std.types.option.opt;
 use std.types.size.usize;
 use std.types.string.str;
 
-# weights cycle through 0..MAXW on click
+# weights cycle through 0..MAXW, then -MAXW..-1, on click
 val MAXW: i32 = 4;
 # largest unscaled weight-grid cell and sum toggle
 val CELL: f32 = 28.0;
@@ -32,7 +33,7 @@ val TOG:  f32 = 26.0;
 # zero every footprint weight
 fun clear_weights(k: *kernel.Kernel) {
     var i: usize = 0;
-    for (i < 81) {
+    for (i < kernel.FOOTPRINT) {
         k.weights[i] = 0;
         i            = i + 1;
     }
@@ -51,6 +52,20 @@ fun moore_ones(k: *kernel.Kernel) {
         }
         dy = dy + 1;
     }
+}
+
+# the weight a click moves a cell to: up to MAXW, then over to -MAXW and up
+# to 0; a weight past MAXW either way, typed in the rule string, goes to 0
+fun cycle(w: i32) i32 {
+    if (w == MAXW)                { ret 0 - MAXW; }
+    if (w > MAXW || w < 0 - MAXW) { ret 0; }
+    ret w + 1;
+}
+
+# how strongly a weight of magnitude m is shaded, up to 1 at MAXW
+fun shade(m: i32) f32 {
+    if (m >= MAXW) { ret 1.0; }
+    ret m::f32 / MAXW::f32;
 }
 
 # the clickable weight grid, centred in the column
@@ -75,19 +90,20 @@ fun weights(u: *ui.Ui, k: *kernel.Kernel) bool {
             val wv:  i32    = kernel.weight_at(k, dx, dy);
             ui.rect(u, cx0, cy0, cx1, cy1, ui.fill(hh, false), 1.0);
             if (wv > 0) {
-                ui.rect(u, cx0, cy0, cx1, cy1, theme.ACCENT, 0.2 + 0.8 * wv::f32 / MAXW::f32);
+                ui.rect(u, cx0, cy0, cx1, cy1, theme.ACCENT, 0.2 + 0.8 * shade(wv));
+            }
+            or (wv < 0) {
+                ui.rect(u, cx0, cy0, cx1, cy1, theme.WARN, 0.2 + 0.8 * shade(0 - wv));
             }
             if (dx == 0 && dy == 0) { ui.frame(u, cx0, cy0, cx1, cy1, ui.px(u, 1.0), theme.TEXT_DIM, 1.0); }
-            var digit: [2]u8;
-            digit[0] = '0' + wv::u8;
-            digit[1] = 0;
+            var num: [24]u8;
+            num[text.buf_i64(?num[0], 0, wv::i64)] = 0;
             var ink: u32 = theme.TEXT_FAINT;
-            if (wv > 0) { ink = theme.ACCENT_INK; }
-            ui.text_centre(u, u.small, ?digit[0], cx0, cy0, cx1, cy1, ink, 1.0);
+            if (wv != 0) { ink = theme.ACCENT_INK; }
+            # a label wider than its cell is left out, as on a wide footprint
+            if (ui.measure(u.small, ?num[0]) <= c) { ui.text_centre(u, u.small, ?num[0], cx0, cy0, cx1, cy1, ink, 1.0); }
             if (hh.clicked) {
-                var nv: i32 = wv + 1;
-                if (nv > MAXW) { nv = 0; }
-                kernel.set_weight(k, dx, dy, nv);
+                kernel.set_weight(k, dx, dy, cycle(wv));
                 ed = true;
             }
             dx = dx + 1;
@@ -98,8 +114,8 @@ fun weights(u: *ui.Ui, k: *kernel.Kernel) bool {
     ret ed;
 }
 
-# one labelled, wrapping row of sum toggles over a mask
-fun sums(u: *ui.Ui, label: str, mask: *u64, most: i32) bool {
+# one labelled, wrapping row of sum toggles over a set
+fun sums(u: *ui.Ui, label: str, m: *kernel.Sums, most: i32) bool {
     ui.note(u, label);
     val g:   f32   = ui.px(u, 3.0);
     var t:   f32   = ui.px(u, TOG);
@@ -112,16 +128,16 @@ fun sums(u: *ui.Ui, label: str, mask: *u64, most: i32) bool {
     for (i < count) {
         val x0: f32    = u.x + (i % per)::f32 * (t + g);
         val y0: f32    = u.y + (i / per)::f32 * (t + g);
-        val on: bool   = kernel.has_bit(@mask, i) != 0;
+        val on: bool   = kernel.has(m, i) != 0;
         val hh: ui.Hit = ui.region(u, x0, y0, x0 + t, y0 + t);
         ui.rect(u, x0, y0, x0 + t, y0 + t, ui.fill(hh, on), 1.0);
-        var num: [4]u8;
+        var num: [8]u8;
         val o:   usize = text.buf_u64(?num[0], 0, i::u64);
         num[o] = 0;
         ui.text_centre(u, u.small, ?num[0], x0, y0, x0 + t, y0 + t, ui.ink(on), 1.0);
         if (hh.clicked) {
-            @mask = kernel.toggle_bit(@mask, i);
-            ed    = true;
+            kernel.toggle(m, i);
+            ed = true;
         }
         i = i + 1;
     }
@@ -239,4 +255,23 @@ fun kernel_editor(u: *ui.Ui, k: *kernel.Kernel) bool {
     if (sums(u, "Birth", ?k.birth, most))     { ed = true; }
     if (sums(u, "Survive", ?k.survive, most)) { ed = true; }
     ret ed;
+}
+
+test cycle__runs_through_every_weight_negatives_included {
+    var seen: [9]bool;
+    var w:    i32   = 0;
+    var i:    usize = 0;
+    for (i < 9) {
+        seen[(w + MAXW)::usize] = true;
+        w                       = cycle(w);
+        i                       = i + 1;
+    }
+    if (w != 0) { ret 1; }
+    i = 0;
+    for (i < 9) {
+        if (!seen[i]) { ret 2; }
+        i = i + 1;
+    }
+    if (cycle(MAXW) != 0 - MAXW || cycle(-1) != 0 || cycle(99) != 0) { ret 3; }
+    ret 0;
 }

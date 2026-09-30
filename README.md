@@ -15,9 +15,11 @@ core by chunk. boom owns the window, input, Vulkan renderer and frame loop; the
 interface is drawn over the cells in the same overlay pass by a small
 immediate-mode layer of cellar's own, with text from an embedded TrueType face.
 
-A kernel is a `(2r+1)x(2r+1)` integer-weight footprint plus birth and survive
-bitmasks over the saturated weighted neighbor sum, so it generalizes
-Larger-than-Life while still expressing the classic Life family exactly.
+A kernel is a `(2r+1)x(2r+1)` integer-weight footprint, of radius up to 16 and
+negative weights allowed, plus birth and survive sets over the saturated
+weighted neighbor sum, so it generalizes Larger-than-Life (Golly's
+`R5,C0,M1,S34..58,B34..45,NM` for Bosco's rule, or HROT's
+`R2,C0,S2-3,B3,NC`) while still expressing the classic Life family exactly.
 Built-in kernels: Conway's Life (`B3/S23`), HighLife (`B36/S23`), Seeds
 (`B2/S`) and Day & Night (`B3678/S34678`).
 
@@ -80,8 +82,9 @@ corner, and the side panel groups every control by task:
   selection. copying or cutting a selection makes it the custom pattern and arms
   the stamp. The library's sources are listed in
   [res/patterns](res/patterns/README.md)
-- **rule**: presets, the rule in B/S notation, radius, a clickable weight grid,
-  and birth and survive toggles over the reachable sums
+- **rule**: presets, the rule in B/S notation, radius, a clickable weight grid
+  whose cells cycle from 0 up to 4 and on through -4 to -1, and birth and
+  survive toggles over the reachable sums
 - **view**: colour mode (a solid colour from a set of swatches, fading trails,
   or colour by age), grid lines, and the interface size from 100 to 200 percent
 - **files**: named saves of the world and the custom pattern, a list of every
