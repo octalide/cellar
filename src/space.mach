@@ -17,13 +17,16 @@
 # generation. a hash over chunk coordinates finds a chunk's slot.
 #
 # settle keeps the pool the shape stepping needs: every chunk with a live cell
-# has the neighbours its census mask asks for, and a chunk that is empty, cold
-# and asked for by no live neighbour is freed. the mask has a bit per neighbour,
-# set where a live cell lies near that side, so a sparse world keeps only the
-# chunks it can spread into. it works from a census, per slot the live count,
-# whether anything is warm, the incarnation the count was taken of, the mask,
-# and the extent of the live cells, which the CPU writes as it steps, asking
-# for every neighbour, and the GPU writes once a frame.
+# has the chunks its census mask asks for, and a chunk that is empty, cold and
+# asked for by no live chunk is freed. the mask has a bit per chunk of the 5 by
+# 5 block around a chunk (see halo), so a live chunk can keep chunks
+# two away, and a sparse world keeps only the chunks it can spread into before
+# the next census. it works from a census, per slot the live count, whether
+# anything is warm, the incarnation the count was taken of, the mask, and the
+# extent of the live cells. the CPU writes one as it steps, asking for the
+# adjacent chunks, since it settles every generation; the GPU's is read back
+# once a frame and asks for the ring or the wide halo, whichever its budget
+# runs within, and a chunk counted on the host asks for the same.
 
 use cellar.layout;
 use allo: std.allocator;
@@ -43,10 +46,65 @@ pub val SIDE: i64 = layout.SIDE::i64;
 pub val CELLS: usize = layout.CELLS::usize;
 # page-table words per slot
 pub val ENTRY: usize = layout.ENTRY::usize;
-# census words per slot: live count, warm, incarnation, neighbour mask, extent
+# census words per slot: live count, warm, incarnation, halo mask, extent
 pub val CENSUS: usize = 5;
-# a mask asking for all eight neighbours, its bits laid out as the entry's words
-pub val MASK_ALL: u32 = 0x1ef;
+# a halo mask asking for the eight adjacent chunks
+pub val MASK_RING: u32 = 0x729c0;
+# a halo mask asking for every chunk up to two away, the widest halo
+pub val MASK_HALO: u32 = 0x1ffefff;
+# a live chunk's halo, the chunks around it its live cells may spread into
+# before the next census settles the pool, as a mask with a bit per chunk of
+# the 5 by 5 block around it, row-major with the chunk itself at HALO_SELF
+pub val HALO_SIDE: u32 = 5;
+pub val HALO_SELF: u32 = 12;
+# cells of spread a pool holds room for once every live chunk has the ring
+# halo: an adjacent chunk is asked for when a live cell lies in the half of its
+# chunk toward it, so a chunk left out is more than half a chunk away
+pub val SPREAD_RING: u32 = 32;
+# cells of spread a pool holds room for once every live chunk has the wide
+# halo: the adjacent chunks always, and the second chunk on a side when a live
+# cell lies in the half toward it, so a chunk left out is more than a chunk and
+# a half away
+pub val SPREAD_WIDE: u32 = 96;
+
+# the halo row or column bits a live cell in the low or the high half of its
+# chunk along one axis needs, the chunk's own at bit 2
+fun halo_axis(high: u32, wide: bool) u32 {
+    if (wide) {
+        if (high != 0) { ret 0x1e; }
+        ret 0xf;
+    }
+    if (high != 0) { ret 0xc; }
+    ret 0x6;
+}
+
+# the halo mask for live cells in the quadrants of a chunk quads names
+# (cellar.layout.quadrant)
+# ---
+# wide: the wide halo, else the ring
+pub fun halo(quads: u32, wide: bool) u32 {
+    var m: u32 = 0;
+    var q: u32 = 0;
+    for (q < 4) {
+        if (((quads >> q) & 1) != 0) {
+            val xs: u32 = halo_axis(q & 1, wide);
+            val ys: u32 = halo_axis(q >> 1, wide);
+            var r:  u32 = 0;
+            for (r < HALO_SIDE) {
+                if (((ys >> r) & 1) != 0) { m = m | (xs << (r * HALO_SIDE)); }
+                r = r + 1;
+            }
+        }
+        q = q + 1;
+    }
+    ret m & ~(1 << HALO_SELF);
+}
+
+# the halo mask for the live cells an extent word describes
+pub fun halo_of(ext: u32, wide: bool) u32 {
+    ret halo(ext >> layout.EXTENT_QUADS, wide);
+}
+
 # a neighbour that does not exist
 pub val NONE: u32 = layout.NONE;
 # added to chunk coordinates in the page table
@@ -94,6 +152,7 @@ pub rec Mirror {
 # census:    per slot live count, warm, incarnation, mask and extent, from the
 #            last step
 # dirty:     per slot DIRTY_ENTRY and DIRTY_CELLS, for a mirror to upload
+# asked:     per slot whether a live chunk's mask asked for it, while settling
 # frees:     free slots below hi
 # nfree:     how many frees holds
 # hash:      slot per bucket, NONE when empty, linear probing
@@ -101,6 +160,8 @@ pub rec Mirror {
 # serial:    the last incarnation handed out
 # stepped:   whether back is kept
 # sense:     how the census reads a cell, the running rule's
+# wide:      a chunk counted or painted on the host asks for the wide halo,
+#            as the GPU's census does while it steps uncapped
 pub rec Space {
     a:         *allo.Allocator;
     cap:       usize;
@@ -115,6 +176,7 @@ pub rec Space {
     census:    *u32;
     before:    *u32;
     dirty:     *u8;
+    asked:     *u8;
     frees:     *u32;
     nfree:     usize;
     hash:      *u32;
@@ -122,6 +184,7 @@ pub rec Space {
     serial:    u32;
     stepped:   bool;
     sense:     layout.Sense;
+    wide:      bool;
 }
 
 # one chunk's step, as a rule family's CPU step sees it
@@ -150,6 +213,7 @@ pub rec Block {
 # y0:    first row holding one
 # x1:    last column holding one
 # y1:    last row holding one
+# quads: the quadrants holding one (cellar.layout.quadrant)
 pub rec Tally {
     sense: layout.Sense;
     live:  u32;
@@ -158,18 +222,20 @@ pub rec Tally {
     y0:    u32;
     x1:    u32;
     y1:    u32;
+    quads: u32;
 }
 
 # an empty tally reading cells through sense
 pub fun tally(sense: layout.Sense) Tally {
-    ret Tally{sense: sense, live: 0, warm: 0, x0: 63, y0: 63, x1: 0, y1: 0};
+    ret Tally{sense: sense, live: 0, warm: 0, x0: 63, y0: 63, x1: 0, y1: 0, quads: 0};
 }
 
 # count the cell written at (x, y) of the chunk
 #[inline]
 pub fun note(t: *Tally, c: u32, x: u32, y: u32) {
     if (layout.live(c, t.sense.live_mask, t.sense.live_lo, t.sense.live_hi) != 0) {
-        t.live = t.live + 1;
+        t.live  = t.live + 1;
+        t.quads = t.quads | layout.quadrant(x, y);
         if (x < t.x0) { t.x0 = x; }
         if (y < t.y0) { t.y0 = y; }
         if (x > t.x1) { t.x1 = x; }
@@ -178,7 +244,7 @@ pub fun note(t: *Tally, c: u32, x: u32, y: u32) {
     if ((c & t.sense.warm_mask) != 0) { t.warm = 1; }
 }
 
-# write a tally as a slot's census words
+# write a tally as a slot's census words, asking for the adjacent chunks
 # ---
 # t:   the tally of every cell in the chunk
 # cn:  the slot's CENSUS words
@@ -190,8 +256,8 @@ pub fun tally_census(t: *Tally, cn: *u32, inc: u32) {
     cn[3] = 0;
     cn[4] = 0;
     if (t.live != 0) {
-        cn[3] = MASK_ALL;
-        cn[4] = layout.extent(t.x0, t.y0, t.x1, t.y1);
+        cn[3] = MASK_RING;
+        cn[4] = layout.extent(t.x0, t.y0, t.x1, t.y1) | (t.quads << layout.EXTENT_QUADS);
     }
 }
 
@@ -301,8 +367,11 @@ fun alloc_arrays(sp: *Space, cap: usize) err[allo.Error] {
     var dirty:  *u8                  = nil;
     val rd:     res[*u8, allo.Error] = allo.zallocate[u8](a, cap);
     if (sel rd.ok) { dirty = rd.ok; }
+    var asked: *u8                  = nil;
+    val ra:    res[*u8, allo.Error] = allo.zallocate[u8](a, cap);
+    if (sel ra.ok) { asked = ra.ok; }
     if (table == nil || cells == nil || (sp.stepped && back == nil) || census == nil
-        || before == nil || frees == nil || hash == nil || dirty == nil) {
+        || before == nil || frees == nil || hash == nil || dirty == nil || asked == nil) {
         if (table != nil)  { allo.deallocate[u32](a, table, cap * ENTRY); }
         if (cells != nil)  { allo.deallocate[u32](a, cells, cap * CELLS); }
         if (back != nil)   { allo.deallocate[u32](a, back, cap * CELLS); }
@@ -311,6 +380,7 @@ fun alloc_arrays(sp: *Space, cap: usize) err[allo.Error] {
         if (frees != nil)  { allo.deallocate[u32](a, frees, cap); }
         if (hash != nil)   { allo.deallocate[u32](a, hash, hcap); }
         if (dirty != nil)  { allo.deallocate[u8](a, dirty, cap); }
+        if (asked != nil)  { allo.deallocate[u8](a, asked, cap); }
         ret err[allo.Error].err{allo.Error.exhausted{}};
     }
     # carry the old pool over, then rebuild the hash at its new size
@@ -320,6 +390,7 @@ fun alloc_arrays(sp: *Space, cap: usize) err[allo.Error] {
         if (back != nil) { mem.copy[u32](back, sp.back, sp.hi * CELLS); }
         mem.copy[u32](census, sp.census, sp.hi * CENSUS);
         mem.copy[u8](dirty, sp.dirty, sp.hi);
+        mem.copy[u8](asked, sp.asked, sp.hi);
         mem.copy[u32](frees, sp.frees, sp.nfree);
         free_arrays(sp);
     }
@@ -329,6 +400,7 @@ fun alloc_arrays(sp: *Space, cap: usize) err[allo.Error] {
     sp.census = census;
     sp.before = before;
     sp.dirty  = dirty;
+    sp.asked  = asked;
     sp.frees  = frees;
     sp.hash   = hash;
     sp.cap    = cap;
@@ -350,6 +422,7 @@ fun free_arrays(sp: *Space) {
     allo.deallocate[u32](a, sp.census, sp.cap * CENSUS);
     allo.deallocate[u32](a, sp.before, sp.cap * CENSUS);
     allo.deallocate[u8](a, sp.dirty, sp.cap);
+    allo.deallocate[u8](a, sp.asked, sp.cap);
     allo.deallocate[u32](a, sp.frees, sp.cap);
     allo.deallocate[u32](a, sp.hash, sp.hcap);
 }
@@ -371,6 +444,7 @@ pub fun init(sp: *Space, a: *allo.Allocator, stepped: bool) err[allo.Error] {
     sp.serial    = 0;
     sp.stepped   = stepped;
     mem.zero[u8]((?sp.sense)::*u8, $size_of(layout.Sense));
+    sp.wide = false;
     ret alloc_arrays(sp, FIRST_CAP);
 }
 
@@ -510,28 +584,57 @@ pub fun release(sp: *Space, s: usize) {
     sp.live            = sp.live - 1;
 }
 
-# give a chunk the neighbours a mask asks for
+# lower hi past the free slots at the top of the pool, and order the free
+# slots so the lowest is handed out first
+#
+# a mirror works on every slot below hi, free or not, so a pool that once grew
+# far, for a wide halo or a pattern that has since died, would otherwise cost
+# as much as it did then for as long as one chunk near its top lived on.
+pub fun compact(sp: *Space) {
+    for (sp.hi > 0 && !used(sp, sp.hi - 1)) { sp.hi = sp.hi - 1; }
+    sp.nfree = 0;
+    var s: usize = sp.hi;
+    for (s > 0) {
+        s = s - 1;
+        if (!used(sp, s)) {
+            sp.frees[sp.nfree] = s::u32;
+            sp.nfree           = sp.nfree + 1;
+        }
+    }
+}
+
+# give a chunk the chunks a halo mask asks for, and mark each asked for
 # ---
-# mask: a bit per entry word, the chunk's own ignored
+# mask: a bit per chunk of the 5 by 5 block around it, its own ignored
 # ret:  false when the pool could not hold them
 pub fun surround_by(sp: *Space, s: usize, mask: u32) bool {
     val cx: i64   = slot_x(sp, s);
     val cy: i64   = slot_y(sp, s);
+    val w:  usize = HALO_SIDE::usize;
+    var ok: bool  = true;
     var k:  usize = 0;
-    for (k < 9) {
-        if (k != 4 && ((mask >> k::u32) & 1) != 0 && sp.table[s * ENTRY + k] == NONE) {
-            if (alloc(sp, cx + (k % 3)::i64 - 1, cy + (k / 3)::i64 - 1) == NONE) { ret false; }
+    for (k < w * w) {
+        if (k != HALO_SELF::usize && ((mask >> k::u32) & 1) != 0) {
+            val dx: i64 = (k % w)::i64 - (w / 2)::i64;
+            val dy: i64 = (k / w)::i64 - (w / 2)::i64;
+            var n:  u32 = NONE;
+            # an adjacent chunk is in the entry, a further one is looked up
+            if (dx >= -1 && dx <= 1 && dy >= -1 && dy <= 1) { n = sp.table[s * ENTRY + ((dy + 1) * 3 + dx + 1)::usize]; }
+            if (n == NONE)                                  { n = alloc(sp, cx + dx, cy + dy); }
+            if (n == NONE)                                  { ok = false; }
+            or                                              { sp.asked[n::usize] = 1; }
         }
         k = k + 1;
     }
-    ret true;
+    ret ok;
 }
 
-# give a chunk all eight neighbours
+# give a chunk every chunk of the halo the host asks for, the ring or the wide one
 # ---
 # ret: false when the pool could not hold them
 pub fun surround(sp: *Space, s: usize) bool {
-    ret surround_by(sp, s, MASK_ALL);
+    if (sp.wide) { ret surround_by(sp, s, MASK_HALO); }
+    ret surround_by(sp, s, MASK_RING);
 }
 
 # whether a census entry describes the chunk the slot holds now
@@ -542,10 +645,10 @@ fun current(sp: *Space, census: *u32, n: usize, s: usize) bool {
 
 # reshape the pool around what a census found
 #
-# every chunk the census saw holding a live cell gets the neighbours its mask asks for.
-# then, when frees is set, every chunk the census saw empty and cold whose
-# neighbours it saw empty is freed; a neighbour allocated since the census was
-# taken did not exist then, so it counts as empty. the census is copied into the
+# every chunk the census saw holding a live cell gets the chunks its mask asks
+# for. then, when frees is set, every chunk the census saw empty and cold that
+# no such mask asked for is freed; a chunk allocated since the census was taken
+# did not exist then, so it counts as empty. the census is copied into the
 # pool's own for the slots it describes.
 # ---
 # sp:     the pool
@@ -555,10 +658,11 @@ fun current(sp: *Space, census: *u32, n: usize, s: usize) bool {
 # ret:    false when the pool could not hold a needed chunk
 pub fun settle(sp: *Space, census: *u32, n: usize, frees: bool) bool {
     # the pool's own census moves when surrounding a chunk grows the pool
-    val own: bool  = census == sp.census;
-    var c:   *u32  = census;
-    var ok:  bool  = true;
-    var s:   usize = 0;
+    val own: bool = census == sp.census;
+    var c:   *u32 = census;
+    var ok:  bool = true;
+    mem.zero[u8](sp.asked, sp.hi);
+    var s: usize = 0;
     for (s < n && s < sp.hi) {
         if (own) { c = sp.census; }
         if (current(sp, c, n, s) && c[s * CENSUS] != 0) {
@@ -568,24 +672,15 @@ pub fun settle(sp: *Space, census: *u32, n: usize, frees: bool) bool {
     }
     if (own) { c = sp.census; }
     if (frees) {
+        val had: usize = sp.nfree;
         s = 0;
         for (s < n && s < sp.hi) {
-            if (current(sp, c, n, s) && c[s * CENSUS] == 0 && c[s * CENSUS + 1] == 0) {
-                var busy: bool  = false;
-                var k:    usize = 0;
-                for (k < 9 && !busy) {
-                    val nb: u32 = sp.table[s * ENTRY + k];
-                    # the neighbour asks for this chunk when its mask has the bit
-                    # for the side this chunk lies on from it
-                    if (k != 4 && nb != NONE && current(sp, c, n, nb::usize)
-                        && c[nb::usize * CENSUS] != 0
-                        && ((c[nb::usize * CENSUS + 3] >> (8 - k)::u32) & 1) != 0) { busy = true; }
-                    k = k + 1;
-                }
-                if (!busy) { release(sp, s); }
+            if (current(sp, c, n, s) && c[s * CENSUS] == 0 && c[s * CENSUS + 1] == 0 && sp.asked[s] == 0) {
+                release(sp, s);
             }
             s = s + 1;
         }
+        if (sp.nfree != had) { compact(sp); }
     }
     if (own) { ret ok; }
     s = 0;
@@ -654,6 +749,7 @@ pub fun recount(sp: *Space, s: usize) {
         i = i + 1;
     }
     tally_census(?t, ?sp.census[s * CENSUS], incarnation(sp, s));
+    if (t.live != 0) { sp.census[s * CENSUS + 3] = halo(t.quads, sp.wide); }
 }
 
 test alloc__links_neighbours_both_ways_and_release_unlinks {
@@ -706,6 +802,43 @@ test alloc__grows_the_pool_and_keeps_every_chunk_findable {
     ret 0;
 }
 
+test halo__asks_toward_the_quadrants_holding_live_cells {
+    # a live cell in the north-west quadrant: west, north and north-west, and
+    # with the wide halo the 4 by 4 block reaching two chunks that way
+    if (halo(1, false) != ((1 << 6) | (1 << 7) | (1 << 11))) { ret 1; }
+    if (halo(1, true) != (0x7bdef & ~(1 << HALO_SELF)))      { ret 2; }
+    if (halo(0xf, false) != MASK_RING)                       { ret 3; }
+    if (halo(0xf, true) != MASK_HALO)                        { ret 4; }
+    if (halo(0, true) != 0)                                  { ret 5; }
+    ret 0;
+}
+
+test compact__lowers_hi_and_hands_out_the_lowest_free_slot_first {
+    var a: allo.Allocator;
+    page.make(?a);
+    var sp:   Space;
+    val made: err[allo.Error] = init(?sp, ?a, false);
+    if (sel made.err) { ret 1; }
+    var i: i64 = 0;
+    for (i < 6) {
+        alloc(?sp, i * 10, 0);
+        i = i + 1;
+    }
+    release(?sp, 1);
+    release(?sp, 4);
+    release(?sp, 5);
+    compact(?sp);
+    if (sp.hi != 4 || sp.nfree != 1) { ret 2; }
+    release(?sp, 3);
+    compact(?sp);
+    if (sp.hi != 3)                            { ret 3; }
+    if (alloc(?sp, 100, 100) != 1)             { ret 4; }
+    if (alloc(?sp, 200, 200) != 3)             { ret 5; }
+    if (find(?sp, 20, 0) != 2 || sp.live != 4) { ret 6; }
+    dnit(?sp);
+    ret 0;
+}
+
 test settle__gives_a_live_chunk_only_the_neighbours_its_mask_asks_for {
     var a: allo.Allocator;
     page.make(?a);
@@ -713,14 +846,15 @@ test settle__gives_a_live_chunk_only_the_neighbours_its_mask_asks_for {
     val made: err[allo.Error] = init(?sp, ?a, false);
     if (sel made.err) { ret 1; }
     val s: usize = alloc(?sp, 0, 0)::usize;
-    # live, warm, the chunk's incarnation, and a mask asking west and north-west
+    # live, warm, the chunk's incarnation, and a mask asking north-west, west
+    # and two to the west
     sp.census[s * CENSUS]     = 1;
     sp.census[s * CENSUS + 1] = 1;
     sp.census[s * CENSUS + 2] = incarnation(?sp, s);
-    sp.census[s * CENSUS + 3] = 0x9;
-    if (!settle(?sp, sp.census, sp.hi, true))                  { ret 2; }
-    if (sp.live != 3)                                          { ret 3; }
-    if (find(?sp, -1, 0) == NONE || find(?sp, -1, -1) == NONE) { ret 4; }
+    sp.census[s * CENSUS + 3] = (1 << 6) | (1 << 11) | (1 << 10);
+    if (!settle(?sp, sp.census, sp.hi, true))                                              { ret 2; }
+    if (sp.live != 4)                                                                      { ret 3; }
+    if (find(?sp, -1, 0) == NONE || find(?sp, -1, -1) == NONE || find(?sp, -2, 0) == NONE) { ret 4; }
     # the asked-for chunks stay while the live chunk asks, and go once it does not
     sp.census[s * CENSUS + 3] = 0;
     sp.census[s * CENSUS]     = 0;

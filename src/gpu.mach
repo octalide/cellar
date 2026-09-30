@@ -11,12 +11,19 @@
 # each frame records its generations, then a census stage that counts every
 # chunk, then a readback of the census. the readback lands a couple of frames
 # later, and collect settles the host's pool from it: chunks that came alive
-# get their neighbours and dead ones are freed. that lag is why the generations
-# a frame may record are budgeted. a pattern spreads at most the rule's radius
-# a generation, and a census that saw every live chunk surrounded by chunks
-# leaves room for 64 cells of spread before anything can reach past them, so
-# no generation is recorded that could outrun the last census the pool was
-# settled from.
+# get their halo and dead ones are freed. that lag is why the generations a
+# frame may record are budgeted. a pattern spreads at most the rule's radius a
+# generation, and a census that gave every live chunk its halo
+# (cellar.space.halo) leaves room for that halo's reach of spread before
+# anything can reach past it, so no generation is recorded that could outrun
+# the last census the pool was settled from.
+#
+# the halo is the ring of adjacent chunks, 32 cells of reach, unless uncapped
+# stepping keeps running into the budget, when it widens to chunks two away and
+# 96 cells, at nearly three times the slots. the budget rises only once a
+# census taken with the wide halo has settled, so every live chunk holds it,
+# and before the ring's first census can free the far chunks the budget drops
+# to what the ring holds.
 #
 # a chunk allocated empty is cleared on the GPU by a stage of its own rather
 # than uploaded, and each step stamps which chunks it left alive or warm, so the
@@ -72,12 +79,20 @@ pub val SHADES: usize = 256;
 # generations one frame may record, leaving storage binding sets for the
 # clear, the growth, the census, the reduction and the draw
 pub val MAX_STEPS: usize = 240;
-# cells a census that gave every live chunk the neighbours its cells lean towards
-# leaves room to spread: the census asks for a side when a live cell lies within
-# this many cells of it, and a cell further off cannot reach past it sooner
-val REACH: u64 = 32;
+# consecutive uncapped frames the budget cut short before the halo widens
+val WIDEN_AFTER: u32 = 8;
+# the most that grows to while widening keeps failing to pay off
+val WIDEN_MAX: u32 = 512;
+# consecutive uncapped frames that fell behind the display, or that the ring
+# would have held, before the halo narrows
+val NARROW_AFTER: u32 = 8;
+# a hold on the limit that is not in effect
+val NO_HOLD: u64 = 0xffffffffffffffff;
 # a frame this many microseconds apart from the last has missed its budget
 val SLOW_US: u64 = 24000;
+# a frame no more than this many microseconds apart from the last kept up with
+# the display, so frame time is not what bounds it
+val QUICK_US: u64 = 18000;
 # generations the first uncapped frame asks for, before pacing has adapted it
 val FIRST_PACE: usize = 16;
 # censuses in flight a frame can look back over
@@ -124,19 +139,23 @@ pub rec Look {
 # ---
 # id:     the census id
 # spread: cells of spread recorded up to it
+# seq:    censuses recorded up to and including it, which never wraps
 # gens:   generations recorded up to it
 # bulk:   the bulk-edit count then
 # edits:  the edit count then
 # cap:    slots the readback covers
 # hi:     slots the census counted
+# wide:   the halo settling it asks for is the wide one
 rec Snap {
     id:     u32;
+    seq:    u64;
     spread: u64;
     gens:   u64;
     bulk:   u64;
     edits:  u64;
     cap:    usize;
     hi:     usize;
+    wide:   bool;
 }
 
 # a painted cell waiting to be uploaded
@@ -203,6 +222,17 @@ rec Pool {
 # spread:   cells of spread recorded since the world was made
 # gens:     generations recorded since the world was made
 # limit:    the spread the last settled census allows
+# wide:     censuses are recorded asking for the wide halo
+# want:     the halo the next census should ask for is the wide one
+# streak:   consecutive uncapped frames that argue for changing the halo
+# patience: budget-bound frames in a row the halo next widens after
+# hold:     the most limit may be until a census recorded since the halo
+#           narrowed settles, NO_HOLD when none is owed
+# seq:      censuses recorded
+# held:     the seq of the first census recorded once the halo narrowed
+# settled:  the seq of the last census settled
+# lag:      spread recorded since the last census settled, as it landed
+# stepped:  spread the last frame recorded
 # bulk:     bulk edits: clears, fills
 # edits:    every edit, bulk or painted
 # writes:   painted cells to upload
@@ -241,6 +271,16 @@ pub rec Gpu {
     spread:   u64;
     gens:     u64;
     limit:    u64;
+    wide:     bool;
+    want:     bool;
+    streak:   u32;
+    patience: u32;
+    hold:     u64;
+    seq:      u64;
+    held:     u64;
+    settled:  u64;
+    lag:      u64;
+    stepped:  u64;
     bulk:     u64;
     edits:    u64;
     writes:   Vector[Write];
@@ -253,9 +293,15 @@ pub rec Gpu {
     built:    [layout.MIP]u32;
 }
 
-# the census id's four words, then a packed word, a mask and an extent per slot
+# the census id's four words, then a packed word and an extent per slot
 fun status_bytes(cap: usize) usize {
-    ret 16 + cap * 12;
+    ret 16 + cap * 8;
+}
+
+# cells of spread a pool settled to a halo holds room for
+fun reach(wide: bool) u64 {
+    if (wide) { ret space.SPREAD_WIDE::u64; }
+    ret space.SPREAD_RING::u64;
 }
 
 # a packed census word's incarnation bits
@@ -293,7 +339,7 @@ pub fun ceiling(l: gfx.Limits) usize {
     n = fit(n, words, 0, space.CELLS);
     n = fit(n, words, 0, MIP);
     n = fit(n, words, HEAD, space.ENTRY);
-    n = fit(n, words, status_bytes(0) / 4, 3);
+    n = fit(n, words, status_bytes(0) / 4, 2);
     n = fit(n, words, 0, 2);
     n = fit(n, words, 0, 1);
     ret n;
@@ -432,7 +478,17 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     g.id       = 0;
     g.spread   = 0;
     g.gens     = 0;
-    g.limit    = REACH;
+    g.limit    = reach(false);
+    g.wide     = false;
+    g.want     = false;
+    g.streak   = 0;
+    g.patience = WIDEN_AFTER;
+    g.hold     = NO_HOLD;
+    g.seq      = 0;
+    g.held     = 0;
+    g.settled  = 0;
+    g.lag      = 0;
+    g.stepped  = 0;
     g.bulk     = 0;
     g.edits    = 0;
     g.mat      = gfx.material();
@@ -572,11 +628,14 @@ pub fun note_edit(g: *Gpu) {
 }
 
 # note a clear or fill: the pool was rebuilt whole and settled on the host,
-# so every census recorded before it is stale and the full reach is free again
+# which gives every live chunk the halo in effect, so every census recorded
+# before it is stale and that halo's reach is free again
 pub fun note_bulk(g: *Gpu) {
-    g.bulk  = g.bulk + 1;
-    g.edits = g.edits + 1;
-    g.limit = g.spread + REACH;
+    g.bulk    = g.bulk + 1;
+    g.edits   = g.edits + 1;
+    g.limit   = g.spread + reach(g.wide);
+    g.hold    = NO_HOLD;
+    g.settled = g.seq;
     vector.clear[Write](?g.writes);
     vector.clear[u32](?g.stamped);
 }
@@ -599,7 +658,11 @@ pub fun stride(g: *Gpu) usize {
 #
 # a frame that arrives late after the last shrinks the stride, and one on time
 # that used everything it asked for grows it, so the GPU steps as many
-# generations as the frame budget holds
+# generations as the frame budget holds. the halo widens once the budget cut
+# several frames in a row short that kept up with the display, reach rather
+# than frame time bounding them, and narrows once several in a row fell behind
+# the display or would have fit the ring. each such narrowing doubles how many
+# frames the next widening waits for, until stepping stops being uncapped.
 # ---
 # g:     the GPU side
 # asked: generations the frame asked for
@@ -607,8 +670,10 @@ pub fun stride(g: *Gpu) usize {
 pub fun tune(g: *Gpu, asked: usize, done: usize) {
     val now: time.InstantClock = time.instant();
     if (sel now.err) { ret; }
+    var quick: bool = false;
     if (g.timed) {
         val us: u64 = (time.instant_sub(now.ok, g.last) / 1000)::u64;
+        quick = us <= QUICK_US;
         if (us > SLOW_US) {
             g.pace = g.pace - g.pace / 4;
             if (g.pace == 0) { g.pace = 1; }
@@ -620,11 +685,32 @@ pub fun tune(g: *Gpu, asked: usize, done: usize) {
     }
     g.last  = now.ok;
     g.timed = true;
+
+    var argues: bool = done < asked && quick;
+    if (g.wide) { argues = !quick || (done >= asked && g.lag + g.stepped <= reach(false)); }
+    if (argues) { g.streak = g.streak + 1; }
+    or          { g.streak = 0; }
+    if (!g.wide && g.streak >= g.patience) {
+        g.want   = true;
+        g.streak = 0;
+    }
+    or (g.wide && g.streak >= NARROW_AFTER) {
+        # the wide halo slowed the frames more than its reach helped, so the
+        # next widening waits twice as long
+        g.want     = false;
+        g.streak   = 0;
+        g.patience = g.patience * 2;
+        if (g.patience > WIDEN_MAX) { g.patience = WIDEN_MAX; }
+    }
 }
 
-# forget the last uncapped frame's time, once stepping is no longer uncapped
+# forget the last uncapped frame's time, and the wide halo, once stepping is
+# no longer uncapped
 pub fun rest(g: *Gpu) {
-    g.timed = false;
+    g.timed    = false;
+    g.want     = false;
+    g.streak   = 0;
+    g.patience = WIDEN_AFTER;
 }
 
 # how many generations may be recorded before the next census lands
@@ -665,7 +751,7 @@ pub fun collect(g: *Gpu, sp: *space.Space) Landed {
     if (!gfx.renderer_readback_take(g.r, ?g.p.rb, g.p.got::*u8, len)) { ret none; }
     val id:   u32   = g.p.got[0];
     val snap: *Snap = ?g.ring[id::usize % RING];
-    if (snap.id != id || id == 0 || snap.cap != g.p.cap || snap.bulk != g.bulk) { ret none; }
+    if (snap.id != id || id == 0 || snap.cap != g.p.cap || snap.bulk != g.bulk || snap.seq < g.settled) { ret none; }
     var n: usize = sp.hi;
     if (n > snap.hi) { n = snap.hi; }
     # a slot matches its report when the incarnation bits agree. fewer than
@@ -673,20 +759,27 @@ pub fun collect(g: *Gpu, sp: *space.Space) Landed {
     # makes more than the pool holds, so bits that agree name the same chunk
     var s: usize = 0;
     for (s < n) {
-        val w:   u32  = g.p.got[4 + s * 3];
+        val w:   u32  = g.p.got[4 + s * 2];
         val c:   *u32 = ?g.p.landed[s * space.CENSUS];
         val inc: u32  = space.incarnation(sp, s);
         c[0] = w & 0x1fff;
         c[1] = (w >> 13) & 1;
         c[2] = 0;
         if (inc != 0 && (w >> 14) == (inc & TAG)) { c[2] = inc; }
-        c[3] = g.p.got[5 + s * 3];
-        c[4] = g.p.got[6 + s * 3];
-        s    = s + 1;
+        c[4] = g.p.got[5 + s * 2];
+        c[3] = 0;
+        if (c[0] != 0) { c[3] = space.halo_of(c[4], snap.wide); }
+        s = s + 1;
     }
     val ok: bool = space.settle(sp, g.p.landed, n, snap.edits == g.edits);
+    g.settled = snap.seq;
+    g.lag     = g.spread - snap.spread;
+    # a census recorded since the halo narrowed has freed what the ring leaves out
+    if (snap.seq >= g.held) { g.hold = NO_HOLD; }
     # a census the pool could not be settled from leaves the limit where it was
-    if (ok && snap.spread + REACH > g.limit) { g.limit = snap.spread + REACH; }
+    var to: u64 = snap.spread + reach(snap.wide);
+    if (to > g.hold)        { to = g.hold; }
+    if (ok && to > g.limit) { g.limit = to; }
     ret Landed{fresh: true, fits: ok, behind: g.gens - snap.gens};
 }
 
@@ -1092,7 +1185,8 @@ pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, 
     val e15: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.view, 0, look::*u8, LOOK * 4);
     if (sel e15.err) { ret res[usize, gfx.Error].err{e15.err}; }
     if (g.stepping) {
-        g.id = g.id + 1;
+        g.id  = g.id + 1;
+        g.seq = g.seq + 1;
         if (g.id == 0) { g.id = 1; }
     }
     # the draw reads the rule's sense from the head, whichever engine steps
@@ -1130,6 +1224,20 @@ pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, 
         g.gens   = g.gens + 1;
         i        = i + 1;
     }
+    g.stepped = n::u64 * radius::u64;
+
+    # a narrower halo frees chunks the budget may already have spread into, so
+    # the budget drops to what the ring holds from this census on, and stays
+    # there until a census recorded from now on has settled
+    if (g.want != g.wide) {
+        g.wide  = g.want;
+        sp.wide = g.wide;
+        if (!g.wide) {
+            g.hold = g.spread + reach(false);
+            g.held = g.seq;
+            if (g.limit > g.hold) { g.limit = g.hold; }
+        }
+    }
 
     if (g.hi != 0) {
         var rb: [4]*gfx.StorageBuffer;
@@ -1155,11 +1263,13 @@ pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, 
     val snap: *Snap = ?g.ring[g.id::usize % RING];
     snap.id     = g.id;
     snap.spread = g.spread;
+    snap.seq    = g.seq;
     snap.gens   = g.gens;
     snap.bulk   = g.bulk;
     snap.edits  = g.edits;
     snap.cap    = g.p.cap;
     snap.hi     = g.hi;
+    snap.wide   = g.wide;
     ret res[usize, gfx.Error].ok{n};
 }
 
