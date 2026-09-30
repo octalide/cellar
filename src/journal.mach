@@ -1,0 +1,916 @@
+# undo and redo: a journal of the changes made to the world, kept as
+# before-images
+#
+# a step is one change. it keeps what the change overwrote and nothing else:
+# the chunks its edits covered, as they stood before the first of them wrote
+# (only those holding a live or warm cell, the rest were empty), the boxes of
+# chunks those edits covered, and the rule and generation. a change that
+# replaces the world whole (clear, randomize, reset, and a load or open of a
+# world) or re-encodes every cell (a rule change sim.set_rule cannot make in
+# place) keeps the whole world instead, and one that replaces the custom
+# pattern keeps the pattern it replaced. the journal watches the simulation
+# (sim.Watch), so every edit made through the bulk edit API and every clear is
+# kept however it was reached, its chunks pulled from the GPU first by the
+# edit's own pull.
+#
+# which commands are steps: a paint stroke (a paint and the lines that
+# continue it are one step), a stamp, a rule change, clear, randomize, reset,
+# a load or open of a world, a load of a pattern, and every area operation but
+# shrink (copy and cut keep the custom pattern they replace). saves, shrink and
+# anything that only changes the view are not.
+#
+# running: a stretch of stepping is one step, kept whole as the world stood
+# when it began. playing or single-stepping from paused opens one, and later
+# steps, pauses and plays join it until a command of another kind or an undo
+# closes it; generations are never steps of their own. while the world runs,
+# every recorded command joins the open run step, so undoing it returns to
+# where play started, edits made while running and all. undo and redo pause a
+# running world first.
+#
+# undo swaps a step's image with the world's as it stands, so the step then
+# holds what redo puts back. a new step that changes anything clears every
+# step that was undone, and one that changes nothing is dropped and leaves
+# them. the journal holds at most limit bytes: the oldest steps go first,
+# and a step larger than the limit alone clears the history, since nothing
+# before it could be reached.
+
+use cellar.pattern;
+use cellar.region;
+use cellar.rule;
+use cellar.sim;
+use cellar.snapshot;
+use cellar.space;
+use cellar.world;
+use allo: std.allocator;
+use std.allocator.page;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+# bytes a journal holds unless told otherwise
+pub val LIMIT: usize = 268435456;
+
+# a step closed as soon as its command has run
+pub val KIND_EDIT: u8 = 0;
+# a paint stroke, which the lines continuing it join
+pub val KIND_STROKE: u8 = 1;
+# a stretch of stepping, which later steps and anything done while running join
+pub val KIND_RUN: u8 = 2;
+
+# one change, as the image of what it replaced
+# ---
+# whole:      the world before the change, held when the change replaced it whole
+# chunks:     the chunks the change's edits covered, as they were before, those
+#             holding anything
+# areas:      the boxes of chunks the edits covered, in chunks, half-open
+# rule:       the rule before
+# generation: the generation before
+# custom:     the custom pattern before, when kept
+# kept:       custom holds a pattern
+# bytes:      what the step holds, once measured
+rec Step {
+    whole:      snapshot.Snapshot;
+    chunks:     snapshot.Snapshot;
+    areas:      Vector[space.Box];
+    rule:       rule.Rule;
+    generation: u64;
+    custom:     pattern.Pattern;
+    kept:       bool;
+    bytes:      usize;
+}
+
+# the journal
+# ---
+# a:       allocator behind every image
+# s:       the simulation it watches, once bound
+# steps:   the steps, oldest first: those below at can be undone, the rest redone
+# at:      steps that can be undone
+# cur:     the step being recorded
+# open:    cur is being recorded
+# kind:    cur's kind (KIND_*)
+# lost:    cur could not be kept, and the history was cleared
+# dropped: the history was cleared since dropped was last asked
+# touched: the watch was asked about a change while cur was open
+# busy:    an undo or redo is writing the world, which is not recorded
+# bytes:   what the steps hold
+# limit:   the most bytes the steps may hold
+pub rec Journal {
+    a:       *allo.Allocator;
+    s:       *sim.Sim;
+    steps:   Vector[Step];
+    at:      usize;
+    cur:     Step;
+    open:    bool;
+    kind:    u8;
+    lost:    bool;
+    dropped: bool;
+    touched: bool;
+    busy:    bool;
+    bytes:   usize;
+    limit:   usize;
+}
+
+# what an undo or redo did
+# ---
+# done: the world was put back
+# none: there was nothing to put back
+# lost: the world could not be put back, and the history was cleared
+pub tag Went: u8 {
+    done;
+    none;
+    lost;
+}
+
+fun step_init(st: *Step, a: *allo.Allocator) {
+    snapshot.init(?st.whole, a);
+    snapshot.init(?st.chunks, a);
+    st.areas = vector.init[space.Box](a);
+    st.kept  = false;
+    st.bytes = 0;
+}
+
+fun step_dnit(st: *Step) {
+    snapshot.dnit(?st.whole);
+    snapshot.dnit(?st.chunks);
+    vector.dnit[space.Box](?st.areas);
+    if (st.kept) { pattern.dnit(?st.custom); }
+    st.kept = false;
+}
+
+# what a step holds
+fun measure(st: *Step) usize {
+    var n: usize = snapshot.bytes(?st.whole) + snapshot.bytes(?st.chunks) + st.areas.cap * $size_of(space.Box);
+    if (st.kept) { n = n + st.custom.w * st.custom.h; }
+    ret n;
+}
+
+# an empty journal, watching nothing yet
+# ---
+# j: the journal
+# a: allocator for its images, outliving it
+pub fun init(j: *Journal, a: *allo.Allocator) {
+    j.a       = a;
+    j.s       = nil;
+    j.steps   = vector.init[Step](a);
+    j.at      = 0;
+    j.open    = false;
+    j.kind    = KIND_EDIT;
+    j.lost    = false;
+    j.dropped = false;
+    j.touched = false;
+    j.busy    = false;
+    j.bytes   = 0;
+    j.limit   = LIMIT;
+}
+
+# release every step
+pub fun dnit(j: *Journal) {
+    forget(j);
+    if (j.open) { step_dnit(?j.cur); }
+    j.open = false;
+    vector.dnit[Step](?j.steps);
+}
+
+# watch a simulation, whose changes the steps record from now on
+#
+# the journal and the simulation must not move while bound. binding another
+# simulation forgets the steps, which belong to the world they were taken from.
+pub fun bind(j: *Journal, s: *sim.Sim) {
+    if (j.s == s) { ret; }
+    if (j.s != nil) {
+        forget(j);
+        if (j.open) { step_dnit(?j.cur); }
+        j.open = false;
+    }
+    j.s = s;
+    sim.set_watch(s, sim.Watch{ctx: j::*u8, wants: wants, keep: keep});
+}
+
+# steps that can be undone
+pub fun undoable(j: *Journal) usize {
+    ret j.at;
+}
+
+# steps that can be redone
+pub fun redoable(j: *Journal) usize {
+    ret j.steps.len - j.at;
+}
+
+# whether the history was cleared since this was last asked
+pub fun dropped(j: *Journal) bool {
+    val d: bool = j.dropped;
+    j.dropped = false;
+    ret d;
+}
+
+# release every step
+fun forget(j: *Journal) {
+    var i: usize = 0;
+    for (i < j.steps.len) {
+        step_dnit(?j.steps.data[i]);
+        i = i + 1;
+    }
+    vector.clear[Step](?j.steps);
+    j.at    = 0;
+    j.bytes = 0;
+}
+
+# give up on the open step, which cannot be kept: the history before it can
+# no longer be reached, so it goes too
+fun lose(j: *Journal) {
+    if (j.lost) { ret; }
+    j.lost    = true;
+    j.dropped = true;
+    step_dnit(?j.cur);
+    step_init(?j.cur, j.a);
+    forget(j);
+}
+
+# give up on the open step once it holds more than the journal may
+fun check(j: *Journal) {
+    if (measure(?j.cur) > j.limit) { lose(j); }
+}
+
+# the box of chunks a box of cells touches
+fun chunks_of(b: space.Box) space.Box {
+    ret space.Box{x0: space.chunk_of(b.x0), y0: space.chunk_of(b.y0), x1: space.chunk_of(b.x1 - 1) + 1, y1: space.chunk_of(b.y1 - 1) + 1};
+}
+
+fun inside(b: space.Box, cx: i64, cy: i64) bool {
+    ret cx >= b.x0 && cx < b.x1 && cy >= b.y0 && cy < b.y1;
+}
+
+# whether one of a step's first n areas covers the chunk
+fun covered(st: *Step, n: usize, cx: i64, cy: i64) bool {
+    var i: usize = 0;
+    for (i < n) {
+        if (inside(st.areas.data[i], cx, cy)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the watch's question: whether the open step still needs the cells a change
+# is about to write
+fun wants(ctx: *u8, b: space.Box, whole: bool) bool {
+    val j: *Journal = ctx::*Journal;
+    if (!j.open || j.busy || j.lost) { ret false; }
+    j.touched = true;
+    if (j.cur.whole.held) { ret false; }
+    if (whole)            { ret true; }
+    # an area inside one the step already covers was kept when that one was
+    val c: space.Box = chunks_of(b);
+    var i: usize     = 0;
+    for (i < j.cur.areas.len) {
+        val o: space.Box = j.cur.areas.data[i];
+        if (c.x0 >= o.x0 && c.y0 >= o.y0 && c.x1 <= o.x1 && c.y1 <= o.y1) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# chunks being kept into a step, or listed ahead of laying an image
+# ---
+# st:    the step whose areas decide what is already covered
+# n:     areas of st counted, the rest not
+# into:  the chunk image the words are added to, or nil
+# where: receives the chunks' coordinates, or nil
+# ok:    every chunk was kept
+rec Gather {
+    st:    *Step;
+    n:     usize;
+    into:  *snapshot.Snapshot;
+    where: *Vector[space.Box];
+    ok:    bool;
+}
+
+fun gather(ctx: *u8, cx: i64, cy: i64, cells: *u32) {
+    val g: *Gather = ctx::*Gather;
+    if (!g.ok || covered(g.st, g.n, cx, cy)) { ret; }
+    if (g.into != nil) {
+        val added: err[allo.Error] = snapshot.add(g.into, cx, cy, cells);
+        if (sel added.err) { g.ok = false; }
+    }
+    if (g.where != nil) {
+        val put: res[usize, allo.Error] = vector.push[space.Box](g.where, space.Box{x0: cx, y0: cy, x1: cx + 1, y1: cy + 1});
+        if (sel put.err) { g.ok = false; }
+    }
+}
+
+# the watch's hand-over: keep the cells, current on the host or in the tree,
+# before the change writes them
+#
+# the world is read through the simulation (sim.capture, sim.chunks_in), so it
+# is kept whichever engine holds it.
+fun keep(ctx: *u8, b: space.Box, whole: bool, current: bool) {
+    val j: *Journal = ctx::*Journal;
+    if (!current) {
+        lose(j);
+        ret;
+    }
+    val s:  *sim.Sim = j.s;
+    val st: *Step    = ?j.cur;
+    if (whole) {
+        if (!sim.capture(s, ?st.whole)) { lose(j); }
+        or                              { check(j); }
+        ret;
+    }
+    val c: space.Box = chunks_of(b);
+    var g: Gather    = Gather{st: st, n: st.areas.len, into: ?st.chunks, where: nil, ok: true};
+    sim.chunks_in(s, c, gather, (?g)::*u8);
+    if (!g.ok) {
+        lose(j);
+        ret;
+    }
+    val pushed: res[usize, allo.Error] = vector.push[space.Box](?st.areas, c);
+    if (sel pushed.err) {
+        lose(j);
+        ret;
+    }
+    check(j);
+}
+
+# start recording a step of a kind, or go on with the open one
+#
+# a run step keeps the whole world at once, pulled from the GPU when it steps.
+# call outside a frame, or in one before the GPU has recorded anything.
+# ---
+# j:    the journal, bound
+# kind: the step's kind (KIND_*)
+# join: go on with an open step of the same kind rather than close it
+pub fun begin(j: *Journal, kind: u8, join: bool) {
+    if (j.open && join && j.kind == kind) { ret; }
+    close(j);
+    val s: *sim.Sim = j.s;
+    step_init(?j.cur, j.a);
+    j.cur.rule       = s.rule;
+    j.cur.generation = s.generation;
+    snapshot.open(?j.cur.chunks, s.generation, ?s.rule);
+    j.open    = true;
+    j.kind    = kind;
+    j.lost    = false;
+    j.touched = false;
+    if (kind != KIND_RUN)           { ret; }
+    if (!sim.take(s, ?j.cur.whole)) { lose(j); }
+    or                              { check(j); }
+}
+
+# the command a step was begun for has run: an edit's step closes, and a
+# stroke or run stays open for what joins it
+pub fun end(j: *Journal) {
+    if (j.open && j.kind == KIND_EDIT) { close(j); }
+}
+
+# the custom pattern is being replaced: the open step keeps p, the pattern it
+# held, when it has none yet, and otherwise p is released
+pub fun keep_custom(j: *Journal, p: pattern.Pattern) {
+    var q: pattern.Pattern = p;
+    if (!j.open || j.busy || j.lost || j.cur.kept) {
+        pattern.dnit(?q);
+        ret;
+    }
+    j.cur.custom = q;
+    j.cur.kept   = true;
+    check(j);
+}
+
+# whether the open step changed nothing
+fun unchanged(j: *Journal) bool {
+    val st: *Step = ?j.cur;
+    if (st.kept || st.generation != j.s.generation || !rule.same(?st.rule, ?j.s.rule)) { ret false; }
+    if (j.kind == KIND_RUN)                                                            { ret !j.touched; }
+    ret !st.whole.held && st.areas.len == 0;
+}
+
+# close the open step: keep it when it changed anything, clearing what could
+# be redone, and bring the journal within its limit
+pub fun close(j: *Journal) {
+    if (!j.open) { ret; }
+    j.open = false;
+    if (j.lost || unchanged(j)) {
+        step_dnit(?j.cur);
+        ret;
+    }
+    var i: usize = j.at;
+    for (i < j.steps.len) {
+        j.bytes = j.bytes - j.steps.data[i].bytes;
+        step_dnit(?j.steps.data[i]);
+        i = i + 1;
+    }
+    j.steps.len = j.at;
+    j.cur.bytes = measure(?j.cur);
+    val pushed: res[usize, allo.Error] = vector.push[Step](?j.steps, j.cur);
+    if (sel pushed.err) {
+        step_dnit(?j.cur);
+        forget(j);
+        j.dropped = true;
+        ret;
+    }
+    j.at    = j.at + 1;
+    j.bytes = j.bytes + j.cur.bytes;
+    trim(j);
+}
+
+# drop step i, moving the later ones down
+fun remove(j: *Journal, i: usize) {
+    j.bytes = j.bytes - j.steps.data[i].bytes;
+    step_dnit(?j.steps.data[i]);
+    var k: usize = i;
+    for (k + 1 < j.steps.len) {
+        j.steps.data[k] = j.steps.data[k + 1];
+        k               = k + 1;
+    }
+    j.steps.len = j.steps.len - 1;
+    if (i < j.at) { j.at = j.at - 1; }
+}
+
+# drop steps until the journal is within its limit: the oldest that can be
+# undone first, then the furthest that can be redone
+fun trim(j: *Journal) {
+    for (j.bytes > j.limit && j.steps.len != 0) {
+        if (j.at > 0) {
+            remove(j, 0);
+            if (j.at == 0 && j.bytes > j.limit) { j.dropped = true; }
+        }
+        or { remove(j, j.steps.len - 1); }
+    }
+}
+
+# write a step's chunk images over the areas it covers, keeping what they held
+# in back first when back is not nil
+#
+# the chunks holding anything in an area are listed first, through the
+# simulation, then those the image lacks are killed and the image's written,
+# so it works whichever engine holds the world.
+fun lay(j: *Journal, st: *Step, back: *Step) bool {
+    val s:  *sim.Sim          = j.s;
+    var at: Vector[space.Box] = vector.init[space.Box](j.a);
+    var ok: bool              = true;
+    var k:  usize             = 0;
+    for (ok && k < st.areas.len) {
+        val c: space.Box = st.areas.data[k];
+        if (!sim.edit_begin(s, c.x0 * space.SIDE, c.y0 * space.SIDE, c.x1 * space.SIDE, c.y1 * space.SIDE)) {
+            ok = false;
+            brk;
+        }
+        vector.clear[space.Box](?at);
+        var into: *snapshot.Snapshot = nil;
+        if (back != nil) { into = ?back.chunks; }
+        var g: Gather = Gather{st: st, n: k, into: into, where: ?at, ok: true};
+        sim.chunks_in(s, c, gather, (?g)::*u8);
+        ok = g.ok;
+        var i: usize = 0;
+        for (ok && i < at.len) {
+            val cx: i64 = at.data[i].x0;
+            val cy: i64 = at.data[i].y0;
+            if (snapshot.find(?st.chunks, cx, cy) == st.chunks.n) { ok = sim.edit_chunk(s, cx, cy, nil); }
+            i = i + 1;
+        }
+        i = 0;
+        for (ok && i < st.chunks.n) {
+            val cx: i64 = st.chunks.at[i * 2];
+            val cy: i64 = st.chunks.at[i * 2 + 1];
+            if (inside(c, cx, cy) && !covered(st, k, cx, cy)) { ok = sim.edit_chunk(s, cx, cy, snapshot.cells_of(?st.chunks, i)); }
+            i = i + 1;
+        }
+        if (!sim.edit_end(s)) { ok = false; }
+        k = k + 1;
+    }
+    vector.dnit[space.Box](?at);
+    ret ok;
+}
+
+# put step i's image in place of the world, leaving the world's image in the step
+fun swap(j: *Journal, i: usize, custom: *pattern.Pattern) bool {
+    val s:    *sim.Sim = j.s;
+    val st:   *Step    = ?j.steps.data[i];
+    var back: Step;
+    step_init(?back, j.a);
+    back.rule       = s.rule;
+    back.generation = s.generation;
+    j.busy          = true;
+    var ok: bool = true;
+    if (st.whole.held) {
+        # the world after a whole change is kept whole, with no chunks over it
+        ok = sim.take(s, ?back.whole);
+        if (ok) { ok = sim.restore(s, ?st.whole); }
+        if (ok) { ok = lay(j, st, nil); }
+    }
+    or {
+        snapshot.open(?back.chunks, s.generation, ?s.rule);
+        ok = lay(j, st, ?back);
+        # the areas move to the image of the world as it was
+        back.areas = st.areas;
+        st.areas   = vector.init[space.Box](j.a);
+    }
+    j.busy = false;
+    if (!ok) {
+        step_dnit(?back);
+        ret false;
+    }
+    sim.set_rule(s, st.rule);
+    s.generation = st.generation;
+    if (st.kept) {
+        back.custom = @custom;
+        back.kept   = true;
+        @custom     = st.custom;
+        st.kept     = false;
+    }
+    j.bytes = j.bytes - st.bytes;
+    step_dnit(st);
+    back.bytes = measure(?back);
+    @st        = back;
+    j.bytes    = j.bytes + back.bytes;
+    ret true;
+}
+
+# the world could not be put back, so no step describes it any more
+fun failed(j: *Journal) Went {
+    forget(j);
+    ret Went.lost{};
+}
+
+# pause the world and close the open step, which an undo or redo ends
+fun settle(j: *Journal) {
+    j.s.running = 0;
+    close(j);
+}
+
+# undo the newest step, pausing the world first
+# ---
+# j:      the journal, bound
+# custom: the custom pattern, swapped with the step's when it kept one
+# ret:    what happened
+pub fun undo(j: *Journal, custom: *pattern.Pattern) Went {
+    settle(j);
+    if (j.at == 0)                  { ret Went.none{}; }
+    if (!swap(j, j.at - 1, custom)) { ret failed(j); }
+    j.at = j.at - 1;
+    trim(j);
+    ret Went.done{};
+}
+
+# redo the step undone last, pausing the world first
+# ---
+# j:      the journal, bound
+# custom: the custom pattern, swapped with the step's when it kept one
+# ret:    what happened
+pub fun redo(j: *Journal, custom: *pattern.Pattern) Went {
+    settle(j);
+    if (j.at == j.steps.len)    { ret Went.none{}; }
+    if (!swap(j, j.at, custom)) { ret failed(j); }
+    j.at = j.at + 1;
+    trim(j);
+    ret Went.done{};
+}
+
+# one of a dozen kinds of change, placed by i, recorded in j: strokes, stamps,
+# selection operations, rule changes, clears, randomizes and far bulk edits
+#[testing]
+fun change(j: *Journal, s: *sim.Sim, i: i64, glider: *pattern.Pattern, cut: *pattern.Pattern) {
+    val x:     i64       = (i * 37) % 200 - 100;
+    val y:     i64       = (i * 53) % 160 - 80;
+    val b:     space.Box = space.Box{x0: x, y0: y, x1: x + 40 + (i * 7) % 90, y1: y + 30 + (i * 11) % 70};
+    val k:     i64       = i % 12;
+    var ruled: [4]usize  = [4]usize{1, 5, 0, 4};
+    if (k == 0 || k == 6) {
+        begin(j, KIND_STROKE, false);
+        sim.paint(s, x, y, 1);
+        begin(j, KIND_STROKE, true);
+        world.line(s, x, y, x + 70, y + 9, 1);
+        begin(j, KIND_STROKE, true);
+        world.line(s, x + 70, y + 9, x + 3, y + 60, (i % 2)::u8);
+        ret;
+    }
+    begin(j, KIND_EDIT, false);
+    if (k == 1) { pattern.stamp(s, glider, x, y); }
+    if (k == 2) { region.clear(s, b); }
+    if (k == 3) { region.fill(s, b, 0.4); }
+    if (k == 4) { region.invert(s, b); }
+    if (k == 5) { region.cut(s, b, cut); }
+    # HighLife, Star Wars, Life and Brian's Brain in turn, so every other change
+    # crosses families and re-encodes the world
+    if (k == 7)                  { sim.set_rule(s, rule.preset_rule(ruled[((i / 12) % 4)::usize])); }
+    if (k == 8)                  { region.fill(s, space.Box{x0: 6900 + i, y0: 6990, x1: 7300, y1: 7090}, 0.2); }
+    if (k == 9)                  { region.clear_outside(s, space.Box{x0: -200, y0: -150, x1: 260, y1: 170}); }
+    if (k == 10 && i % 24 == 10) { sim.clear(s); }
+    or (k == 10)                 { sim.randomize(s, 0.3, 96); }
+    if (k == 11)                 { pattern.stamp(s, glider, 64 * i, -64 * i); }
+    end(j);
+}
+
+# whether an undo or redo put the world back
+#[testing]
+fun done(w: Went) bool {
+    ret sel w.done;
+}
+
+# whether the rig's CPU world is as a snapshot holds it, and the GPU's as the CPU's
+#[testing]
+fun as_taken(t: *sim.Rig, want: *snapshot.Snapshot) bool {
+    var now: snapshot.Snapshot;
+    snapshot.init(?now, ?t.a);
+    val same: bool = sim.take(?t.cpu, ?now) && sim.same_snapshot(?now, want);
+    snapshot.dnit(?now);
+    ret same && sim.rig_same(t);
+}
+
+test undo__a_hundred_mixed_changes_undo_to_the_same_world_and_redo_on_both_engines {
+    var t:    sim.Rig;
+    val code: i32 = sim.rig_open(?t, rule.preset_rule(0), sim.seed_world);
+    if (code != 0) { ret code; }
+    var jc: Journal;
+    var jg: Journal;
+    init(?jc, ?t.a);
+    init(?jg, ?t.a);
+    bind(?jc, ?t.cpu);
+    bind(?jg, ?t.gpu);
+    var glider: pattern.Pattern;
+    var cc:     pattern.Pattern;
+    var cg:     pattern.Pattern;
+    pattern.init(?glider, ?t.a, 3, 3, "glider");
+    pattern.init(?cc, ?t.a, 0, 0, "cut");
+    pattern.init(?cg, ?t.a, 0, 0, "cut");
+    pattern.set(?glider, 1, 0, 1);
+    pattern.set(?glider, 2, 1, 1);
+    pattern.set(?glider, 0, 2, 1);
+    pattern.set(?glider, 1, 2, 1);
+    pattern.set(?glider, 2, 2, 1);
+
+    # the GPU runs ahead of the host's staging cells before anything is kept
+    sim.rig_step(?t, 4);
+    if (!sim.rig_settle(?t)) { ret 2; }
+    var before: snapshot.Snapshot;
+    var after:  snapshot.Snapshot;
+    snapshot.init(?before, ?t.a);
+    snapshot.init(?after, ?t.a);
+    if (!sim.take(?t.cpu, ?before)) { ret 3; }
+
+    var i: i64 = 0;
+    for (i < 100) {
+        if (i % 12 == 6) {
+            # a stretch of play is one step, and the GPU steps past the host's cells
+            begin(?jc, KIND_RUN, true);
+            begin(?jg, KIND_RUN, true);
+            sim.rig_step(?t, 3);
+            if (!sim.rig_settle(?t)) { ret 4; }
+        }
+        change(?jc, ?t.cpu, i, ?glider, ?cc);
+        change(?jg, ?t.gpu, i, ?glider, ?cg);
+        i = i + 1;
+    }
+    # undo while running pauses, and puts back the world as play found it
+    close(?jc);
+    close(?jg);
+    if (!sim.take(?t.cpu, ?after)) { ret 5; }
+    sim.toggle_running(?t.cpu);
+    sim.toggle_running(?t.gpu);
+    begin(?jc, KIND_RUN, true);
+    begin(?jg, KIND_RUN, true);
+    sim.rig_step(?t, 5);
+    if (!sim.rig_settle(?t)) { ret 6; }
+    # every change and every stretch of play is a step
+    val steps: usize = undoable(?jc) + 1;
+    if (steps != 109)                                   { ret 18; }
+    if (!done(undo(?jc, ?cc)) || !done(undo(?jg, ?cg))) { ret 7; }
+    if (t.cpu.running != 0 || t.gpu.running != 0)       { ret 8; }
+    if (!as_taken(?t, ?after))                          { ret 9; }
+
+    var n: usize = 1;
+    for (done(undo(?jc, ?cc))) {
+        if (!done(undo(?jg, ?cg))) { ret 10; }
+        n = n + 1;
+    }
+    if (n != steps || undoable(?jg) != 0) { ret 11; }
+    if (!as_taken(?t, ?before))           { ret 12; }
+
+    # redo walks forward to the same world, the run last
+    for (done(redo(?jc, ?cc))) {
+        if (!done(redo(?jg, ?cg))) { ret 13; }
+        n = n - 1;
+        if (n == 1 && !as_taken(?t, ?after)) { ret 14; }
+    }
+    if (n != 0 || redoable(?jg) != 0) { ret 15; }
+
+    # a new change clears what could be redone
+    if (!done(undo(?jc, ?cc))) { ret 16; }
+    change(?jc, ?t.cpu, 1, ?glider, ?cc);
+    close(?jc);
+    if (redoable(?jc) != 0 || done(redo(?jc, ?cc))) { ret 17; }
+
+    snapshot.dnit(?before);
+    snapshot.dnit(?after);
+    pattern.dnit(?glider);
+    pattern.dnit(?cc);
+    pattern.dnit(?cg);
+    dnit(?jc);
+    dnit(?jg);
+    sim.rig_close(?t);
+    ret 0;
+}
+
+test undo__a_strobing_b0_world_comes_back_in_the_phase_it_was_kept_in_on_both_engines {
+    var r:      rule.Rule;
+    val parsed: res[rule.Rule, str] = rule.parse("B03/S23");
+    if (sel parsed.ok) { r = parsed.ok; }
+    var t:    sim.Rig;
+    val code: i32 = sim.rig_open(?t, r, sim.seed_soup);
+    if (code != 0) { ret code; }
+    var jc: Journal;
+    var jg: Journal;
+    init(?jc, ?t.a);
+    init(?jg, ?t.a);
+    bind(?jc, ?t.cpu);
+    bind(?jg, ?t.gpu);
+    var cc: pattern.Pattern;
+    var cg: pattern.Pattern;
+    pattern.init(?cc, ?t.a, 0, 0, "cut");
+    pattern.init(?cg, ?t.a, 0, 0, "cut");
+
+    # an odd generation, whose cells the pool holds as the world's complement
+    sim.rig_step(?t, 3);
+    if (!sim.rig_settle(?t))  { ret 2; }
+    if (!sim.flipped(?t.cpu)) { ret 3; }
+    var odd:   snapshot.Snapshot;
+    var later: snapshot.Snapshot;
+    snapshot.init(?odd, ?t.a);
+    snapshot.init(?later, ?t.a);
+    if (!sim.take(?t.cpu, ?odd)) { ret 4; }
+
+    # a dead cell painted into the live background, then two more generations
+    begin(?jc, KIND_EDIT, false);
+    begin(?jg, KIND_EDIT, false);
+    sim.paint(?t.cpu, 200, 200, 0);
+    sim.paint(?t.gpu, 200, 200, 0);
+    close(?jc);
+    close(?jg);
+    begin(?jc, KIND_RUN, true);
+    begin(?jg, KIND_RUN, true);
+    sim.rig_step(?t, 2);
+    if (!sim.rig_settle(?t)) { ret 5; }
+    close(?jc);
+    close(?jg);
+    if (!sim.take(?t.cpu, ?later)) { ret 6; }
+
+    if (!done(undo(?jc, ?cc)) || !done(undo(?jg, ?cg)))                                                               { ret 7; }
+    if (t.cpu.generation != 3 || !sim.flipped(?t.cpu) || sim.alive(?t.cpu, 200, 200) || !sim.alive(?t.cpu, 201, 200)) { ret 8; }
+    if (!done(undo(?jc, ?cc)) || !done(undo(?jg, ?cg)))                                                               { ret 9; }
+    if (!as_taken(?t, ?odd) || !sim.flipped(?t.cpu))                                                                  { ret 10; }
+    if (!done(redo(?jc, ?cc)) || !done(redo(?jg, ?cg)))                                                               { ret 11; }
+    if (!done(redo(?jc, ?cc)) || !done(redo(?jg, ?cg)))                                                               { ret 12; }
+    if (!as_taken(?t, ?later) || !sim.flipped(?t.cpu))                                                                { ret 13; }
+
+    snapshot.dnit(?odd);
+    snapshot.dnit(?later);
+    pattern.dnit(?cc);
+    pattern.dnit(?cg);
+    dnit(?jc);
+    dnit(?jg);
+    sim.rig_close(?t);
+    ret 0;
+}
+
+test limit__evicts_the_oldest_steps_and_a_step_past_it_clears_the_history {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    var j: Journal;
+    init(?j, ?a);
+    bind(?j, ?s);
+    # thirty chunks far enough apart that each paint below keeps one
+    var k: i64 = 0;
+    for (k < 30) {
+        sim.paint(?s, k * 256, 0, 1);
+        k = k + 1;
+    }
+    begin(?j, KIND_EDIT, false);
+    sim.paint(?s, 1, 0, 1);
+    end(?j);
+    if (undoable(?j) != 1) { ret 2; }
+    # room for ten steps like it
+    j.limit = j.bytes * 10 + j.bytes / 2;
+    k       = 1;
+    for (k < 30) {
+        begin(?j, KIND_EDIT, false);
+        sim.paint(?s, k * 256 + 1, 0, 1);
+        end(?j);
+        k = k + 1;
+    }
+    if (undoable(?j) != 10 || j.bytes > j.limit) { ret 3; }
+    var custom: pattern.Pattern;
+    pattern.init(?custom, ?a, 0, 0, "custom");
+    for (done(undo(?j, ?custom))) {}
+    # the oldest twenty stay done, the newest ten are undone
+    k = 0;
+    for (k < 30) {
+        if (sim.alive(?s, k * 256 + 1, 0) != (k < 20)) { ret 4; }
+        k = k + 1;
+    }
+    if (dropped(?j)) { ret 5; }
+
+    # a step that alone holds more than the limit clears the history
+    k = 0;
+    for (done(redo(?j, ?custom))) { k = k + 1; }
+    if (k != 10) { ret 6; }
+    begin(?j, KIND_EDIT, false);
+    sim.randomize(?s, 0.5, 1024);
+    end(?j);
+    if (!dropped(?j) || undoable(?j) != 0 || redoable(?j) != 0 || j.bytes != 0) { ret 7; }
+    pattern.dnit(?custom);
+    dnit(?j);
+    sim.dnit(?s);
+    ret 0;
+}
+
+test undo__mixed_changes_on_hashlife_undo_and_redo_as_on_the_pool {
+    var a: allo.Allocator;
+    page.make(?a);
+    var p:  sim.Sim;
+    var t:  sim.Sim;
+    val m1: err[allo.Error] = sim.init(?p, ?a);
+    if (sel m1.err) { ret 1; }
+    val m2: err[allo.Error] = sim.init(?t, ?a);
+    if (sel m2.err) { ret 1; }
+    sim.seed_world(?p);
+    sim.seed_world(?t);
+    if (!sim.use_hashlife(?t, true)) { ret 2; }
+    var jp: Journal;
+    var jt: Journal;
+    init(?jp, ?a);
+    init(?jt, ?a);
+    bind(?jp, ?p);
+    bind(?jt, ?t);
+    var glider: pattern.Pattern;
+    var cp:     pattern.Pattern;
+    var ct:     pattern.Pattern;
+    pattern.init(?glider, ?a, 3, 3, "glider");
+    pattern.init(?cp, ?a, 0, 0, "cut");
+    pattern.init(?ct, ?a, 0, 0, "cut");
+    pattern.set(?glider, 1, 0, 1);
+    pattern.set(?glider, 2, 1, 1);
+    pattern.set(?glider, 0, 2, 1);
+    pattern.set(?glider, 1, 2, 1);
+    pattern.set(?glider, 2, 2, 1);
+
+    var i: i64 = 0;
+    for (i < 48) {
+        if (i % 12 == 6) {
+            begin(?jp, KIND_RUN, true);
+            begin(?jt, KIND_RUN, true);
+            var g: usize = 0;
+            for (g < 3) {
+                sim.step(?p);
+                sim.step(?t);
+                g = g + 1;
+            }
+        }
+        if (i % 12 == 7) {
+            # HighLife and Life in turn, which the tree runs
+            val r: rule.Rule = rule.preset_rule(((i / 12) % 2)::usize);
+            begin(?jp, KIND_EDIT, false);
+            begin(?jt, KIND_EDIT, false);
+            sim.set_rule(?p, r);
+            sim.set_rule(?t, r);
+            end(?jp);
+            end(?jt);
+        }
+        or {
+            change(?jp, ?p, i, ?glider, ?cp);
+            change(?jt, ?t, i, ?glider, ?ct);
+        }
+        if (!sim.on_tree(?t) || !sim.same_as_tree(?p, ?t)) { ret 3; }
+        i = i + 1;
+    }
+    close(?jp);
+    close(?jt);
+    if (undoable(?jp) != undoable(?jt) || undoable(?jt) == 0) { ret 4; }
+    var n: usize = 0;
+    for (done(undo(?jp, ?cp))) {
+        if (!done(undo(?jt, ?ct)))                                                         { ret 5; }
+        if (!sim.on_tree(?t) || p.generation != t.generation || !sim.same_as_tree(?p, ?t)) { ret 6; }
+        n = n + 1;
+    }
+    if (undoable(?jt) != 0) { ret 7; }
+    for (done(redo(?jp, ?cp))) {
+        if (!done(redo(?jt, ?ct)))                                     { ret 8; }
+        if (p.generation != t.generation || !sim.same_as_tree(?p, ?t)) { ret 9; }
+        n = n - 1;
+    }
+    if (n != 0 || redoable(?jt) != 0) { ret 10; }
+    pattern.dnit(?glider);
+    pattern.dnit(?cp);
+    pattern.dnit(?ct);
+    dnit(?jp);
+    dnit(?jt);
+    sim.dnit(?p);
+    sim.dnit(?t);
+    ret 0;
+}

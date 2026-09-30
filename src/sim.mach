@@ -23,8 +23,13 @@
 # staging copy. painting, stamping, randomize, load and clear edit the host's
 # pool either way, and the GPU picks the edits up as the frame begins, and a
 # read pulls an area's chunks from the GPU before the host's cells there are
-# read. outside the pool every cell is dead, so a rule that births from nothing
-# (B0) only acts inside the chunks that exist.
+# read. outside the pool every cell is dead. a rule whose background flips each
+# generation (rule.Caps.b0) is held as the world's complement on odd
+# generations, which flipped says: the draw shows those inverted, and edits and
+# reads see the world through them, so a cell painted live is live whatever the
+# parity. the phase follows from the rule and the generation, which snapshots
+# and world files keep, so nothing else records it. the population and bounds
+# count the cells as held.
 #
 # the hashlife member holds the world in a hash-consed quadtree
 # (cellar.hashlife) and has no pool, no heat and no age: a step advances 2^k
@@ -36,6 +41,13 @@
 # squares of the tree in view at the zoom are summarised into it (record). it
 # runs the rules caps.hashlife allows, and a rule it cannot run moves the
 # world back into the pool first.
+#
+# a watch (the undo journal) is shown the cells an edit, a clear or a rule
+# change that re-encodes them is about to change, brought level with the GPU's
+# first, before anything is written, whichever member holds the world. it reads
+# them through chunks_in and take and writes them back through edit_chunk and
+# restore, so it never learns where the cells are kept. the tree never holds a
+# rule caps.b0 marks, so it is never flipped.
 
 use gfx: boom.graphics;
 use boom.window;
@@ -44,6 +56,7 @@ use cellar.gpu;
 use cellar.hashlife;
 use cellar.history;
 use cellar.rule;
+use cellar.rules.weighted;
 use cellar.rules.weighted.word;
 use cellar.snapshot;
 use cellar.space;
@@ -150,6 +163,25 @@ pub rec Seen {
     box:   [4]i64;
 }
 
+# what is shown the cells a change is about to write, so it can keep them
+#
+# wants is asked before an edit of a box writes anything, or before a clear or
+# a re-encoding rule change with whole set, and says whether the cells there
+# are wanted as they stand.
+# when they are, the host's cells over the box, or everywhere with whole, are
+# brought level with the GPU's and keep is called before the change goes
+# ahead. current false tells keep they could not be read, and a clear goes
+# ahead anyway, where an edit is refused.
+# ---
+# ctx:   passed back to each call
+# wants: (ctx, box in cells, whole) whether the cells are wanted
+# keep:  (ctx, box in cells, whole, current) keep them now
+pub rec Watch {
+    ctx:   *u8;
+    wants: fun(*u8, space.Box, bool) bool;
+    keep:  fun(*u8, space.Box, bool, bool);
+}
+
 # cellular-automaton simulation state
 # ---
 # space:      the pool of chunks: the world on the cpu and gpu members, what is
@@ -172,6 +204,8 @@ pub rec Seen {
 # edit:       the open bulk edit, if any
 # read:       the open read, if any
 # history:    recent populations by generation, since the last clear
+# watched:    watch is set
+# watch:      what is shown the cells a change is about to write
 pub rec Sim {
     space:      space.Space;
     rule:       rule.Rule;
@@ -191,6 +225,8 @@ pub rec Sim {
     edit:       Edit;
     read:       Read;
     history:    history.History;
+    watched:    bool;
+    watch:      Watch;
 }
 
 # an empty world stepped by the CPU, with the first preset's rule
@@ -219,6 +255,7 @@ pub fun init(s: *Sim, a: *allo.Allocator) err[allo.Error] {
     s.running    = 0;
     s.edit.open  = false;
     s.read.open  = false;
+    s.watched    = false;
     history.clear(?s.history);
     ret e;
 }
@@ -250,6 +287,23 @@ fun touched(s: *Sim) {
     s.epoch = s.epoch + 1;
 }
 
+# show every edit and clear from now on to a watch, replacing any before it
+pub fun set_watch(s: *Sim, w: Watch) {
+    s.watch   = w;
+    s.watched = true;
+}
+
+# whether the watch wants the cells over [x0, x1) by [y0, y1), or everywhere with whole
+fun wanted(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64, whole: bool) bool {
+    if (!s.watched) { ret false; }
+    ret s.watch.wants(s.watch.ctx, space.Box{x0: x0, y0: y0, x1: x1, y1: y1}, whole);
+}
+
+# hand the watch the cells it wanted
+fun kept(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64, whole: bool, current: bool) {
+    s.watch.keep(s.watch.ctx, space.Box{x0: x0, y0: y0, x1: x1, y1: y1}, whole, current);
+}
+
 # replace the rule the world runs
 #
 # a rule whose words read as the old one's keeps the cells as they are, ages
@@ -260,6 +314,11 @@ fun touched(s: *Sim) {
 # only a state the new rule lacks changes. a rule the quadtree cannot run moves
 # the world into the pool first. call outside a frame, or in one before gpu
 # frame has recorded anything.
+# a rule held in another form (see rule.Caps.b0 and cellar.rules.weighted)
+# keeps the held cells too, so at a generation where one holds the complement
+# and the other does not, the world reads as the held cells' complement from
+# then on: the world before it had an unbounded live background no pool can
+# hold.
 # ---
 # s:   simulation
 # r:   the rule
@@ -272,16 +331,21 @@ pub fun set_rule(s: *Sim, r: rule.Rule) bool {
     val same: bool      = alike(?old, ?new);
     if (on_tree(s) && !rule.caps(?new).hashlife && !use_hashlife(s, false)) { ret false; }
     if (on_tree(s)) {
+        # the tree holds states, and only a state the new rule lacks changes
+        val fewer: bool = rule.states(?new) < rule.states(?old);
+        if (fewer && wanted(s, 0, 0, 0, 0, true)) { kept(s, 0, 0, 0, 0, true, true); }
         s.rule        = r;
         s.space.sense = rule.sense(?s.rule);
         hashlife.set_rule(?s.tree, r);
         touched(s);
-        if (rule.states(?new) < rule.states(?old) && !hashlife.limit_states(?s.tree, rule.states(?new))) { overflow(s); }
+        if (fewer && !hashlife.limit_states(?s.tree, rule.states(?new))) { overflow(s); }
         ret true;
     }
     if (!same) {
         val synced: err[gfx.Error] = sync(s);
         if (sel synced.err) { ret false; }
+        # re-encoding rewrites every cell, so the watch is shown the world whole
+        if (wanted(s, 0, 0, 0, 0, true)) { kept(s, 0, 0, 0, 0, true, true); }
     }
     s.rule        = r;
     s.space.sense = rule.sense(?s.rule);
@@ -510,7 +574,7 @@ pub fun step(s: *Sim) {
         if (s.pending < MAX_PENDING) { s.pending = s.pending + 1; }
         ret;
     }
-    if (!cpu.step(?s.space, ?s.rule, ?s.team)) {
+    if (!cpu.step(?s.space, ?s.rule, s.generation, ?s.team)) {
         overflow(s);
         ret;
     }
@@ -688,13 +752,13 @@ fun show_tree(s: *Sim, look: *gpu.Look) {
 pub fun record(s: *Sim, uncapped: bool, look: *gpu.Look) err[gfx.Error] {
     if (on_tree(s)) {
         show_tree(s, look);
-        ret gpu.show(s.gpu, ?s.space, ?s.rule, look);
+        ret gpu.show(s.gpu, ?s.space, ?s.rule, s.generation, look);
     }
     var want: usize = s.pending;
     val fast: bool  = uncapped && s.running != 0 && on_gpu(s) && !s.full;
     if (fast)                 { want = gpu.stride(s.gpu); }
     if (!on_gpu(s) || s.full) { want = 0; }
-    val done: res[usize, gfx.Error] = gpu.frame(s.gpu, ?s.space, ?s.rule, want, look);
+    val done: res[usize, gfx.Error] = gpu.frame(s.gpu, ?s.space, ?s.rule, s.generation, want, look);
     if (sel done.err) { ret err[gfx.Error].err{done.err}; }
     s.generation = s.generation + done.ok::u64;
     if (fast)                 { gpu.tune(s.gpu, want, done.ok); }
@@ -717,6 +781,10 @@ pub fun sync(s: *Sim) err[gfx.Error] {
 # ---
 # s: simulation
 pub fun clear(s: *Sim) {
+    if (wanted(s, 0, 0, 0, 0, true)) {
+        val synced: err[gfx.Error] = sync(s);
+        kept(s, 0, 0, 0, 0, true, sel synced.ok);
+    }
     space.reset(?s.space);
     hashlife.clear(?s.tree);
     touched(s);
@@ -850,15 +918,86 @@ pub fun randomize(s: *Sim, density: f32, side: usize) {
 # ret: false when the GPU's cells could not be read or the copy not stored,
 #      leaving nothing held
 pub fun take(s: *Sim, sn: *snapshot.Snapshot) bool {
-    if (on_tree(s)) { ret snapshot.capture_tree(sn, ?s.tree, s.generation, ?s.rule); }
     val synced: err[gfx.Error] = sync(s);
     if (sel synced.err) {
         snapshot.drop(sn);
         ret false;
     }
+    ret capture(s, sn);
+}
+
+# copy the world as the host holds it now into a snapshot, pulling nothing, as
+# take does once the cells are current: for a watch shown them
+# ---
+# s:   simulation
+# sn:  the snapshot, whose previous copy is replaced
+# ret: false when the copy could not be stored, leaving nothing held
+pub fun capture(s: *Sim, sn: *snapshot.Snapshot) bool {
+    if (on_tree(s)) { ret snapshot.capture_tree(sn, ?s.tree, s.generation, ?s.rule); }
     val copied: err[allo.Error] = snapshot.capture(sn, ?s.space, s.generation, ?s.rule);
-    if (sel copied.err) { ret false; }
-    ret true;
+    ret sel copied.ok;
+}
+
+# what a list of chunks by their words hands each one: its column and row and
+# its space.CELLS words, row-major, which last until the next call
+pub def Words: fun(*u8, i64, i64, *u32);
+
+# the world being listed by words
+# ---
+# s:   simulation
+# f:   the visit
+# ctx: passed back to f
+rec ByWords {
+    s:   *Sim;
+    f:   Words;
+    ctx: *u8;
+}
+
+fun tree_words(ctx: *u8, cx: i64, cy: i64, cells: *u8) {
+    val bw: *ByWords = ctx::*ByWords;
+    var w:  [4096]u32;
+    var i:  usize    = 0;
+    for (i < space.CELLS) {
+        w[i] = rule.word(?bw.s.rule, cells[i]::u32);
+        i    = i + 1;
+    }
+    bw.f(bw.ctx, cx, cy, ?w[0]);
+}
+
+# hand f every chunk in a box of chunks that holds a word but 0, as the host
+# holds its words or the tree its states, written as the rule's words
+#
+# the host's cells are the staging copy on the GPU, current only after sync or
+# for the chunks an open edit or read pulled. f must not change the world.
+# ---
+# s:   simulation, with no edit's chunks written yet
+# b:   the box, in chunks, half-open
+# f:   the visit
+# ctx: passed back to f
+pub fun chunks_in(s: *Sim, b: space.Box, f: Words, ctx: *u8) {
+    if (on_tree(s)) {
+        var bw:  ByWords = ByWords{s: s, f: f, ctx: ctx};
+        var buf: [4096]u8;
+        var box: [4]i64;
+        box[0] = b.x0 * space.SIDE;
+        box[1] = b.y0 * space.SIDE;
+        box[2] = b.x1 * space.SIDE;
+        box[3] = b.y1 * space.SIDE;
+        hashlife.chunks_within(?s.tree, ?box[0], tree_words, (?bw)::*u8, ?buf[0]);
+        ret;
+    }
+    val sp:  *space.Space = ?s.space;
+    val top: usize        = sp.hi;
+    var sl:  usize        = 0;
+    for (sl < top) {
+        if (space.used(sp, sl)) {
+            val cx: i64  = space.slot_x(sp, sl);
+            val cy: i64  = space.slot_y(sp, sl);
+            val c:  *u32 = ?sp.cells[sl * space.CELLS];
+            if (cx >= b.x0 && cx < b.x1 && cy >= b.y0 && cy < b.y1 && snapshot.any(c)) { f(ctx, cx, cy, c); }
+        }
+        sl = sl + 1;
+    }
 }
 
 # replace the world with a snapshot's, at its generation and under its rule,
@@ -901,7 +1040,22 @@ pub fun restore(s: *Sim, sn: *snapshot.Snapshot) bool {
     ret ok;
 }
 
-# the word a state is written as, fresh
+# whether the cells hold the world's complement this generation, which the
+# draw shows inverted and edits and reads see through: the rule's background
+# flips each generation and the generation is odd
+pub fun flipped(s: *Sim) bool {
+    ret rule.caps(?s.rule).b0 && (s.generation & 1) != 0;
+}
+
+# the state the pool holds for a state of the world, or the world's for a held
+# one: the same but swapped this generation when flipped, whose rules hold two
+# states
+fun held(s: *Sim, v: u8) u8 {
+    if (flipped(s)) { ret 1 - v; }
+    ret v;
+}
+
+# the word a held state is written as, fresh
 fun cell_of(s: *Sim, v: u8) u32 {
     ret rule.word(?s.rule, v::u32);
 }
@@ -993,7 +1147,7 @@ pub fun read_begin(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64) bool {
 # x:   first column
 # y:   row
 # n:   cells to read
-# out: receives n states, as the rule reads them
+# out: receives n states of the world, as the rule reads them
 # ret: false when any cell lies outside the area, leaving out untouched
 pub fun read_run(s: *Sim, x: i64, y: i64, n: usize, out: *u8) bool {
     val r: *Read = ?s.read;
@@ -1008,18 +1162,24 @@ pub fun read_run(s: *Sim, x: i64, y: i64, n: usize, out: *u8) bool {
         val k: usize = (stop - at)::usize;
         if (on_tree(s)) {
             val p: *u8 = tree_chunk(s, at, y, false);
-            if (p == nil) { mem.zero[u8](?out[o], k); }
-            or            { mem.copy[u8](?out[o], ?p[space.local_of(y) * 64 + space.local_of(at)], k); }
+            if (p == nil) { mem.fill[u8](?out[o], held(s, 0), k); }
+            or {
+                var i: usize = 0;
+                for (i < k) {
+                    out[o + i] = held(s, p[space.local_of(y) * 64 + space.local_of(at) + i]);
+                    i          = i + 1;
+                }
+            }
             at = stop;
             cnt;
         }
         val sl: u32 = space.find(sp, space.chunk_of(at), space.chunk_of(y));
-        if (sl == space.NONE) { mem.zero[u8](?out[o], k); }
+        if (sl == space.NONE) { mem.fill[u8](?out[o], held(s, 0), k); }
         or {
             val row: *u32  = ?sp.cells[sl::usize * space.CELLS + space.local_of(y) * 64 + space.local_of(at)];
             var i:   usize = 0;
             for (i < k) {
-                out[o + i] = rule.state(?s.rule, row[i])::u8;
+                out[o + i] = held(s, rule.state(?s.rule, row[i])::u8);
                 i          = i + 1;
             }
         }
@@ -1051,8 +1211,9 @@ pub fun reaches(x0: i64, y0: i64, x1: i64, y1: i64) bool {
 # the world is left alone. the chunks the area covers are pulled from the GPU
 # first, unless an open read over the area already pulled them, so writing them
 # whole loses nothing, and an area of up to SPARSE_CELLS
-# cells skips that and is written cell by cell, recorded as small writes. on
-# the tree a chunk is taken out as a run first writes a live cell to it, or
+# cells skips that and is written cell by cell, recorded as small writes,
+# unless the watch wants its cells, which are then pulled all the same. on the
+# tree a chunk is taken out as a run first writes a live cell to it, or
 # anything to one that holds live cells. call outside a frame, or in one before
 # gpu frame has recorded anything, and between begin and end make no other edit.
 # ---
@@ -1077,14 +1238,23 @@ pub fun edit_begin(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64) bool {
     e.lost   = false;
     e.sparse = e.x1 - e.x0 <= SPARSE_CELLS::i64 && e.y1 - e.y0 <= SPARSE_CELLS::i64
         && (e.x1 - e.x0) * (e.y1 - e.y0) <= SPARSE_CELLS::i64;
-    if (e.sparse || on_tree(s)) {
+    val watch: bool = e.x1 > e.x0 && wanted(s, e.x0, e.y0, e.x1, e.y1, false);
+    if (on_tree(s)) {
+        # the tree is always current, so the watch reads it as it stands
+        if (watch) { kept(s, e.x0, e.y0, e.x1, e.y1, false, true); }
         e.open = true;
         ret true;
     }
     # an open read over the area has pulled its chunks already, and nothing
     # has stepped since
     val pull: bool = !read_covers(s, e.x0, e.y0, e.x1, e.y1);
-    if (!stage(s, e.x0, e.y0, e.x1, e.y1, pull, true)) { ret false; }
+    if (e.sparse) {
+        # a small edit writes single cells and pulls nothing, unless the watch
+        # needs the chunks as they stand
+        if (watch && !stage(s, e.x0, e.y0, e.x1, e.y1, pull, false)) { ret false; }
+    }
+    or (!stage(s, e.x0, e.y0, e.x1, e.y1, pull, true)) { ret false; }
+    if (watch)                                         { kept(s, e.x0, e.y0, e.x1, e.y1, false, true); }
     e.open = true;
     ret true;
 }
@@ -1125,10 +1295,11 @@ pub fun edit_set(s: *Sim, x: i64, y: i64, v: u8) bool {
 # x:   first column
 # y:   row
 # n:   cells to write
-# v:   state, below the rule's states
+# w:   state of the world, below the rule's states
 # ret: false when any cell lies outside the area or the pool or the tree was full
-pub fun edit_run(s: *Sim, x: i64, y: i64, n: usize, v: u8) bool {
+pub fun edit_run(s: *Sim, x: i64, y: i64, n: usize, w: u8) bool {
     val e: *Edit = ?s.edit;
+    val v: u8    = held(s, w);
     if (!e.open || y < e.y0 || y >= e.y1 || x < e.x0 || x + n::i64 > e.x1) { ret false; }
     var ok:  bool = true;
     var at:  i64  = x;
@@ -1166,6 +1337,54 @@ pub fun edit_run(s: *Sim, x: i64, y: i64, n: usize, v: u8) bool {
     }
     if (!ok) { e.lost = true; }
     ret ok;
+}
+
+# write a whole chunk's cells in the open edit, as they are given
+#
+# the edit must not be a small one and must cover the chunk whole.
+# ---
+# s:     simulation
+# cx:    chunk column
+# cy:    chunk row
+# cells: space.CELLS words, row-major, or nil to kill every cell of the chunk
+# ret:   false when no such edit is open, the chunk lies outside it, or the
+#        pool was full
+pub fun edit_chunk(s: *Sim, cx: i64, cy: i64, cells: *u32) bool {
+    val e: *Edit = ?s.edit;
+    if (!e.open || (e.sparse && !on_tree(s)))                                                                             { ret false; }
+    if (cx * space.SIDE < e.x0 || cy * space.SIDE < e.y0 || (cx + 1) * space.SIDE > e.x1 || (cy + 1) * space.SIDE > e.y1) { ret false; }
+    if (on_tree(s)) {
+        # the tree holds states, which the words are read back to
+        val p: *u8 = hashlife.chunk(?s.tree, cx, cy, cells != nil);
+        if (p == nil) {
+            if (cells == nil) { ret true; }
+            e.lost = true;
+            ret false;
+        }
+        var i: usize = 0;
+        for (i < space.CELLS) {
+            p[i] = 0;
+            if (cells != nil) { p[i] = rule.state(?s.rule, cells[i])::u8; }
+            i = i + 1;
+        }
+        hashlife.wrote(?s.tree, cx, cy);
+        ret true;
+    }
+    val sp: *space.Space = ?s.space;
+    var sl: u32          = space.find(sp, cx, cy);
+    if (sl == space.NONE) {
+        if (cells == nil) { ret true; }
+        sl = space.alloc(sp, cx, cy);
+        if (sl == space.NONE) {
+            e.lost = true;
+            ret false;
+        }
+    }
+    val to: *u32 = ?sp.cells[sl::usize * space.CELLS];
+    if (cells == nil) { mem.zero[u32](to, space.CELLS); }
+    or                { mem.copy[u32](to, cells, space.CELLS); }
+    sp.dirty[sl::usize] = sp.dirty[sl::usize] | space.DIRTY_CELLS;
+    ret true;
 }
 
 # close the open edit: count the chunks it wrote, surround the live ones, and
@@ -1230,6 +1449,11 @@ pub fun edit_end(s: *Sim) bool {
 # ret: false when the edit could not be made
 pub fun clear_outside(s: *Sim, b: space.Box) bool {
     if (on_tree(s)) {
+        # every cell it can kill lies in the live box, which the watch is shown
+        val live: opt[space.Box] = bounds(s);
+        if (sel live.none) { ret true; }
+        val lb: space.Box = live.some;
+        if (wanted(s, lb.x0, lb.y0, lb.x1, lb.y1, false)) { kept(s, lb.x0, lb.y0, lb.x1, lb.y1, false, true); }
         val ok: bool = hashlife.keep_inside(?s.tree, b.x0, b.y0, b.x1, b.y1);
         touched(s);
         ret ok;
@@ -1410,9 +1634,9 @@ pub fun cell(s: *Sim, x: i64, y: i64) u32 {
     ret s.space.cells[sl::usize * space.CELLS + space.local_of(y) * 64 + space.local_of(x)];
 }
 
-# whether the cell at (x, y) is live, from the host's cells or the tree
+# whether the cell at (x, y) of the world is live, from the host's cells or the tree
 pub fun alive(s: *Sim, x: i64, y: i64) bool {
-    ret space.live(?s.space, cell(s, x, y));
+    ret space.live(?s.space, cell(s, x, y)) != flipped(s);
 }
 
 # live cells in the world, as of the last step or census
@@ -2139,7 +2363,7 @@ test frame__steps_on_the_gpu_exactly_as_the_cpu_does_for_every_family {
 # whether two snapshots hold the same chunks, cells, generation and rule, in
 # whatever order they were taken
 #[testing]
-fun same_snapshot(a: *snapshot.Snapshot, b: *snapshot.Snapshot) bool {
+pub fun same_snapshot(a: *snapshot.Snapshot, b: *snapshot.Snapshot) bool {
     if (!a.held || !b.held || a.n != b.n || a.generation != b.generation) { ret false; }
     if (!rule.same(?a.rule, ?b.rule))                                     { ret false; }
     var i: usize = 0;
@@ -2296,7 +2520,7 @@ fun against_chunk(ctx: *u8, cx: i64, cy: i64, cells: *u8) {
 # of the pool is the tree's, and the populations agree, so the tree holds
 # nothing else
 #[testing]
-fun same_as_tree(p: *Sim, t: *Sim) bool {
+pub fun same_as_tree(p: *Sim, t: *Sim) bool {
     if (population(p) != population(t)) {
         print.eprintlnf("populations differ: {} and {}", population(p)::u64, population(t)::u64);
         ret false;
@@ -2737,5 +2961,162 @@ test hashlife__a_zoomed_out_view_summarises_squares_of_the_tree {
     show_tree(?t, ?look);
     if (sp.dirty[space.find(sp, 0, 0)::usize] == 0) { ret 10; }
     dnit(?t);
+    ret 0;
+}
+
+# side of the reference plane's grid, centred on the origin, reaching past the
+# chunks a soup's world allocates
+#[testing]
+val PLANE: i64 = 320;
+
+# seed a 32 by 32 soup centred on the origin
+#[testing]
+pub fun seed_soup(s: *Sim) {
+    s.rng = rand.seed(5, 6, 7, 8);
+    fill_begin(s);
+    var y: i64 = -16;
+    for (y < 16) {
+        var x: i64 = -16;
+        for (x < 16) {
+            if (rand.range(?s.rng, 0, 1000) < 400) { fill_cell(s, x, y, 1); }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    fill_end(s);
+}
+
+# one generation of a naive unbounded plane: a grid, and bg every cell beyond it
+# ---
+# k:    the rule
+# from: the grid, PLANE by PLANE
+# to:   receives the grid one generation on
+# bg:   the state of every cell beyond the grid
+# ret:  that state one generation on
+#[testing]
+fun plane_step(k: *weighted.Kernel, from: *u8, to: *u8, bg: u8) u8 {
+    val r: i64 = k.radius::i64;
+    var y: i64 = 0;
+    for (y < PLANE) {
+        var x: i64 = 0;
+        for (x < PLANE) {
+            var sum: i32 = 0;
+            var dy:  i64 = 0 - r;
+            for (dy <= r) {
+                var dx: i64 = 0 - r;
+                for (dx <= r) {
+                    var c: u8 = bg;
+                    if (x + dx >= 0 && x + dx < PLANE && y + dy >= 0 && y + dy < PLANE) { c = from[((y + dy) * PLANE + x + dx)::usize]; }
+                    if (c != 0)                                                         { sum = sum + weighted.weight_at(k, dx, dy); }
+                    dx = dx + 1;
+                }
+                dy = dy + 1;
+            }
+            to[(y * PLANE + x)::usize] = weighted.next_state(k, from[(y * PLANE + x)::usize], sum);
+            x                          = x + 1;
+        }
+        y = y + 1;
+    }
+    var all: i32 = 0;
+    if (bg != 0) { all = weighted.total(k); }
+    ret weighted.next_state(k, bg, all);
+}
+
+# run a soup under a rule on both engines and hold what the world shows to a
+# naive unbounded plane's, over a grid reaching past every allocated chunk
+#
+# a rule in the COMPLEMENT form shows the plane's complement, as Golly does.
+# ---
+# rs:  the rule string
+# ret: 0 when they agree throughout, else the failed check
+#[testing]
+fun matches_plane(rs: str) i32 {
+    val parsed: res[rule.Rule, str] = rule.parse(rs);
+    if (sel parsed.err) { ret 1; }
+    var r: rule.Rule = parsed.ok;
+    var k: weighted.Kernel;
+    if (sel r.weighted) { k = r.weighted; }
+    var comp: u8 = 0;
+    if (weighted.form(?k) == word.COMPLEMENT) { comp = 1; }
+    var t:    Rig;
+    val code: i32 = rig_open(?t, r, seed_soup);
+    if (code != 0) { ret code; }
+    val n:  usize                = (PLANE * PLANE)::usize;
+    val ga: res[*u8, allo.Error] = allo.allocate[u8](?t.a, n);
+    if (sel ga.err) { ret 2; }
+    val gb: res[*u8, allo.Error] = allo.allocate[u8](?t.a, n);
+    if (sel gb.err) { ret 2; }
+    var from: *u8   = ga.ok;
+    var to:   *u8   = gb.ok;
+    var bg:   u8    = comp;
+    val half: i64   = PLANE / 2;
+    var i:    usize = 0;
+    for (i < n) {
+        from[i] = alive(?t.cpu, (i % PLANE::usize)::i64 - half, (i / PLANE::usize)::i64 - half) ^ comp;
+        i       = i + 1;
+    }
+    var outside: usize = 0;
+    var fail:    i32   = 0;
+    var g:       u64   = 1;
+    for (g <= 24 && fail == 0) {
+        rig_step(?t, 1);
+        bg = plane_step(?k, from, to, bg);
+        val was: *u8 = from;
+        from = to;
+        to   = was;
+        i    = 0;
+        for (i < n && fail == 0) {
+            val x: i64 = (i % PLANE::usize)::i64 - half;
+            val y: i64 = (i / PLANE::usize)::i64 - half;
+            if (alive(?t.cpu, x, y) != (from[i] ^ comp)) {
+                print.eprintlnf("{}: generation {} differs from the plane at ({}, {})", rs, g, x, y);
+                fail = 10;
+            }
+            if (space.find(?t.cpu.space, space.chunk_of(x), space.chunk_of(y)) == space.NONE) { outside = outside + 1; }
+            i = i + 1;
+        }
+        # an odd generation and an even one on the GPU as well
+        if (fail == 0 && g >= 23 && !rig_same(?t)) { fail = 20 + g::i32; }
+        g = g + 1;
+    }
+    if (fail == 0 && outside == 0) { fail = 30; }
+    allo.deallocate[u8](?t.a, ga.ok, n);
+    allo.deallocate[u8](?t.a, gb.ok, n);
+    rig_close(?t);
+    ret fail;
+}
+
+test b0__rules_match_an_unbounded_plane_on_both_engines {
+    var rules: [3]str = [3]str{"B0123478/S01234678", "B0/S8", "B03/S23"};
+    var i:     usize  = 0;
+    for (i < 3) {
+        val got: i32 = matches_plane(rules[i]);
+        if (got != 0) {
+            print.eprintlnf("{}: check {} failed", rules[i], got);
+            ret got;
+        }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test b0__edits_and_reads_see_the_world_at_an_odd_generation {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    Sim;
+    val made: err[allo.Error] = init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    val parsed: res[rule.Rule, str] = rule.parse("B03/S23");
+    if (sel parsed.err) { ret 2; }
+    set_rule(?s, parsed.ok);
+    step(?s);
+    # the empty world's background flipped live, held as nothing
+    if (!flipped(?s) || !alive(?s, 900, -900) || population(?s) != 0) { ret 3; }
+    paint(?s, 5, 5, 0);
+    if (alive(?s, 5, 5) || !alive(?s, 6, 5)) { ret 4; }
+    var row: [4]u8;
+    if (!read_begin(?s, 4, 5, 8, 6) || !read_run(?s, 4, 5, 4, ?row[0]) || !read_end(?s)) { ret 5; }
+    if (row[0] != 1 || row[1] != 0 || row[2] != 1 || row[3] != 1)                        { ret 6; }
+    dnit(?s);
     ret 0;
 }
