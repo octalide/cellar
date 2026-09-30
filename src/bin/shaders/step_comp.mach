@@ -13,30 +13,10 @@
 # only cools, and one that is also cold, and was cold the step before, already
 # holds zeros in both pools and is skipped.
 
-rec Cells {
-    v: [134217728]u32;
-}
-
-# the rule, then one page-table entry per slot: the slots of the 3 by 3 block
-# of chunks around it, its chunk coordinates biased by 2^30, and its
-# incarnation, zero while the slot is free
-rec Meta {
-    radius:     u32;
-    birth_lo:   u32;
-    birth_hi:   u32;
-    survive_lo: u32;
-    survive_hi: u32;
-    census:     u32;
-    hi:         u32;
-    serial:     u32;
-    weights:    [88]u32;
-    table:      [393216]u32;
-}
-
-# per slot: the serial of the last step that left a live cell, and a warm one
-rec Flags {
-    v: [65536]u32;
-}
+use cellar.layout;
+use cellar.layout.Cells;
+use cellar.layout.Flags;
+use cellar.layout.Meta;
 
 #[storage(1, 0, "readonly")]
 var src:   Cells;
@@ -51,8 +31,8 @@ var flags: Flags;
 var gid: u32x3;
 
 fun cool(v: u32) u32 {
-    val heat: u32 = v & 255;
-    if (heat > 12) { ret heat - 12; }
+    val heat: u32 = v & layout.HEAT_MASK;
+    if (heat > layout.DECAY) { ret heat - layout.DECAY; }
     ret 0;
 }
 
@@ -62,9 +42,9 @@ fun comp_main() {
     val slot: u32 = gid[1];
     val ly:   i32 = (gid[0] / 8)::i32;
     val x0:   u32 = (gid[0] % 8) * 8;
-    val base: u32 = slot * 12;
-    val row:  u32 = slot * 4096 + (ly * 64)::u32;
-    if (meta.table[base + 11] == 0) { ret; }
+    val base: u32 = slot * layout.ENTRY;
+    val row:  u32 = slot * layout.CELLS + (ly * layout.SIDE::i32)::u32;
+    if (meta.table[base + (layout.ENTRY - 1)] == 0) { ret; }
 
     # the serial that produced the source. a stamp this step already wrote
     # may have replaced it, so a stamp of either serial counts as set then; a
@@ -76,7 +56,7 @@ fun comp_main() {
     var k:    u32 = 0;
     for (k < 9) {
         val n: u32 = meta.table[base + k];
-        if (n != 0xffffffff) {
+        if (n != layout.NONE) {
             val f: u32 = flags.v[n * 2];
             if (f == last || f == now) { busy = 1; }
         }
@@ -118,30 +98,30 @@ fun comp_main() {
             var y:  i32 = ly + dy;
             var cy: u32 = 1;
             if (y < 0) {
-                y  = y + 64;
+                y  = y + layout.SIDE::i32;
                 cy = 0;
             }
-            or (y >= 64) {
-                y  = y - 64;
+            or (y >= layout.SIDE::i32) {
+                y  = y - layout.SIDE::i32;
                 cy = 2;
             }
             var dx: i32 = 0 - r;
             for (dx <= r) {
-                val w: i32 = meta.weights[((dy + r) * width + dx + r)::u32]::i32 - 1024;
+                val w: i32 = meta.weights[((dy + r) * width + dx + r)::u32]::i32 - layout.WEIGHT_BIAS::i32;
                 if (w != 0) {
                     var xx: i32 = lx + dx;
                     var cx: u32 = 1;
                     if (xx < 0) {
-                        xx = xx + 64;
+                        xx = xx + layout.SIDE::i32;
                         cx = 0;
                     }
-                    or (xx >= 64) {
-                        xx = xx - 64;
+                    or (xx >= layout.SIDE::i32) {
+                        xx = xx - layout.SIDE::i32;
                         cx = 2;
                     }
                     val n: u32 = meta.table[base + cy * 3 + cx];
-                    if (n != 0xffffffff) {
-                        if (src.v[n * 4096 + (y * 64 + xx)::u32] >= 256) { sum = sum + w; }
+                    if (n != layout.NONE) {
+                        if (src.v[n * layout.CELLS + (y * layout.SIDE::i32 + xx)::u32] >= layout.LIVE) { sum = sum + w; }
                     }
                 }
                 dx = dx + 1;
@@ -155,7 +135,7 @@ fun comp_main() {
         val cur: u32 = src.v[row + x];
         var lo:  u32 = meta.birth_lo;
         var hi:  u32 = meta.birth_hi;
-        if (cur >= 256) {
+        if (cur >= layout.LIVE) {
             lo = meta.survive_lo;
             hi = meta.survive_hi;
         }
@@ -165,13 +145,13 @@ fun comp_main() {
 
         var next: u32 = 0;
         if (bit != 0) {
-            var age: u32 = (cur >> 8) + 1;
-            if (age > 0xffffff) { age = 0xffffff; }
-            next = (age << 8) | 255;
+            var age: u32 = (cur >> layout.AGE_SHIFT) + 1;
+            if (age > layout.AGE_MAX) { age = layout.AGE_MAX; }
+            next = (age << layout.AGE_SHIFT) | layout.HEAT_MASK;
             live = 1;
         }
         or { next = cool(cur); }
-        warm           = warm | (next & 255);
+        warm           = warm | (next & layout.HEAT_MASK);
         dst.v[row + x] = next;
         x              = x + 1;
     }
