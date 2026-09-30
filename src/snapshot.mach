@@ -1,0 +1,138 @@
+# a copy of the world at one moment: its chunks, its generation and its rule
+#
+# only chunks holding a live or warm cell are kept, each as its coordinates and
+# its cells whole, so a snapshot costs what the world's front cells do and
+# never a dense grid of its extent. the simulation fills one from its pool
+# (sim.take) and replays one through its fill path (sim.restore).
+
+use cellar.kernel;
+use cellar.space;
+use allo: std.allocator;
+use mem:  std.memory;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+
+# the copy
+# ---
+# a:          allocator behind the buffers
+# held:       a copy was taken and not dropped since
+# generation: the world's generation when it was taken
+# kernel:     the rule it ran under
+# n:          chunks held
+# cap:        chunks the buffers hold
+# at:         each chunk's column and row, 2 a chunk
+# cells:      each chunk's cells, space.CELLS a chunk
+pub rec Snapshot {
+    a:          *allo.Allocator;
+    held:       bool;
+    generation: u64;
+    kernel:     kernel.Kernel;
+    n:          usize;
+    cap:        usize;
+    at:         *i64;
+    cells:      *u32;
+}
+
+# an empty snapshot holding nothing
+# ---
+# sn: the snapshot
+# a:  allocator for its buffers, outliving it
+pub fun init(sn: *Snapshot, a: *allo.Allocator) {
+    sn.a     = a;
+    sn.held  = false;
+    sn.n     = 0;
+    sn.cap   = 0;
+    sn.at    = nil;
+    sn.cells = nil;
+}
+
+fun release(sn: *Snapshot) {
+    if (sn.cap == 0) { ret; }
+    allo.deallocate[i64](sn.a, sn.at, sn.cap * 2);
+    allo.deallocate[u32](sn.a, sn.cells, sn.cap * space.CELLS);
+    sn.at    = nil;
+    sn.cells = nil;
+    sn.cap   = 0;
+}
+
+# forget the copy and free its buffers
+pub fun drop(sn: *Snapshot) {
+    release(sn);
+    sn.held = false;
+    sn.n    = 0;
+}
+
+# free the buffers
+pub fun dnit(sn: *Snapshot) {
+    drop(sn);
+}
+
+# whether a slot in use holds a cell that is live or still warm
+fun holds(sp: *space.Space, s: usize) bool {
+    val c: *u32  = ?sp.cells[s * space.CELLS];
+    var i: usize = 0;
+    for (i < space.CELLS) {
+        if (c[i] != 0) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# buffers for exactly n chunks, reused when they are big enough and not more
+# than twice too big
+fun fit(sn: *Snapshot, n: usize) err[allo.Error] {
+    if (n <= sn.cap && n * 2 >= sn.cap) { ret err[allo.Error].ok{}; }
+    release(sn);
+    if (n == 0) { ret err[allo.Error].ok{}; }
+    val at: res[*i64, allo.Error] = allo.allocate[i64](sn.a, n * 2);
+    if (sel at.err) { ret err[allo.Error].err{at.err}; }
+    val cells: res[*u32, allo.Error] = allo.allocate[u32](sn.a, n * space.CELLS);
+    if (sel cells.err) {
+        allo.deallocate[i64](sn.a, at.ok, n * 2);
+        ret err[allo.Error].err{cells.err};
+    }
+    sn.at    = at.ok;
+    sn.cells = cells.ok;
+    sn.cap   = n;
+    ret err[allo.Error].ok{};
+}
+
+# copy a pool's host cells, replacing whatever was held
+#
+# the host's cells must be current: on the GPU, sync first.
+# ---
+# sn:         the snapshot
+# sp:         the pool
+# generation: the world's generation
+# k:          the rule
+# ret:        ok, or the allocator's refusal, which leaves nothing held
+pub fun capture(sn: *Snapshot, sp: *space.Space, generation: u64, k: *kernel.Kernel) err[allo.Error] {
+    sn.held = false;
+    sn.n    = 0;
+    var n: usize = 0;
+    var s: usize = 0;
+    for (s < sp.hi) {
+        if (space.used(sp, s) && holds(sp, s)) { n = n + 1; }
+        s = s + 1;
+    }
+    val made: err[allo.Error] = fit(sn, n);
+    if (sel made.err) { ret made; }
+    s = 0;
+    for (s < sp.hi) {
+        if (space.used(sp, s) && holds(sp, s)) {
+            sn.at[sn.n * 2]     = space.slot_x(sp, s);
+            sn.at[sn.n * 2 + 1] = space.slot_y(sp, s);
+            mem.copy[u32](?sn.cells[sn.n * space.CELLS], ?sp.cells[s * space.CELLS], space.CELLS);
+            sn.n = sn.n + 1;
+        }
+        s = s + 1;
+    }
+    sn.generation = generation;
+    sn.kernel     = @k;
+    sn.held       = true;
+    ret err[allo.Error].ok{};
+}
