@@ -72,6 +72,7 @@ dropped.
 | `Ctrl+Shift+Z`, `Ctrl+Y` | redo                                                             |
 | `D`, `E`, `T`, `V`       | draw, erase, stamp or select tool                                |
 | `Z`, `X`                 | rotate the stamp, flip the stamp                                 |
+| `Q`, `Shift+Q`           | next or previous state to draw, with a rule of more than two     |
 | left mouse               | use the tool; drag to select                                     |
 | `Ctrl+C`, `Ctrl+X`       | copy or cut the selection to the stamp and the clipboard, as RLE |
 | `Ctrl+V`                 | paste a pattern as the stamp, keeping the current rule           |
@@ -106,12 +107,14 @@ corner, and the side panel groups every control by task:
   area randomize fills, from 32 to 4096 cells square, and the engine: the chunk
   pool, or HashLife where the rule allows, with its step of 2^k generations
   and a generation to go straight to
-- **draw**: the tool, a library of about three hundred classic patterns
-  (still lifes, oscillators, spaceships, guns, puffers, methuselahs and growth)
-  to browse by category or search by name, a custom pattern drawn in place, and
-  a preview of the selected one, and with the select tool the operations on the
-  selection. copying or cutting a selection makes it the custom pattern and arms
-  the stamp. The library's sources are listed in
+- **draw**: the tool, with a rule of more than two states the state the pen
+  and the custom pattern's editor paint, each in the rule's colour for it, a
+  library of about three hundred classic patterns (still lifes, oscillators,
+  spaceships, guns, puffers, methuselahs and growth) to browse by category or
+  search by name, a custom pattern drawn in place, and a preview of the
+  selected one, and with the select tool the operations on the selection.
+  copying or cutting a selection makes it the custom pattern and arms the
+  stamp. The library's sources are listed in
   [res/patterns](res/patterns/README.md)
 - **rule**: presets, the rule in B/S notation, radius, a clickable weight grid
   whose cells cycle from 0 up to 4 and on through -4 to -1, and birth and
