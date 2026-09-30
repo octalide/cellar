@@ -35,7 +35,10 @@
 # generation, skipping the chunks the steps left cold.
 #
 # where the compute stages cannot be built, the CPU steps and this only draws,
-# uploading the chunks in view every frame with their pyramids.
+# uploading the chunks in view every frame with their pyramids. the CPU steps
+# on a thread of its own while uncapped, so a growth it asks for there is only
+# noted, and the next frame makes the buffers on the thread that owns the
+# device.
 
 use gfx: boom.graphics;
 use gm:  boom.math;
@@ -216,6 +219,8 @@ rec Pool {
 # hi:       slots the GPU's page table covers
 # front:    which of cells holds the world
 # stepping: the compute stages built, so the GPU steps
+# owed:     slots a growth asked for while the CPU steps, which the next frame
+#           makes the buffers for
 # serial:   the serial of the last step recorded; stamps equal to it are current
 # ring:     recent censuses
 # id:       the last census id
@@ -265,6 +270,7 @@ pub rec Gpu {
     hi:       usize;
     front:    usize;
     stepping: bool;
+    owed:     usize;
     serial:   u32;
     ring:     [8]Snap;
     id:       u32;
@@ -471,6 +477,7 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     g.p.got    = nil;
     g.p.landed = nil;
     g.p.cap    = 0;
+    g.owed     = 0;
     g.reserved = false;
     g.retired  = false;
     g.hi       = 0;
@@ -562,14 +569,28 @@ fun drop_steps(g: *Gpu, n: usize) {
 
 # make room for a pool of cap slots, ahead of the host's pool growing to it
 #
-# the buffers are made now, where a refusal can still turn the growth down,
-# and the next frame moves the world into them.
+# while the GPU steps, the buffers are made now, where a refusal can still
+# turn the growth down, and the next frame moves the world into them. while the
+# CPU steps, which it may do off the device's thread, the growth is owed and
+# the next frame makes them, failing the frame if the device refuses.
 # ---
 # g:   the GPU side
 # cap: slots the host's pool grows to
-# ret: false when the device refused the buffers
+# ret: false when the device refused the buffers, or cap is past its ceiling
 pub fun reserve(g: *Gpu, cap: usize) bool {
     if (cap <= g.p.cap || (g.reserved && cap <= g.next.cap)) { ret true; }
+    if (!g.stepping) {
+        # the CPU may be stepping on its own thread, which must not call the
+        # device, so the next frame makes the buffers
+        if (cap > g.slots) { ret false; }
+        if (cap > g.owed)  { g.owed = cap; }
+        ret true;
+    }
+    ret make_next(g, cap);
+}
+
+# make the buffers a growth to cap slots moves the world into
+fun make_next(g: *Gpu, cap: usize) bool {
     # nothing has been recorded into a pool made since the last frame
     if (g.reserved) {
         drop_pool(g, ?g.next);
@@ -903,6 +924,10 @@ fun flush(g: *Gpu, sp: *space.Space) err[gfx.Error] {
         drop_pool(g, ?g.old);
         g.retired = false;
     }
+    if (g.owed > g.p.cap && !(g.reserved && g.owed <= g.next.cap) && !make_next(g, g.owed)) {
+        ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.overrun{(g.owed * space.CELLS * 4)::u64}}};
+    }
+    g.owed = 0;
     val grew: bool = g.reserved;
     if (grew) {
         # the world moves into the larger buffers reserve made, and only the
