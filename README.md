@@ -49,8 +49,11 @@ corner, and the side panel groups every control by task:
 
 - **run**: play, step, speed, uncapped stepping, randomize and clear, and the
   area randomize fills, from 32 to 4096 cells square
-- **draw**: the tool, a palette of built-in patterns and a custom one drawn in
-  place, with a preview of the selected pattern
+- **draw**: the tool, a library of about three hundred classic patterns
+  (still lifes, oscillators, spaceships, guns, puffers, methuselahs and growth)
+  to browse by category or search by name, a custom pattern drawn in place, and
+  a preview of the selected one. The library's sources are listed in
+  [res/patterns](res/patterns/README.md)
 - **rule**: presets, the rule in B/S notation, radius, a clickable weight grid,
   and birth and survive toggles over the reachable sums
 - **view**: colour mode (a solid colour from a set of swatches, fading trails,
