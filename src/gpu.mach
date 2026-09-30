@@ -86,6 +86,9 @@ val FRAG_SPV:   [_]u8;
 pub val HEAD: usize = layout.HEAD::usize;
 # words of the view buffer ahead of the palettes
 pub val LOOK: usize = 20;
+# the largest rule buffer uploaded in the frame's command stream: a larger one
+# goes up staged (see sync_table)
+val INLINE_MAX: usize = 65536;
 # words of a slot's coverage pyramid
 pub val MIP: usize = layout.MIP::usize;
 # entries in each palette
@@ -635,7 +638,15 @@ pub fun refusal(g: *Gpu, f: usize) str {
 # bring the rule buffer level with the rule running, ahead of the frame's steps
 #
 # a rule needing more words than the buffer holds replaces it, which waits for
-# the frames in flight that read it.
+# the frames in flight that read it. the rule buffer changes only when the rule
+# does, and a rule table's tree can run to megabytes: recorded in the frame's
+# command stream, as a frame's own small writes are, it would be copied into
+# the command buffer 64 KiB at a time and carried there whole. so a buffer
+# past INLINE_MAX bytes goes up staged, a copy the queue is drained for, which
+# waits once for the frames in flight as a replaced buffer already does, and
+# only when the rule changes. a smaller one, a wide kernel's weights that the
+# rule panel changes with every click, stays in the command stream and never
+# stalls.
 fun sync_table(g: *Gpu, r: *rule.Rule) err[gfx.Error] {
     if (g.tabled && rule.same(r, ?g.shown)) { ret err[gfx.Error].ok{}; }
     val n: usize = rule.table_words(r);
@@ -654,8 +665,14 @@ fun sync_table(g: *Gpu, r: *rule.Rule) err[gfx.Error] {
     val room: res[usize, allo.Error] = vector.ensure[u32](?g.packed, n);
     if (sel room.err) { ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.overrun{(n * 4)::u64}}}; }
     rule.pack_table(r, g.packed.data);
-    val up: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.table, 0, g.packed.data::*u8, n * 4);
-    if (sel up.err) { ret up; }
+    if (n * 4 > INLINE_MAX) {
+        val staged: err[gfx.Error] = gfx.storage_buffer_upload(g.d, ?g.table, 0, g.packed.data::*u8, n * 4);
+        if (sel staged.err) { ret staged; }
+    }
+    or {
+        val up: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.table, 0, g.packed.data::*u8, n * 4);
+        if (sel up.err) { ret up; }
+    }
     g.shown  = @r;
     g.tabled = true;
     ret err[gfx.Error].ok{};
