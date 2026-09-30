@@ -25,6 +25,10 @@
 #                                    quadtree engine's base case (cellar.hashlife)
 #   pack(r: *R, w: *u32)             its rule, into layout.RULE words of the
 #                                    meta head, for its stage
+#   TABLE: bool                      its stage binds a rule buffer
+#   table_words(r: *R) usize         the words of the rule buffer r needs
+#   pack_table(r: *R, w: *u32)       its rule, into table_words(r) words of
+#                                    the rule buffer, for its stage
 #   stage(len: *usize) *u8           its step stage's SPIR-V
 #   SAMPLE_COUNT, sample(i) str      rule strings the per-family tests run
 #
@@ -58,9 +62,19 @@
 # the rule, the grid travels everywhere the rule string does. a family that
 # cannot run on a bounded grid says so in its caps, and parse refuses the pair.
 #
-# a family whose rule does not fit layout.RULE words, a rule table, needs a
-# rule buffer of its own bound to its stage, which boom's four storage bindings
-# leave no room for yet.
+# a rule buffer holds what does not fit a family's window of the meta head: a
+# wide kernel's weights and sums, or a rule table's transitions. a family with
+# TABLE set has its stage bind one more storage buffer than the four every
+# step stage binds, at layout.TABLE_BINDING (layout.Table), and a family
+# without it binds none and gives table_words 0. the rule buffer is its
+# family's alone, sized by table_words for the rule running, and packed and
+# uploaded only when the rule changes, never each frame, so a rule table of
+# megabytes costs its upload once. the window keeps what the stage reads for
+# every cell and changes with the rule alone, a radius or a state count, and
+# the buffer's layout is the family's own, as the window's is. a device whose
+# dispatches bind too few storage buffers for a family's stage
+# (bindings(i) against boom's max_dispatch_bindings) cannot step that family's
+# rules on the GPU, and the simulation refuses them there (see cellar.sim).
 
 use cellar.layout;
 use cellar.rules.generations;
@@ -68,6 +82,10 @@ use cellar.rules.weighted;
 use wword: cellar.rules.weighted.word;
 use cellar.space;
 use cellar.topology;
+use allo: std.allocator;
+use std.allocator.page;
+use std.collections.vector;
+use std.collections.vector.Vector;
 use std.system.panic;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -170,6 +188,18 @@ fun unmatched() {
 pub fun stage(i: usize, len: *usize) *u8 {
     if (i == 1) { ret generations.stage(len); }
     ret weighted.stage(len);
+}
+
+# whether family i's step stage binds a rule buffer
+pub fun table(i: usize) bool {
+    if (i == 1) { ret generations.TABLE; }
+    ret weighted.TABLE;
+}
+
+# the storage buffers family i's step stage binds
+pub fun bindings(i: usize) usize {
+    if (table(i)) { ret layout.STEP_BINDINGS::usize + 1; }
+    ret layout.STEP_BINDINGS::usize;
 }
 
 # how many sample rule strings family i gives its tests
@@ -436,6 +466,30 @@ pub fun pack(r: *Rule, w: *u32) {
     unmatched();
 }
 
+# the words of the rule buffer a rule needs, 0 for a family that keeps none
+pub fun table_words(r: *Rule) usize {
+    if (sel r.kind.weighted)    { ret weighted.table_words(?r.kind.weighted); }
+    if (sel r.kind.generations) { ret generations.table_words(?r.kind.generations); }
+    unmatched();
+    ret 0;
+}
+
+# pack the rule into its family's rule buffer
+# ---
+# r: the rule
+# w: table_words(r) words
+pub fun pack_table(r: *Rule, w: *u32) {
+    if (sel r.kind.weighted) {
+        weighted.pack_table(?r.kind.weighted, w);
+        ret;
+    }
+    if (sel r.kind.generations) {
+        generations.pack_table(?r.kind.generations, w);
+        ret;
+    }
+    unmatched();
+}
+
 # a built-in rule
 # ---
 # label:      its display name
@@ -509,7 +563,7 @@ test preset__every_rule_string_parses_and_round_trips {
 test match_preset__names_a_preset_rule_and_nothing_else {
     var r: Rule = preset_rule(1);
     if (!string.str_equals(label(?r), "HighLife")) { ret 1; }
-    if (sel r.kind.weighted)                       { r.kind.weighted.birth = weighted.toggle_bit(r.kind.weighted.birth, 5); }
+    if (sel r.kind.weighted)                       { weighted.toggle(?r.kind.weighted.birth, 5); }
     val n: opt[usize] = match_preset(?r);
     if (sel n.some)                              { ret 2; }
     if (!string.str_equals(label(?r), "custom")) { ret 3; }
@@ -517,6 +571,8 @@ test match_preset__names_a_preset_rule_and_nothing_else {
 }
 
 test dispatch__every_function_handles_every_family {
+    var a: allo.Allocator;
+    page.make(?a);
     var own: [4096]u32;
     var out: [4096]u32;
     var buf: [FORMAT_MAX + 1]u8;
@@ -527,7 +583,8 @@ test dispatch__every_function_handles_every_family {
         if (sel named.none)  { ret 1; }
         if (named.some != f) { ret 1; }
         var len: usize = 0;
-        if (stage(f, ?len) == nil || len == 0) { ret 2; }
+        if (stage(f, ?len) == nil || len == 0)                                                          { ret 2; }
+        if (bindings(f) < layout.STEP_BINDINGS::usize || bindings(f) > layout.STEP_BINDINGS::usize + 1) { ret 2; }
         var n: usize = 0;
         for (n < sample_count(f)) {
             val got: res[Rule, str] = parse_as(f, sample(f, n));
@@ -550,6 +607,16 @@ test dispatch__every_function_handles_every_family {
             if (radius(?r) == 0)                                           { ret 10; }
             caps(?r);
             pack(?r, ?win[0]);
+            # a family with a rule buffer packs its rule there, and one without packs none
+            val words: usize = table_words(?r);
+            if (table(f) != (words != 0)) { ret 13; }
+            var tab:  Vector[u32]            = vector.init[u32](?a);
+            val room: res[usize, allo.Error] = vector.ensure[u32](?tab, words + 1);
+            if (sel room.err) { ret 14; }
+            tab.data[words] = 0xdeadbeef;
+            pack_table(?r, tab.data);
+            if (tab.data[words] != 0xdeadbeef) { ret 14; }
+            vector.dnit[u32](?tab);
             label(?r);
             match_preset(?r);
             # a busy step of an empty chunk alone leaves it empty, at either parity

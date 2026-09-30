@@ -34,6 +34,14 @@
 # (cellar.layout.Mip), which a reduce stage builds after the frame's last
 # generation, skipping the chunks the steps left cold.
 #
+# a rule family whose rule does not fit its window of the meta head keeps it
+# in a rule buffer of its own (see cellar.rule), bound after the four buffers
+# every step binds. it is packed and uploaded, in order with the frame's
+# dispatches, only when the rule it holds is not the one running, and made
+# larger, waiting for the device, only when a rule needs more words than it
+# holds. a family whose stage binds more storage buffers than the device's
+# dispatches can is not built, and its rules cannot be stepped here (steps).
+#
 # where the compute stages cannot be built, the CPU steps and this only draws,
 # uploading the chunks in view whose cells changed since they were last sent,
 # with their pyramids. the CPU steps on a thread of its own while uncapped, so
@@ -59,6 +67,7 @@ use std.types.bool.true;
 use std.types.error.err;
 use std.types.result.res;
 use std.types.size.usize;
+use std.types.string.str;
 
 #[embed("{artifact.stage-clear_comp.out}")]
 val CLEAR_SPV:  [_]u8;
@@ -215,6 +224,12 @@ rec Pool {
 # retired:  old holds buffers
 # view:     the look and the palettes
 # steps:    each rule family's step stage
+# ready:    which families' step stages were built
+# table:    the running family's rule buffer, once one needed it
+# words:    words table holds, 0 before it is made
+# tabled:   table holds the rule in shown
+# shown:    the rule table was last packed from
+# packed:   the rule buffer staged for upload
 # clear:    the clear stage
 # grow:     the stage that carries the world into larger buffers
 # census:   the census stage
@@ -267,6 +282,12 @@ pub rec Gpu {
     retired:  bool;
     view:     gfx.StorageBuffer;
     steps:    [rule.FAMILIES]gfx.Compute;
+    ready:    [rule.FAMILIES]bool;
+    table:    gfx.StorageBuffer;
+    words:    usize;
+    tabled:   bool;
+    shown:    rule.Rule;
+    packed:   Vector[u32];
     clear:    gfx.Compute;
     grow:     gfx.Compute;
     census:   gfx.Compute;
@@ -524,6 +545,9 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     g.stamped  = vector.init[u32](a);
     g.pace     = FIRST_PACE;
     g.timed    = false;
+    g.words    = 0;
+    g.tabled   = false;
+    g.packed   = vector.init[u32](a);
     # stamps start at zero, which neither of the first two serials matches
     g.serial = 2;
 
@@ -561,29 +585,80 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     ret make_pool(g, ?g.p, cap);
 }
 
-# build every rule family's step stage, all or none
+# build the step stage of every rule family whose bindings the device's
+# dispatches hold, all of those or none
 fun build_steps(g: *Gpu) bool {
-    var i: usize = 0;
+    val most: usize = gfx.renderer_limits(g.r).max_dispatch_bindings;
+    var i:    usize = 0;
     for (i < rule.FAMILIES) {
-        var len: usize          = 0;
-        val spv: *u8            = rule.stage(i, ?len);
-        val sc:  err[gfx.Error] = gfx.compute(?g.steps[i], g.d, spv, len);
-        if (sel sc.err) {
-            drop_steps(g, i);
-            ret false;
+        g.ready[i] = false;
+        i          = i + 1;
+    }
+    i = 0;
+    for (i < rule.FAMILIES) {
+        if (rule.bindings(i) <= most) {
+            var len: usize          = 0;
+            val spv: *u8            = rule.stage(i, ?len);
+            val sc:  err[gfx.Error] = gfx.compute(?g.steps[i], g.d, spv, len);
+            if (sel sc.err) {
+                drop_steps(g, i);
+                ret false;
+            }
+            g.ready[i] = true;
         }
         i = i + 1;
     }
     ret true;
 }
 
-# delete the first n families' step stages
+# delete the built step stages of the first n families
 fun drop_steps(g: *Gpu, n: usize) {
     var i: usize = 0;
     for (i < n) {
-        gfx.compute_delete(?g.steps[i], g.d);
-        i = i + 1;
+        if (g.ready[i]) { gfx.compute_delete(?g.steps[i], g.d); }
+        g.ready[i] = false;
+        i          = i + 1;
     }
+}
+
+# whether the GPU steps rules of family f
+pub fun steps(g: *Gpu, f: usize) bool {
+    ret g.stepping && g.ready[f];
+}
+
+# why the GPU cannot step rules of family f, or nil when it can or does not step
+pub fun refusal(g: *Gpu, f: usize) str {
+    if (!g.stepping || g.ready[f]) { ret nil; }
+    ret "this GPU's compute stages bind too few storage buffers for the rule buffer this family's rules need, so they cannot run while it steps the world";
+}
+
+# bring the rule buffer level with the rule running, ahead of the frame's steps
+#
+# a rule needing more words than the buffer holds replaces it, which waits for
+# the frames in flight that read it.
+fun sync_table(g: *Gpu, r: *rule.Rule) err[gfx.Error] {
+    if (g.tabled && rule.same(r, ?g.shown)) { ret err[gfx.Error].ok{}; }
+    val n: usize = rule.table_words(r);
+    if (n == 0) { ret err[gfx.Error].ok{}; }
+    if (n > g.words) {
+        if (g.words != 0) { gfx.storage_buffer_delete(g.d, ?g.table); }
+        g.words  = 0;
+        g.tabled = false;
+        var want: usize = 1024;
+        for (want < n) { want = want * 2; }
+        val e: err[gfx.Error] = make(g.d, want * 4, ?g.table);
+        if (sel e.err) { ret e; }
+        g.words = want;
+    }
+    vector.clear[u32](?g.packed);
+    val room: res[usize, allo.Error] = vector.ensure[u32](?g.packed, n);
+    if (sel room.err) { ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.overrun{(n * 4)::u64}}}; }
+    rule.pack_table(r, g.packed.data);
+    val up: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.table, 0, g.packed.data::*u8, n * 4);
+    if (sel up.err) { ret up; }
+    g.shown  = @r;
+    g.tabled = true;
+    ret err[gfx.Error].ok{};
 }
 
 # make room for a pool of cap slots, ahead of the host's pool growing to it
@@ -650,6 +725,8 @@ pub fun dnit(g: *Gpu) {
     drop_pool(g, ?g.p);
     gfx.storage_buffer_delete(g.d, ?g.view);
     gfx.shader_delete(?g.draw, g.d);
+    if (g.words != 0) { gfx.storage_buffer_delete(g.d, ?g.table); }
+    vector.dnit[u32](?g.packed);
     if (g.stepping) {
         drop_steps(g, rule.FAMILIES);
         gfx.compute_delete(?g.clear, g.d);
@@ -1259,7 +1336,16 @@ pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, 
     val radius: usize = rule.radius(r);
     val b:      usize = budget(g, radius);
     if (n > b) { n = b; }
-    val step: *gfx.Compute = ?g.steps[rule.family_of(r)];
+    val fam: usize = rule.family_of(r);
+    # a family the device could not build a stage for is refused before it
+    # runs (cellar.sim), so it is never asked to step here
+    if (!g.ready[fam]) { n = 0; }
+    if (n > 0 && g.hi != 0 && rule.table(fam)) {
+        val et: err[gfx.Error] = sync_table(g, r);
+        if (sel et.err) { ret res[usize, gfx.Error].err{et.err}; }
+    }
+    val step:  *gfx.Compute = ?g.steps[fam];
+    val bound: usize        = rule.bindings(fam);
 
     var i: usize = 0;
     for (i < n) {
@@ -1267,12 +1353,13 @@ pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, 
             g.serial = g.serial + 1;
             val es: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.meta, layout.SERIAL_AT::usize * 4, (?g.serial)::*u8, 4);
             if (sel es.err) { ret res[usize, gfx.Error].err{es.err}; }
-            var bufs: [4]*gfx.StorageBuffer;
-            bufs[0] = ?g.p.cells[g.front];
-            bufs[1] = ?g.p.cells[1 - g.front];
-            bufs[2] = ?g.p.meta;
-            bufs[3] = ?g.p.flags;
-            val e18: err[gfx.Error] = gfx.renderer_dispatch(g.r, step, ?bufs[0], 4, 8, g.hi::u32, 1);
+            var bufs: [5]*gfx.StorageBuffer;
+            bufs[0]                           = ?g.p.cells[g.front];
+            bufs[1]                           = ?g.p.cells[1 - g.front];
+            bufs[2]                           = ?g.p.meta;
+            bufs[3]                           = ?g.p.flags;
+            bufs[layout.TABLE_BINDING::usize] = ?g.table;
+            val e18: err[gfx.Error] = gfx.renderer_dispatch(g.r, step, ?bufs[0], bound, 8, g.hi::u32, 1);
             if (sel e18.err) { ret res[usize, gfx.Error].err{e18.err}; }
             g.front = 1 - g.front;
         }
