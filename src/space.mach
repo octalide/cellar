@@ -39,6 +39,7 @@ use cellar.layout;
 use cellar.topology;
 use allo: std.allocator;
 use std.allocator.page;
+use std.math.bits;
 use mem: std.memory;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -214,6 +215,40 @@ pub rec Block {
     gen:  u64;
 }
 
+# the word of a cell of a block, in its chunk's coordinates, which a family's
+# step reads every cell outside its own chunk through
+# ---
+# b:   the block
+# x:   the column, in [-SIDE, 2 * SIDE)
+# y:   the row, in [-SIDE, 2 * SIDE)
+# ret: the cell, zero in a chunk that does not exist
+#[inline]
+pub fun block_cell(b: *Block, x: i64, y: i64) u32 {
+    var lx: i64   = x;
+    var ly: i64   = y;
+    var cx: usize = 1;
+    var cy: usize = 1;
+    if (lx < 0) {
+        lx = lx + SIDE;
+        cx = 0;
+    }
+    or (lx >= SIDE) {
+        lx = lx - SIDE;
+        cx = 2;
+    }
+    if (ly < 0) {
+        ly = ly + SIDE;
+        cy = 0;
+    }
+    or (ly >= SIDE) {
+        ly = ly - SIDE;
+        cy = 2;
+    }
+    val src: *u32 = b.nb[cy * 3 + cx];
+    if (src == nil) { ret 0; }
+    ret src[(ly * SIDE + lx)::usize];
+}
+
 # a chunk's census as its cells are written, which a step keeps while it goes
 # ---
 # sense: how a cell is read
@@ -252,6 +287,26 @@ pub fun note(t: *Tally, c: u32, x: u32, y: u32) {
         if (y > t.y1) { t.y1 = y; }
     }
     if ((c & t.sense.warm_mask) != 0) { t.warm = 1; }
+}
+
+# count a row of the chunk written at once, as note would each of its cells
+# ---
+# t:    the tally
+# live: the row's live cells, bit x for column x
+# warm: a warm cell was written in the row
+# y:    the row
+pub fun note_row(t: *Tally, live: u64, warm: bool, y: u32) {
+    if (warm)      { t.warm = 1; }
+    if (live == 0) { ret; }
+    val x0: u32 = bits.ctz(live)::u32;
+    val x1: u32 = 63 - bits.clz(live)::u32;
+    t.live = t.live + bits.popcount(live)::u32;
+    if ((live & 0xffffffff) != 0) { t.quads = t.quads | layout.quadrant(0, y); }
+    if ((live >> 32) != 0)        { t.quads = t.quads | layout.quadrant(32, y); }
+    if (x0 < t.x0)                { t.x0 = x0; }
+    if (y < t.y0)                 { t.y0 = y; }
+    if (x1 > t.x1)                { t.x1 = x1; }
+    if (y > t.y1)                 { t.y1 = y; }
 }
 
 # write a tally as a slot's census words, asking for the adjacent chunks
