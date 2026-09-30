@@ -38,6 +38,8 @@ use cellar.paths;
 use cellar.pattern;
 use cellar.persist;
 use cellar.render;
+use cellar.rule;
+use cellar.rules.weighted;
 use cellar.runner;
 use cellar.shot;
 use cellar.sim;
@@ -106,6 +108,8 @@ val SMALL_PX: f32 = 14.0;
 # bench:       the measurement being run, args.BENCH_NONE for a normal session
 # bench_cpu:   the measurement steps on the CPU
 # bench_secs:  seconds the measurement runs for
+# bench_r:     the radius the measured rule reads, Life's weights widened to it
+# bench_gps:   generations a second the measurement is capped at, 0 uncapped
 # started:     when the measurement began
 # frames:      frames drawn since it began
 # gen0:        the generation it began at
@@ -132,6 +136,8 @@ pub rec Game {
     bench:       u8;
     bench_cpu:   bool;
     bench_secs:  f64;
+    bench_r:     usize;
+    bench_gps:   usize;
     started:     Instant;
     frames:      u64;
     gen0:        u64;
@@ -714,9 +720,17 @@ pub fun on_dnit(ctx: *Context) {
     app.dnit(?g.app);
 }
 
-# seed the measured world and frame it, running uncapped
+# seed the measured world and frame it, running uncapped or at the speed asked
+#
+# a wider radius keeps Life's weights, so the world evolves as Life does while
+# each generation costs the wider footprint and is budgeted its wider spread
 fun bench_world(g: *Game) {
     val s: *sim.Sim = ?g.sim;
+    if (sel s.rule.weighted) {
+        var k: weighted.Kernel = s.rule.weighted;
+        weighted.set_radius(?k, g.bench_r);
+        sim.set_rule(s, rule.Rule.weighted{k});
+    }
     if (g.bench == args.BENCH_DENSE) {
         sim.randomize(s, sim.DEFAULT_DENSITY, 512);
         g.app.zoom = 900.0 / 512.0 / render.BASE_PPC;
@@ -742,11 +756,15 @@ fun bench_world(g: *Game) {
         g.app.zoom = 900.0 / 20480.0 / render.BASE_PPC;
     }
     g.app.uncapped = 1;
-    g.app.panel    = 0;
-    g.app.refit    = false;
-    s.running      = 1;
-    g.frames       = 0;
-    g.gen0         = 0;
+    if (g.bench_gps != 0) {
+        g.app.uncapped = 0;
+        g.app.speed    = g.bench_gps::f32;
+    }
+    g.app.panel = 0;
+    g.app.refit = false;
+    s.running   = 1;
+    g.frames    = 0;
+    g.gen0      = 0;
 }
 
 # count a measured frame, and report and stop once the time is up
@@ -766,7 +784,7 @@ fun bench_frame(ctx: *Context, g: *Game) {
     val frame:  f64 = secs * 1000000.0 / g.frames::f64;
     var engine: str = "gpu";
     if (!sim.on_gpu(?g.sim)) { engine = "cpu"; }
-    print.printlnf("bench {} chunks {} population {} gens/s {} frame us {}", engine, g.sim.space.live::u64,
-        sim.population(?g.sim)::u64, (gens / secs)::u64, frame::u64);
+    print.printlnf("bench {} radius {} chunks {} population {} gens/s {} frame us {}", engine, rule.radius(?g.sim.rule)::u64,
+        g.sim.space.live::u64, sim.population(?g.sim)::u64, (gens / secs)::u64, frame::u64);
     context_stop(ctx);
 }
