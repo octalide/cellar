@@ -107,7 +107,7 @@ fun read_sel(ap: *app.App, b: *Vector[u8], pos: usize) {
 
 # buffer size for the serialized settings, ample for the integers, the
 # selection and the longest rule string
-val CAP: usize = 4096;
+val CAP: usize = rule.FORMAT_MAX + 4096;
 
 # append v's decimal digits and a separating space to buf at off; ret the new
 # offset.
@@ -212,7 +212,7 @@ pub fun save(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) err[persi
     buf[o] = '\n';
     o      = text.buf_str(buf, o + 1, rule.family_id(rule.family_of(?s.rule)));
     buf[o] = ' ';
-    var rb: [1101]u8;
+    var rb: [rule.FORMAT_MAX + 1]u8;
     o      = text.buf_str(buf, o + 1, rule.format(?s.rule, ?rb[0]));
     buf[o] = '\n';
     o      = o + 1;
@@ -296,20 +296,27 @@ pub fun load(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) err[persi
     ret err[persist.Error].ok{};
 }
 
+# the widest kernel versions 1 to 3 kept, and the weights they wrote for it
+val OLD_RADIUS:  usize = 4;
+val OLD_WEIGHTS: usize = 81;
+
 # read the weighted kernel versions 1 to 3 kept as integers: its radius, its
-# birth and survive masks and 81 weights
+# birth and survive masks, saturating at 63, and 81 weights, those past its
+# footprint unused
 fun read_kernel(b: *Vector[u8], p: *usize) weighted.Kernel {
     var k: weighted.Kernel;
     var r: usize = read_uint(b, p);
-    if (r < 1)                   { r = 1; }
-    if (r > weighted.MAX_RADIUS) { r = weighted.MAX_RADIUS; }
+    if (r < 1)          { r = 1; }
+    if (r > OLD_RADIUS) { r = OLD_RADIUS; }
     k.radius  = r;
-    k.birth   = read_uint(b, p)::u64;
-    k.survive = read_uint(b, p)::u64;
+    k.birth   = weighted.legacy_sums(read_uint(b, p)::u64);
+    k.survive = weighted.legacy_sums(read_uint(b, p)::u64);
+    val n: usize = (2 * r + 1) * (2 * r + 1);
     var i: usize = 0;
-    for (i < 81) {
-        k.weights[i] = read_int(b, p)::i32;
-        i            = i + 1;
+    for (i < OLD_WEIGHTS) {
+        val w: i32 = read_int(b, p)::i32;
+        if (i < n) { k.weights[i] = w; }
+        i = i + 1;
     }
     ret k;
 }
@@ -321,7 +328,7 @@ fun read_kernel(b: *Vector[u8], p: *usize) weighted.Kernel {
 # s:  the simulation
 fun read_rule(b: *Vector[u8], at: usize, s: *sim.Sim) {
     var id:   [32]u8;
-    var line: [1101]u8;
+    var line: [rule.FORMAT_MAX + 1]u8;
     var n:    usize = 0;
     var o:    usize = at;
     for (o < b.len && b.data[o] != ' ' && b.data[o] != '\n' && b.data[o] != '\r') {
@@ -400,9 +407,12 @@ test load__round_trips_negative_weights_and_reads_wrapped_ones {
     if (sel made.err) { ret 1; }
     var ap: app.App;
     app.init(?ap);
+    # a kernel wider than versions 1 to 3 could keep, with a sum past their 63
     if (sel s.rule.weighted) {
+        weighted.set_radius(?s.rule.weighted, 10);
         s.rule.weighted.weights[0] = -3;
         s.rule.weighted.weights[1] = 5;
+        weighted.set(?s.rule.weighted.survive, 200);
     }
 
     val path:  str                = "out/test/test_config_weights.config";
@@ -450,7 +460,7 @@ test load__round_trips_negative_weights_and_reads_wrapped_ones {
     if (sel loaded2.err)      { ret 5; }
     if (!sel t.rule.weighted) { ret 6; }
     if (sel t.rule.weighted) {
-        if (t.rule.weighted.weights[0] != -3 || t.rule.weighted.weights[80] != -3) { ret 6; }
+        if (t.rule.weighted.weights[0] != -3 || t.rule.weighted.weights[8] != -3 || t.rule.weighted.weights[9] != 0) { ret 6; }
     }
 
     # a rule line naming a family this version does not run keeps the rule
@@ -604,7 +614,7 @@ test load__reads_every_version {
         val birth: u64 = (1::u64 << 3) | (1::u64 << (v + 3));
         if (!write_old(path, v, birth))   { ret 10 + v::i32; }
         if (!loads_ok(?a, ?ap, ?s, path)) { ret 20 + v::i32; }
-        var want: rule.Rule = rule.Rule.weighted{weighted.moore(birth, 12)};
+        var want: rule.Rule = rule.Rule.weighted{weighted.moore(weighted.sums(birth), weighted.sums(12))};
         if (!rule.same(?s.rule, ?want)) { ret 30 + v::i32; }
         # version 3 names its pattern, and older ones migrate slot 0 to the glider
         var sel_want: usize = library.find(l, "Glider");

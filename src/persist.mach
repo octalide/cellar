@@ -70,7 +70,7 @@ val VERSION: u8 = '4';
 # the oldest sparse version load_world reads
 val OLDEST: u8 = '2';
 # bytes reserved for a world file's first line and header
-val HEAD_MAX: usize = 2048;
+val HEAD_MAX: usize = rule.FORMAT_MAX + 2048;
 # the longest header value read, less its NUL: the longest rule string
 val VALUE_MAX: usize = rule.FORMAT_MAX;
 # the most states a world file's cells may hold
@@ -268,7 +268,7 @@ fun write_header(buf: *u8, s: *sim.Sim, v: *View) usize {
     off      = off + 1;
     buf[off] = '\n';
     off      = off + 1;
-    var rb: [1101]u8;
+    var rb: [rule.FORMAT_MAX + 1]u8;
     off = text.buf_str(buf, off, "family ");
     off = text.buf_str(buf, off, rule.family_id(rule.family_of(?s.rule)));
     off = text.buf_str(buf, off, "\nrule ");
@@ -409,9 +409,9 @@ fun world_version(b: *Vector[u8]) u8 {
 rec Head {
     family:     [32]u8;
     ruled:      bool;
-    rule:       [1101]u8;
+    rule:       [rule.FORMAT_MAX + 1]u8;
     shaped:     bool;
-    shape:      [1101]u8;
+    shape:      [rule.FORMAT_MAX + 1]u8;
     states:     u32;
     generation: u64;
     view:       View;
@@ -545,7 +545,7 @@ fun read_header(b: *Vector[u8], p: usize, out: *usize, h: *Head) err[Error] {
         var end: usize = e;
         for (end < b.len && b.data[end] != '\n') { end = end + 1; }
         for (end > e && (b.data[end - 1] == ' ' || b.data[end - 1] == '\t' || b.data[end - 1] == '\r')) { end = end - 1; }
-        var value: [1101]u8;
+        var value: [rule.FORMAT_MAX + 1]u8;
         var len:   usize = end - e;
         # a value too long for any field this version reads is read as none at all
         if (len > VALUE_MAX) { len = 0; }
@@ -677,13 +677,15 @@ fun world_from(a: *allo.Allocator, s: *sim.Sim, v: *View, data: *Vector[u8]) res
             val head: err[Error] = read_header(data, start, ?start, ?h);
             if (sel head.err) { ret res[Loaded, Error].err{head.err}; }
         }
-        var at:     Vector[i64] = vector.init[i64](a);
-        var cells:  Vector[u8]  = vector.init[u8](a);
-        val parsed: err[Error]  = parse_sparse(data, start, h.states, ?at, ?cells, s.space.max_slots);
+        # the world runs no rule of a family the GPU stepping it cannot step
+        var refused: bool        = false;
+        var at:      Vector[i64] = vector.init[i64](a);
+        var cells:   Vector[u8]  = vector.init[u8](a);
+        val parsed:  err[Error]  = parse_sparse(data, start, h.states, ?at, ?cells, s.space.max_slots);
         if (sel parsed.ok) {
             # the rule first, so the cells are written as its words
             val named: opt[rule.Rule] = head_rule(?h);
-            if (sel named.some) { sim.set_rule(s, named.some); }
+            if (sel named.some && !sim.set_rule(s, named.some)) { refused = true; }
             val have: u32 = rule.states(?s.rule);
             sim.fill_begin(s);
             var k: usize = 0;
@@ -706,7 +708,7 @@ fun world_from(a: *allo.Allocator, s: *sim.Sim, v: *View, data: *Vector[u8]) res
         vector.dnit[i64](?at);
         vector.dnit[u8](?cells);
         if (sel parsed.err) { ret res[Loaded, Error].err{parsed.err}; }
-        ret res[Loaded, Error].ok{Loaded{foreign: foreign(?h)}};
+        ret res[Loaded, Error].ok{Loaded{foreign: refused || foreign(?h)}};
     }
 
     # an old dense world is a custom pattern, centred on the origin
@@ -755,7 +757,7 @@ fun stamp_from(a: *allo.Allocator, s: *sim.Sim, data: *Vector[u8]) res[Opened, E
         val named: str = format.text_of(?info.rule);
         if (named[0] != 0) {
             val k: res[rule.Rule, str] = rule.parse(named);
-            if (sel k.ok) { sim.set_rule(s, k.ok); }
+            if (sel k.ok) { foreign = !sim.set_rule(s, k.ok); }
             or            { foreign = true; }
         }
     }
@@ -1008,11 +1010,13 @@ test load_world__round_trips_a_wide_weighted_kernel {
     var s:    sim.Sim;
     val made: err[allo.Error] = sim.init(?s, ?a);
     if (sel made.err) { ret 1; }
+    # wider than cellar 0.4 ran, with negative weights and a sum past 63
     var k: weighted.Kernel = weighted.life();
-    weighted.set_radius(?k, 2);
-    weighted.set_weight(?k, -2, 0, -4);
-    weighted.set_weight(?k, 1, 2, 3);
-    k.birth = weighted.set_bit(k.birth, 11);
+    weighted.set_radius(?k, 12);
+    weighted.set_weight(?k, -12, 0, -4);
+    weighted.set_weight(?k, 1, 12, 3);
+    weighted.set(?k.birth, 11);
+    weighted.set(?k.survive, 70);
     sim.set_rule(?s, rule.Rule.weighted{k});
     block(?s, 0, 0);
     var v: View = View{pan_x: 0.0, pan_y: 0.0, zoom: 1.0, mode: render.MODE_SOLID};
@@ -1025,10 +1029,10 @@ test load_world__round_trips_a_wide_weighted_kernel {
     if (sel made2.err) { ret 3; }
     val loaded: res[Loaded, Error] = load_world(?a, ?t, ?v, path);
     fs.remove_file(path);
-    if (sel loaded.err)                                 { ret 4; }
-    if (loaded.ok.foreign || rule.radius(?t.rule) != 2) { ret 5; }
-    if (!rule.same(?t.rule, ?s.rule))                   { ret 6; }
-    if (sim.population(?t) != 4)                        { ret 7; }
+    if (sel loaded.err)                                  { ret 4; }
+    if (loaded.ok.foreign || rule.radius(?t.rule) != 12) { ret 5; }
+    if (!rule.same(?t.rule, ?s.rule))                    { ret 6; }
+    if (sim.population(?t) != 4)                         { ret 7; }
     sim.dnit(?s);
     sim.dnit(?t);
     ret 0;
@@ -1317,13 +1321,13 @@ test load_world__reads_cellar_2_and_every_cellar_3_header {
     if (sel both.err)                            { ret 12; }
     if (both.ok.foreign || !sel s.rule.weighted) { ret 12; }
     if (sel s.rule.weighted) {
-        if (s.rule.weighted.birth != 64 || s.rule.weighted.survive != 12) { ret 12; }
+        if (s.rule.weighted.birth.w[0] != 64 || s.rule.weighted.survive.w[0] != 12) { ret 12; }
     }
-    val wide: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v3_wide.cellar", "cellar 3\nrule B3/S23\nkernel 9 8 12 1\n\n");
+    val wide: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v3_wide.cellar", "cellar 3\nrule B3/S23\nkernel 17 8 12 1\n\n");
     if (sel wide.err)                             { ret 13; }
     if (!wide.ok.foreign || !sel s.rule.weighted) { ret 13; }
     if (sel s.rule.weighted) {
-        if (s.rule.weighted.birth != 64) { ret 13; }
+        if (s.rule.weighted.birth.w[0] != 64) { ret 13; }
     }
 
     # a version from the future, a header that never ends, and a value that
