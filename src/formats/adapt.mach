@@ -15,6 +15,9 @@ use std.types.error.err;
 use std.types.size.usize;
 
 # a sink that fills a heap pattern, sized to the file's box
+#
+# a pattern is dense, so it plans by the box: one past pattern.holds, whatever
+# its population, is refused before anything is allocated.
 # ---
 # p:    the pattern to fill; on open it is resized and takes the file's rule and
 #       comments, and its name when the file has one
@@ -24,15 +27,28 @@ pub rec PatternSink {
     sink: format.Sink;
 }
 
+# the width and height of an Info's box, 0 by 0 when it has none
+fun box_size(info: *format.Info, w: *i64, h: *i64) {
+    @w = 0;
+    @h = 0;
+    if (info.bounded) {
+        @w = info.x1 - info.x0;
+        @h = info.y1 - info.y0;
+    }
+}
+
+fun pattern_plan(ctx: *u8, info: *format.Info) bool {
+    var w: i64 = 0;
+    var h: i64 = 0;
+    box_size(info, ?w, ?h);
+    ret pattern.holds(w::u64, h::u64);
+}
+
 fun pattern_open(ctx: *u8, info: *format.Info) bool {
     val s: *PatternSink = ctx::*PatternSink;
     var w: i64          = 0;
     var h: i64          = 0;
-    if (info.bounded) {
-        w = info.x1 - info.x0;
-        h = info.y1 - info.y0;
-    }
-    if (w > pattern.MAX_SIDE::i64 || h > pattern.MAX_SIDE::i64) { ret false; }
+    box_size(info, ?w, ?h);
     val r: err[allo.Error] = pattern.resize(s.p, w::usize, h::usize);
     if (sel r.err) { ret false; }
     s.p.x = info.x0;
@@ -69,6 +85,8 @@ fun pattern_close(ctx: *u8) bool {
 pub fun pattern_sink(s: *PatternSink, p: *pattern.Pattern) *format.Sink {
     s.p          = p;
     s.sink.ctx   = s::*u8;
+    s.sink.plan  = pattern_plan;
+    s.sink.fit   = nil;
     s.sink.open  = pattern_open;
     s.sink.run   = pattern_run;
     s.sink.close = pattern_close;
@@ -76,30 +94,53 @@ pub fun pattern_sink(s: *PatternSink, p: *pattern.Pattern) *format.Sink {
 }
 
 # a sink that overlays the cells onto the world, offset, in one bulk edit
+#
+# it plans and fits without touching the world: a box past the world's reach is
+# refused, and the chunks the runs would add to the pool are counted, so a
+# pattern the pool cannot hold is refused whole while one far larger than the
+# pool in extent but sparse enough loads. only open begins the edit.
 # ---
-# s:      simulation to write onto
-# dx:     columns to shift every cell by
-# dy:     rows to shift every cell by
-# centre: on open, shift instead so the file's box is centred on the origin,
-#         as pattern.stamp centres a pattern
-# opened: whether the edit is open
-# sink:   the sink to hand to formats.load
+# s:       simulation to write onto
+# dx:      columns to shift every cell by
+# dy:      rows to shift every cell by
+# centre:  on plan, shift instead so the file's box is centred on the origin,
+#          as pattern.stamp centres a pattern
+# planned: need holds a measure
+# opened:  whether the edit is open
+# need:    what the pattern adds to the pool, from plan to close
+# sink:    the sink to hand to formats.load
 pub rec WorldSink {
-    s:      *sim.Sim;
-    dx:     i64;
-    dy:     i64;
-    centre: bool;
-    opened: bool;
-    sink:   format.Sink;
+    s:       *sim.Sim;
+    dx:      i64;
+    dy:      i64;
+    centre:  bool;
+    planned: bool;
+    opened:  bool;
+    need:    sim.Need;
+    sink:    format.Sink;
 }
 
-fun world_open(ctx: *u8, info: *format.Info) bool {
+fun world_plan(ctx: *u8, info: *format.Info) bool {
     val w: *WorldSink = ctx::*WorldSink;
     if (!info.bounded) { ret true; }
     if (w.centre) {
         w.dx = pattern.corner(0, (info.x1 - info.x0)::usize) - info.x0;
         w.dy = pattern.corner(0, (info.y1 - info.y0)::usize) - info.y0;
     }
+    if (!sim.reaches(info.x0 + w.dx, info.y0 + w.dy, info.x1 + w.dx, info.y1 + w.dy)) { ret false; }
+    sim.need_init(?w.need, w.s);
+    w.planned = true;
+    ret true;
+}
+
+fun world_fit(ctx: *u8, x: i64, y: i64, n: usize, v: u8) bool {
+    val w: *WorldSink = ctx::*WorldSink;
+    ret sim.need_run(?w.need, x + w.dx, y + w.dy, n);
+}
+
+fun world_open(ctx: *u8, info: *format.Info) bool {
+    val w: *WorldSink = ctx::*WorldSink;
+    if (!info.bounded) { ret true; }
     w.opened = sim.edit_begin(w.s, info.x0 + w.dx, info.y0 + w.dy, info.x1 + w.dx, info.y1 + w.dy);
     ret w.opened;
 }
@@ -111,6 +152,8 @@ fun world_run(ctx: *u8, x: i64, y: i64, n: usize, v: u8) bool {
 
 fun world_close(ctx: *u8) bool {
     val w: *WorldSink = ctx::*WorldSink;
+    if (w.planned) { sim.need_dnit(?w.need); }
+    w.planned = false;
     if (!w.opened) { ret true; }
     w.opened = false;
     ret sim.edit_end(w.s);
@@ -127,8 +170,11 @@ pub fun world_sink(w: *WorldSink, s: *sim.Sim, dx: i64, dy: i64) *format.Sink {
     w.dx         = dx;
     w.dy         = dy;
     w.centre     = false;
+    w.planned    = false;
     w.opened     = false;
     w.sink.ctx   = w::*u8;
+    w.sink.plan  = world_plan;
+    w.sink.fit   = world_fit;
     w.sink.open  = world_open;
     w.sink.run   = world_run;
     w.sink.close = world_close;

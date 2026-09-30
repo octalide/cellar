@@ -20,6 +20,8 @@ use cellar.space;
 use cellar.team;
 use allo: std.allocator;
 use std.allocator.page;
+use std.collections.set;
+use std.collections.set.Set;
 use mem: std.memory;
 use std.print;
 use std.rand;
@@ -370,6 +372,11 @@ fun in_area(s: *Sim, sl: usize) bool {
         && cy >= space.chunk_of(e.y0) && cy <= space.chunk_of(e.y1 - 1);
 }
 
+# whether the cells in [x0, x1) by [y0, y1) lie within the world's reach, space.REACH
+pub fun reaches(x0: i64, y0: i64, x1: i64, y1: i64) bool {
+    ret x0 >= 0 - space.REACH && y0 >= 0 - space.REACH && x1 <= space.REACH && y1 <= space.REACH;
+}
+
 # open a bulk edit of the cells in [x0, x1) by [y0, y1)
 #
 # cells inside the area are written with edit_set and edit_run and the rest of
@@ -384,9 +391,10 @@ fun in_area(s: *Sim, sl: usize) bool {
 # y0:  first row
 # x1:  column after the last
 # y1:  row after the last
-# ret: false when an edit is already open or the GPU's cells could not be read
+# ret: false when an edit is already open, the area passes the world's reach,
+#      or the GPU's cells could not be read
 pub fun edit_begin(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64) bool {
-    if (s.edit.open) { ret false; }
+    if (s.edit.open || !reaches(x0, y0, x1, y1)) { ret false; }
     val e: *Edit = ?s.edit;
     e.x0 = x0;
     e.y0 = y0;
@@ -542,6 +550,82 @@ pub fun edit_end(s: *Sim) bool {
     if (s.gpu != nil)  { gpu.note_edit(s.gpu); }
     if (!ok || e.lost) { overflow(s); }
     ret ok && !e.lost;
+}
+
+# a chunk's coordinates
+rec ChunkAt {
+    cx: i64;
+    cy: i64;
+}
+
+# the chunks an edit would add to the pool, measured before it is written
+#
+# a live cell's chunk and its eight neighbours all exist once an edit ends, so
+# those of them the pool lacks are what the edit adds, and a pattern needing
+# more than the pool has room for can be refused before any of it is written.
+# ---
+# s:     simulation measured against
+# add:   the chunks the edit would allocate
+# room:  slots the pool may still take
+# last:  the chunk the last run ended in, whose block is already counted
+# any:   whether last holds one
+# spent: the measure ran out of room or memory
+pub rec Need {
+    s:     *Sim;
+    add:   Set[ChunkAt];
+    room:  usize;
+    last:  ChunkAt;
+    any:   bool;
+    spent: bool;
+}
+
+# start measuring an edit against the pool as it stands
+# ---
+# n: measure to initialize; need_dnit releases it
+# s: simulation, left alone until the edit is written
+pub fun need_init(n: *Need, s: *Sim) {
+    n.s     = s;
+    n.add   = set.init[ChunkAt](s.space.a);
+    n.room  = 0;
+    n.any   = false;
+    n.spent = false;
+    if (s.space.max_slots > s.space.live) { n.room = s.space.max_slots - s.space.live; }
+}
+
+# release a measure
+pub fun need_dnit(n: *Need) {
+    set.dnit[ChunkAt](?n.add);
+}
+
+# count n live cells from (x, y) rightward into a measure
+# ---
+# ret: false once the edit needs more chunks than the pool has room for, or
+#      the measure could not grow
+pub fun need_run(n: *Need, x: i64, y: i64, count: usize) bool {
+    if (n.spent) { ret false; }
+    val cy: i64 = space.chunk_of(y);
+    var cx: i64 = space.chunk_of(x);
+    val to: i64 = space.chunk_of(x + count::i64 - 1);
+    for (cx <= to) {
+        if (!n.any || n.last.cx != cx || n.last.cy != cy) {
+            var k: i64 = 0;
+            for (k < 9) {
+                val at: ChunkAt = ChunkAt{cx: cx + k % 3 - 1, cy: cy + k / 3 - 1};
+                if (space.find(?n.s.space, at.cx, at.cy) == space.NONE) {
+                    val put: res[bool, allo.Error] = set.insert[ChunkAt](?n.add, at);
+                    if (sel put.err || set.length[ChunkAt](n.add) > n.room) {
+                        n.spent = true;
+                        ret false;
+                    }
+                }
+                k = k + 1;
+            }
+            n.last = ChunkAt{cx: cx, cy: cy};
+            n.any  = true;
+        }
+        cx = cx + 1;
+    }
+    ret true;
 }
 
 # set the cell at (x, y) to v, fresh: a live cell starts at age 1 and full
