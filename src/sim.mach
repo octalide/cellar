@@ -13,6 +13,7 @@ use gfx: boom.graphics;
 use boom.window;
 use cellar.cpu;
 use cellar.gpu;
+use cellar.history;
 use cellar.kernel;
 use cellar.space;
 use cellar.team;
@@ -25,6 +26,7 @@ use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 
@@ -68,6 +70,7 @@ pub rec Edit {
 # running:    1 while auto-stepping, else 0
 # preset:     index of the active kernel preset
 # edit:       the open bulk edit, if any
+# history:    recent populations by generation, since the last clear
 pub rec Sim {
     space:      space.Space;
     kernel:     kernel.Kernel;
@@ -80,6 +83,7 @@ pub rec Sim {
     running:    u8;
     preset:     usize;
     edit:       Edit;
+    history:    history.History;
 }
 
 # an empty world stepped by the CPU, with the default kernel
@@ -100,6 +104,7 @@ pub fun init(s: *Sim, a: *allo.Allocator) err[allo.Error] {
     s.generation = 0;
     s.running    = 0;
     s.edit.open  = false;
+    history.clear(?s.history);
     ret e;
 }
 
@@ -145,6 +150,7 @@ pub fun step(s: *Sim) {
         ret;
     }
     s.generation = s.generation + 1;
+    history.add(?s.history, s.generation, population(s)::u64);
 }
 
 # stop until the world is cleared once a chunk it needs could not be made: a
@@ -157,12 +163,23 @@ fun overflow(s: *Sim) {
 }
 
 # settle the pool from the GPU's newest census, once a frame before anything
-# is recorded
+# is recorded, and note the population it found
+#
+# the CPU's census is always current, so without the GPU stepping the
+# population is noted as it stands.
 # ---
 # s: simulation
 pub fun collect(s: *Sim) {
-    if (s.gpu == nil)                  { ret; }
-    if (!gpu.collect(s.gpu, ?s.space)) { overflow(s); }
+    if (!on_gpu(s)) {
+        history.add(?s.history, s.generation, population(s)::u64);
+        ret;
+    }
+    val got: gpu.Landed = gpu.collect(s.gpu, ?s.space);
+    if (!got.fits)  { overflow(s); }
+    if (!got.fresh) { ret; }
+    # every census older than the last clear is refused, so it is never more
+    # generations behind than have been counted since
+    history.add(?s.history, s.generation - got.behind, population(s)::u64);
 }
 
 # record the frame's generations on the GPU
@@ -206,6 +223,7 @@ pub fun clear(s: *Sim) {
     s.generation = 0;
     s.pending    = 0;
     s.full       = false;
+    history.clear(?s.history);
     if (s.gpu != nil) { gpu.note_bulk(s.gpu); }
 }
 
@@ -499,6 +517,14 @@ pub fun population(s: *Sim) usize {
     ret space.population(?s.space);
 }
 
+# the smallest box holding every live cell, as of the last step or census
+# ---
+# s:   simulation
+# ret: the box, or none when nothing is alive
+pub fun bounds(s: *Sim) opt[space.Box] {
+    ret space.bounds(?s.space);
+}
+
 # flip between running and paused
 # ---
 # s: simulation
@@ -548,9 +574,15 @@ test step__blinker_oscillates_with_period_two {
     if (!alive(?s, 0, -1) || !alive(?s, 0, 0) || !alive(?s, 0, 1)) { ret 2; }
     if (alive(?s, -1, 0))                                          { ret 3; }
 
+    val b: opt[space.Box] = bounds(?s);
+    if (sel b.none)                                                            { ret 6; }
+    if (b.some.x0 != 0 || b.some.y0 != -1 || b.some.x1 != 1 || b.some.y1 != 2) { ret 7; }
+
     step(?s);
     if (!alive(?s, -1, 0) || !alive(?s, 1, 0)) { ret 4; }
     if (population(?s) != 3)                   { ret 5; }
+    # a sample for each step
+    if (s.history.len != 2 || history.gen_at(?s.history, 1) != 2 || history.pop_at(?s.history, 1) != 3) { ret 8; }
     dnit(?s);
     ret 0;
 }
@@ -599,7 +631,15 @@ test randomize__fills_a_centred_square_and_clear_empties_the_pool {
     ret 0;
 }
 
-# run frames until the GPU has recorded every generation owed
+# the generation of the newest population sample, 0 when there is none
+#[testing]
+fun sampled(s: *Sim) u64 {
+    if (s.history.len == 0) { ret 0; }
+    ret history.gen_at(?s.history, s.history.len - 1);
+}
+
+# run frames until the GPU has recorded every generation owed and a census of
+# the last has landed
 #[testing]
 fun settle_frames(r: *gfx.Renderer, s: *Sim, want: u64) bool {
     var frames: usize = 0;
@@ -608,7 +648,7 @@ fun settle_frames(r: *gfx.Renderer, s: *Sim, want: u64) bool {
     look.half_w = 32.0;
     look.half_h = 32.0;
     look.win_w  = 64.0;
-    for (s.generation < want && frames < 1000) {
+    for ((s.generation < want || sampled(s) != want) && frames < 1000) {
         window.window_poll();
         val br: res[bool, gfx.Error] = gfx.renderer_begin_frame(r);
         if (sel br.err) { ret false; }
@@ -621,7 +661,7 @@ fun settle_frames(r: *gfx.Renderer, s: *Sim, want: u64) bool {
         }
         frames = frames + 1;
     }
-    ret s.generation == want;
+    ret s.generation == want && sampled(s) == want;
 }
 
 # whether every cell either world holds is the same in the other
@@ -818,6 +858,16 @@ test frame__steps_on_the_gpu_exactly_as_the_cpu_does {
         val synced: err[gfx.Error] = sync(?gpu_world);
         if (sel synced.err)                      { ret 5; }
         if (!same_world(?cpu_world, ?gpu_world)) { ret 6 + phase::i32; }
+        # the census the GPU's readout and graph read agrees with the CPU's
+        if (population(?cpu_world) != population(?gpu_world))                                             { ret 9; }
+        if (history.pop_at(?gpu_world.history, gpu_world.history.len - 1) != population(?cpu_world)::u64) { ret 10; }
+        val cb: opt[space.Box] = bounds(?cpu_world);
+        val gb: opt[space.Box] = bounds(?gpu_world);
+        if (sel cb.none) { ret 11; }
+        if (sel gb.none) { ret 12; }
+        if (cb.some.x0 != gb.some.x0 || cb.some.y0 != gb.some.y0 || cb.some.x1 != gb.some.x1 || cb.some.y1 != gb.some.y1) {
+            ret 13;
+        }
         phase = phase + 1;
     }
     if (population(?cpu_world) == 0) { ret 8; }
