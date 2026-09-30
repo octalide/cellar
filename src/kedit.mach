@@ -2,17 +2,22 @@
 # editor
 #
 # edits a copy of the simulation's rule and submits it as a command: a preset
-# quick-load for any family, and for a weighted kernel a radius stepper, a
-# clickable weight grid where each cell cycles its integer weight, from 0 up
-# to MAXW and then from -MAXW back up to 0, and birth and survive toggles over
-# every reachable weighted sum.
+# quick-load for any family, and for a weighted kernel a radius stepper, its
+# weights and its birth and survive sets. a small kernel, to radius SMALL, has
+# a clickable weight grid where each cell cycles its integer weight, from 0 up
+# to MAXW and then from -MAXW back up to 0, and a toggle for every reachable
+# sum. a wider one has too many cells and sums for that: its grid zooms and
+# scrolls and is painted with a brush (cellar.brush), and its sets are sum
+# lists typed in place (cellar.sumlist).
 
 use cellar.app;
+use cellar.brush;
 use cellar.command;
 use cellar.rule;
 use kernel: cellar.rules.weighted;
 use cellar.ruletext;
 use cellar.sim;
+use cellar.sumlist;
 use cellar.text;
 use cellar.theme;
 use cellar.ui;
@@ -29,6 +34,10 @@ val MAXW: i32 = 4;
 # largest unscaled weight-grid cell and sum toggle
 val CELL: f32 = 28.0;
 val TOG:  f32 = 26.0;
+# the widest radius edited cell by cell and sum by sum
+val SMALL: usize = 2;
+# unscaled thickness of the wide grid's scroll bars
+val BAR: f32 = 8.0;
 
 # zero every footprint weight
 fun clear_weights(k: *kernel.Kernel) {
@@ -146,27 +155,260 @@ fun sums(u: *ui.Ui, label: str, m: *kernel.Sums, most: i32) bool {
     ret ed;
 }
 
-# the radius stepper: its label, value and the two buttons
-fun radius(u: *ui.Ui, k: *kernel.Kernel) bool {
+# a labelled stepper, its value between - and + buttons at the right
+# ---
+# u:     the interface
+# label: the label
+# value: the value shown
+# ret:   -1 for -, 1 for +, 0 for neither
+fun stepper(u: *ui.Ui, label: str, value: str) i32 {
     val h:  f32 = ui.px(u, ui.ROW);
     val y0: f32 = u.y;
-    ui.text_mid(u, u.body, "Radius", u.x, y0, y0 + h, theme.TEXT, 1.0);
-    val b:  f32  = h;
-    val x1: f32  = u.x + u.w;
-    var ed: bool = false;
-    if (ui.button_at(u, "+", x1 - b, y0, x1, y0 + h, false) && k.radius < kernel.MAX_RADIUS) {
-        kernel.set_radius(k, k.radius + 1);
-        ed = true;
-    }
-    var num: [4]u8;
-    val o:   usize = text.buf_u64(?num[0], 0, k.radius::u64);
-    num[o] = 0;
-    ui.text_centre(u, u.body, ?num[0], x1 - b * 2.0, y0, x1 - b, y0 + h, theme.TEXT, 1.0);
-    if (ui.button_at(u, "-", x1 - b * 3.0, y0, x1 - b * 2.0, y0 + h, false) && k.radius > 1) {
-        kernel.set_radius(k, k.radius - 1);
-        ed = true;
-    }
+    ui.text_mid(u, u.body, label, u.x, y0, y0 + h, theme.TEXT, 1.0);
+    val b:  f32 = h;
+    val x1: f32 = u.x + u.w;
+    var d:  i32 = 0;
+    if (ui.button_at(u, "+", x1 - b, y0, x1, y0 + h, false)) { d = 1; }
+    ui.text_centre(u, u.body, value, x1 - b * 2.0, y0, x1 - b, y0 + h, theme.TEXT, 1.0);
+    if (ui.button_at(u, "-", x1 - b * 3.0, y0, x1 - b * 2.0, y0 + h, false)) { d = -1; }
     ui.advance(u, h);
+    ret d;
+}
+
+# the radius stepper
+fun radius(u: *ui.Ui, k: *kernel.Kernel) bool {
+    var num: [24]u8;
+    num[text.buf_u64(?num[0], 0, k.radius::u64)] = 0;
+    val d: i32 = stepper(u, "Radius", ?num[0]);
+    if (d > 0 && k.radius < kernel.MAX_RADIUS) {
+        kernel.set_radius(k, k.radius + 1);
+        ret true;
+    }
+    if (d < 0 && k.radius > 1) {
+        kernel.set_radius(k, k.radius - 1);
+        ret true;
+    }
+    ret false;
+}
+
+# the wide grid's cell size: the footprint fitted to the column, larger at a zoom level
+fun wide_cell(u: *ui.Ui, zoom: usize, n: i64) f32 {
+    var c: f32 = ui.px(u, CELL);
+    if (c * n::f32 > u.w)                                { c = u.w / n::f32; }
+    if (zoom > 0 && ui.px(u, brush.zoom_cell(zoom)) > c) { c = ui.px(u, brush.zoom_cell(zoom)); }
+    ret c;
+}
+
+# whether an offset is among n images
+fun among(at: *brush.Offset, n: usize, dx: i64, dy: i64) bool {
+    var i: usize = 0;
+    for (i < n) {
+        if (at[i].dx == dx && at[i].dy == dy) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the fill of a scroll bar's thumb
+fun thumb(h: ui.Hit) u32 {
+    if (h.held || h.hot) { ret theme.TEXT_FAINT; }
+    ret theme.CONTROL_ON;
+}
+
+# a first cell and a view of shown cells clamped into n, centred on c
+fun first_cell(c: i64, r: i64, shown: i64, n: i64) i64 {
+    var f: i64 = c + r - shown / 2;
+    if (f > n - shown) { f = n - shown; }
+    if (f < 0)         { f = 0; }
+    ret f;
+}
+
+# the wide weight grid: a zoomed, scrolled view of the footprint painted by
+# dragging, the hovered cell's images outlined, and a readout of the cell
+# ---
+# u:   the interface
+# b:   the brush and view
+# k:   the kernel, painted in place
+# ret: whether a weight changed
+fun wide_weights(u: *ui.Ui, b: *brush.Brush, k: *kernel.Kernel) bool {
+    val r:     i64 = k.radius::i64;
+    val n:     i64 = 2 * r + 1;
+    val bw:    f32 = ui.px(u, BAR);
+    val g:     f32 = ui.px(u, 3.0);
+    val c:     f32 = wide_cell(u, b.zoom, n);
+    var shown: i64 = n;
+    if (c * n::f32 > u.w + 0.5) {
+        shown = ((u.w - bw - g) / c)::i64;
+        if (shown < 1) { shown = 1; }
+    }
+    val fx: i64 = first_cell(b.cx, r, shown, n);
+    val fy: i64 = first_cell(b.cy, r, shown, n);
+    b.cx = fx + shown / 2 - r;
+    b.cy = fy + shown / 2 - r;
+    val bars: bool = shown < n;
+    val side: f32  = c * shown::f32;
+    var room: f32  = side;
+    if (bars) { room = side + g + bw; }
+    val x0:   f32    = u.x + (u.w - room) / 2.0;
+    val y0:   f32    = u.y;
+    val hh:   ui.Hit = ui.region(u, x0, y0, x0 + side, y0 + side);
+    val over: bool   = ui.inside(u, x0, y0, x0 + side, y0 + side);
+    var hx:   i64    = 0;
+    var hy:   i64    = 0;
+    var at:   [8]brush.Offset;
+    var na:   usize  = 0;
+    var ed:   bool   = false;
+    if (over) {
+        hx = fx + ((u.mx - x0) / c)::i64 - r;
+        hy = fy + ((u.my - y0) / c)::i64 - r;
+        if (hx > r) { hx = r; }
+        if (hy > r) { hy = r; }
+        na = brush.images(hx, hy, b.sym, ?at[0]);
+        if (hh.held && brush.paint(k, hx, hy, b.weight, b.sym)) { ed = true; }
+    }
+
+    var gap: f32 = ui.px(u, 2.0);
+    if (c < ui.px(u, 10.0)) { gap = ui.px(u, 1.0); }
+    var iy: i64 = 0;
+    for (iy < shown) {
+        var ix: i64 = 0;
+        for (ix < shown) {
+            val dx:   i64  = fx + ix - r;
+            val dy:   i64  = fy + iy - r;
+            val cx0:  f32  = x0 + ix::f32 * c;
+            val cy0:  f32  = y0 + iy::f32 * c;
+            val cx1:  f32  = cx0 + c - gap;
+            val cy1:  f32  = cy0 + c - gap;
+            val wv:   i32  = kernel.weight_at(k, dx, dy);
+            val hot:  bool = na > 0 && among(?at[0], na, dx, dy);
+            var back: u32  = theme.CONTROL;
+            if (hot) { back = theme.CONTROL_HOT; }
+            ui.rect(u, cx0, cy0, cx1, cy1, back, 1.0);
+            if (wv > 0) {
+                ui.rect(u, cx0, cy0, cx1, cy1, theme.ACCENT, 0.2 + 0.8 * shade(wv));
+            }
+            or (wv < 0) {
+                ui.rect(u, cx0, cy0, cx1, cy1, theme.WARN, 0.2 + 0.8 * shade(0 - wv));
+            }
+            if (dx == 0 && dy == 0) { ui.frame(u, cx0, cy0, cx1, cy1, ui.px(u, 1.0), theme.TEXT_DIM, 1.0); }
+            if (hot)                { ui.frame(u, cx0, cy0, cx1, cy1, ui.px(u, 1.0), theme.TEXT, 0.8); }
+            var num: [24]u8;
+            num[text.buf_i64(?num[0], 0, wv::i64)] = 0;
+            var ink: u32 = theme.TEXT_FAINT;
+            if (wv != 0)                                 { ink = theme.ACCENT_INK; }
+            if (ui.measure(u.small, ?num[0]) <= c - gap) { ui.text_centre(u, u.small, ?num[0], cx0, cy0, cx1, cy1, ink, 1.0); }
+            ix = ix + 1;
+        }
+        iy = iy + 1;
+    }
+
+    if (bars) {
+        # the bars show the view's share of the footprint, and a drag on one centres the view there
+        val tx0: f32    = x0;
+        val ty0: f32    = y0 + side + g;
+        val hb:  ui.Hit = ui.region(u, tx0, ty0, tx0 + side, ty0 + bw);
+        ui.rect(u, tx0, ty0, tx0 + side, ty0 + bw, theme.CONTROL, 1.0);
+        ui.rect(u, tx0 + side * fx::f32 / n::f32, ty0, tx0 + side * (fx + shown)::f32 / n::f32, ty0 + bw, thumb(hb), 1.0);
+        if (hb.held) { b.cx = ((u.mx - tx0) / side * n::f32)::i64 - r; }
+        val vx0: f32    = x0 + side + g;
+        val vb:  ui.Hit = ui.region(u, vx0, y0, vx0 + bw, y0 + side);
+        ui.rect(u, vx0, y0, vx0 + bw, y0 + side, theme.CONTROL, 1.0);
+        ui.rect(u, vx0, y0 + side * fy::f32 / n::f32, vx0 + bw, y0 + side * (fy + shown)::f32 / n::f32, thumb(vb), 1.0);
+        if (vb.held) { b.cy = ((u.my - y0) / side * n::f32)::i64 - r; }
+    }
+    ui.advance(u, room);
+
+    var line: [64]u8;
+    var o:    usize = 0;
+    if (over) {
+        o = text.buf_str(?line[0], 0, "x ");
+        o = text.buf_i64(?line[0], o, hx);
+        o = text.buf_str(?line[0], o, "   y ");
+        o = text.buf_i64(?line[0], o, hy);
+        o = text.buf_str(?line[0], o, "   weight ");
+        o = text.buf_i64(?line[0], o, kernel.weight_at(k, hx, hy)::i64);
+    }
+    or { o = text.buf_str(?line[0], 0, "drag to paint the brush's weight"); }
+    line[o] = 0;
+    ui.text(u, u.small, ?line[0], u.x, u.y, theme.TEXT_DIM, 1.0);
+    u.y = u.y + ui.line(u.small) + ui.px(u, ui.GAP);
+    ret ed;
+}
+
+# the zoom, brush weight and symmetry of the wide grid
+fun brush_controls(u: *ui.Ui, b: *brush.Brush, k: *kernel.Kernel) {
+    val n:   i64   = 2 * k.radius::i64 + 1;
+    val fit: f32   = wide_cell(u, 0, n);
+    val c:   f32   = wide_cell(u, b.zoom, n);
+    var num: [24]u8;
+    var o:   usize = 0;
+    if (b.zoom == 0) { o = text.buf_str(?num[0], 0, "fit"); }
+    or {
+        val m: u64 = (c * 10.0 / fit + 0.5)::u64;
+        o = text.buf_u64(?num[0], 0, m / 10);
+        o = text.buf_str(?num[0], o, ".");
+        o = text.buf_u64(?num[0], o, m % 10);
+        o = text.buf_str(?num[0], o, "x");
+    }
+    num[o] = 0;
+    val z: i32 = stepper(u, "Zoom", ?num[0]);
+    # a level adds nothing once a cell is as large as it gets
+    if (z > 0 && b.zoom < brush.ZOOMS && c < ui.px(u, CELL)) {
+        b.zoom = b.zoom + 1;
+        for (b.zoom < brush.ZOOMS && ui.px(u, brush.zoom_cell(b.zoom)) <= c) { b.zoom = b.zoom + 1; }
+    }
+    if (z < 0 && b.zoom > 0) {
+        b.zoom = b.zoom - 1;
+        for (b.zoom > 0 && ui.px(u, brush.zoom_cell(b.zoom)) <= fit) { b.zoom = b.zoom - 1; }
+    }
+
+    num[text.buf_i64(?num[0], 0, b.weight::i64)] = 0;
+    val w: i32 = stepper(u, "Brush weight", ?num[0]);
+    if (w > 0 && b.weight < MAXW)     { b.weight = b.weight + 1; }
+    if (w < 0 && b.weight > 0 - MAXW) { b.weight = b.weight - 1; }
+
+    var syms: [3]str;
+    syms[0] = "None";
+    syms[1] = "4-fold";
+    syms[2] = "8-fold";
+    ui.note(u, "Symmetry");
+    ui.segmented(u, ?syms[0], 3, ?b.sym);
+}
+
+# a labelled sum list for a wide kernel's set
+# ---
+# u:    the interface
+# l:    the list's field
+# name: "Birth" or "Survive"
+# m:    the set, replaced when a list is entered
+# most: the greatest sum the kernel reaches
+# ret:  whether the set was replaced
+fun sum_list(u: *ui.Ui, l: *sumlist.SumList, name: str, m: *kernel.Sums, most: usize) bool {
+    var lb: [64]u8;
+    var o:  usize = text.buf_str(?lb[0], 0, name);
+    o     = text.buf_str(?lb[0], o, " sums, 0 to ");
+    o     = text.buf_u64(?lb[0], o, most::u64);
+    lb[o] = 0;
+    ui.note(u, ?lb[0]);
+    var ed:  bool = false;
+    val did: u8   = ui.text_field(u, ?l.field, "none, or like 34-45, 58");
+    if (did == ui.FIELD_EDITED) { sumlist.edited(l, most); }
+    if (did == ui.FIELD_ENTERED) {
+        val got: opt[kernel.Sums] = sumlist.enter(l, most);
+        if (sel got.some) {
+            if (!kernel.same_sums(?got.some, m)) {
+                @m = got.some;
+                ed = true;
+            }
+        }
+        or { ui.focus(u, ?l.field); }
+    }
+    # an entered set runs from the next frame, so this one leaves the field as enter set it
+    if (did != ui.FIELD_ENTERED && u.focus != ?l.field) { sumlist.sync(l, m, most); }
+    if (l.error != nil) {
+        ui.text(u, u.small, l.error, u.x, u.y, theme.WARN, 1.0);
+        u.y = u.y + ui.line(u.small) + ui.px(u, ui.GAP);
+    }
     ret ed;
 }
 
@@ -176,7 +418,10 @@ fun radius(u: *ui.Ui, k: *kernel.Kernel) bool {
 # a: application state
 # s: the simulation whose kernel is edited, locked by the caller
 pub fun section(u: *ui.Ui, a: *app.App, s: *sim.Sim) {
-    if (!ui.heading(u, "RULE", ?a.open_rule)) { ret; }
+    if (!ui.heading(u, "RULE", ?a.open_rule)) {
+        a.brush.stroke = false;
+        ret;
+    }
     # edits go to a copy, which replaces the rule when the frame applies commands
     var copy: rule.Rule = @world.rule(s);
     var ed:   bool      = false;
@@ -201,7 +446,7 @@ pub fun section(u: *ui.Ui, a: *app.App, s: *sim.Sim) {
     rule_field(u, a, s);
 
     if (sel copy.kind.weighted) {
-        if (kernel_editor(u, ?copy.kind.weighted)) { ed = true; }
+        if (kernel_editor(u, a, ?copy.kind.weighted)) { ed = true; }
     }
     if (ed) { app.submit(a, command.Command.rule{copy}); }
 }
@@ -232,13 +477,30 @@ fun rule_field(u: *ui.Ui, a: *app.App, s: *sim.Sim) {
 # the weighted kernel's radius, weights and sums
 # ---
 # u:   the interface
+# a:   application state, holding the wide editor's brush and lists
 # k:   the kernel, edited in place
 # ret: whether anything was edited
-fun kernel_editor(u: *ui.Ui, k: *kernel.Kernel) bool {
-    var ed: bool = false;
+fun kernel_editor(u: *ui.Ui, a: *app.App, k: *kernel.Kernel) bool {
+    val b:  *brush.Brush = ?a.brush;
+    var ed: bool         = false;
+    # a stroke shows what it has painted, and applies it as one edit once the button is up
+    if (b.stroke && b.pending.radius != k.radius) { b.stroke = false; }
+    if (b.stroke) {
+        @k = b.pending;
+        if (!u.down) {
+            b.stroke = false;
+            ed       = true;
+        }
+    }
 
-    if (radius(u, k))  { ed = true; }
-    if (weights(u, k)) { ed = true; }
+    if (radius(u, k)) { ed = true; }
+    val wide: bool = k.radius > SMALL;
+    if (!wide && weights(u, k)) { ed = true; }
+    if (wide && wide_weights(u, b, k)) {
+        b.stroke  = true;
+        b.pending = @k;
+    }
+    if (wide) { brush_controls(u, b, k); }
     var acts: [2]str;
     acts[0] = "Clear weights";
     acts[1] = "Moore";
@@ -252,6 +514,11 @@ fun kernel_editor(u: *ui.Ui, k: *kernel.Kernel) bool {
         ed = true;
     }
     val most: i32 = kernel.max_sum(k);
+    if (wide) {
+        if (sum_list(u, ?a.birth_list, "Birth", ?k.birth, most::usize))       { ed = true; }
+        if (sum_list(u, ?a.survive_list, "Survive", ?k.survive, most::usize)) { ed = true; }
+        ret ed;
+    }
     if (sums(u, "Birth", ?k.birth, most))     { ed = true; }
     if (sums(u, "Survive", ?k.survive, most)) { ed = true; }
     ret ed;
