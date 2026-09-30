@@ -267,26 +267,27 @@ pub fun pattern_source(s: *PatternSource, p: *pattern.Pattern) *format.Source {
     ret ?s.source;
 }
 
-# a chunk holding cells, where a WorldSource reads them
+# a chunk holding a state but 0, where a WorldSource reads it
 # ---
 # cx: chunk column
 # cy: chunk row
-rec Live {
+rec Held {
     cx: i64;
     cy: i64;
 }
 
-# a source that reads the world's live cells, sparse
+# a source that reads the world's cells in a state but 0, dying ones included,
+# sparse
 #
-# it keeps the chunks holding cells ordered by row and then column, so a row
-# of the world is read from its chunks alone, and a run reaching a chunk's edge
-# goes on into the next chunk of the row when that one lies beside it. the
+# it keeps the chunks holding such a state ordered by row and then column, so a
+# row of the world is read from its chunks alone, and a run reaching a chunk's
+# edge goes on into the next chunk of the row when that one lies beside it. the
 # cells of one chunk row at a time are read through the simulation, whichever
-# engine holds the world. the cost is the live chunks', not the extent's. the
+# engine holds the world. the cost is the held chunks', not the extent's. the
 # world must not change while the source is in use.
 # ---
 # s:      simulation to read
-# live:   the chunks holding cells, ordered
+# held:   the chunks holding a state, ordered
 # cells:  the states of the chunks of the row being read, in order
 # band:   the first chunk of the chunk row being read
 # end:    the chunk after that row's last
@@ -296,7 +297,7 @@ rec Live {
 # source: the source to hand to formats.save
 pub rec WorldSource {
     s:      *sim.Sim;
-    live:   Vector[Live];
+    held:   Vector[Held];
     cells:  Vector[u8];
     band:   usize;
     end:    usize;
@@ -306,7 +307,7 @@ pub rec WorldSource {
     source: format.Source;
 }
 
-fun live_order(a: *Live, b: *Live) i64 {
+fun held_order(a: *Held, b: *Held) i64 {
     if (a.cy != b.cy) {
         if (a.cy < b.cy) { ret -1; }
         ret 1;
@@ -321,16 +322,16 @@ fun live_order(a: *Live, b: *Live) i64 {
 # ends the runs early
 fun band_end(w: *WorldSource, from: usize) usize {
     var e: usize = from;
-    for (e < w.live.len && w.live.data[e].cy == w.live.data[from].cy) { e = e + 1; }
+    for (e < w.held.len && w.held.data[e].cy == w.held.data[from].cy) { e = e + 1; }
     vector.clear[u8](?w.cells);
     val room: res[usize, allo.Error] = vector.reserve[u8](?w.cells, (e - from) * space.CELLS);
     if (sel room.err) {
-        w.band = w.live.len;
-        ret w.live.len;
+        w.band = w.held.len;
+        ret w.held.len;
     }
     var k: usize = from;
     for (k < e) {
-        sim.chunk_cells(w.s, w.live.data[k].cx, w.live.data[k].cy, ?w.cells.data[(k - from) * space.CELLS]);
+        sim.chunk_cells(w.s, w.held.data[k].cx, w.held.data[k].cy, ?w.cells.data[(k - from) * space.CELLS]);
         k = k + 1;
     }
     w.cells.len = (e - from) * space.CELLS;
@@ -360,9 +361,9 @@ fun run_of(w: *WorldSource, k: usize, lx: i64, ly: i64, v: u8) i64 {
 
 fun world_next(ctx: *u8, r: *format.Run) bool {
     val w: *WorldSource = ctx::*WorldSource;
-    for (w.band < w.live.len) {
+    for (w.band < w.held.len) {
         for (w.k < w.end) {
-            val c: *Live = ?w.live.data[w.k];
+            val c: *Held = ?w.held.data[w.k];
             for (w.lx < space.SIDE && state_at(w, w.k, w.lx, w.ly) == 0) { w.lx = w.lx + 1; }
             if (w.lx == space.SIDE) {
                 w.k  = w.k + 1;
@@ -377,7 +378,7 @@ fun world_next(ctx: *u8, r: *format.Run) bool {
             w.lx = w.lx + m;
             var n: i64 = m;
             # a run reaching the edge goes on into the chunk beside it
-            for (w.lx == space.SIDE && w.k + 1 < w.end && w.live.data[w.k + 1].cx == w.live.data[w.k].cx + 1) {
+            for (w.lx == space.SIDE && w.k + 1 < w.end && w.held.data[w.k + 1].cx == w.held.data[w.k].cx + 1) {
                 w.k = w.k + 1;
                 val more: i64 = run_of(w, w.k, 0, w.ly, v);
                 n    = n + more;
@@ -401,20 +402,21 @@ fun world_next(ctx: *u8, r: *format.Run) bool {
 
 # the chunks a WorldSource is listing
 # ---
-# live: the list
+# held: the list
 # ok:   every chunk was kept
 rec Listed {
-    live: *Vector[Live];
+    held: *Vector[Held];
     ok:   bool;
 }
 
 fun list_chunk(ctx: *u8, cx: i64, cy: i64, cells: *u8) {
     val at:  *Listed                = ctx::*Listed;
-    val put: res[usize, allo.Error] = vector.push[Live](at.live, Live{cx: cx, cy: cy});
+    val put: res[usize, allo.Error] = vector.push[Held](at.held, Held{cx: cx, cy: cy});
     if (sel put.err) { at.ok = false; }
 }
 
-# point a WorldSource at a simulation, its extent the box of its live cells
+# point a WorldSource at a simulation, its extent the box of its cells in a
+# state but 0
 #
 # the cells are brought from the GPU first when it steps.
 # ---
@@ -424,15 +426,15 @@ fun list_chunk(ctx: *u8, cx: i64, cy: i64, cells: *u8) {
 # ret: the source, or why the chunks could not be listed or read
 pub fun world_source(w: *WorldSource, s: *sim.Sim, a: *allo.Allocator) res[*format.Source, format.Error] {
     w.s     = s;
-    w.live  = vector.init[Live](a);
+    w.held  = vector.init[Held](a);
     w.cells = vector.init[u8](a);
     val synced: err[gfx.Error] = sim.sync(s);
     if (sel synced.err) { ret res[*format.Source, format.Error].err{format.Error.sink{}}; }
-    var at: Listed = Listed{live: ?w.live, ok: true};
+    var at: Listed = Listed{held: ?w.held, ok: true};
     sim.chunks(s, list_chunk, (?at)::*u8);
     if (!at.ok) { ret res[*format.Source, format.Error].err{format.Error.alloc{allo.Error.exhausted{}}}; }
-    sort.sort_by[Live](w.live.data, w.live.len, live_order);
-    val box: opt[space.Box] = sim.bounds(s);
+    sort.sort_by[Held](w.held.data, w.held.len, held_order);
+    val box: opt[space.Box] = sim.state_bounds(s);
     w.source.ctx = w::*u8;
     w.source.x0  = 0;
     w.source.y0  = 0;
@@ -453,6 +455,6 @@ pub fun world_source(w: *WorldSource, s: *sim.Sim, a: *allo.Allocator) res[*form
 
 # release a WorldSource's chunk list and cells
 pub fun world_source_dnit(w: *WorldSource) {
-    vector.dnit[Live](?w.live);
+    vector.dnit[Held](?w.held);
     vector.dnit[u8](?w.cells);
 }
