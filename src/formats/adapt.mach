@@ -288,7 +288,9 @@ rec Held {
 # cells of one chunk row at a time are read through the simulation, whichever
 # engine holds the world. the cost is the held chunks', not the extent's, and
 # the chunks are listed on the first rewind, so an encoder that reads the
-# quadtree instead, when HashLife holds the world, never lists them. the world
+# quadtree instead, when HashLife holds the world, never lists them. that
+# rewind also makes room for the cells of the widest chunk row, so a save
+# without the memory fails there rather than writing the runs short. the world
 # must not change while the source is in use.
 # ---
 # s:      simulation to read
@@ -327,17 +329,10 @@ fun held_order(a: *Held, b: *Held) i64 {
 }
 
 # the chunk after the chunk row starting at from, whose chunks' cells are read
-# into cells, or the end of the list when there is no memory for them, which
-# ends the runs early
+# into cells, which rewind made room for
 fun band_end(w: *WorldSource, from: usize) usize {
     var e: usize = from;
     for (e < w.held.len && w.held.data[e].cy == w.held.data[from].cy) { e = e + 1; }
-    vector.clear[u8](?w.cells);
-    val room: res[usize, allo.Error] = vector.reserve[u8](?w.cells, (e - from) * space.CELLS);
-    if (sel room.err) {
-        w.band = w.held.len;
-        ret w.held.len;
-    }
     var k: usize = from;
     for (k < e) {
         sim.chunk_cells(w.s, w.held.data[k].cx, w.held.data[k].cy, ?w.cells.data[(k - from) * space.CELLS]);
@@ -369,6 +364,17 @@ fun world_rewind(ctx: *u8) err[format.Error] {
         sim.chunks(w.s, list_chunk, (?at)::*u8);
         if (!at.ok) { ret err[format.Error].err{format.Error.alloc{allo.Error.exhausted{}}}; }
         sort.sort_by[Held](w.held.data, w.held.len, held_order);
+        # room for the widest chunk row, so reading the runs never allocates
+        var widest: usize = 0;
+        var from:   usize = 0;
+        for (from < w.held.len) {
+            var e: usize = from;
+            for (e < w.held.len && w.held.data[e].cy == w.held.data[from].cy) { e = e + 1; }
+            if (e - from > widest) { widest = e - from; }
+            from = e;
+        }
+        val room: res[usize, allo.Error] = vector.reserve[u8](?w.cells, widest * space.CELLS);
+        if (sel room.err) { ret err[format.Error].err{format.Error.alloc{room.err}}; }
         w.listed = true;
     }
     w.band = 0;
