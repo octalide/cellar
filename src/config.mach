@@ -7,10 +7,17 @@
 # side panel replaced the floating windows, are read for everything but their
 # window positions. the world is not part of settings; the files section saves
 # it.
+#
+# from version 3 the selected pattern follows the line on a second one, by name,
+# as "library <name>" or "custom", so a library that grows or reorders keeps the
+# selection. its old slot in the first line is written as 0 and skipped. older
+# files kept the index of one of seven built-ins there, which is read through
+# the names those built-ins have in the library.
 
 use cellar.app;
+use cellar.format;
 use cellar.kernel;
-use cellar.pattern;
+use cellar.library;
 use cellar.persist;
 use cellar.sim;
 use cellar.text;
@@ -28,10 +35,65 @@ use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
+use std.types.string;
 use std.types.string.str;
 
-# settings-format version written; version 1 is still read
-val VERSION: u64 = 2;
+# settings-format version written; versions 1 and 2 are still read
+val VERSION: u64 = 3;
+
+# the second line's selection of the custom pattern
+val SEL_CUSTOM: str = "custom";
+# the second line's prefix before a library pattern's name
+val SEL_LIBRARY: str = "library ";
+
+# the library name of the i-th built-in a version 1 or 2 file selected by
+# index, CUSTOM's old index 7 giving "" and any other index the glider
+fun old_builtin(i: usize) str {
+    if (i == 1) { ret "Blinker"; }
+    if (i == 2) { ret "Block"; }
+    if (i == 3) { ret "Beehive"; }
+    if (i == 4) { ret "Lightweight spaceship"; }
+    if (i == 5) { ret "Pulsar"; }
+    if (i == 6) { ret "Gosper glider gun"; }
+    if (i == 7) { ret ""; }
+    ret "Glider";
+}
+
+# select what a version 1 or 2 file's pattern index named
+fun migrate_sel(ap: *app.App, i: usize) {
+    val name: str = old_builtin(i);
+    if (name[0] == 0) { app.choose(ap, app.CUSTOM); }
+    or                { app.choose_named(ap, name); }
+}
+
+# whether s starts with prefix
+fun starts(s: str, prefix: str) bool {
+    var i: usize = 0;
+    for (prefix[i] != 0) {
+        if (s[i] != prefix[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# select what a version 3 selection line names; anything unknown selects the default
+fun read_sel(ap: *app.App, b: *Vector[u8], pos: usize) {
+    var o: usize = pos;
+    for (o < b.len && b.data[o] != '\n') { o = o + 1; }
+    o = o + 1;
+    var line: [256]u8;
+    var n:    usize = 0;
+    for (o < b.len && n < 255 && b.data[o] != '\n' && b.data[o] != '\r') {
+        line[n] = b.data[o];
+        n       = n + 1;
+        o       = o + 1;
+    }
+    line[n] = 0;
+    val l: str = ?line[0];
+    if (string.str_equals(l, SEL_CUSTOM)) { app.choose(ap, app.CUSTOM); }
+    or (starts(l, SEL_LIBRARY))           { app.choose_named(ap, ?line[string.str_len(SEL_LIBRARY)]); }
+    or                                    { app.choose_default(ap); }
+}
 
 # buffer size for the serialized settings line, ample for ~105 integers
 val CAP: usize = 4096;
@@ -118,7 +180,7 @@ pub fun save(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) err[persi
     o = wr(buf, o, (ap.tool == app.TOOL_ERASE)::u64);
     o = wr(buf, o, ap.bounds_idx::u64);
     o = wr(buf, o, (ap.tool == app.TOOL_STAMP)::u64);
-    o = wr(buf, o, ap.pattern_sel::u64);
+    o = wr(buf, o, 0);
     o = wr(buf, o, theme.red(ap.solid)::u64);
     o = wr(buf, o, theme.green(ap.solid)::u64);
     o = wr(buf, o, theme.blue(ap.solid)::u64);
@@ -137,6 +199,13 @@ pub fun save(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) err[persi
     o      = wr(buf, o, ap.open_view::u64);
     o      = wr(buf, o, ap.open_files::u64);
     o      = wr(buf, o, ap.scale_idx::u64);
+    buf[o] = '\n';
+    o      = o + 1;
+    if (ap.pattern_sel >= library.count(?ap.library)) { o = text.buf_str(buf, o, SEL_CUSTOM); }
+    or {
+        o = text.buf_str(buf, o, SEL_LIBRARY);
+        o = text.buf_str(buf, o, library.name(?ap.library, ap.pattern_sel));
+    }
     buf[o] = '\n';
     o      = o + 1;
 
@@ -163,7 +232,7 @@ pub fun load(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) err[persi
 
     var p:       usize = 0;
     val version: usize = read_uint(?data, ?p);
-    if (version != 1 && version != VERSION::usize) {
+    if (version < 1 || version > VERSION::usize) {
         vector.dnit[u8](?data);
         ret err[persist.Error].err{persist.Error.version{}};
     }
@@ -182,8 +251,8 @@ pub fun load(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) err[persi
     ap.tool = app.TOOL_DRAW;
     if (erase != 0) { ap.tool = app.TOOL_ERASE; }
     if (stamp != 0) { ap.tool = app.TOOL_STAMP; }
-    ap.pattern_sel = read_uint(?data, ?p);
-    if (ap.pattern_sel > pattern.BUILTIN_COUNT) { ap.pattern_sel = 0; }
+    val old_sel: usize = read_uint(?data, ?p);
+    if (version < 3) { migrate_sel(ap, old_sel); }
     val cr: u32 = byte(read_uint(?data, ?p));
     val cg: u32 = byte(read_uint(?data, ?p));
     val cb: u32 = byte(read_uint(?data, ?p));
@@ -204,7 +273,7 @@ pub fun load(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) err[persi
     val match: opt[usize] = kernel.match_preset(?s.kernel);
     if (sel match.some) { s.kernel.name = kernel.preset(match.some).name; }
 
-    if (version == VERSION::usize) {
+    if (version >= 2) {
         ap.panel      = bit(read_uint(?data, ?p));
         ap.open_run   = bit(read_uint(?data, ?p));
         ap.open_draw  = bit(read_uint(?data, ?p));
@@ -214,6 +283,7 @@ pub fun load(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) err[persi
         ap.scale_idx  = read_uint(?data, ?p);
         if (ap.scale_idx >= app.SCALE_COUNT) { ap.scale_idx = 0; }
     }
+    if (version >= 3) { read_sel(ap, ?data, p); }
 
     vector.dnit[u8](?data);
     ret err[persist.Error].ok{};
@@ -323,5 +393,83 @@ test load__round_trips_negative_weights_and_reads_wrapped_ones {
     fs.remove_file(path);
     sim.dnit(?s);
     sim.dnit(?t);
+    ret 0;
+}
+
+# write a version 2 settings file whose pattern slot holds sel
+fun write_v2(path: str, sel_idx: u64) bool {
+    var buf: [CAP]u8;
+    var o:   usize = 0;
+    o = wr(?buf[0], o, 2);
+    o = wr(?buf[0], o, 120);
+    var j: usize = 0;
+    for (j < 6) {
+        o = wr(?buf[0], o, 0);
+        j = j + 1;
+    }
+    o = wr(?buf[0], o, sel_idx);
+    j = 0;
+    for (j < 3 + 3 + 81 + 7) {
+        o = wr(?buf[0], o, 1);
+        j = j + 1;
+    }
+    buf[o] = '\n';
+    val wrote: err[fs.FsError] = fs.write_bytes(path, ?buf[0], o + 1, persist.FILE_MODE);
+    ret !(sel wrote.err);
+}
+
+# whether settings save to path
+fun saves_ok(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) bool {
+    val r: err[persist.Error] = save(a, ap, s, path);
+    ret !(sel r.err);
+}
+
+# whether settings load from path
+fun loads_ok(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) bool {
+    val r: err[persist.Error] = load(a, ap, s, path);
+    ret !(sel r.err);
+}
+
+test load__keeps_the_selected_pattern_by_name_and_migrates_old_indices {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    var ap: app.App;
+    app.init(?ap);
+    val shown: err[format.Error] = app.attach(?ap, ?a);
+    if (sel shown.err) { ret 2; }
+    val l:    *library.Library = ?ap.library;
+    val path: str              = "out/test/test_config_sel.config";
+
+    # a library pattern and the custom one round-trip by name
+    app.choose_named(?ap, "Pulsar");
+    val pulsar: usize = ap.pattern_sel;
+    if (pulsar >= library.count(l))   { ret 3; }
+    if (!saves_ok(?a, ?ap, ?s, path)) { ret 4; }
+    app.choose_default(?ap);
+    if (!loads_ok(?a, ?ap, ?s, path) || ap.pattern_sel != pulsar) { ret 5; }
+    app.choose(?ap, app.CUSTOM);
+    if (!saves_ok(?a, ?ap, ?s, path)) { ret 6; }
+    app.choose_default(?ap);
+    if (!loads_ok(?a, ?ap, ?s, path) || ap.pattern_sel != app.CUSTOM) { ret 7; }
+
+    # an older file's index names the built-in it had, 7 the custom pattern, and
+    # anything else the glider
+    if (!write_v2(path, 7))                                                                         { ret 8; }
+    if (!loads_ok(?a, ?ap, ?s, path) || ap.pattern_sel != app.CUSTOM)                               { ret 9; }
+    if (!write_v2(path, 4))                                                                         { ret 10; }
+    if (!loads_ok(?a, ?ap, ?s, path) || ap.pattern_sel != library.find(l, "Lightweight spaceship")) { ret 11; }
+    if (!write_v2(path, 6))                                                                         { ret 12; }
+    if (!loads_ok(?a, ?ap, ?s, path) || ap.pattern_sel != library.find(l, "Gosper glider gun"))     { ret 13; }
+    if (!write_v2(path, 42))                                                                        { ret 14; }
+    if (!loads_ok(?a, ?ap, ?s, path) || ap.pattern_sel != library.find(l, "Glider"))                { ret 15; }
+    # the old file's other fields still read
+    if (ap.panel != 1 || ap.speed < 11.9 || ap.speed > 12.1) { ret 16; }
+
+    fs.remove_file(path);
+    app.dnit(?ap);
+    sim.dnit(?s);
     ret 0;
 }
