@@ -32,8 +32,8 @@
 
 use gfx: boom.graphics;
 use gm:  boom.math;
-use cellar.kernel;
 use cellar.layout;
+use cellar.rule;
 use cellar.space;
 use allo: std.allocator;
 use std.chrono.time;
@@ -48,8 +48,6 @@ use std.types.error.err;
 use std.types.result.res;
 use std.types.size.usize;
 
-#[embed("{artifact.stage-step_comp.out}")]
-val STEP_SPV:   [_]u8;
 #[embed("{artifact.stage-clear_comp.out}")]
 val CLEAR_SPV:  [_]u8;
 #[embed("{artifact.stage-grow_comp.out}")]
@@ -63,7 +61,7 @@ val VERT_SPV:   [_]u8;
 #[embed("{artifact.stage-cells_frag.out}")]
 val FRAG_SPV:   [_]u8;
 
-# words of the meta buffer ahead of the page table: the rule
+# words of the meta buffer ahead of the page table: the shared words and the rule
 pub val HEAD: usize = layout.HEAD::usize;
 # words of the view buffer ahead of the palettes
 pub val LOOK: usize = 20;
@@ -188,7 +186,7 @@ rec Pool {
 #           them has run
 # retired:  old holds buffers
 # view:     the look and the palettes
-# step:     the step stage
+# steps:    each rule family's step stage
 # clear:    the clear stage
 # grow:     the stage that carries the world into larger buffers
 # census:   the census stage
@@ -226,7 +224,7 @@ pub rec Gpu {
     old:      Pool;
     retired:  bool;
     view:     gfx.StorageBuffer;
-    step:     gfx.Compute;
+    steps:    [rule.FAMILIES]gfx.Compute;
     clear:    gfx.Compute;
     grow:     gfx.Compute;
     census:   gfx.Compute;
@@ -251,7 +249,7 @@ pub rec Gpu {
     pace:     usize;
     last:     Instant;
     timed:    bool;
-    head:     [96]u32;
+    head:     [128]u32;
     built:    [layout.MIP]u32;
 }
 
@@ -452,8 +450,7 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     gfx.shader_set_state(?g.draw, gfx.pipeline_desc_2d());
 
     g.stepping = false;
-    val sc: err[gfx.Error] = gfx.compute(?g.step, g.d, ?STEP_SPV[0], $length_of(STEP_SPV));
-    if (sel sc.ok) {
+    if (build_steps(g)) {
         val zc: err[gfx.Error] = gfx.compute(?g.clear, g.d, ?CLEAR_SPV[0], $length_of(CLEAR_SPV));
         if (sel zc.ok) {
             val gc: err[gfx.Error] = gfx.compute(?g.grow, g.d, ?GROW_SPV[0], $length_of(GROW_SPV));
@@ -468,7 +465,7 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
             }
             if (!g.stepping) { gfx.compute_delete(?g.clear, g.d); }
         }
-        if (!g.stepping) { gfx.compute_delete(?g.step, g.d); }
+        if (!g.stepping) { drop_steps(g, rule.FAMILIES); }
     }
 
     val e7: err[gfx.Error] = make(g.d, (LOOK + SHADES * 8) * 4, ?g.view);
@@ -480,6 +477,31 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     if (cap > g.slots) { ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.overrun{(cap * space.CELLS * 4)::u64}}}; }
     forget_censuses(g);
     ret make_pool(g, ?g.p, cap);
+}
+
+# build every rule family's step stage, all or none
+fun build_steps(g: *Gpu) bool {
+    var i: usize = 0;
+    for (i < rule.FAMILIES) {
+        var len: usize          = 0;
+        val spv: *u8            = rule.stage(i, ?len);
+        val sc:  err[gfx.Error] = gfx.compute(?g.steps[i], g.d, spv, len);
+        if (sel sc.err) {
+            drop_steps(g, i);
+            ret false;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# delete the first n families' step stages
+fun drop_steps(g: *Gpu, n: usize) {
+    var i: usize = 0;
+    for (i < n) {
+        gfx.compute_delete(?g.steps[i], g.d);
+        i = i + 1;
+    }
 }
 
 # make room for a pool of cap slots, ahead of the host's pool growing to it
@@ -516,7 +538,7 @@ pub fun mirror(g: *Gpu) space.Mirror {
 # measure the CPU engine against the GPU's
 pub fun forgo_compute(g: *Gpu) {
     if (!g.stepping) { ret; }
-    gfx.compute_delete(?g.step, g.d);
+    drop_steps(g, rule.FAMILIES);
     gfx.compute_delete(?g.clear, g.d);
     gfx.compute_delete(?g.grow, g.d);
     gfx.compute_delete(?g.census, g.d);
@@ -533,7 +555,7 @@ pub fun dnit(g: *Gpu) {
     gfx.storage_buffer_delete(g.d, ?g.view);
     gfx.shader_delete(?g.draw, g.d);
     if (g.stepping) {
-        gfx.compute_delete(?g.step, g.d);
+        drop_steps(g, rule.FAMILIES);
         gfx.compute_delete(?g.clear, g.d);
         gfx.compute_delete(?g.grow, g.d);
         gfx.compute_delete(?g.census, g.d);
@@ -958,7 +980,7 @@ fun upload_view(g: *Gpu, sp: *space.Space, look: *Look) err[gfx.Error] {
             if (x >= x0 && x <= x1 && y >= y0 && y <= y1) {
                 val e: err[gfx.Error] = upload_cells(g, sp, s, 1, false);
                 if (sel e.err) { ret e; }
-                pyramid(?sp.cells[s * space.CELLS], ?g.built[0]);
+                pyramid(?sp.cells[s * space.CELLS], sp.sense, ?g.built[0]);
                 val em: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.mip, s * MIP * 4, (?g.built[0])::*u8, MIP * 4);
                 if (sel em.err) { ret em; }
                 sent = sent + 1;
@@ -972,8 +994,9 @@ fun upload_view(g: *Gpu, sp: *space.Space, look: *Look) err[gfx.Error] {
 # a chunk's coverage pyramid built from its cells, as the reduce stage builds it
 # ---
 # cells: the chunk's space.CELLS cells
+# sn:    how a cell is read, the rule's sense
 # out:   receives MIP texels
-pub fun pyramid(cells: *u32, out: *u32) {
+pub fun pyramid(cells: *u32, sn: layout.Sense, out: *u32) {
     var l: u32 = 1;
     for (l <= layout.LEVELS) {
         val s:    u32 = 1 << l;
@@ -989,11 +1012,12 @@ pub fun pyramid(cells: *u32, out: *u32) {
             var i:    u32 = 0;
             for (i < s * s) {
                 val c: u32 = cells[((oy + i / s) * layout.SIDE + ox + i % s)::usize];
-                if (c >= layout.LIVE) {
+                if (layout.live(c, sn.live_mask, sn.live_lo, sn.live_hi) != 0) {
                     live = live + 1;
-                    ages = ages + layout.texel_age(c);
+                    ages = ages + layout.texel_age(c, sn.age_shift, sn.age_mask);
                 }
-                if ((c & layout.HEAT_MASK) > heat) { heat = c & layout.HEAT_MASK; }
+                val h: u32 = layout.texel_heat(c, sn.heat_shift, sn.heat_mask);
+                if (h > heat) { heat = h; }
                 i = i + 1;
             }
             out[(at + t)::usize] = layout.texel(live, heat, ages);
@@ -1013,7 +1037,7 @@ pub fun pyramids_hold(g: *Gpu, sp: *space.Space) bool {
         if (space.used(sp, s) && sp.dirty[s] == 0) {
             val e: err[gfx.Error] = gfx.storage_buffer_read(g.d, ?g.p.mip, s * MIP * 4, (?got[0])::*u8, MIP * 4);
             if (sel e.err) { ret false; }
-            pyramid(?sp.cells[s * space.CELLS], ?g.built[0]);
+            pyramid(?sp.cells[s * space.CELLS], sp.sense, ?g.built[0]);
             var i: usize = 0;
             for (i < MIP) {
                 if (got[i] != g.built[i]) { ret false; }
@@ -1025,22 +1049,22 @@ pub fun pyramids_hold(g: *Gpu, sp: *space.Space) bool {
     ret true;
 }
 
-fun write_head(g: *Gpu, k: *kernel.Kernel) {
-    g.head[0] = k.radius::u32;
-    g.head[1] = (k.birth & 0xffffffff)::u32;
-    g.head[2] = (k.birth >> 32)::u32;
-    g.head[3] = (k.survive & 0xffffffff)::u32;
-    g.head[4] = (k.survive >> 32)::u32;
-    g.head[5] = g.id;
-    g.head[6] = g.hi::u32;
-    g.head[7] = g.serial;
-    var i: usize = 0;
-    for (i < layout.WEIGHTS::usize) {
-        var w: u32 = layout.WEIGHT_BIAS;
-        if (i < 81) { w = (k.weights[i] + layout.WEIGHT_BIAS::i32)::u32; }
-        g.head[8 + i] = w;
-        i             = i + 1;
-    }
+# stage the meta head: the shared words, then the rule in its family's window
+fun write_head(g: *Gpu, r: *rule.Rule) {
+    val sn: layout.Sense = rule.sense(r);
+    mem.zero[u32](?g.head[0], HEAD);
+    g.head[0]  = g.id;
+    g.head[1]  = g.hi::u32;
+    g.head[2]  = g.serial;
+    g.head[3]  = sn.live_mask;
+    g.head[4]  = sn.live_lo;
+    g.head[5]  = sn.live_hi;
+    g.head[6]  = sn.warm_mask;
+    g.head[7]  = sn.heat_shift;
+    g.head[8]  = sn.heat_mask;
+    g.head[9]  = sn.age_shift;
+    g.head[10] = sn.age_mask;
+    rule.pack(r, ?g.head[layout.SHARED]);
 }
 
 # record a frame's work: bring the pool level, step, count, and set the view
@@ -1050,46 +1074,51 @@ fun write_head(g: *Gpu, k: *kernel.Kernel) {
 # ---
 # g:     the GPU side
 # sp:    the host's pool
-# k:     the rule
+# r:     the rule
 # steps: generations wanted; fewer are recorded when the budget is short
 # look:  the camera and colours for the draw
 # ret:   the generations recorded, or why recording failed
-pub fun frame(g: *Gpu, sp: *space.Space, k: *kernel.Kernel, steps: usize, look: *Look) res[usize, gfx.Error] {
+pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, steps: usize, look: *Look) res[usize, gfx.Error] {
     val e14: err[gfx.Error] = flush(g, sp);
     if (sel e14.err) { ret res[usize, gfx.Error].err{e14.err}; }
     val e15: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.view, 0, look::*u8, LOOK * 4);
     if (sel e15.err) { ret res[usize, gfx.Error].err{e15.err}; }
+    if (g.stepping) {
+        g.id = g.id + 1;
+        if (g.id == 0) { g.id = 1; }
+    }
+    # the draw reads the rule's sense from the head, whichever engine steps
+    write_head(g, r);
+    val e17: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.meta, 0, (?g.head[0])::*u8, HEAD * 4);
+    if (sel e17.err) { ret res[usize, gfx.Error].err{e17.err}; }
     if (!g.stepping) {
         val e16: err[gfx.Error] = upload_view(g, sp, look);
         if (sel e16.err) { ret res[usize, gfx.Error].err{e16.err}; }
         ret res[usize, gfx.Error].ok{0};
     }
 
-    var n: usize = steps;
-    val b: usize = budget(g, k.radius);
+    var n:      usize = steps;
+    val radius: usize = rule.radius(r);
+    val b:      usize = budget(g, radius);
     if (n > b) { n = b; }
-    g.id = g.id + 1;
-    if (g.id == 0) { g.id = 1; }
-    write_head(g, k);
-    val e17: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.meta, 0, (?g.head[0])::*u8, HEAD * 4);
-    if (sel e17.err) { ret res[usize, gfx.Error].err{e17.err}; }
+    val step: *gfx.Compute = ?g.steps[rule.family_of(r)];
 
     var i: usize = 0;
     for (i < n) {
         if (g.hi != 0) {
             g.serial = g.serial + 1;
-            val es: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.meta, 7 * 4, (?g.serial)::*u8, 4);
+            val es: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.meta, layout.SERIAL_AT::usize * 4, (?g.serial)::*u8, 4);
             if (sel es.err) { ret res[usize, gfx.Error].err{es.err}; }
             var bufs: [4]*gfx.StorageBuffer;
             bufs[0] = ?g.p.cells[g.front];
             bufs[1] = ?g.p.cells[1 - g.front];
             bufs[2] = ?g.p.meta;
             bufs[3] = ?g.p.flags;
-            val e18: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.step, ?bufs[0], 4, 8, g.hi::u32, 1);
+            val e18: err[gfx.Error] = gfx.renderer_dispatch(g.r, step, ?bufs[0], 4, 8, g.hi::u32, 1);
             if (sel e18.err) { ret res[usize, gfx.Error].err{e18.err}; }
             g.front = 1 - g.front;
         }
-        g.spread = g.spread + k.radius::u64;
+        g.spread = g.spread + radius::u64;
         g.gens   = g.gens + 1;
         i        = i + 1;
     }

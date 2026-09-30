@@ -11,8 +11,8 @@
 #   words 9, 10 the chunk's coordinates biased by BIAS, so they stay positive
 #   word 11     the slot's incarnation, zero while it is free
 #
-# a cell is age << 8 | heat: alive while its age is nonzero, 255 heat while
-# alive and fading by DECAY a generation once dead. the front cells are the
+# a cell is a word the rule family gives its meaning, which the pool reads
+# through the family's sense (cellar.layout.Sense). the front cells are the
 # world; the back cells, kept only when the CPU steps, take the next
 # generation. a hash over chunk coordinates finds a chunk's slot.
 #
@@ -59,12 +59,6 @@ pub val REACH: i64 = (BIAS - 1) * SIDE;
 # world may take. a mirror on a device sets its own, lower where the device
 # needs it
 pub val HOST_SLOTS: usize = 32768;
-# the oldest age a cell records
-pub val AGE_MAX: u32 = layout.AGE_MAX;
-# heat a dead cell loses per generation, giving fading trails
-pub val DECAY: u32 = layout.DECAY;
-# a live cell painted or seeded fresh: age 1, full heat
-pub val BORN: u32 = layout.BORN;
 # the slots a new pool holds
 val FIRST_CAP: usize = 64;
 
@@ -106,6 +100,7 @@ pub rec Mirror {
 # hcap:      buckets, the power of two buckets gives for cap
 # serial:    the last incarnation handed out
 # stepped:   whether back is kept
+# sense:     how the census reads a cell, the running rule's
 pub rec Space {
     a:         *allo.Allocator;
     cap:       usize;
@@ -126,11 +121,80 @@ pub rec Space {
     hcap:      usize;
     serial:    u32;
     stepped:   bool;
+    sense:     layout.Sense;
 }
 
-# whether a cell is alive
-pub fun alive(c: u32) bool {
-    ret c >= layout.LIVE;
+# one chunk's step, as a rule family's CPU step sees it
+# ---
+# nb:   the front cells of the 3 by 3 block of chunks around it, row-major with
+#       the chunk itself at 4, nil where a chunk does not exist and reads as
+#       zeros
+# out:  the chunk's back cells, every one of which the step writes
+# busy: a live cell lay in the block as the step began, or the rule changes
+#       quiescent cells; when not, only the chunk's own cells can change
+pub rec Block {
+    nb:   [9]*u32;
+    out:  *u32;
+    busy: bool;
+}
+
+# a chunk's census as its cells are written, which a step keeps while it goes
+# ---
+# sense: how a cell is read
+# live:  live cells so far
+# warm:  1 once a warm cell is written
+# x0:    first column holding a live cell
+# y0:    first row holding one
+# x1:    last column holding one
+# y1:    last row holding one
+pub rec Tally {
+    sense: layout.Sense;
+    live:  u32;
+    warm:  u32;
+    x0:    u32;
+    y0:    u32;
+    x1:    u32;
+    y1:    u32;
+}
+
+# an empty tally reading cells through sense
+pub fun tally(sense: layout.Sense) Tally {
+    ret Tally{sense: sense, live: 0, warm: 0, x0: 63, y0: 63, x1: 0, y1: 0};
+}
+
+# count the cell written at (x, y) of the chunk
+#[inline]
+pub fun note(t: *Tally, c: u32, x: u32, y: u32) {
+    if (layout.live(c, t.sense.live_mask, t.sense.live_lo, t.sense.live_hi) != 0) {
+        t.live = t.live + 1;
+        if (x < t.x0) { t.x0 = x; }
+        if (y < t.y0) { t.y0 = y; }
+        if (x > t.x1) { t.x1 = x; }
+        if (y > t.y1) { t.y1 = y; }
+    }
+    if ((c & t.sense.warm_mask) != 0) { t.warm = 1; }
+}
+
+# write a tally as a slot's census words
+# ---
+# t:   the tally of every cell in the chunk
+# cn:  the slot's CENSUS words
+# inc: the slot's incarnation
+pub fun tally_census(t: *Tally, cn: *u32, inc: u32) {
+    cn[0] = t.live;
+    cn[1] = t.warm;
+    cn[2] = inc;
+    cn[3] = 0;
+    cn[4] = 0;
+    if (t.live != 0) {
+        cn[3] = MASK_ALL;
+        cn[4] = layout.extent(t.x0, t.y0, t.x1, t.y1);
+    }
+}
+
+# whether a cell is live, as the pool's sense reads it
+pub fun live(sp: *Space, c: u32) bool {
+    ret layout.live(c, sp.sense.live_mask, sp.sense.live_lo, sp.sense.live_hi) != 0;
 }
 
 # the chunk coordinate holding a cell coordinate
@@ -303,6 +367,7 @@ pub fun init(sp: *Space, a: *allo.Allocator, stepped: bool) err[allo.Error] {
     sp.nfree     = 0;
     sp.serial    = 0;
     sp.stepped   = stepped;
+    mem.zero[u8]((?sp.sense)::*u8, $size_of(layout.Sense));
     ret alloc_arrays(sp, FIRST_CAP);
 }
 
@@ -578,36 +643,14 @@ pub fun population(sp: *Space) usize {
 
 # count a slot's live and warm cells into its census from its front cells
 pub fun recount(sp: *Space, s: usize) {
-    var live: u32   = 0;
-    var warm: u32   = 0;
-    var x0:   u32   = 63;
-    var y0:   u32   = 63;
-    var x1:   u32   = 0;
-    var y1:   u32   = 0;
-    val c:    *u32  = ?sp.cells[s * CELLS];
-    var i:    usize = 0;
+    var t: Tally = tally(sp.sense);
+    val c: *u32  = ?sp.cells[s * CELLS];
+    var i: usize = 0;
     for (i < CELLS) {
-        if (c[i] >= layout.LIVE) {
-            live = live + 1;
-            val x: u32 = (i & 63)::u32;
-            val y: u32 = (i >> 6)::u32;
-            if (x < x0) { x0 = x; }
-            if (y < y0) { y0 = y; }
-            if (x > x1) { x1 = x; }
-            if (y > y1) { y1 = y; }
-        }
-        if ((c[i] & layout.HEAT_MASK) != 0) { warm = 1; }
+        note(?t, c[i], (i & 63)::u32, (i >> 6)::u32);
         i = i + 1;
     }
-    sp.census[s * CENSUS]     = live;
-    sp.census[s * CENSUS + 1] = warm;
-    sp.census[s * CENSUS + 2] = incarnation(sp, s);
-    sp.census[s * CENSUS + 3] = 0;
-    sp.census[s * CENSUS + 4] = 0;
-    if (live != 0) {
-        sp.census[s * CENSUS + 3] = MASK_ALL;
-        sp.census[s * CENSUS + 4] = layout.extent(x0, y0, x1, y1);
-    }
+    tally_census(?t, ?sp.census[s * CENSUS], incarnation(sp, s));
 }
 
 test alloc__links_neighbours_both_ways_and_release_unlinks {

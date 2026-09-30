@@ -1,24 +1,30 @@
 # interface settings and the active rule, kept between runs
 #
-# they are one fixed-order line of integers in the data directory. every value
-# is a decimal integer, signed only for kernel weights, fractional fields scaled (speed x10,
-# colours x255), so one integer formatter and one whitespace tokenizer cover
-# the whole file, with no float parsing. version 1 files, written before the
-# side panel replaced the floating windows, are read for everything but their
-# window positions. the world is not part of settings; the files section saves
+# they are a fixed-order line of integers in the data directory, then a line
+# naming the selected pattern, then a line naming the rule. every value on the
+# first line is a decimal integer, fractional fields scaled (speed x10, colours
+# x255), so one integer formatter and one whitespace tokenizer cover it, with
+# no float parsing. the world is not part of settings; the files section saves
 # it.
 #
-# from version 3 the selected pattern follows the line on a second one, by name,
-# as "library <name>" or "custom", so a library that grows or reorders keeps the
-# selection. its old slot in the first line is written as 0 and skipped. older
-# files kept the index of one of seven built-ins there, which is read through
-# the names those built-ins have in the library.
+# the selected pattern is named "library <name>" or "custom", so a library that
+# grows or reorders keeps the selection. its old slot in the first line is
+# written as 0 and skipped. the rule is "<family> <rule string>": its rule
+# family's id and its rule string, as the family writes it.
+#
+# older versions are still read. versions 1 to 3 kept the rule as a weighted
+# kernel's integers inside the first line, weights signed or, before that,
+# wrapped. versions 1 and 2, what 0.3.0 and 0.4.0 wrote, kept the index of one
+# of seven built-ins in the pattern slot, which is read through the names those
+# built-ins have in the library, and version 1 has no window positions.
+# version 3 added the selection line.
 
 use cellar.app;
 use cellar.format;
-use cellar.kernel;
 use cellar.library;
 use cellar.persist;
+use cellar.rule;
+use cellar.rules.weighted;
 use cellar.sim;
 use cellar.text;
 use cellar.theme;
@@ -38,8 +44,12 @@ use std.types.size.usize;
 use std.types.string;
 use std.types.string.str;
 
-# settings-format version written; versions 1 and 2 are still read
-val VERSION: u64 = 3;
+# settings-format version written; versions 1 to 3 are still read
+val VERSION: u64 = 4;
+# the last version that kept the rule as a weighted kernel's integers
+val KERNEL_INTS: usize = 3;
+# the first version with the selection line
+val SEL_LINE: usize = 3;
 
 # the second line's selection of the custom pattern
 val SEL_CUSTOM: str = "custom";
@@ -76,7 +86,7 @@ fun starts(s: str, prefix: str) bool {
     ret true;
 }
 
-# select what a version 3 selection line names; anything unknown selects the default
+# select what a selection line names; anything unknown selects the default
 fun read_sel(ap: *app.App, b: *Vector[u8], pos: usize) {
     var o: usize = pos;
     for (o < b.len && b.data[o] != '\n') { o = o + 1; }
@@ -95,7 +105,8 @@ fun read_sel(ap: *app.App, b: *Vector[u8], pos: usize) {
     or                                    { app.choose_default(ap); }
 }
 
-# buffer size for the serialized settings line, ample for ~105 integers
+# buffer size for the serialized settings, ample for the integers, the
+# selection and the longest rule string
 val CAP: usize = 4096;
 
 # append v's decimal digits and a separating space to buf at off; ret the new
@@ -161,7 +172,7 @@ fun read_int(b: *Vector[u8], pos: *usize) i64 {
 # ---
 # a:   allocator backing the transient buffer
 # ap:  application state to serialize
-# s:   simulation whose kernel is serialized
+# s:   simulation whose rule is serialized
 # ret: ok, or why the settings were not written
 pub fun save(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) err[persist.Error] {
     val made: err[fs.FsError] = persist.make_parent(a, path);
@@ -172,26 +183,18 @@ pub fun save(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) err[persi
     val buf: *u8 = rc.ok;
 
     var o: usize = 0;
-    o = wr(buf, o, VERSION);
-    o = wr(buf, o, (ap.speed * 10.0)::u64);
-    o = wr(buf, o, ap.mode::u64);
-    o = wr(buf, o, ap.gutter::u64);
-    o = wr(buf, o, ap.uncapped::u64);
-    o = wr(buf, o, (ap.tool == app.TOOL_ERASE)::u64);
-    o = wr(buf, o, ap.bounds_idx::u64);
-    o = wr(buf, o, (ap.tool == app.TOOL_STAMP)::u64);
-    o = wr(buf, o, 0);
-    o = wr(buf, o, theme.red(ap.solid)::u64);
-    o = wr(buf, o, theme.green(ap.solid)::u64);
-    o = wr(buf, o, theme.blue(ap.solid)::u64);
-    o = wr(buf, o, s.kernel.radius::u64);
-    o = wr(buf, o, s.kernel.birth);
-    o = wr(buf, o, s.kernel.survive);
-    var i: usize = 0;
-    for (i < 81) {
-        o = wr_int(buf, o, s.kernel.weights[i]::i64);
-        i = i + 1;
-    }
+    o      = wr(buf, o, VERSION);
+    o      = wr(buf, o, (ap.speed * 10.0)::u64);
+    o      = wr(buf, o, ap.mode::u64);
+    o      = wr(buf, o, ap.gutter::u64);
+    o      = wr(buf, o, ap.uncapped::u64);
+    o      = wr(buf, o, (ap.tool == app.TOOL_ERASE)::u64);
+    o      = wr(buf, o, ap.bounds_idx::u64);
+    o      = wr(buf, o, (ap.tool == app.TOOL_STAMP)::u64);
+    o      = wr(buf, o, 0);
+    o      = wr(buf, o, theme.red(ap.solid)::u64);
+    o      = wr(buf, o, theme.green(ap.solid)::u64);
+    o      = wr(buf, o, theme.blue(ap.solid)::u64);
     o      = wr(buf, o, ap.panel::u64);
     o      = wr(buf, o, ap.open_run::u64);
     o      = wr(buf, o, ap.open_draw::u64);
@@ -207,6 +210,11 @@ pub fun save(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) err[persi
         o = text.buf_str(buf, o, library.name(?ap.library, ap.pattern_sel));
     }
     buf[o] = '\n';
+    o      = text.buf_str(buf, o + 1, rule.family_id(rule.family_of(?s.rule)));
+    buf[o] = ' ';
+    var rb: [1101]u8;
+    o      = text.buf_str(buf, o + 1, rule.format(?s.rule, ?rb[0]));
+    buf[o] = '\n';
     o      = o + 1;
 
     val wrote: err[fs.FsError] = fs.write_bytes(path, buf, o, persist.FILE_MODE);
@@ -215,12 +223,13 @@ pub fun save(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) err[persi
     ret err[persist.Error].ok{};
 }
 
-# read settings from path into ap and s.kernel, if the file exists and its
-# version is known. a missing file leaves the defaults untouched.
+# read settings from path into ap and s's rule, if the file exists and its
+# version is known. a missing file leaves the defaults untouched, and a rule
+# this version cannot run leaves the rule as it was.
 # ---
 # a:   allocator for the read buffer
 # ap:  application state to populate
-# s:   simulation whose kernel is populated
+# s:   simulation whose rule is populated
 # ret: ok when loaded or absent, or why the file was refused
 pub fun load(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) err[persist.Error] {
     val rr: res[Vector[u8], fs.FsError] = fs.read_bytes(a, path);
@@ -236,6 +245,11 @@ pub fun load(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) err[persi
         vector.dnit[u8](?data);
         ret err[persist.Error].err{persist.Error.version{}};
     }
+    # the integers end with the first line
+    val full: usize = data.len;
+    var nl:   usize = 0;
+    for (nl < full && data.data[nl] != '\n') { nl = nl + 1; }
+    if (version > KERNEL_INTS) { data.len = nl; }
 
     ap.speed = read_uint(?data, ?p)::f32 / 10.0;
     if (ap.speed < 1.0)   { ap.speed = 1.0; }
@@ -252,26 +266,13 @@ pub fun load(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) err[persi
     if (erase != 0) { ap.tool = app.TOOL_ERASE; }
     if (stamp != 0) { ap.tool = app.TOOL_STAMP; }
     val old_sel: usize = read_uint(?data, ?p);
-    if (version < 3) { migrate_sel(ap, old_sel); }
+    if (version < SEL_LINE) { migrate_sel(ap, old_sel); }
     val cr: u32 = byte(read_uint(?data, ?p));
     val cg: u32 = byte(read_uint(?data, ?p));
     val cb: u32 = byte(read_uint(?data, ?p));
     ap.solid = (cr << 16) | (cg << 8) | cb;
 
-    var r: usize = read_uint(?data, ?p);
-    if (r < 1)                 { r = 1; }
-    if (r > kernel.MAX_RADIUS) { r = kernel.MAX_RADIUS; }
-    s.kernel.radius  = r;
-    s.kernel.birth   = read_uint(?data, ?p)::u64;
-    s.kernel.survive = read_uint(?data, ?p)::u64;
-    var i: usize = 0;
-    for (i < 81) {
-        s.kernel.weights[i] = read_int(?data, ?p)::i32;
-        i                   = i + 1;
-    }
-    s.kernel.name = "custom";
-    val match: opt[usize] = kernel.match_preset(?s.kernel);
-    if (sel match.some) { s.kernel.name = kernel.preset(match.some).name; }
+    if (version <= KERNEL_INTS) { sim.set_rule(s, rule.Rule.weighted{read_kernel(?data, ?p)}); }
 
     if (version >= 2) {
         ap.panel      = bit(read_uint(?data, ?p));
@@ -283,10 +284,66 @@ pub fun load(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) err[persi
         ap.scale_idx  = read_uint(?data, ?p);
         if (ap.scale_idx >= app.SCALE_COUNT) { ap.scale_idx = 0; }
     }
-    if (version >= 3) { read_sel(ap, ?data, p); }
-
+    data.len = full;
+    if (version >= SEL_LINE) { read_sel(ap, ?data, p); }
+    if (version > KERNEL_INTS) {
+        # the rule is the line after the selection
+        var at: usize = nl + 1;
+        for (at < full && data.data[at] != '\n') { at = at + 1; }
+        if (at < full) { read_rule(?data, at + 1, s); }
+    }
     vector.dnit[u8](?data);
     ret err[persist.Error].ok{};
+}
+
+# read the weighted kernel versions 1 to 3 kept as integers: its radius, its
+# birth and survive masks and 81 weights
+fun read_kernel(b: *Vector[u8], p: *usize) weighted.Kernel {
+    var k: weighted.Kernel;
+    var r: usize = read_uint(b, p);
+    if (r < 1)                   { r = 1; }
+    if (r > weighted.MAX_RADIUS) { r = weighted.MAX_RADIUS; }
+    k.radius  = r;
+    k.birth   = read_uint(b, p)::u64;
+    k.survive = read_uint(b, p)::u64;
+    var i: usize = 0;
+    for (i < 81) {
+        k.weights[i] = read_int(b, p)::i32;
+        i            = i + 1;
+    }
+    ret k;
+}
+
+# read the rule line, "<family> <rule string>", into s when its family reads it
+# ---
+# b:  the file
+# at: where the line starts
+# s:  the simulation
+fun read_rule(b: *Vector[u8], at: usize, s: *sim.Sim) {
+    var id:   [32]u8;
+    var line: [1101]u8;
+    var n:    usize = 0;
+    var o:    usize = at;
+    for (o < b.len && b.data[o] != ' ' && b.data[o] != '\n' && b.data[o] != '\r') {
+        if (n < 31) { id[n] = b.data[o]; }
+        n = n + 1;
+        o = o + 1;
+    }
+    if (n > 31) { ret; }
+    id[n] = 0;
+    if (o < b.len && b.data[o] == ' ') { o = o + 1; }
+    var m: usize = 0;
+    for (o < b.len && b.data[o] != '\n' && b.data[o] != '\r') {
+        if (m == rule.FORMAT_MAX) { ret; }
+        line[m] = b.data[o];
+        m       = m + 1;
+        o       = o + 1;
+    }
+    line[m] = 0;
+    val f: opt[usize] = rule.family_named(?id[0]);
+    if (sel f.none) { ret; }
+    val r: res[rule.Rule, str] = rule.parse_as(f.some, ?line[0]);
+    if (sel r.ok) { sim.set_rule(s, r.ok); }
 }
 
 test load__round_trips_settings {
@@ -299,13 +356,13 @@ test load__round_trips_settings {
 
     var ap: app.App;
     app.init(?ap);
-    ap.speed       = 30.0;
-    ap.mode        = 2;
-    ap.uncapped    = 1;
-    ap.solid       = 0xff0080;
-    ap.open_rule   = 1;
-    ap.tool        = app.TOOL_STAMP;
-    s.kernel.birth = 42;
+    ap.speed     = 30.0;
+    ap.mode      = 2;
+    ap.uncapped  = 1;
+    ap.solid     = 0xff0080;
+    ap.open_rule = 1;
+    ap.tool      = app.TOOL_STAMP;
+    sim.set_rule(?s, rule.preset_rule(1));
 
     val path:  str                = "out/test/test_config.config";
     val saved: err[persist.Error] = save(?a, ?ap, ?s, path);
@@ -319,12 +376,12 @@ test load__round_trips_settings {
     val loaded: err[persist.Error] = load(?a, ?bp, ?t, path);
     if (sel loaded.err) { ret 1; }
 
-    if (bp.mode != 2)              { ret 1; }
-    if (bp.uncapped != 1)          { ret 1; }
-    if (bp.open_rule != 1)         { ret 1; }
-    if (bp.solid != 0xff0080)      { ret 1; }
-    if (bp.tool != app.TOOL_STAMP) { ret 1; }
-    if (t.kernel.birth != 42)      { ret 1; }
+    if (bp.mode != 2)                 { ret 1; }
+    if (bp.uncapped != 1)             { ret 1; }
+    if (bp.open_rule != 1)            { ret 1; }
+    if (bp.solid != 0xff0080)         { ret 1; }
+    if (bp.tool != app.TOOL_STAMP)    { ret 1; }
+    if (!rule.same(?t.rule, ?s.rule)) { ret 1; }
     # speed x10 and color x255 round-trip within the quantization step
     if (bp.speed < 29.0 || bp.speed > 31.0) { ret 1; }
 
@@ -343,8 +400,10 @@ test load__round_trips_negative_weights_and_reads_wrapped_ones {
     if (sel made.err) { ret 1; }
     var ap: app.App;
     app.init(?ap);
-    s.kernel.weights[0] = -3;
-    s.kernel.weights[1] = 5;
+    if (sel s.rule.weighted) {
+        s.rule.weighted.weights[0] = -3;
+        s.rule.weighted.weights[1] = 5;
+    }
 
     val path:  str                = "out/test/test_config_weights.config";
     val saved: err[persist.Error] = save(?a, ?ap, ?s, path);
@@ -354,8 +413,8 @@ test load__round_trips_negative_weights_and_reads_wrapped_ones {
     val made2: err[allo.Error] = sim.init(?t, ?a);
     if (sel made2.err) { ret 1; }
     val loaded: err[persist.Error] = load(?a, ?ap, ?t, path);
-    if (sel loaded.err)                                        { ret 1; }
-    if (t.kernel.weights[0] != -3 || t.kernel.weights[1] != 5) { ret 2; }
+    if (sel loaded.err)               { ret 1; }
+    if (!rule.same(?t.rule, ?s.rule)) { ret 2; }
 
     # the file holds -3 as text, not a wrapped u64
     val rr: res[Vector[u8], fs.FsError] = fs.read_bytes(?a, path);
@@ -370,10 +429,11 @@ test load__round_trips_negative_weights_and_reads_wrapped_ones {
     vector.dnit[u8](?data);
     if (!has_minus) { ret 3; }
 
-    # a file written by an older version stores -3 as a wrapped u64
+    # a version 2 file, as 0.3.0 wrote, keeps the kernel as integers, and one
+    # written before that stores -3 as a wrapped u64
     var buf: [CAP]u8;
     var o:   usize = 0;
-    o = wr(?buf[0], o, VERSION - 1);
+    o = wr(?buf[0], o, 2);
     var j: usize = 0;
     for (j < 14) {
         o = wr(?buf[0], o, 1);
@@ -387,8 +447,21 @@ test load__round_trips_negative_weights_and_reads_wrapped_ones {
     val wrote: err[fs.FsError] = fs.write_bytes(path, ?buf[0], o, persist.FILE_MODE);
     if (sel wrote.err) { ret 4; }
     val loaded2: err[persist.Error] = load(?a, ?ap, ?t, path);
-    if (sel loaded2.err)                                         { ret 5; }
-    if (t.kernel.weights[0] != -3 || t.kernel.weights[80] != -3) { ret 6; }
+    if (sel loaded2.err)      { ret 5; }
+    if (!sel t.rule.weighted) { ret 6; }
+    if (sel t.rule.weighted) {
+        if (t.rule.weighted.weights[0] != -3 || t.rule.weighted.weights[80] != -3) { ret 6; }
+    }
+
+    # a rule line naming a family this version does not run keeps the rule
+    val later: str             = "4 10 0 0 0 0 0 0 0 255 255 255 1 1 1 1 1 1 0\ncustom\nlenia R13,T10\n";
+    val w3:    err[fs.FsError] = fs.write_bytes(path, later::*u8, string.str_len(later), persist.FILE_MODE);
+    if (sel w3.err) { ret 7; }
+    var before:  rule.Rule          = t.rule;
+    val loaded3: err[persist.Error] = load(?a, ?ap, ?t, path);
+    if (sel loaded3.err)              { ret 8; }
+    if (!rule.same(?t.rule, ?before)) { ret 9; }
+    if (ap.panel != 1)                { ret 10; }
 
     fs.remove_file(path);
     sim.dnit(?s);
@@ -467,6 +540,90 @@ test load__keeps_the_selected_pattern_by_name_and_migrates_old_indices {
     if (!loads_ok(?a, ?ap, ?s, path) || ap.pattern_sel != library.find(l, "Glider"))                { ret 15; }
     # the old file's other fields still read
     if (ap.panel != 1 || ap.speed < 11.9 || ap.speed > 12.1) { ret 16; }
+
+    fs.remove_file(path);
+    app.dnit(?ap);
+    sim.dnit(?s);
+    ret 0;
+}
+
+# write a settings file of a version before 4, its rule the Life-like kernel
+# with birth mask birth and survive mask 12, its pattern slot 0 and, from
+# version 3, a selection line naming the pulsar
+fun write_old(path: str, version: u64, birth: u64) bool {
+    var buf: [CAP]u8;
+    var o:   usize = 0;
+    o = wr(?buf[0], o, version);
+    o = wr(?buf[0], o, 120);
+    var j: usize = 0;
+    for (j < 7) {
+        o = wr(?buf[0], o, 0);
+        j = j + 1;
+    }
+    o = wr(?buf[0], o, 1);
+    o = wr(?buf[0], o, 1);
+    o = wr(?buf[0], o, 1);
+    o = wr(?buf[0], o, 1);
+    o = wr(?buf[0], o, birth);
+    o = wr(?buf[0], o, 12);
+    j = 0;
+    for (j < 81) {
+        var w: u64 = 0;
+        if (j < 9 && j != 4) { w = 1; }
+        o = wr(?buf[0], o, w);
+        j = j + 1;
+    }
+    j = 0;
+    for (version >= 2 && j < 7) {
+        o = wr(?buf[0], o, 1);
+        j = j + 1;
+    }
+    buf[o] = '\n';
+    o      = o + 1;
+    if (version >= 3) { o = text.buf_str(?buf[0], o, "library Pulsar\n"); }
+    val wrote: err[fs.FsError] = fs.write_bytes(path, ?buf[0], o, persist.FILE_MODE);
+    ret !(sel wrote.err);
+}
+
+test load__reads_every_version {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    var ap: app.App;
+    app.init(?ap);
+    val shown: err[format.Error] = app.attach(?ap, ?a);
+    if (sel shown.err) { ret 2; }
+    val l:    *library.Library = ?ap.library;
+    val path: str              = "out/test/test_config_versions.config";
+
+    # versions 1 to 3 keep the rule as a kernel's integers: each loads its own
+    var v: u64 = 1;
+    for (v <= 3) {
+        val birth: u64 = (1::u64 << 3) | (1::u64 << (v + 3));
+        if (!write_old(path, v, birth))   { ret 10 + v::i32; }
+        if (!loads_ok(?a, ?ap, ?s, path)) { ret 20 + v::i32; }
+        var want: rule.Rule = rule.Rule.weighted{weighted.moore(birth, 12)};
+        if (!rule.same(?s.rule, ?want)) { ret 30 + v::i32; }
+        # version 3 names its pattern, and older ones migrate slot 0 to the glider
+        var sel_want: usize = library.find(l, "Glider");
+        if (v == 3)                     { sel_want = library.find(l, "Pulsar"); }
+        if (ap.pattern_sel != sel_want) { ret 40 + v::i32; }
+        v = v + 1;
+    }
+    if (ap.panel != 1) { ret 50; }
+
+    # version 4 keeps the pattern and the rule by name, through the family
+    app.choose_named(?ap, "Block");
+    val block: usize = ap.pattern_sel;
+    sim.set_rule(?s, rule.preset_rule(3));
+    if (!saves_ok(?a, ?ap, ?s, path)) { ret 60; }
+    app.choose_default(?ap);
+    sim.set_rule(?s, rule.preset_rule(0));
+    if (!loads_ok(?a, ?ap, ?s, path)) { ret 61; }
+    var dn: rule.Rule = rule.preset_rule(3);
+    if (!rule.same(?s.rule, ?dn) || ap.pattern_sel != block) { ret 62; }
 
     fs.remove_file(path);
     app.dnit(?ap);
