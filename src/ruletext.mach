@@ -1,0 +1,131 @@
+# the rule section's text field: the running rule as its family writes it,
+# typed over and applied
+#
+# without the keyboard the field shows the running rule, and shows it again
+# whenever that rule changes, by a preset, the kernel editor or a load. typing
+# leaves the rule alone until enter, which applies the text when some family
+# reads it and otherwise keeps the text with what is wrong with it. escape, or
+# taking the keyboard away, goes back to the running rule.
+
+use cellar.rule;
+use cellar.ui;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string;
+use std.types.string.str;
+
+# the field and what it shows
+# ---
+# field: the text
+# shown: the rule the text was last set from
+# dirty: the text is not shown's, being typed or refused
+# error: what the families found wrong with the text entered, nil for nothing
+pub rec RuleText {
+    field: ui.Field;
+    shown: rule.Rule;
+    dirty: bool;
+    error: str;
+}
+
+# make an empty field, which shows the running rule once synced
+pub fun init(t: *RuleText) {
+    ui.field_init(?t.field, rule.FORMAT_MAX, nil);
+    t.dirty = true;
+    t.error = nil;
+}
+
+# show a rule
+pub fun show(t: *RuleText, r: *rule.Rule) {
+    var b: [1152]u8;
+    ui.field_set(?t.field, rule.format(r, ?b[0]));
+    t.shown = @r;
+    t.dirty = false;
+    t.error = nil;
+}
+
+# follow the running rule while the field is not being typed in
+# ---
+# t:   the field
+# cur: the running rule
+pub fun sync(t: *RuleText, cur: *rule.Rule) {
+    if (t.dirty || !rule.same(?t.shown, cur)) { show(t, cur); }
+}
+
+# note that the text was typed over, which clears a refusal until the next enter
+pub fun edited(t: *RuleText) {
+    t.dirty = true;
+    t.error = nil;
+}
+
+# read the text as a rule, as enter asks
+#
+# a rule the families read is shown as its family writes it, and a refused
+# text stays as typed with what is wrong.
+# ---
+# t:   the field
+# ret: the rule to apply, or none when the text was refused
+pub fun enter(t: *RuleText) opt[rule.Rule] {
+    val r: res[rule.Rule, str] = rule.parse(ui.field_text(?t.field));
+    if (sel r.err) {
+        t.dirty = true;
+        t.error = r.err;
+        ret opt[rule.Rule].none{};
+    }
+    var b:   [1152]u8;
+    var got: rule.Rule = r.ok;
+    ui.field_set(?t.field, rule.format(?got, ?b[0]));
+    # the running rule becomes got when the command applies, which sync then shows
+    t.dirty = false;
+    t.error = nil;
+    ret opt[rule.Rule].some{got};
+}
+
+test ruletext__every_preset_round_trips_through_the_field {
+    if (rule.FORMAT_MAX > ui.FIELD_CAP) { ret 1; }
+    var t: RuleText;
+    init(?t);
+    var i: usize = 0;
+    for (i < rule.PRESET_COUNT) {
+        var p: rule.Rule = rule.preset_rule(i);
+        sync(?t, ?p);
+        if (!string.str_equals(ui.field_text(?t.field), rule.preset(i).rulestring)) { ret 2; }
+        val a: opt[rule.Rule] = enter(?t);
+        if (sel a.none)              { ret 3; }
+        if (!rule.same(?a.some, ?p)) { ret 3; }
+        # typed as the preset writes it, the string applies the preset
+        ui.field_set(?t.field, rule.preset(i).rulestring);
+        edited(?t);
+        val b: opt[rule.Rule] = enter(?t);
+        if (sel b.none)              { ret 4; }
+        if (!rule.same(?b.some, ?p)) { ret 4; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test ruletext__a_refused_string_keeps_the_rule_and_says_why {
+    var t:   RuleText;
+    var cur: rule.Rule = rule.preset_rule(0);
+    init(?t);
+    sync(?t, ?cur);
+    ui.field_set(?t.field, "B3/S29");
+    edited(?t);
+    val a: opt[rule.Rule] = enter(?t);
+    if (sel a.some || t.error == nil || t.error[0] == 0)       { ret 1; }
+    if (!string.str_equals(ui.field_text(?t.field), "B3/S29")) { ret 2; }
+    # an edit clears the reason, and the running rule comes back once the field lets go
+    ui.field_type(?t.field, 'x');
+    edited(?t);
+    if (t.error != nil) { ret 3; }
+    sync(?t, ?cur);
+    if (!string.str_equals(ui.field_text(?t.field), "B3/S23")) { ret 4; }
+    # a rule changed elsewhere is shown
+    var hl: rule.Rule = rule.preset_rule(1);
+    sync(?t, ?hl);
+    if (!string.str_equals(ui.field_text(?t.field), "B36/S23")) { ret 5; }
+    ret 0;
+}
