@@ -1,19 +1,25 @@
-# a copy of the world at one moment: its chunks, its generation and its rule
+# a copy of the world at one moment: its chunks or its tree, its generation
+# and its rule
 #
-# only chunks holding a live or warm cell are kept, each as its coordinates and
-# its cells whole, so a snapshot costs what the world's front cells do and
-# never a dense grid of its extent. the simulation fills one from its pool
-# (sim.take) and replays one through its fill path (sim.restore). one can also
-# be built a chunk at a time (add), which the undo journal keeps its chunk
-# before-images in. the cells are kept as the pool holds them, the world's
-# complement at the generations a rule that births on 0 holds it so, which the
-# rule and generation kept beside them say, so a restore resumes in the same
-# phase.
+# a world in the pool is kept as its chunks: only those holding a live or warm
+# cell, each as its coordinates and its cells whole, so a snapshot costs what
+# the world's front cells do and never a dense grid of its extent. a world in
+# the quadtree is kept as the tree's distinct nodes (hashlife.export), so it
+# costs what the tree does, however large the world. the simulation fills one
+# from whichever holds the world (sim.take) and replays either form into
+# whichever holds it then (sim.restore). a chunk snapshot can also be built a
+# chunk at a time (add), which the undo journal keeps its chunk before-images
+# in. the cells are kept as the pool holds them, the world's complement at the
+# generations a rule that births on 0 holds it so, which the rule and
+# generation kept beside them say, so a restore resumes in the same phase.
 
+use cellar.hashlife;
 use cellar.rule;
 use cellar.space;
 use allo: std.allocator;
-use mem:  std.memory;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use mem: std.memory;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -31,6 +37,8 @@ use std.types.size.usize;
 # cap:        chunks the buffers hold
 # at:         each chunk's column and row, 2 a chunk
 # cells:      each chunk's cells, space.CELLS a chunk
+# treed:      the copy is a tree's, in tree rather than the chunks
+# tree:       the tree's nodes as hashlife.export writes them
 pub rec Snapshot {
     a:          *allo.Allocator;
     held:       bool;
@@ -40,6 +48,8 @@ pub rec Snapshot {
     cap:        usize;
     at:         *i64;
     cells:      *u32;
+    treed:      bool;
+    tree:       Vector[u32];
 }
 
 # an empty snapshot holding nothing
@@ -53,6 +63,8 @@ pub fun init(sn: *Snapshot, a: *allo.Allocator) {
     sn.cap   = 0;
     sn.at    = nil;
     sn.cells = nil;
+    sn.treed = false;
+    sn.tree  = vector.init[u32](a);
 }
 
 fun release(sn: *Snapshot) {
@@ -67,13 +79,16 @@ fun release(sn: *Snapshot) {
 # forget the copy and free its buffers
 pub fun drop(sn: *Snapshot) {
     release(sn);
-    sn.held = false;
-    sn.n    = 0;
+    sn.held  = false;
+    sn.n     = 0;
+    sn.treed = false;
+    vector.clear[u32](?sn.tree);
 }
 
 # free the buffers
 pub fun dnit(sn: *Snapshot) {
     drop(sn);
+    vector.dnit[u32](?sn.tree);
 }
 
 # whether a chunk's cells hold one that is not the quiescent background
@@ -91,9 +106,9 @@ fun holds(sp: *space.Space, s: usize) bool {
     ret any(?sp.cells[s * space.CELLS]);
 }
 
-# the bytes the buffers take
+# the bytes the buffers take, the chunks' and the tree's
 pub fun bytes(sn: *Snapshot) usize {
-    ret sn.cap * (2 * 8 + space.CELLS * 4);
+    ret sn.cap * (2 * 8 + space.CELLS * 4) + sn.tree.cap * 4;
 }
 
 # the index of the chunk at (cx, cy), or n when none is held
@@ -136,7 +151,9 @@ fun fit(sn: *Snapshot, n: usize) err[allo.Error] {
 # generation: the world's generation
 # r:          the rule
 pub fun open(sn: *Snapshot, generation: u64, r: *rule.Rule) {
-    sn.n          = 0;
+    sn.n     = 0;
+    sn.treed = false;
+    vector.clear[u32](?sn.tree);
     sn.generation = generation;
     sn.rule       = @r;
     sn.held       = true;
@@ -186,8 +203,10 @@ pub fun add(sn: *Snapshot, cx: i64, cy: i64, cells: *u32) err[allo.Error] {
 # r:          the rule
 # ret:        ok, or the allocator's refusal, which leaves nothing held
 pub fun capture(sn: *Snapshot, sp: *space.Space, generation: u64, r: *rule.Rule) err[allo.Error] {
-    sn.held = false;
-    sn.n    = 0;
+    sn.held  = false;
+    sn.n     = 0;
+    sn.treed = false;
+    vector.clear[u32](?sn.tree);
     var n: usize = 0;
     var s: usize = 0;
     for (s < sp.hi) {
@@ -210,4 +229,24 @@ pub fun capture(sn: *Snapshot, sp: *space.Space, generation: u64, r: *rule.Rule)
     sn.rule       = @r;
     sn.held       = true;
     ret err[allo.Error].ok{};
+}
+
+# copy a tree's world, replacing whatever was held
+# ---
+# sn:         the snapshot
+# t:          the tree, made
+# generation: the world's generation
+# r:          the rule
+# ret:        false when the copy could not be stored, leaving nothing held
+pub fun capture_tree(sn: *Snapshot, t: *hashlife.Tree, generation: u64, r: *rule.Rule) bool {
+    drop(sn);
+    if (!hashlife.export(t, ?sn.tree)) {
+        vector.clear[u32](?sn.tree);
+        ret false;
+    }
+    sn.treed      = true;
+    sn.generation = generation;
+    sn.rule       = @r;
+    sn.held       = true;
+    ret true;
 }

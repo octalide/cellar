@@ -34,6 +34,7 @@ use cellar.rules.weighted;
 use cellar.sim;
 use cellar.space;
 use cellar.text;
+use cellar.topology;
 use allo: std.allocator;
 use std.allocator.page;
 use alloc_testing: std.allocator.testing;
@@ -61,8 +62,6 @@ val TEST_DIR: str = "out/test";
 pub val DIR_MODE: i32 = 0o755;
 # permission bits for saved files
 pub val FILE_MODE: i32 = 0o644;
-# bytes reserved for a chunk's header when sizing a buffer
-val HEADER_MAX: usize = 32;
 # the first line of a world file, less its version digit
 val MAGIC: str = "cellar ";
 # the version save_world writes
@@ -268,7 +267,7 @@ fun write_header(buf: *u8, s: *sim.Sim, v: *View) usize {
     off      = off + 1;
     buf[off] = '\n';
     off      = off + 1;
-    var rb: [1101]u8;
+    var rb: [rule.FORMAT_MAX + 1]u8;
     off = text.buf_str(buf, off, "family ");
     off = text.buf_str(buf, off, rule.family_id(rule.family_of(?s.rule)));
     off = text.buf_str(buf, off, "\nrule ");
@@ -304,52 +303,78 @@ pub fun save_world(a: *allo.Allocator, s: *sim.Sim, v: *View, path: str) err[Err
     val made: err[fs.FsError] = make_parent(a, path);
     if (sel made.err) { ret err[Error].err{Error.fs{made.err}}; }
 
-    val sp:   *space.Space = ?s.space;
-    val r:    *rule.Rule   = ?s.rule;
-    val w:    usize        = digits(rule.states(r));
-    var live: usize        = 0;
-    var sl:   usize        = 0;
-    for (sl < sp.hi) {
-        if (sim.holds_state(s, sl)) { live = live + 1; }
-        sl = sl + 1;
+    var head: [HEAD_MAX]u8;
+    var out:  Out;
+    out.buf = vector.init[u8](a);
+    out.w   = digits(rule.states(?s.rule));
+    out.ok  = true;
+    val n:  usize                  = write_header(?head[0], s, v);
+    val hr: res[usize, allo.Error] = vector.reserve[u8](?out.buf, n);
+    out.ok = sel hr.ok;
+    var i: usize = 0;
+    for (i < n && out.ok) {
+        put(?out, head[i]);
+        i = i + 1;
     }
-    val cap: usize                = HEAD_MAX + live * (HEADER_MAX + 64 * (64 * w + 1));
-    val rb:  res[*u8, allo.Error] = allo.allocate[u8](a, cap);
-    if (sel rb.err) { ret err[Error].err{Error.alloc{rb.err}}; }
-    val buf: *u8   = rb.ok;
-    var off: usize = write_header(buf, s, v);
-    sl = 0;
-    for (sl < sp.hi) {
-        if (sim.holds_state(s, sl)) {
-            off      = buf_i64(buf, off, space.slot_x(sp, sl));
-            buf[off] = ' ';
-            off      = buf_i64(buf, off + 1, space.slot_y(sp, sl));
-            buf[off] = '\n';
-            off      = off + 1;
-            val c: *u32  = ?sp.cells[sl * space.CELLS];
-            var i: usize = 0;
-            for (i < space.CELLS) {
-                var v: u32   = rule.state(r, c[i]);
-                var d: usize = w;
-                for (d > 0) {
-                    buf[off + d - 1] = '0' + (v % 10)::u8;
-                    v                = v / 10;
-                    d                = d - 1;
-                }
-                off = off + w;
-                if (i % 64 == 63) {
-                    buf[off] = '\n';
-                    off      = off + 1;
-                }
-                i = i + 1;
-            }
-        }
-        sl = sl + 1;
+    if (out.ok) { sim.chunks(s, write_chunk, (?out)::*u8); }
+    if (!out.ok) {
+        vector.dnit[u8](?out.buf);
+        ret err[Error].err{Error.alloc{allo.Error.exhausted{}}};
     }
-    val wrote: err[fs.FsError] = fs.write_bytes(path, buf, off, FILE_MODE);
-    allo.deallocate[u8](a, buf, cap);
+    val wrote: err[fs.FsError] = fs.write_bytes(path, out.buf.data, out.buf.len, FILE_MODE);
+    vector.dnit[u8](?out.buf);
     if (sel wrote.err) { ret err[Error].err{Error.fs{wrote.err}}; }
     ret err[Error].ok{};
+}
+
+# a world file being written
+# ---
+# buf: the bytes so far
+# w:   digits a state takes
+# ok:  every byte was kept
+rec Out {
+    buf: Vector[u8];
+    w:   usize;
+    ok:  bool;
+}
+
+fun put(o: *Out, b: u8) {
+    if (!o.ok) { ret; }
+    val r: res[usize, allo.Error] = vector.push[u8](?o.buf, b);
+    if (sel r.err) { o.ok = false; }
+}
+
+# write a chunk's line and its 64 rows of states
+fun write_chunk(ctx: *u8, cx: i64, cy: i64, cells: *u8) {
+    val o:   *Out  = ctx::*Out;
+    var num: [24]u8;
+    var n:   usize = buf_i64(?num[0], 0, cx);
+    num[n] = ' ';
+    n      = buf_i64(?num[0], n + 1, cy);
+    num[n] = '\n';
+    var i: usize = 0;
+    for (i <= n) {
+        put(o, num[i]);
+        i = i + 1;
+    }
+    var dg: [4]u8;
+    i = 0;
+    for (i < space.CELLS && o.ok) {
+        var v: u32   = cells[i]::u32;
+        var d: usize = o.w;
+        for (d > 0) {
+            dg[d - 1] = '0' + (v % 10)::u8;
+            v         = v / 10;
+            d         = d - 1;
+        }
+        d = 0;
+        for (d < o.w) {
+            put(o, dg[d]);
+            d = d + 1;
+        }
+        if (i % 64 == 63) { put(o, '\n'); }
+        i = i + 1;
+    }
 }
 
 # read a signed decimal at off, skipping spaces before it
@@ -409,9 +434,9 @@ fun world_version(b: *Vector[u8]) u8 {
 rec Head {
     family:     [32]u8;
     ruled:      bool;
-    rule:       [1101]u8;
+    rule:       [rule.FORMAT_MAX + 1]u8;
     shaped:     bool;
-    shape:      [1101]u8;
+    shape:      [rule.FORMAT_MAX + 1]u8;
     states:     u32;
     generation: u64;
     view:       View;
@@ -545,7 +570,7 @@ fun read_header(b: *Vector[u8], p: usize, out: *usize, h: *Head) err[Error] {
         var end: usize = e;
         for (end < b.len && b.data[end] != '\n') { end = end + 1; }
         for (end > e && (b.data[end - 1] == ' ' || b.data[end - 1] == '\t' || b.data[end - 1] == '\r')) { end = end - 1; }
-        var value: [1101]u8;
+        var value: [rule.FORMAT_MAX + 1]u8;
         var len:   usize = end - e;
         # a value too long for any field this version reads is read as none at all
         if (len > VALUE_MAX) { len = 0; }
@@ -679,14 +704,16 @@ fun world_from(a: *allo.Allocator, s: *sim.Sim, v: *View, data: *Vector[u8]) res
         }
         var at:     Vector[i64] = vector.init[i64](a);
         var cells:  Vector[u8]  = vector.init[u8](a);
-        val parsed: err[Error]  = parse_sparse(data, start, h.states, ?at, ?cells, s.space.max_slots);
+        val parsed: err[Error]  = parse_sparse(data, start, h.states, ?at, ?cells, sim.load_chunks(s));
         if (sel parsed.ok) {
-            # the rule first, so the cells are written as its words
+            # the world empties first, so a rule the quadtree cannot run moves
+            # nothing out of it, and the rule comes before the cells are written
+            # as its words
+            sim.fill_begin(s);
             val named: opt[rule.Rule] = head_rule(?h);
             if (sel named.some) { sim.set_rule(s, named.some); }
-            val have: u32 = rule.states(?s.rule);
-            sim.fill_begin(s);
-            var k: usize = 0;
+            val have: u32   = rule.states(?s.rule);
+            var k:    usize = 0;
             for (k < at.len / 2) {
                 val ox: i64   = at.data[k * 2] * space.SIDE;
                 val oy: i64   = at.data[k * 2 + 1] * space.SIDE;
@@ -755,7 +782,8 @@ fun stamp_from(a: *allo.Allocator, s: *sim.Sim, data: *Vector[u8]) res[Opened, E
         val named: str = format.text_of(?info.rule);
         if (named[0] != 0) {
             val k: res[rule.Rule, str] = rule.parse(named);
-            if (sel k.ok) { sim.set_rule(s, k.ok); }
+            # a rule the pool cannot take the world for is not taken either
+            if (sel k.ok) { foreign = !sim.set_rule(s, k.ok); }
             or            { foreign = true; }
         }
     }
@@ -1013,7 +1041,7 @@ test load_world__round_trips_a_wide_weighted_kernel {
     weighted.set_weight(?k, -2, 0, -4);
     weighted.set_weight(?k, 1, 2, 3);
     k.birth = weighted.set_bit(k.birth, 11);
-    sim.set_rule(?s, rule.Rule.weighted{k});
+    sim.set_rule(?s, rule.of(rule.Kind.weighted{k}));
     block(?s, 0, 0);
     var v: View = View{pan_x: 0.0, pan_y: 0.0, zoom: 1.0, mode: render.MODE_SOLID};
 
@@ -1070,6 +1098,37 @@ test load_world__round_trips_a_generations_world_and_its_dying_cells {
         }
         y = y + 1;
     }
+    sim.dnit(?s);
+    sim.dnit(?t);
+    ret 0;
+}
+
+test load_world__round_trips_a_bounded_grid_in_its_rule {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    val k: res[rule.Rule, str] = rule.parse("B3/S23:K100*,90");
+    if (sel k.err)               { ret 1; }
+    if (!sim.set_rule(?s, k.ok)) { ret 1; }
+    block(?s, 0, 0);
+    # a block across the grid's east edge, half of it dropped
+    block(?s, 49, 0);
+    var v: View = View{pan_x: 0.0, pan_y: 0.0, zoom: 1.0, mode: render.MODE_SOLID};
+
+    val path:  str        = "out/test/test_bounded.cellar";
+    val saved: err[Error] = save_world(?a, ?s, ?v, path);
+    if (sel saved.err) { ret 2; }
+    var t:     sim.Sim;
+    val made2: err[allo.Error] = sim.init(?t, ?a);
+    if (sel made2.err) { ret 3; }
+    val loaded: res[Loaded, Error] = load_world(?a, ?t, ?v, path);
+    fs.remove_file(path);
+    if (sel loaded.err)                                                           { ret 4; }
+    if (loaded.ok.foreign || !rule.same(?t.rule, ?s.rule))                        { ret 5; }
+    if (!topology.bounded(?t.rule.grid))                                          { ret 6; }
+    if (sim.population(?t) != 6 || !sim.alive(?t, 49, 1) || sim.alive(?t, 50, 1)) { ret 7; }
     sim.dnit(?s);
     sim.dnit(?t);
     ret 0;
@@ -1307,23 +1366,23 @@ test load_world__reads_cellar_2_and_every_cellar_3_header {
     if (v.pan_y != 7.25 || v.pan_x != 1.5 || v.mode != render.MODE_AGE) { ret 6; }
 
     # a rule cellar cannot run loads the world with the rule as it was
-    val odd: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v3_odd.cellar", "cellar 3\nrule B3/S23:T20,30\ngeneration 3\n\n");
+    val odd: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v3_odd.cellar", "cellar 3\nrule B3/S23:S20\ngeneration 3\n\n");
     if (sel odd.err)                                                      { ret 7; }
     if (!odd.ok.foreign || !rule.same(?s.rule, ?hl) || s.generation != 3) { ret 7; }
 
     # a whole kernel is preferred to the notation beside it, and one this
     # version cannot run is foreign even beside a rule it can
     val both: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v3_both.cellar", "cellar 3\nrule B3/S23\nkernel 1 64 12 1 1 1 1 0 1 1 1 1\n\n");
-    if (sel both.err)                            { ret 12; }
-    if (both.ok.foreign || !sel s.rule.weighted) { ret 12; }
-    if (sel s.rule.weighted) {
-        if (s.rule.weighted.birth != 64 || s.rule.weighted.survive != 12) { ret 12; }
+    if (sel both.err)                                 { ret 12; }
+    if (both.ok.foreign || !sel s.rule.kind.weighted) { ret 12; }
+    if (sel s.rule.kind.weighted) {
+        if (s.rule.kind.weighted.birth != 64 || s.rule.kind.weighted.survive != 12) { ret 12; }
     }
     val wide: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v3_wide.cellar", "cellar 3\nrule B3/S23\nkernel 9 8 12 1\n\n");
-    if (sel wide.err)                             { ret 13; }
-    if (!wide.ok.foreign || !sel s.rule.weighted) { ret 13; }
-    if (sel s.rule.weighted) {
-        if (s.rule.weighted.birth != 64) { ret 13; }
+    if (sel wide.err)                                  { ret 13; }
+    if (!wide.ok.foreign || !sel s.rule.kind.weighted) { ret 13; }
+    if (sel s.rule.kind.weighted) {
+        if (s.rule.kind.weighted.birth != 64) { ret 13; }
     }
 
     # a version from the future, a header that never ends, and a value that

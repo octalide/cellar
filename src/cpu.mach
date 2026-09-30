@@ -10,6 +10,11 @@
 # cold only clears. every family keeps the pool's background dead, a rule that
 # births on 0 included (see cellar.rule), so this holds under every rule.
 #
+# a seamed chunk of a bounded grid (cellar.layout) is stepped after the rest,
+# one at a time: its 3 by 3 block is gathered through its links into frames
+# the family steps as it would any block, busy, and what it writes off the
+# grid is cleared before the census is taken.
+#
 # a chunk whose cells the step changed is marked space.DIRTY_CELLS, since the
 # host's cells are the world's, so a GPU that only draws sends only those.
 
@@ -18,6 +23,7 @@ use cellar.rule;
 use cellar.rules.weighted;
 use cellar.space;
 use cellar.team;
+use cellar.topology;
 use allo: std.allocator;
 use std.allocator.page;
 use mem: std.memory;
@@ -39,7 +45,7 @@ fun step_slot(arg: *u8, s: usize) {
     val sp: *space.Space = rd.sp;
     val e:  *u32         = ?sp.table[s * space.ENTRY];
     val cn: *u32         = ?sp.census[s * space.CENSUS];
-    if (e[11] == 0) { ret; }
+    if (e[layout.INCARNATION_AT::usize] == 0 || space.seamed(sp, s)) { ret; }
     val out: *u32 = ?sp.back[s * space.CELLS];
 
     # the census as the step began says whether anything nearby is alive
@@ -56,14 +62,80 @@ fun step_slot(arg: *u8, s: usize) {
         q = q + 1;
     }
     b.out = out;
-    var t:   space.Tally = space.tally(rd.sens);
-    val was: *u32        = ?sp.before[s * space.CENSUS];
-    if (!b.busy && was[1] == 0) { mem.zero[u32](out, space.CELLS); }
-    or                          { rule.step_chunk(rd.r, ?b, ?t); }
-    space.tally_census(?t, cn, e[11]);
-    # a chunk's cells changed unless they were all zero and stay so, and only
-    # a changed chunk is sent to the draw again
+    var t: space.Tally = space.tally(rd.sens);
+    if (!b.busy && sp.before[s * space.CENSUS + 1] == 0) { mem.zero[u32](out, space.CELLS); }
+    or                                                   { rule.step_chunk(rd.r, ?b, ?t); }
+    space.tally_census(?t, cn, e[layout.INCARNATION_AT::usize]);
+    note_change(sp, s, ?t);
+}
+
+# mark a stepped chunk DIRTY_CELLS unless its cells were all zero and stay so,
+# so only a changed chunk is sent to the draw again
+# ---
+# sp: the pool
+# s:  the slot
+# t:  the tally of the cells the step wrote
+fun note_change(sp: *space.Space, s: usize, t: *space.Tally) {
+    val was: *u32 = ?sp.before[s * space.CENSUS];
     if (was[0] != 0 || was[1] != 0 || t.live != 0 || t.warm != 0) { sp.dirty[s] = sp.dirty[s] | space.DIRTY_CELLS; }
+}
+
+# the frames of a seamed chunk's block, gathered one chunk at a time
+val FRAMES: usize = 9 * 4096;
+
+# step a seamed chunk from its block gathered into frames
+fun step_seamed(rd: *Round, s: usize, fr: *u32) {
+    val sp:   *space.Space = rd.sp;
+    val side: i32          = space.SIDE::i32;
+    val r:    i32          = rule.radius(rd.r)::i32;
+    var b:    space.Block;
+    var k:    usize        = 0;
+    for (k < 9) {
+        b.nb[k] = ?fr[k * space.CELLS];
+        k       = k + 1;
+    }
+    # every cell the family can read, up to the radius around the frame
+    var y: i32 = 0 - r;
+    for (y < side + r) {
+        val fy: i32 = (y + side) / side;
+        var x:  i32 = 0 - r;
+        for (x < side + r) {
+            val fx: i32 = (x + side) / side;
+            val at: i32 = (fy * 3 + fx) * space.CELLS::i32 + (y - (fy - 1) * side) * side + x - (fx - 1) * side;
+            fr[at::usize] = space.resolve(sp, s, x, y);
+            x             = x + 1;
+        }
+        y = y + 1;
+    }
+    val out: *u32 = ?sp.back[s * space.CELLS];
+    b.out  = out;
+    b.busy = true;
+    b.gen  = rd.gen;
+    var t: space.Tally = space.tally(rd.sens);
+    rule.step_chunk(rd.r, ?b, ?t);
+    val edge: u32         = sp.table[s * space.ENTRY + layout.EDGE_AT::usize];
+    var u:    space.Tally = space.tally(rd.sens);
+    var i:    usize       = 0;
+    for (i < space.CELLS) {
+        val lx: u32 = (i & 63)::u32;
+        val ly: u32 = (i >> 6)::u32;
+        if (layout.edge_side(edge, lx::i32, ly::i32) != 4) { out[i] = 0; }
+        space.note(?u, out[i], lx, ly);
+        i = i + 1;
+    }
+    space.tally_census(?u, ?sp.census[s * space.CENSUS], space.incarnation(sp, s));
+    note_change(sp, s, ?u);
+}
+
+# step every seamed chunk of the pool, after the rest
+fun step_seams(rd: *Round) {
+    var fr: [FRAMES]u32;
+    val sp: *space.Space = rd.sp;
+    var s:  usize        = 0;
+    for (s < sp.hi) {
+        if (space.used(sp, s) && space.seamed(sp, s)) { step_seamed(rd, s, ?fr[0]); }
+        s = s + 1;
+    }
 }
 
 # advance the pool one generation and reshape it around the result
@@ -85,6 +157,7 @@ pub fun step(sp: *space.Space, r: *rule.Rule, gen: u64, t: *team.Team) bool {
     rd.sens = sp.sense;
     mem.copy[u32](sp.before, sp.census, sp.hi * space.CENSUS);
     team.run(t, step_slot, (?rd)::*u8, sp.hi);
+    if (topology.bounded(?sp.grid)) { step_seams(?rd); }
     val front: *u32 = sp.cells;
     sp.cells = sp.back;
     sp.back  = front;
@@ -99,7 +172,7 @@ test step__a_glider_crosses_chunk_borders_and_the_pool_follows {
     if (sel made.err) { ret 1; }
     var t: team.Team;
     team.start(?t);
-    var r: rule.Rule = rule.Rule.weighted{weighted.life()};
+    var r: rule.Rule = rule.of(rule.Kind.weighted{weighted.life()});
     sp.sense = rule.sense(?r);
 
     # a south-east glider just west and north of the origin's chunk corner
