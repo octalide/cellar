@@ -125,6 +125,7 @@ pub fun validate(a: *allo.Allocator, f: *format.Format, p: *u8, n: usize, info: 
     e.sink = nil;
     e.info = info;
     e.fits = false;
+    e.tree = nil;
     val r: err[format.Error] = f.decode(a, p, n, ?e);
     if (sel r.err) { ret r; }
     format.settle(info);
@@ -138,8 +139,10 @@ pub fun validate(a: *allo.Allocator, f: *format.Format, p: *u8, n: usize, info: 
 # offered every run, and only once it has taken them all is it opened and
 # given them. so malformed or truncated input, and a pattern the sink judges
 # too large, are refused having changed nothing. a sink that neither plans nor
-# fits can still refuse a valid pattern part way, for lack of room. a load the
-# sink planned is closed either way.
+# fits can still refuse a valid pattern part way, for lack of room. a format
+# that builds is handed the sink's tree when it offers one, which is opened in
+# place of the sink and built in place of the runs, with nothing to fit. a load
+# the sink planned is closed either way.
 # ---
 # a:    allocator for the decoder's scratch
 # f:    the format
@@ -152,26 +155,32 @@ pub fun load(a: *allo.Allocator, f: *format.Format, p: *u8, n: usize, sink: *for
     val ok: err[format.Error] = validate(a, f, p, n, info);
     if (sel ok.err)                                     { ret ok; }
     if (sink.plan != nil && !sink.plan(sink.ctx, info)) { ret err[format.Error].err{format.Error.sink{}}; }
+    var tree: *format.TreeSink = nil;
+    if (f.builds) { tree = sink.tree; }
     var r: err[format.Error] = err[format.Error].ok{};
-    if (sink.fit != nil) { r = pass(a, f, p, n, sink, true); }
-    val fits: bool = sel r.ok;
-    if (fits && !sink.open(sink.ctx, info)) { r = err[format.Error].err{format.Error.sink{}}; }
-    val opened: bool = sel r.ok;
-    if (opened) { r = pass(a, f, p, n, sink, false); }
+    if (sink.fit != nil && tree == nil) { r = pass(a, f, p, n, sink, true, nil); }
+    val fits:   bool = sel r.ok;
+    var opened: bool = false;
+    if (fits && tree == nil) { opened = sink.open(sink.ctx, info); }
+    or (fits)                { opened = tree.open(tree.ctx, info); }
+    if (fits && !opened)     { r = err[format.Error].err{format.Error.sink{}}; }
+    if (opened)              { r = pass(a, f, p, n, sink, false, tree); }
     val kept: bool = sink.close(sink.ctx);
     if (sel r.err) { ret r; }
     if (!kept)     { ret err[format.Error].err{format.Error.sink{}}; }
     ret err[format.Error].ok{};
 }
 
-# decode validated bytes into a sink's fit or run, gathering a scratch Info
-fun pass(a: *allo.Allocator, f: *format.Format, p: *u8, n: usize, sink: *format.Sink, fits: bool) err[format.Error] {
+# decode validated bytes into a sink's fit or run, or its tree when tree is
+# not nil, gathering a scratch Info
+fun pass(a: *allo.Allocator, f: *format.Format, p: *u8, n: usize, sink: *format.Sink, fits: bool, tree: *format.TreeSink) err[format.Error] {
     var again: format.Info;
     format.info_init(?again, a);
     var e: format.Emit;
     e.sink = sink;
     e.info = ?again;
     e.fits = fits;
+    e.tree = tree;
     val r: err[format.Error] = f.decode(a, p, n, ?e);
     format.info_dnit(?again);
     ret r;
