@@ -18,6 +18,8 @@ use boom.context.Context;
 use boom.context.context_fail;
 use boom.context.context_stop;
 use boom.context.context_user;
+use boom.event.Event;
+use boom.event.queue_pop;
 use gfx: boom.graphics;
 use inp: boom.input;
 use gm:  boom.math;
@@ -92,6 +94,7 @@ val SMALL_PX: f32 = 14.0;
 # faces_at:    the interface scale the faces were built for, 0 for none
 # snap:        a screenshot being read back
 # capture:     a path to save one screenshot to and quit, or nil
+# open:        a world or pattern file to open at startup, or nil
 # countdown:   frames left before that screenshot
 # owed:        seconds of capped stepping carried to the next tick
 # sim_ok:      sim holds a pool to release
@@ -117,6 +120,7 @@ pub rec Game {
     faces_at:    f32;
     snap:        shot.Shot;
     capture:     str;
+    open:        str;
     countdown:   i32;
     owed:        f64;
     sim_ok:      bool;
@@ -233,13 +237,22 @@ pub fun on_init(ctx: *Context) {
     # the world is seeded once the GPU has set how far the pool may grow
     if (g.bench != BENCH_NONE) { bench_world(g); }
     or {
-        world.randomize(?g.sim, app.bounds_size(g.app.bounds_idx));
+        # a file named on the command line is opened onto an empty world with the
+        # first frame, like any other load; with none the world starts random
+        if (g.open != nil) { open_at_start(g); }
+        or                 { world.randomize(?g.sim, app.bounds_size(g.app.bounds_idx)); }
         # a documentation capture shows the world a few generations in
         if (g.capture != nil) { world.toggle(?g.sim); }
     }
 
     val spawned: err[thread.ThreadError] = runner.start(?g.runner, ?g.sim);
     if (sel spawned.err) { give_up(ctx, "could not start the simulation thread"); }
+}
+
+# queue the file named on the command line to open with the first frame
+fun open_at_start(g: *Game) {
+    val f: opt[command.File] = app.file(?g.app, g.open);
+    if (sel f.some) { app.submit(?g.app, command.Command.open{f.some}); }
 }
 
 # release the faces
@@ -323,6 +336,16 @@ fun keys(ctx: *Context, g: *Game) {
     if (inp.key_pressed(in, inp.KEY_F12))                                  { a.shot = true; }
 }
 
+# hand the window's queued events, typed text among them, to the interface in
+# order, so none waits for a later tick or is dropped when the queue fills
+fun events(ctx: *Context, g: *Game) {
+    for {
+        val e: opt[Event] = queue_pop(?ctx.events);
+        if (sel e.none) { brk; }
+        ui.feed(?g.ui, e.some);
+    }
+}
+
 # read the keyboard, scroll and pan, and run capped stepping
 fun tick(ctx: *Context) {
     val g:  *Game      = game_of(ctx);
@@ -330,7 +353,11 @@ fun tick(ctx: *Context) {
     val a:  *app.App   = ?g.app;
     val u:  *ui.Ui     = ?g.ui;
 
-    keys(ctx, g);
+    # while a field has the keyboard the key bindings stay quiet, including on
+    # the tick whose enter or escape gives it back
+    val typing: bool = ui.typing(u);
+    events(ctx, g);
+    if (!typing)       { keys(ctx, g); }
     if (a.toast_t > 0) { a.toast_t = a.toast_t - 1; }
 
     val sw: f32         = ctx.window.width::f32;
@@ -348,10 +375,12 @@ fun tick(ctx: *Context) {
     # the pan is the view centre in cells, moved by pixels at the current zoom
     val ppc:  f32 = render.BASE_PPC * a.zoom;
     val step: f32 = ui.px(u, PAN_STEP) / ppc;
-    if (inp.key_down(in, inp.KEY_LEFT))  { a.pan_x = a.pan_x - step::f64; }
-    if (inp.key_down(in, inp.KEY_RIGHT)) { a.pan_x = a.pan_x + step::f64; }
-    if (inp.key_down(in, inp.KEY_UP))    { a.pan_y = a.pan_y - step::f64; }
-    if (inp.key_down(in, inp.KEY_DOWN))  { a.pan_y = a.pan_y + step::f64; }
+    if (!typing && !ui.typing(u)) {
+        if (inp.key_down(in, inp.KEY_LEFT))  { a.pan_x = a.pan_x - step::f64; }
+        if (inp.key_down(in, inp.KEY_RIGHT)) { a.pan_x = a.pan_x + step::f64; }
+        if (inp.key_down(in, inp.KEY_UP))    { a.pan_y = a.pan_y - step::f64; }
+        if (inp.key_down(in, inp.KEY_DOWN))  { a.pan_y = a.pan_y + step::f64; }
+    }
     # the tick's movement only, so the press that starts a drag never jumps
     if (inp.button_down(in, inp.BUTTON_RIGHT) || inp.button_down(in, inp.BUTTON_MIDDLE)) {
         a.pan_x = a.pan_x - in.mouse_dx / ppc::f64;
@@ -535,7 +564,7 @@ pub fun on_draw(ctx: *Context) {
     runner.enter(?g.runner);
     # the world's edits and file actions run first: a save reads the GPU's
     # cells back, which is only valid before the frame records anything
-    var deps: exec.Deps = exec.Deps{a: ?g.a, p: ?g.paths};
+    var deps: exec.Deps = exec.Deps{a: ?g.a};
     exec.run(a, ?g.sim, ?deps);
     # take the census before this frame's own readback can reuse its slot
     sim.collect(?g.sim);
