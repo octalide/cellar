@@ -33,7 +33,7 @@ Built-in kernels: Conway's Life (`B3/S23`), HighLife (`B36/S23`), Seeds
 | `Z`, `X`               | rotate the stamp, flip the stamp        |
 | left mouse             | use the tool; drag to select            |
 | `Ctrl+C`, `Ctrl+X`     | copy or cut the selection to the stamp  |
-| `Delete`, `Backspace`  | clear the selection                     |
+| `Delete`               | clear the selection                     |
 | `Shift+Delete`         | clear outside the selection             |
 | `Ctrl+R`               | fill the selection at random            |
 | `I`                    | invert the selection                    |
