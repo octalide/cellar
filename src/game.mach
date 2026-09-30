@@ -118,6 +118,9 @@ val SMALL_PX: f32 = 14.0;
 # bench_secs:  seconds the measurement runs for
 # bench_r:     the radius the measured rule reads, Life's weights widened to it
 # bench_gps:   generations a second the measurement is capped at, 0 uncapped
+# engine:      the args.ENGINE_* the command line named
+# want_tree:   the world is to move onto HashLife with the first frame, and
+#              the run stops if it cannot
 # started:     when the measurement began
 # frames:      frames drawn since it began
 # gen0:        the generation it began at
@@ -146,6 +149,8 @@ pub rec Game {
     bench_secs:  f64;
     bench_r:     usize;
     bench_gps:   usize;
+    engine:      u8;
+    want_tree:   bool;
     started:     Instant;
     frames:      u64;
     gen0:        u64;
@@ -240,29 +245,58 @@ pub fun on_init(ctx: *Context) {
         ret;
     }
     g.gpu_ok = true;
-    if (g.bench_cpu)     { gpu.forgo_compute(?g.gpu); }
-    if (!g.gpu.stepping) { print.eprintln("the GPU cannot step the world; stepping on the CPU"); }
+    if (g.bench_cpu || g.engine == args.ENGINE_CPU) { gpu.forgo_compute(?g.gpu); }
+    if (!g.gpu.stepping && g.engine == args.ENGINE_GPU) {
+        give_up(ctx, "cellar: --engine gpu: the GPU here cannot step the world");
+        ret;
+    }
+    if (!g.gpu.stepping && g.engine != args.ENGINE_CPU) { print.eprintln("the GPU cannot step the world; stepping on the CPU"); }
     sim.attach(?g.sim, ?g.gpu);
 
     # the world is seeded once the GPU has set how far the pool may grow
+    g.want_tree = false;
     if (g.bench != args.BENCH_NONE) { bench_world(g); }
-    or {
-        # a file named on the command line is opened onto an empty world with the
-        # first frame, like any other load; with none the world starts random
-        if (g.open != nil) { open_at_start(g); }
-        or                 { world.randomize(?g.sim, app.bounds_size(g.app.bounds_idx)); }
-        # a documentation capture shows the world a few generations in
-        if (g.capture != nil) { world.toggle(?g.sim); }
-    }
+    or                              { g.want_tree = start_world(?g.app, ?g.sim, g.open, g.capture != nil, g.engine); }
 
     val spawned: err[thread.ThreadError] = runner.start(?g.runner, ?g.sim);
     if (sel spawned.err) { give_up(ctx, "could not start the simulation thread"); }
 }
 
-# queue the file named on the command line to open with the first frame
-fun open_at_start(g: *Game) {
-    val f: opt[command.File] = app.file(?g.app, g.open);
-    if (sel f.some) { app.submit(?g.app, command.Command.open{f.some}); }
+# stop the run that asked for HashLife on the command line when it could not
+# have it, saying why
+fun refuse_tree(ctx: *Context, g: *Game) {
+    var rb: [200]u8;
+    if (!world.hashlife_runs(?g.sim)) {
+        print.eprintlnf("cellar: --engine hashlife: HashLife cannot run {}; it runs radius 1 rules without B0", world.rule_string(?g.sim, ?rb[0]));
+    }
+    or { print.eprintln("cellar: --engine hashlife: HashLife could not take the world"); }
+    context_fail(ctx, 1);
+}
+
+# seed the world a session starts with, and queue what its first frame applies
+#
+# a file named on the command line is opened onto an empty world with the
+# first frame, like any other load; with none the world starts random. a
+# documentation capture shows the world a few generations in. HashLife, when
+# named, is moved onto after the file, which may bring the rule, so the file
+# opens and runs as it would without it.
+# ---
+# a:       application state, attached
+# s:       the simulation
+# open:    the file to open, or nil
+# capture: the session is a capture
+# engine:  the args.ENGINE_* named
+# ret:     whether the first frame moves the world onto HashLife
+pub fun start_world(a: *app.App, s: *sim.Sim, open: str, capture: bool, engine: u8) bool {
+    if (open != nil) {
+        val f: opt[command.File] = app.file(a, open);
+        if (sel f.some) { app.submit(a, command.Command.open{f.some}); }
+    }
+    or                                  { world.randomize(s, app.bounds_size(a.bounds_idx)); }
+    if (capture)                        { world.toggle(s); }
+    if (engine != args.ENGINE_HASHLIFE) { ret false; }
+    app.submit(a, command.Command.engine{true});
+    ret true;
 }
 
 # release the faces
@@ -451,7 +485,7 @@ fun zoom_at(a: *app.App, pt: render.Port, mx: f32, my: f32, notches: f32) {
     # by a factor a notch, so it is as quick far out as close in
     if (notches > 0.0) { a.zoom = a.zoom * (1.0 + notches * ZOOM_STEP); }
     if (notches < 0.0) { a.zoom = a.zoom / (1.0 - notches * ZOOM_STEP); }
-    a.zoom = app.clamp_zoom(a.zoom);
+    a.zoom = app.clamp_zoom(a, a.zoom);
     var ax: f64 = 0.0;
     var ay: f64 = 0.0;
     render.world_at(camera(a, pt), mx, my, ?ax, ?ay);
@@ -469,7 +503,7 @@ fun frame(a: *app.App, pt: render.Port) {
     if (h < 1.0) { h = 1.0; }
     var z: f32 = pt.w / w;
     if (pt.h / h < z) { z = pt.h / h; }
-    a.zoom  = app.clamp_zoom(z * 0.9 / render.BASE_PPC);
+    a.zoom  = app.clamp_zoom(a, z * 0.9 / render.BASE_PPC);
     a.pan_x = (b.x0 + b.x1)::f64 / 2.0;
     a.pan_y = (b.y0 + b.y1)::f64 / 2.0;
 }
@@ -621,6 +655,15 @@ pub fun on_draw(ctx: *Context) {
     # cells back, which is only valid before the frame records anything
     var deps: exec.Deps = exec.Deps{a: ?g.a};
     exec.run(a, ?g.sim, ?deps);
+    if (g.want_tree) {
+        g.want_tree = false;
+        if (!world.hashlife(?g.sim)) {
+            runner.leave(?g.runner, false);
+            refuse_tree(ctx, g);
+            ret;
+        }
+    }
+    app.fit_engine(a, world.hashlife(?g.sim));
     if (a.clip_ready) {
         win.window_clipboard_set(?ctx.window, a.clip.data::str);
         a.clip_ready = false;
@@ -628,7 +671,7 @@ pub fun on_draw(ctx: *Context) {
     app.identify_poll(a);
     # take the census before this frame's own readback can reuse its slot
     sim.collect(?g.sim);
-    app.note_full(a, world.full(?g.sim));
+    app.note_full(a, world.full(?g.sim), world.full_reason(?g.sim));
     a.side_x0 = panel.left(u, a, sw);
     val pt: render.Port = panel.port(u, a, sw, sh);
     if (a.refit) {
@@ -818,7 +861,8 @@ fun bench_frame(ctx: *Context, g: *Game) {
     val gens:   f64 = (g.sim.generation - g.gen0)::f64;
     val frame:  f64 = secs * 1000000.0 / g.frames::f64;
     var engine: str = "gpu";
-    if (!sim.on_gpu(?g.sim)) { engine = "cpu"; }
+    if (sel g.sim.engine.cpu)      { engine = "cpu"; }
+    if (sel g.sim.engine.hashlife) { engine = "hashlife"; }
     print.printlnf("bench {} radius {} chunks {} population {} gens/s {} frame us {}", engine, rule.radius(?g.sim.rule)::u64,
         g.sim.space.live::u64, sim.population(?g.sim)::u64, (gens / secs)::u64, frame::u64);
     context_stop(ctx);
@@ -863,5 +907,37 @@ test events__open_the_first_dropped_file_and_say_the_rest_were_ignored {
     fs.remove_file("out/test/drop/row.rle");
     app.dnit(?ap);
     sim.dnit(?s);
+    ret 0;
+}
+
+test start_world__a_file_opens_onto_an_empty_world_running_on_either_engine {
+    var al: allo.Allocator;
+    page.make(?al);
+    val body: str             = "x = 3, y = 1, rule = B3/S23\n3o!\n";
+    val dir:  err[fs.FsError] = persist.make_parent(?al, "out/test/start_world/row.rle");
+    if (sel dir.err) { ret 1; }
+    fs.write_bytes("out/test/start_world/row.rle", body, string.str_len(body), persist.FILE_MODE);
+    var e: u8 = args.ENGINE_ANY;
+    for (e <= args.ENGINE_HASHLIFE) {
+        var s:    sim.Sim;
+        val made: err[allo.Error] = sim.init(?s, ?al);
+        if (sel made.err) { ret 2; }
+        var a: app.App;
+        app.init(?a);
+        val shown: err[format.Error] = app.attach(?a, ?al);
+        if (sel shown.err) { ret 3; }
+        # a randomize area that would fill four thousand cells a side
+        a.bounds_idx = app.BOUNDS_COUNT - 1;
+        val tree: bool      = start_world(?a, ?s, "out/test/start_world/row.rle", true, e);
+        var d:    exec.Deps = exec.Deps{a: ?al};
+        exec.run(?a, ?s, ?d);
+        if (tree != (e == args.ENGINE_HASHLIFE) || world.hashlife(?s) != tree)  { ret 4; }
+        if (sim.population(?s) != 3 || s.generation != 0 || !world.running(?s)) { ret 5; }
+        if (!sim.alive(?s, -1, 0) || !sim.alive(?s, 1, 0))                      { ret 6; }
+        app.dnit(?a);
+        sim.dnit(?s);
+        e = e + args.ENGINE_HASHLIFE;
+    }
+    fs.remove_file("out/test/start_world/row.rle");
     ret 0;
 }

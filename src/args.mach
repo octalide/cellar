@@ -6,8 +6,14 @@
 # twice or a second file is refused, and the binary says why and exits rather
 # than starting.
 #
-#   cellar [--version] [--capture <file.png>] [--bench <gpu|cpu> <dense|sparse> [seconds [radius [speed]]]] [--] [file]
-#   cellar run <pattern> --gens <n> [--rule <rule>] [--out <file>] [--quiet] [--]
+#   cellar [--version] [--capture <file.png>] [--bench <gpu|cpu> <dense|sparse> [seconds [radius [speed]]]]
+#          [--engine <cpu|gpu|hashlife>] [--] [file]
+#   cellar run <pattern> --gens <n> [--rule <rule>] [--engine <cpu|hashlife>] [--out <file>] [--quiet] [--]
+#
+# --engine names the engine the world runs on: the chunk pool stepped by the
+# CPU or by the GPU, or HashLife. left out, the pool runs on the GPU where it
+# can. a batch run has no GPU, and on HashLife --gens goes straight to the
+# generation by powers of two, so it needs no step size of its own.
 #
 # a first argument of exactly "run" names the batch command, whose options are
 # its own, and anything else is the session's command line. a file named run is
@@ -24,15 +30,24 @@ use std.types.string.str;
 use std.types.string.str_equals;
 
 # the usage printed with a refusal of the session's command line, both forms
-pub val USAGE: str = "usage: cellar [--version] [--capture <file.png>] [--bench <gpu|cpu> <dense|sparse> [seconds [radius [speed]]]] [--] [file]\n       cellar run <pattern> --gens <n> [--rule <rule>] [--out <file>] [--quiet] [--]";
+pub val USAGE: str = "usage: cellar [--version] [--capture <file.png>] [--bench <gpu|cpu> <dense|sparse> [seconds [radius [speed]]]]\n              [--engine <cpu|gpu|hashlife>] [--] [file]\n       cellar run <pattern> --gens <n> [--rule <rule>] [--engine <cpu|hashlife>] [--out <file>] [--quiet] [--]";
 
 # the usage printed with a refusal of a batch run, its form alone
-pub val RUN_USAGE: str = "usage: cellar run <pattern> --gens <n> [--rule <rule>] [--out <file>] [--quiet] [--]";
+pub val RUN_USAGE: str = "usage: cellar run <pattern> --gens <n> [--rule <rule>] [--engine <cpu|hashlife>] [--out <file>] [--quiet] [--]";
 
 # an interactive session
 pub val COMMAND_APP: u8 = 0;
 # a headless batch run, see cellar.batch
 pub val COMMAND_RUN: u8 = 1;
+
+# no engine named: the pool, on the GPU where it can step
+pub val ENGINE_ANY: u8 = 0;
+# the pool, stepped by the CPU
+pub val ENGINE_CPU: u8 = 1;
+# the pool, stepped by the GPU
+pub val ENGINE_GPU: u8 = 2;
+# HashLife
+pub val ENGINE_HASHLIFE: u8 = 3;
 
 # the most generations a batch run takes, so the count never overflows
 pub val GENS_MAX: u64 = 1000000000000000;
@@ -52,6 +67,7 @@ pub val BENCH_SECS: f64 = 10.0;
 # pattern: the world or pattern file to run
 # rule:    the rule to run it under, or nil for the file's
 # gens:    generations to step
+# engine:  ENGINE_ANY, ENGINE_CPU or ENGINE_HASHLIFE
 # out:     the file to write the result to, its format by its extension, or
 #          nil for RLE on stdout
 # quiet:   leave the generation and population off stderr
@@ -59,6 +75,7 @@ pub rec Run {
     pattern: str;
     rule:    str;
     gens:    u64;
+    engine:  u8;
     out:     str;
     quiet:   bool;
 }
@@ -74,6 +91,7 @@ pub rec Run {
 # bench_secs: seconds the measurement runs for
 # bench_r:    the radius the measured rule reads, Life's weights widened to it
 # bench_gps:  generations a second the measurement is capped at, 0 uncapped
+# engine:     the ENGINE_* the world runs on
 # open:       a world or pattern file to open, or nil
 pub rec Args {
     command:    u8;
@@ -85,6 +103,7 @@ pub rec Args {
     bench_secs: f64;
     bench_r:    usize;
     bench_gps:  usize;
+    engine:     u8;
     open:       str;
 }
 
@@ -217,6 +236,26 @@ fun value(argc: i64, argv: *str, i: *i64, taken: bool, name: str, out: *str) opt
     ret opt[Error].none{};
 }
 
+# the engine an --engine value names, or ENGINE_ANY for none it knows
+fun engine_named(s: str) u8 {
+    if (str_equals(s, "cpu"))      { ret ENGINE_CPU; }
+    if (str_equals(s, "gpu"))      { ret ENGINE_GPU; }
+    if (str_equals(s, "hashlife")) { ret ENGINE_HASHLIFE; }
+    ret ENGINE_ANY;
+}
+
+# read an --engine value into out, refusing one it does not know and, without
+# gpu, the GPU's
+fun engine_value(argc: i64, argv: *str, i: *i64, out: *u8, gpu: bool) opt[Error] {
+    var n: str        = nil;
+    val e: opt[Error] = value(argc, argv, i, @out != ENGINE_ANY, "--engine", ?n);
+    if (sel e.some) { ret e; }
+    val k: u8 = engine_named(n);
+    if (k == ENGINE_ANY || (k == ENGINE_GPU && !gpu)) { ret opt[Error].some{Error.value{n}}; }
+    @out = k;
+    ret opt[Error].none{};
+}
+
 # read a batch run's arguments, those after "run"
 fun parse_run(argc: i64, argv: *str, r: *Args) opt[Error] {
     val o: *Run = ?r.run;
@@ -224,6 +263,7 @@ fun parse_run(argc: i64, argv: *str, r: *Args) opt[Error] {
     o.pattern = nil;
     o.rule    = nil;
     o.gens    = 0;
+    o.engine  = ENGINE_ANY;
     o.out     = nil;
     o.quiet   = false;
     var counted: bool = false;
@@ -246,8 +286,9 @@ fun parse_run(argc: i64, argv: *str, r: *Args) opt[Error] {
             cnt;
         }
         var e: opt[Error] = opt[Error].none{};
-        if (str_equals(s, "--rule")) { e = value(argc, argv, ?i, o.rule != nil, s, ?o.rule); }
-        or (str_equals(s, "--out"))  { e = value(argc, argv, ?i, o.out != nil, s, ?o.out); }
+        if (str_equals(s, "--rule"))   { e = value(argc, argv, ?i, o.rule != nil, s, ?o.rule); }
+        or (str_equals(s, "--out"))    { e = value(argc, argv, ?i, o.out != nil, s, ?o.out); }
+        or (str_equals(s, "--engine")) { e = engine_value(argc, argv, ?i, ?o.engine, false); }
         or (str_equals(s, "--gens")) {
             var n: str = nil;
             e = value(argc, argv, ?i, counted, s, ?n);
@@ -292,6 +333,7 @@ pub fun parse(argc: i64, argv: *str) res[Args, Error] {
     r.bench_secs = BENCH_SECS;
     r.bench_r    = 1;
     r.bench_gps  = 0;
+    r.engine     = ENGINE_ANY;
     r.open       = nil;
     if (is_run(argc, argv)) {
         val bad: opt[Error] = parse_run(argc, argv, ?r);
@@ -321,6 +363,11 @@ pub fun parse(argc: i64, argv: *str) res[Args, Error] {
             if (i >= argc)        { ret res[Args, Error].err{Error.missing{s}}; }
             r.capture = argv[i];
             i         = i + 1;
+            cnt;
+        }
+        if (str_equals(s, "--engine")) {
+            val bad: opt[Error] = engine_value(argc, argv, ?i, ?r.engine, true);
+            if (sel bad.some) { ret res[Args, Error].err{bad.some}; }
             cnt;
         }
         if (str_equals(s, "--bench")) {
@@ -481,5 +528,33 @@ test parse__refuses_a_batch_run_missing_or_misgiving_its_arguments {
     v[2] = "run";
     if (!str_equals(usage(3, ?v[0]), USAGE)) { ret 12; }
     if (!str_equals(usage(1, ?v[0]), USAGE)) { ret 13; }
+    ret 0;
+}
+
+test parse__names_an_engine_for_the_session_and_the_batch_run {
+    val a: res[Args, Error] = line("--engine", "hashlife", "--capture", "shot.png", "gun.rle");
+    if (!sel a.ok)                                                           { ret 1; }
+    if (a.ok.engine != ENGINE_HASHLIFE || !str_equals(a.ok.open, "gun.rle")) { ret 2; }
+    val b: res[Args, Error] = line("gun.rle", "--engine", "gpu");
+    if (!sel b.ok)                 { ret 3; }
+    if (b.ok.engine != ENGINE_GPU) { ret 4; }
+    val c: res[Args, Error] = line("gun.rle");
+    if (!sel c.ok)                 { ret 5; }
+    if (c.ok.engine != ENGINE_ANY) { ret 6; }
+    val d: res[Args, Error] = line("run", "gun.rle", "--gens", "1000", "--engine", "hashlife");
+    if (!sel d.ok)                                                         { ret 7; }
+    if (d.ok.command != COMMAND_RUN || d.ok.run.engine != ENGINE_HASHLIFE) { ret 8; }
+    val e: res[Args, Error] = line("run", "--engine", "cpu", "gun.rle", "--gens", "4");
+    if (!sel e.ok)                     { ret 9; }
+    if (e.ok.run.engine != ENGINE_CPU) { ret 10; }
+    # an engine cellar lacks, the GPU for a run, one twice and none at all are refused
+    val f: res[Args, Error] = line("--engine", "tpu");
+    if (!(sel f.err && sel f.err.value)) { ret 11; }
+    val g: res[Args, Error] = line("run", "gun.rle", "--gens", "4", "--engine", "gpu");
+    if (!(sel g.err && sel g.err.value)) { ret 12; }
+    val h: res[Args, Error] = line("--engine", "cpu", "--engine", "hashlife");
+    if (!(sel h.err && sel h.err.twice)) { ret 13; }
+    val k: res[Args, Error] = line("run", "gun.rle", "--gens", "4", "--engine");
+    if (!(sel k.err && sel k.err.missing)) { ret 14; }
     ret 0;
 }

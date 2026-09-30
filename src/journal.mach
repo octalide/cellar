@@ -275,40 +275,58 @@ fun wants(ctx: *u8, b: space.Box, whole: bool) bool {
     ret true;
 }
 
-# the watch's hand-over: keep the cells, current on the host, before the
-# change writes them
+# chunks being kept into a step, or listed ahead of laying an image
+# ---
+# st:    the step whose areas decide what is already covered
+# n:     areas of st counted, the rest not
+# into:  the chunk image the words are added to, or nil
+# where: receives the chunks' coordinates, or nil
+# ok:    every chunk was kept
+rec Gather {
+    st:    *Step;
+    n:     usize;
+    into:  *snapshot.Snapshot;
+    where: *Vector[space.Box];
+    ok:    bool;
+}
+
+fun gather(ctx: *u8, cx: i64, cy: i64, cells: *u32) {
+    val g: *Gather = ctx::*Gather;
+    if (!g.ok || covered(g.st, g.n, cx, cy)) { ret; }
+    if (g.into != nil) {
+        val added: err[allo.Error] = snapshot.add(g.into, cx, cy, cells);
+        if (sel added.err) { g.ok = false; }
+    }
+    if (g.where != nil) {
+        val put: res[usize, allo.Error] = vector.push[space.Box](g.where, space.Box{x0: cx, y0: cy, x1: cx + 1, y1: cy + 1});
+        if (sel put.err) { g.ok = false; }
+    }
+}
+
+# the watch's hand-over: keep the cells, current on the host or in the tree,
+# before the change writes them
+#
+# the world is read through the simulation (sim.capture, sim.chunks_in), so it
+# is kept whichever engine holds it.
 fun keep(ctx: *u8, b: space.Box, whole: bool, current: bool) {
     val j: *Journal = ctx::*Journal;
     if (!current) {
         lose(j);
         ret;
     }
-    val s:  *sim.Sim     = j.s;
-    val sp: *space.Space = ?s.space;
-    val st: *Step        = ?j.cur;
+    val s:  *sim.Sim = j.s;
+    val st: *Step    = ?j.cur;
     if (whole) {
-        val took: err[allo.Error] = snapshot.capture(?st.whole, sp, s.generation, ?s.rule);
-        if (sel took.err) { lose(j); }
-        or                { check(j); }
+        if (!sim.capture(s, ?st.whole)) { lose(j); }
+        or                              { check(j); }
         ret;
     }
-    val c:  space.Box = chunks_of(b);
-    val n:  usize     = st.areas.len;
-    var sl: usize     = 0;
-    for (sl < sp.hi) {
-        if (space.used(sp, sl)) {
-            val cx:    i64  = space.slot_x(sp, sl);
-            val cy:    i64  = space.slot_y(sp, sl);
-            val cells: *u32 = ?sp.cells[sl * space.CELLS];
-            if (inside(c, cx, cy) && !covered(st, n, cx, cy) && snapshot.any(cells)) {
-                val added: err[allo.Error] = snapshot.add(?st.chunks, cx, cy, cells);
-                if (sel added.err) {
-                    lose(j);
-                    ret;
-                }
-            }
-        }
-        sl = sl + 1;
+    val c: space.Box = chunks_of(b);
+    var g: Gather    = Gather{st: st, n: st.areas.len, into: ?st.chunks, where: nil, ok: true};
+    sim.chunks_in(s, c, gather, (?g)::*u8);
+    if (!g.ok) {
+        lose(j);
+        ret;
     }
     val pushed: res[usize, allo.Error] = vector.push[space.Box](?st.areas, c);
     if (sel pushed.err) {
@@ -426,48 +444,46 @@ fun trim(j: *Journal) {
 
 # write a step's chunk images over the areas it covers, keeping what they held
 # in back first when back is not nil
+#
+# the chunks holding anything in an area are listed first, through the
+# simulation, then those the image lacks are killed and the image's written,
+# so it works whichever engine holds the world.
 fun lay(j: *Journal, st: *Step, back: *Step) bool {
-    val s:  *sim.Sim     = j.s;
-    val sp: *space.Space = ?s.space;
-    var k:  usize        = 0;
-    for (k < st.areas.len) {
+    val s:  *sim.Sim          = j.s;
+    var at: Vector[space.Box] = vector.init[space.Box](j.a);
+    var ok: bool              = true;
+    var k:  usize             = 0;
+    for (ok && k < st.areas.len) {
         val c: space.Box = st.areas.data[k];
-        if (!sim.edit_begin(s, c.x0 * space.SIDE, c.y0 * space.SIDE, c.x1 * space.SIDE, c.y1 * space.SIDE)) { ret false; }
-        var ok:  bool  = true;
-        val top: usize = sp.hi;
-        var sl:  usize = 0;
-        for (ok && sl < top) {
-            if (space.used(sp, sl)) {
-                val cx: i64 = space.slot_x(sp, sl);
-                val cy: i64 = space.slot_y(sp, sl);
-                if (inside(c, cx, cy) && !covered(st, k, cx, cy)) {
-                    val cells: *u32 = ?sp.cells[sl * space.CELLS];
-                    if (back != nil && snapshot.any(cells)) {
-                        val added: err[allo.Error] = snapshot.add(?back.chunks, cx, cy, cells);
-                        if (sel added.err) { ok = false; }
-                    }
-                    var from: *u32  = nil;
-                    val i:    usize = snapshot.find(?st.chunks, cx, cy);
-                    if (i < st.chunks.n) { from = snapshot.cells_of(?st.chunks, i); }
-                    if (ok)              { sim.edit_chunk(s, cx, cy, from); }
-                }
-            }
-            sl = sl + 1;
+        if (!sim.edit_begin(s, c.x0 * space.SIDE, c.y0 * space.SIDE, c.x1 * space.SIDE, c.y1 * space.SIDE)) {
+            ok = false;
+            brk;
         }
-        # chunks the image holds that the pool has let go of since
+        vector.clear[space.Box](?at);
+        var into: *snapshot.Snapshot = nil;
+        if (back != nil) { into = ?back.chunks; }
+        var g: Gather = Gather{st: st, n: k, into: into, where: ?at, ok: true};
+        sim.chunks_in(s, c, gather, (?g)::*u8);
+        ok = g.ok;
         var i: usize = 0;
+        for (ok && i < at.len) {
+            val cx: i64 = at.data[i].x0;
+            val cy: i64 = at.data[i].y0;
+            if (snapshot.find(?st.chunks, cx, cy) == st.chunks.n) { ok = sim.edit_chunk(s, cx, cy, nil); }
+            i = i + 1;
+        }
+        i = 0;
         for (ok && i < st.chunks.n) {
             val cx: i64 = st.chunks.at[i * 2];
             val cy: i64 = st.chunks.at[i * 2 + 1];
-            if (inside(c, cx, cy) && !covered(st, k, cx, cy) && space.find(sp, cx, cy) == space.NONE) {
-                ok = sim.edit_chunk(s, cx, cy, snapshot.cells_of(?st.chunks, i));
-            }
+            if (inside(c, cx, cy) && !covered(st, k, cx, cy)) { ok = sim.edit_chunk(s, cx, cy, snapshot.cells_of(?st.chunks, i)); }
             i = i + 1;
         }
-        if (!sim.edit_end(s) || !ok) { ret false; }
+        if (!sim.edit_end(s)) { ok = false; }
         k = k + 1;
     }
-    ret true;
+    vector.dnit[space.Box](?at);
+    ret ok;
 }
 
 # put step i's image in place of the world, leaving the world's image in the step
@@ -811,5 +827,90 @@ test limit__evicts_the_oldest_steps_and_a_step_past_it_clears_the_history {
     pattern.dnit(?custom);
     dnit(?j);
     sim.dnit(?s);
+    ret 0;
+}
+
+test undo__mixed_changes_on_hashlife_undo_and_redo_as_on_the_pool {
+    var a: allo.Allocator;
+    page.make(?a);
+    var p:  sim.Sim;
+    var t:  sim.Sim;
+    val m1: err[allo.Error] = sim.init(?p, ?a);
+    if (sel m1.err) { ret 1; }
+    val m2: err[allo.Error] = sim.init(?t, ?a);
+    if (sel m2.err) { ret 1; }
+    sim.seed_world(?p);
+    sim.seed_world(?t);
+    if (!sim.use_hashlife(?t, true)) { ret 2; }
+    var jp: Journal;
+    var jt: Journal;
+    init(?jp, ?a);
+    init(?jt, ?a);
+    bind(?jp, ?p);
+    bind(?jt, ?t);
+    var glider: pattern.Pattern;
+    var cp:     pattern.Pattern;
+    var ct:     pattern.Pattern;
+    pattern.init(?glider, ?a, 3, 3, "glider");
+    pattern.init(?cp, ?a, 0, 0, "cut");
+    pattern.init(?ct, ?a, 0, 0, "cut");
+    pattern.set(?glider, 1, 0, 1);
+    pattern.set(?glider, 2, 1, 1);
+    pattern.set(?glider, 0, 2, 1);
+    pattern.set(?glider, 1, 2, 1);
+    pattern.set(?glider, 2, 2, 1);
+
+    var i: i64 = 0;
+    for (i < 48) {
+        if (i % 12 == 6) {
+            begin(?jp, KIND_RUN, true);
+            begin(?jt, KIND_RUN, true);
+            var g: usize = 0;
+            for (g < 3) {
+                sim.step(?p);
+                sim.step(?t);
+                g = g + 1;
+            }
+        }
+        if (i % 12 == 7) {
+            # HighLife and Life in turn, which the tree runs
+            val r: rule.Rule = rule.preset_rule(((i / 12) % 2)::usize);
+            begin(?jp, KIND_EDIT, false);
+            begin(?jt, KIND_EDIT, false);
+            sim.set_rule(?p, r);
+            sim.set_rule(?t, r);
+            end(?jp);
+            end(?jt);
+        }
+        or {
+            change(?jp, ?p, i, ?glider, ?cp);
+            change(?jt, ?t, i, ?glider, ?ct);
+        }
+        if (!sim.on_tree(?t) || !sim.same_as_tree(?p, ?t)) { ret 3; }
+        i = i + 1;
+    }
+    close(?jp);
+    close(?jt);
+    if (undoable(?jp) != undoable(?jt) || undoable(?jt) == 0) { ret 4; }
+    var n: usize = 0;
+    for (done(undo(?jp, ?cp))) {
+        if (!done(undo(?jt, ?ct)))                                                         { ret 5; }
+        if (!sim.on_tree(?t) || p.generation != t.generation || !sim.same_as_tree(?p, ?t)) { ret 6; }
+        n = n + 1;
+    }
+    if (undoable(?jt) != 0) { ret 7; }
+    for (done(redo(?jp, ?cp))) {
+        if (!done(redo(?jt, ?ct)))                                     { ret 8; }
+        if (p.generation != t.generation || !sim.same_as_tree(?p, ?t)) { ret 9; }
+        n = n - 1;
+    }
+    if (n != 0 || redoable(?jt) != 0) { ret 10; }
+    pattern.dnit(?glider);
+    pattern.dnit(?cp);
+    pattern.dnit(?ct);
+    dnit(?jp);
+    dnit(?jt);
+    sim.dnit(?p);
+    sim.dnit(?t);
     ret 0;
 }
