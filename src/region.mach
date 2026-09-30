@@ -1,0 +1,442 @@
+# operations on a rectangle of the world: copy, cut, clear, clear outside,
+# random fill, invert, and the box its live cells span
+#
+# each reads through the simulation's read and writes through its bulk edit,
+# at most one of each, so an operation is one change to the world however many
+# chunks the rectangle crosses. a rectangle is a space.Box, half-open.
+
+use cellar.command;
+use cellar.pattern;
+use cellar.sim;
+use cellar.space;
+use allo: std.allocator;
+use std.print;
+use std.rand;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.size.usize;
+
+# whether a rectangle holds no cells
+fun empty(b: space.Box) bool {
+    ret b.x1 <= b.x0 || b.y1 <= b.y0;
+}
+
+# the end of the chunk a column lies in, or end when that comes first
+fun stop_at(x: i64, end: i64) i64 {
+    val stop: i64 = (space.chunk_of(x) + 1) * space.SIDE;
+    if (stop > end) { ret end; }
+    ret stop;
+}
+
+# write dead cells over a rectangle in the open edit
+fun kill(s: *sim.Sim, b: space.Box) {
+    var y: i64 = b.y0;
+    for (y < b.y1) {
+        sim.edit_run(s, b.x0, y, (b.x1 - b.x0)::usize, 0);
+        y = y + 1;
+    }
+}
+
+# read a rectangle's cells into p, replacing its cells and keeping its metadata
+# ---
+# s:   simulation
+# b:   the rectangle
+# p:   pattern to fill, initialized
+# ret: false when the GPU's cells could not be read or the pattern not grown
+pub fun copy(s: *sim.Sim, b: space.Box, p: *pattern.Pattern) bool {
+    if (!sim.read_begin(s, b.x0, b.y0, b.x1, b.y1)) { ret false; }
+    val got: err[allo.Error] = pattern.capture(p, s, b.x0, b.y0, b.x1, b.y1);
+    sim.read_end(s);
+    ret sel got.ok;
+}
+
+# read a rectangle's cells into p and kill them, in one read and one edit
+# ---
+# s:   simulation
+# b:   the rectangle
+# p:   pattern to fill, initialized
+# ret: false when the cells could not be read, leaving the world as it was, or
+#      the edit could not be made
+pub fun cut(s: *sim.Sim, b: space.Box, p: *pattern.Pattern) bool {
+    if (!sim.read_begin(s, b.x0, b.y0, b.x1, b.y1)) { ret false; }
+    val got: err[allo.Error] = pattern.capture(p, s, b.x0, b.y0, b.x1, b.y1);
+    if (sel got.err) {
+        sim.read_end(s);
+        ret false;
+    }
+    var ok: bool = sim.edit_begin(s, b.x0, b.y0, b.x1, b.y1);
+    if (ok) {
+        kill(s, b);
+        ok = sim.edit_end(s);
+    }
+    sim.read_end(s);
+    ret ok;
+}
+
+# kill every cell in a rectangle
+# ---
+# s:   simulation
+# b:   the rectangle
+# ret: false when the edit could not be made
+pub fun clear(s: *sim.Sim, b: space.Box) bool {
+    if (empty(b))                                   { ret true; }
+    if (!sim.edit_begin(s, b.x0, b.y0, b.x1, b.y1)) { ret false; }
+    kill(s, b);
+    ret sim.edit_end(s);
+}
+
+# kill every cell outside a rectangle
+#
+# only chunks hold live cells, so the edit spans the chunks the pool holds and
+# writes each one's part outside the rectangle, whatever lies between them.
+# ---
+# s:   simulation
+# b:   the rectangle
+# ret: false when the edit could not be made
+pub fun clear_outside(s: *sim.Sim, b: space.Box) bool {
+    val sp:  *space.Space = ?s.space;
+    var any: bool         = false;
+    var cx0: i64          = 0;
+    var cy0: i64          = 0;
+    var cx1: i64          = 0;
+    var cy1: i64          = 0;
+    var sl:  usize        = 0;
+    for (sl < sp.hi) {
+        if (space.used(sp, sl)) {
+            val cx: i64 = space.slot_x(sp, sl);
+            val cy: i64 = space.slot_y(sp, sl);
+            if (!any || cx < cx0) { cx0 = cx; }
+            if (!any || cy < cy0) { cy0 = cy; }
+            if (!any || cx > cx1) { cx1 = cx; }
+            if (!any || cy > cy1) { cy1 = cy; }
+            any = true;
+        }
+        sl = sl + 1;
+    }
+    if (!any) { ret true; }
+    val e: space.Box = space.Box{x0: cx0 * space.SIDE, y0: cy0 * space.SIDE, x1: (cx1 + 1) * space.SIDE, y1: (cy1 + 1) * space.SIDE};
+    if (!sim.edit_begin(s, e.x0, e.y0, e.x1, e.y1)) { ret false; }
+    # dead cells never take a chunk, so the slots stay as they are while this runs
+    sl = 0;
+    for (sl < sp.hi) {
+        if (!space.used(sp, sl)) {
+            sl = sl + 1;
+            cnt;
+        }
+        val ox: i64 = space.slot_x(sp, sl) * space.SIDE;
+        val oy: i64 = space.slot_y(sp, sl) * space.SIDE;
+        var y:  i64 = oy;
+        for (y < oy + space.SIDE) {
+            if (y < b.y0 || y >= b.y1) { sim.edit_run(s, ox, y, space.SIDE::usize, 0); }
+            or {
+                var l: i64 = b.x0;
+                if (l > ox + space.SIDE) { l = ox + space.SIDE; }
+                if (l > ox)              { sim.edit_run(s, ox, y, (l - ox)::usize, 0); }
+                var r: i64 = b.x1;
+                if (r < ox)              { r = ox; }
+                if (r < ox + space.SIDE) { sim.edit_run(s, r, y, (ox + space.SIDE - r)::usize, 0); }
+            }
+            y = y + 1;
+        }
+        sl = sl + 1;
+    }
+    ret sim.edit_end(s);
+}
+
+# replace a rectangle's cells with a random soup, drawn from the simulation's
+# generator row by row
+# ---
+# s:       simulation
+# b:       the rectangle
+# density: live-cell probability in [0, 1]
+# ret:     false when the edit could not be made or the pool could not hold it
+pub fun fill(s: *sim.Sim, b: space.Box, density: f32) bool {
+    if (empty(b)) { ret true; }
+    var thresh: i64 = (density * 1000.0)::i64;
+    if (thresh < 0)                                 { thresh = 0; }
+    if (thresh > 1000)                              { thresh = 1000; }
+    if (!sim.edit_begin(s, b.x0, b.y0, b.x1, b.y1)) { ret false; }
+    var y: i64 = b.y0;
+    for (y < b.y1) {
+        var start: i64 = b.x0;
+        var v:     u8  = 0;
+        var x:     i64 = b.x0;
+        for (x < b.x1) {
+            var d: u8 = 0;
+            if (rand.range(?s.rng, 0, 1000) < thresh) { d = 1; }
+            if (x > start && d != v) {
+                sim.edit_run(s, start, y, (x - start)::usize, v);
+                start = x;
+            }
+            v = d;
+            x = x + 1;
+        }
+        sim.edit_run(s, start, y, (b.x1 - start)::usize, v);
+        y = y + 1;
+    }
+    ret sim.edit_end(s);
+}
+
+# flip every cell in a rectangle, live to dead and dead to live
+# ---
+# s:   simulation
+# b:   the rectangle
+# ret: false when the cells could not be read, leaving the world as it was, or
+#      the edit could not be made or the pool could not hold it
+pub fun invert(s: *sim.Sim, b: space.Box) bool {
+    if (empty(b))                                   { ret true; }
+    if (!sim.read_begin(s, b.x0, b.y0, b.x1, b.y1)) { ret false; }
+    if (!sim.edit_begin(s, b.x0, b.y0, b.x1, b.y1)) {
+        sim.read_end(s);
+        ret false;
+    }
+    var row: [64]u8;
+    var y:   i64 = b.y0;
+    for (y < b.y1) {
+        var at: i64 = b.x0;
+        for (at < b.x1) {
+            val stop: i64   = stop_at(at, b.x1);
+            val n:    usize = (stop - at)::usize;
+            sim.read_run(s, at, y, n, ?row[0]);
+            var i: usize = 0;
+            for (i < n) {
+                var k: usize = 1;
+                for (i + k < n && row[i + k] == row[i]) { k = k + 1; }
+                sim.edit_run(s, at + i::i64, y, k, 1 - row[i]);
+                i = i + k;
+            }
+            at = stop;
+        }
+        y = y + 1;
+    }
+    val ok: bool = sim.edit_end(s);
+    sim.read_end(s);
+    ret ok;
+}
+
+# the smallest box holding every live cell in a rectangle
+# ---
+# s:   simulation
+# b:   the rectangle
+# out: receives the box, or none when no cell in the rectangle is alive
+# ret: false when the cells could not be read, leaving out untouched
+pub fun bounds(s: *sim.Sim, b: space.Box, out: *opt[space.Box]) bool {
+    if (empty(b)) {
+        @out = opt[space.Box].none{};
+        ret true;
+    }
+    if (!sim.read_begin(s, b.x0, b.y0, b.x1, b.y1)) { ret false; }
+    var got: space.Box = space.Box{x0: 0, y0: 0, x1: 0, y1: 0};
+    var any: bool      = false;
+    var row: [64]u8;
+    var y:   i64       = b.y0;
+    for (y < b.y1) {
+        var at: i64 = b.x0;
+        for (at < b.x1) {
+            val stop: i64   = stop_at(at, b.x1);
+            val n:    usize = (stop - at)::usize;
+            sim.read_run(s, at, y, n, ?row[0]);
+            var i: usize = 0;
+            for (i < n) {
+                if (row[i] != 0) {
+                    val x: i64 = at + i::i64;
+                    if (!any || x < got.x0)     { got.x0 = x; }
+                    if (!any || x + 1 > got.x1) { got.x1 = x + 1; }
+                    if (!any || y < got.y0)     { got.y0 = y; }
+                    if (!any || y + 1 > got.y1) { got.y1 = y + 1; }
+                    any = true;
+                }
+                i = i + 1;
+            }
+            at = stop;
+        }
+        y = y + 1;
+    }
+    sim.read_end(s);
+    if (any) { @out = opt[space.Box].some{got}; }
+    or       { @out = opt[space.Box].none{}; }
+    ret true;
+}
+
+# apply an area operation, reading copy and cut into p and shrink's box into found
+#[testing]
+fun apply(s: *sim.Sim, op: u8, b: space.Box, p: *pattern.Pattern, found: *opt[space.Box]) bool {
+    if (op == command.AREA_COPY)          { ret copy(s, b, p); }
+    if (op == command.AREA_CUT)           { ret cut(s, b, p); }
+    if (op == command.AREA_CLEAR)         { ret clear(s, b); }
+    if (op == command.AREA_CLEAR_OUTSIDE) { ret clear_outside(s, b); }
+    if (op == command.AREA_FILL)          { ret fill(s, b, 0.3); }
+    if (op == command.AREA_INVERT)        { ret invert(s, b); }
+    ret bounds(s, b, found);
+}
+
+# whether (x, y) lies in a rectangle
+#[testing]
+fun inside(b: space.Box, x: i64, y: i64) bool {
+    ret x >= b.x0 && x < b.x1 && y >= b.y0 && y < b.y1;
+}
+
+# hold what an operation left against the cells before it, 0 when all is as it says
+# ---
+# op:    the operation (command.AREA_*)
+# m:     the rectangle pre and post were read over, around b
+# b:     the rectangle operated on
+# pre:   m's cells before
+# post:  m's cells after
+# got:   what copy or cut read
+# found: the box shrink found
+#[testing]
+fun expect(op: u8, m: space.Box, b: space.Box, pre: *pattern.Pattern, post: *pattern.Pattern, got: *pattern.Pattern, found: opt[space.Box]) i32 {
+    val took: bool = op == command.AREA_COPY || op == command.AREA_CUT;
+    if (took && (got.w != (b.x1 - b.x0)::usize || got.h != (b.y1 - b.y0)::usize)) { ret 20; }
+    var any:   bool      = false;
+    var tight: space.Box = space.Box{x0: 0, y0: 0, x1: 0, y1: 0};
+    var born:  usize     = 0;
+    var y:     i64       = m.y0;
+    for (y < m.y1) {
+        var x: i64 = m.x0;
+        for (x < m.x1) {
+            val was:  u8   = pattern.get(pre, (x - m.x0)::usize, (y - m.y0)::usize);
+            val now:  u8   = pattern.get(post, (x - m.x0)::usize, (y - m.y0)::usize);
+            val in:   bool = inside(b, x, y);
+            var want: u8   = was;
+            if (in && (op == command.AREA_CUT || op == command.AREA_CLEAR))                  { want = 0; }
+            if (!in && op == command.AREA_CLEAR_OUTSIDE)                                     { want = 0; }
+            if (in && op == command.AREA_INVERT)                                             { want = 1 - was; }
+            if (in && op == command.AREA_FILL)                                               { born = born + now::usize; }
+            or (now != want)                                                                 { ret 21; }
+            if (took && in && pattern.get(got, (x - b.x0)::usize, (y - b.y0)::usize) != was) { ret 22; }
+            if (in && was != 0) {
+                if (!any || x < tight.x0)     { tight.x0 = x; }
+                if (!any || x + 1 > tight.x1) { tight.x1 = x + 1; }
+                if (!any)                     { tight.y0 = y; }
+                tight.y1 = y + 1;
+                any      = true;
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    # a soup at 0.3 lands well inside a tenth to a half of the cells
+    val cells: usize = ((b.x1 - b.x0) * (b.y1 - b.y0))::usize;
+    if (op == command.AREA_FILL && (born * 10 < cells || born * 2 > cells)) { ret 23; }
+    if (op == command.AREA_SHRINK) {
+        if (sel found.none) {
+            if (any) { ret 24; }
+            ret 0;
+        }
+        if (!any) { ret 25; }
+        val f: space.Box = found.some;
+        if (f.x0 != tight.x0 || f.y0 != tight.y0 || f.x1 != tight.x1 || f.y1 != tight.y1) { ret 26; }
+    }
+    ret 0;
+}
+
+# whether two patterns hold the same cells
+#[testing]
+fun same_cells(p: *pattern.Pattern, q: *pattern.Pattern) bool {
+    if (p.w != q.w || p.h != q.h) { ret false; }
+    var i: usize = 0;
+    for (i < p.w * p.h) {
+        if (p.cells[i] != q.cells[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# whether two answers of shrink agree
+#[testing]
+fun same_box(a: opt[space.Box], b: opt[space.Box]) bool {
+    if (sel a.none) { ret sel b.none; }
+    if (sel b.none) { ret false; }
+    ret a.some.x0 == b.some.x0 && a.some.y0 == b.some.y0 && a.some.x1 == b.some.x1 && a.some.y1 == b.some.y1;
+}
+
+test every_operation__is_correct_across_chunk_borders_on_both_engines {
+    var t:    sim.Rig;
+    val code: i32 = sim.rig_open(?t, sim.seed_world);
+    if (code != 0) { ret code; }
+
+    # a rectangle written chunk by chunk across four columns and three rows of
+    # chunks, and one small enough to be written cell by cell, astride a corner
+    var boxes: [2]space.Box;
+    boxes[0] = space.Box{x0: -70, y0: -30, x1: 90, y1: 100};
+    boxes[1] = space.Box{x0: 57, y0: -9, x1: 71, y1: 8};
+    # every operation, filling again before clear finds nothing, and clearing
+    # outside last so the next rectangle still has a world around it
+    var ops: [9]u8;
+    ops[0] = command.AREA_COPY;
+    ops[1] = command.AREA_INVERT;
+    ops[2] = command.AREA_SHRINK;
+    ops[3] = command.AREA_CUT;
+    ops[4] = command.AREA_SHRINK;
+    ops[5] = command.AREA_FILL;
+    ops[6] = command.AREA_CLEAR;
+    ops[7] = command.AREA_FILL;
+    ops[8] = command.AREA_CLEAR_OUTSIDE;
+
+    var pre:  pattern.Pattern;
+    var post: pattern.Pattern;
+    var cg:   pattern.Pattern;
+    var gg:   pattern.Pattern;
+    pattern.init(?pre, ?t.a, 0, 0, "pre");
+    pattern.init(?post, ?t.a, 0, 0, "post");
+    pattern.init(?cg, ?t.a, 0, 0, "cpu");
+    pattern.init(?gg, ?t.a, 0, 0, "gpu");
+    var bi: usize = 0;
+    for (bi < 2) {
+        val b: space.Box = boxes[bi];
+        val m: space.Box = space.Box{x0: b.x0 - 70, y0: b.y0 - 70, x1: b.x1 + 70, y1: b.y1 + 70};
+        var k: usize     = 0;
+        for (k < 9) {
+            val op: u8 = ops[k];
+            # the GPU runs ahead of the host's staging cells, so reads must pull
+            sim.rig_step(?t, 3);
+            if (!sim.rig_settle(?t)) { ret 2; }
+            # cells painted since the last frame wait on the GPU as single writes,
+            # which a read must see and an edit must not replay over its own
+            sim.paint(?t.cpu, b.x0, b.y0, 1);
+            sim.paint(?t.gpu, b.x0, b.y0, 1);
+            sim.paint(?t.cpu, b.x0 - 1, b.y0 - 1, 1);
+            sim.paint(?t.gpu, b.x0 - 1, b.y0 - 1, 1);
+            if (!copy(?t.cpu, m, ?pre)) { ret 3; }
+            var cf: opt[space.Box] = opt[space.Box].none{};
+            var gf: opt[space.Box] = opt[space.Box].none{};
+            if (!apply(?t.cpu, op, b, ?cg, ?cf)) { ret 4; }
+            if (t.on) {
+                if (!apply(?t.gpu, op, b, ?gg, ?gf))                                              { ret 5; }
+                if ((op == command.AREA_COPY || op == command.AREA_CUT) && !same_cells(?cg, ?gg)) { ret 6; }
+                if (!same_box(cf, gf))                                                            { ret 7; }
+            }
+            if (!copy(?t.cpu, m, ?post)) { ret 8; }
+            val bad: i32 = expect(op, m, b, ?pre, ?post, ?cg, cf);
+            if (bad != 0) {
+                print.eprintlnf("rectangle {} operation {} failed with {}", bi::u64, op::u64, bad::i64);
+                ret bad;
+            }
+            if (op == command.AREA_CLEAR_OUTSIDE) {
+                var live: usize = 0;
+                var i:    usize = 0;
+                for (i < post.w * post.h) {
+                    live = live + post.cells[i]::usize;
+                    i    = i + 1;
+                }
+                if (sim.population(?t.cpu) != live) { ret 9; }
+            }
+            # the GPU steps what the edit left exactly as the CPU does
+            sim.rig_step(?t, 2);
+            if (!sim.rig_same(?t)) { ret 10; }
+            k = k + 1;
+        }
+        bi = bi + 1;
+    }
+    pattern.dnit(?pre);
+    pattern.dnit(?post);
+    pattern.dnit(?cg);
+    pattern.dnit(?gg);
+    sim.rig_close(?t);
+    ret 0;
+}

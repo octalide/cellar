@@ -6,8 +6,10 @@
 # (cellar.gpu); from then on a step is asked of the GPU and recorded with the
 # next frame, and the host's cells are a staging copy. painting, stamping,
 # randomize, load and clear edit the host's pool either way, and the GPU picks
-# the edits up as the frame begins. outside the pool every cell is dead, so a
-# rule that births from nothing (B0) only acts inside the chunks that exist.
+# the edits up as the frame begins, and a read pulls an area's chunks from the
+# GPU before the host's cells there are read. outside the pool every cell is
+# dead, so a rule that births from nothing (B0) only acts inside the chunks
+# that exist.
 
 use gfx: boom.graphics;
 use boom.window;
@@ -60,6 +62,21 @@ pub rec Edit {
     y1:     i64;
 }
 
+# the bounds of an open read, in cells, half-open
+# ---
+# open: between read_begin and read_end
+# x0:   first column
+# y0:   first row
+# x1:   column after the last
+# y1:   row after the last
+pub rec Read {
+    open: bool;
+    x0:   i64;
+    y0:   i64;
+    x1:   i64;
+    y1:   i64;
+}
+
 # cellular-automaton simulation state
 # ---
 # space:      the pool of chunks
@@ -73,6 +90,7 @@ pub rec Edit {
 # running:    1 while auto-stepping, else 0
 # preset:     index of the active kernel preset
 # edit:       the open bulk edit, if any
+# read:       the open read, if any
 # history:    recent populations by generation, since the last clear
 pub rec Sim {
     space:      space.Space;
@@ -86,6 +104,7 @@ pub rec Sim {
     running:    u8;
     preset:     usize;
     edit:       Edit;
+    read:       Read;
     history:    history.History;
 }
 
@@ -107,6 +126,7 @@ pub fun init(s: *Sim, a: *allo.Allocator) err[allo.Error] {
     s.generation = 0;
     s.running    = 0;
     s.edit.open  = false;
+    s.read.open  = false;
     history.clear(?s.history);
     ret e;
 }
@@ -363,13 +383,128 @@ fun cell_of(v: u8) u32 {
     ret 0;
 }
 
+# whether a chunk slot overlaps the cells in [x0, x1) by [y0, y1), which is not empty
+fun overlaps(s: *Sim, sl: usize, x0: i64, y0: i64, x1: i64, y1: i64) bool {
+    val cx: i64 = space.slot_x(?s.space, sl);
+    val cy: i64 = space.slot_y(?s.space, sl);
+    ret cx >= space.chunk_of(x0) && cx <= space.chunk_of(x1 - 1)
+        && cy >= space.chunk_of(y0) && cy <= space.chunk_of(y1 - 1);
+}
+
 # whether a chunk slot overlaps the open edit's area
 fun in_area(s: *Sim, sl: usize) bool {
-    val e:  *Edit = ?s.edit;
-    val cx: i64   = space.slot_x(?s.space, sl);
-    val cy: i64   = space.slot_y(?s.space, sl);
-    ret cx >= space.chunk_of(e.x0) && cx <= space.chunk_of(e.x1 - 1)
-        && cy >= space.chunk_of(e.y0) && cy <= space.chunk_of(e.y1 - 1);
+    val e: *Edit = ?s.edit;
+    ret overlaps(s, sl, e.x0, e.y0, e.x1, e.y1);
+}
+
+# ready the chunks overlapping [x0, x1) by [y0, y1): with pull their host cells
+# are brought level with the GPU's, and with mark they are noted as written whole
+fun stage(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64, pull: bool, mark: bool) bool {
+    if (x1 <= x0 || y1 <= y0) { ret true; }
+    val sp: *space.Space = ?s.space;
+    var sl: usize        = 0;
+    for (sl < sp.hi) {
+        if (!space.used(sp, sl) || !overlaps(s, sl, x0, y0, x1, y1)) {
+            sl = sl + 1;
+            cnt;
+        }
+        var run: usize = 1;
+        for (sl + run < sp.hi && space.used(sp, sl + run) && overlaps(s, sl + run, x0, y0, x1, y1)) { run = run + 1; }
+        if (pull && on_gpu(s)) {
+            val pulled: err[gfx.Error] = gpu.pull_chunks(s.gpu, sp, sl, run);
+            if (sel pulled.err) { ret false; }
+        }
+        # a chunk written whole is uploaded whole, and its cells painted since
+        # the last frame were pulled into it above or by the read that did
+        if (mark && on_gpu(s)) { gpu.forget_writes(s.gpu, sl, run); }
+        var k: usize = 0;
+        for (mark && k < run) {
+            sp.dirty[sl + k] = sp.dirty[sl + k] | space.DIRTY_CELLS;
+            k                = k + 1;
+        }
+        sl = sl + run;
+    }
+    ret true;
+}
+
+# whether the open read covers [x0, x1) by [y0, y1), so its chunks are current
+fun read_covers(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64) bool {
+    val r: *Read = ?s.read;
+    ret r.open && x0 >= r.x0 && y0 >= r.y0 && x1 <= r.x1 && y1 <= r.y1;
+}
+
+# open a read of the cells in [x0, x1) by [y0, y1)
+#
+# the chunks the area covers are pulled from the GPU, so read_run, cell and
+# alive see the world as it stands inside the area until the read closes. an
+# edit may open inside the read, and one inside its area pulls nothing again.
+# call outside a frame, or in one before gpu frame has recorded anything, and
+# step nothing between begin and end.
+# ---
+# s:   simulation
+# x0:  first column
+# y0:  first row
+# x1:  column after the last
+# y1:  row after the last
+# ret: false when a read is already open or the GPU's cells could not be read
+pub fun read_begin(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64) bool {
+    if (s.read.open) { ret false; }
+    val r: *Read = ?s.read;
+    r.x0 = x0;
+    r.y0 = y0;
+    r.x1 = x1;
+    r.y1 = y1;
+    if (x1 <= x0 || y1 <= y0) {
+        r.x1 = x0;
+        r.y1 = y0;
+    }
+    if (!stage(s, r.x0, r.y0, r.x1, r.y1, true, false)) { ret false; }
+    r.open = true;
+    ret true;
+}
+
+# the states of n cells of a row in the open read, from (x, y) rightward
+# ---
+# s:   simulation
+# x:   first column
+# y:   row
+# n:   cells to read
+# out: receives n states, 1 live and 0 dead
+# ret: false when any cell lies outside the area, leaving out untouched
+pub fun read_run(s: *Sim, x: i64, y: i64, n: usize, out: *u8) bool {
+    val r: *Read = ?s.read;
+    if (!r.open || y < r.y0 || y >= r.y1 || x < r.x0 || x + n::i64 > r.x1) { ret false; }
+    val sp:  *space.Space = ?s.space;
+    val end: i64          = x + n::i64;
+    var at:  i64          = x;
+    for (at < end) {
+        var stop: i64 = (space.chunk_of(at) + 1) * space.SIDE;
+        if (stop > end) { stop = end; }
+        val o:  usize = (at - x)::usize;
+        val k:  usize = (stop - at)::usize;
+        val sl: u32   = space.find(sp, space.chunk_of(at), space.chunk_of(y));
+        if (sl == space.NONE) { mem.zero[u8](?out[o], k); }
+        or {
+            val row: *u32  = ?sp.cells[sl::usize * space.CELLS + space.local_of(y) * 64 + space.local_of(at)];
+            var i:   usize = 0;
+            for (i < k) {
+                out[o + i] = space.alive(row[i])::u8;
+                i          = i + 1;
+            }
+        }
+        at = stop;
+    }
+    ret true;
+}
+
+# close the open read
+# ---
+# s:   simulation
+# ret: false when no read was open
+pub fun read_end(s: *Sim) bool {
+    if (!s.read.open) { ret false; }
+    s.read.open = false;
+    ret true;
 }
 
 # whether the cells in [x0, x1) by [y0, y1) lie within the world's reach, space.REACH
@@ -381,7 +516,8 @@ pub fun reaches(x0: i64, y0: i64, x1: i64, y1: i64) bool {
 #
 # cells inside the area are written with edit_set and edit_run and the rest of
 # the world is left alone. the chunks the area covers are pulled from the GPU
-# first, so writing them whole loses nothing, and an area of up to SPARSE_CELLS
+# first, unless an open read over the area already pulled them, so writing them
+# whole loses nothing, and an area of up to SPARSE_CELLS
 # cells skips that and is written cell by cell, recorded as small writes.
 # call outside a frame, or in one before gpu frame has recorded anything, and
 # between begin and end make no other edit.
@@ -407,32 +543,15 @@ pub fun edit_begin(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64) bool {
     e.lost   = false;
     e.sparse = e.x1 - e.x0 <= SPARSE_CELLS::i64 && e.y1 - e.y0 <= SPARSE_CELLS::i64
         && (e.x1 - e.x0) * (e.y1 - e.y0) <= SPARSE_CELLS::i64;
-    e.open = true;
-    if (e.sparse) { ret true; }
-
-    val sp: *space.Space = ?s.space;
-    var sl: usize        = 0;
-    for (sl < sp.hi) {
-        if (!space.used(sp, sl) || !in_area(s, sl)) {
-            sl = sl + 1;
-            cnt;
-        }
-        var run: usize = 1;
-        for (sl + run < sp.hi && space.used(sp, sl + run) && in_area(s, sl + run)) { run = run + 1; }
-        if (on_gpu(s)) {
-            val pulled: err[gfx.Error] = gpu.pull_chunks(s.gpu, sp, sl, run);
-            if (sel pulled.err) {
-                e.open = false;
-                ret false;
-            }
-        }
-        var k: usize = 0;
-        for (k < run) {
-            sp.dirty[sl + k] = sp.dirty[sl + k] | space.DIRTY_CELLS;
-            k                = k + 1;
-        }
-        sl = sl + run;
+    if (e.sparse) {
+        e.open = true;
+        ret true;
     }
+    # an open read over the area has pulled its chunks already, and nothing
+    # has stepped since
+    val pull: bool = !read_covers(s, e.x0, e.y0, e.x1, e.y1);
+    if (!stage(s, e.x0, e.y0, e.x1, e.y1, pull, true)) { ret false; }
+    e.open = true;
     ret true;
 }
 
@@ -881,7 +1000,7 @@ fun same_world(a: *Sim, b: *Sim) bool {
 
 # seed the same soups and far-flung glider into a world
 #[testing]
-fun seed_world(s: *Sim) {
+pub fun seed_world(s: *Sim) {
     s.rng = rand.seed(1, 2, 3, 4);
     fill_begin(s);
     var y: i64 = -70;
@@ -954,41 +1073,125 @@ fun bulk_edit(s: *Sim) {
     edit_end(s);
 }
 
-test frame__steps_on_the_gpu_exactly_as_the_cpu_does {
+# a world the CPU steps and, where a GPU can step one, the same world on the GPU
+# beside it, for tests that hold the two engines to the same result
+# ---
+# a:    allocator behind both worlds
+# cpu:  the world the CPU steps
+# gpu:  the world the GPU steps, attached only when on
+# on:   a GPU steps gpu
+# w:    the window the renderer draws to
+# r:    the renderer
+# g:    the GPU side of gpu
+# made: how far the GPU's setup got, 1 window, 2 renderer, 3 GPU side
+#[testing]
+pub rec Rig {
+    a:    allo.Allocator;
+    cpu:  Sim;
+    gpu:  Sim;
+    on:   bool;
+    w:    window.Window;
+    r:    gfx.Renderer;
+    g:    gpu.Gpu;
+    made: u8;
+}
+
+# seed both worlds and attach the GPU world where a GPU can step it
+#
+# a machine with no window, no renderer or no compute stages leaves on false,
+# so a test runs on the CPU alone or skips.
+# ---
+# t:    the rig; it must not move once opened
+# seed: fills a world, run on each before the GPU is made
+# ret:  0 when open, or the failure's code
+#[testing]
+pub fun rig_open(t: *Rig, seed: fun(*Sim)) i32 {
+    t.on   = false;
+    t.made = 0;
+    page.make(?t.a);
+    val m1: err[allo.Error] = init(?t.cpu, ?t.a);
+    if (sel m1.err) { ret 1; }
+    val m2: err[allo.Error] = init(?t.gpu, ?t.a);
+    if (sel m2.err) { ret 2; }
+    seed(?t.cpu);
+    seed(?t.gpu);
+
     val opened: res[window.Window, window.WindowError] = window.window_open(64, 64, "cellar gpu test");
     if (sel opened.err) {
-        print.eprintln("skipped: no window can be opened here");
+        print.eprintln("no window can be opened here: the CPU alone runs");
         ret 0;
     }
-    var w:  window.Window  = opened.ok;
-    var r:  gfx.Renderer;
-    val up: err[gfx.Error] = gfx.renderer_init(?r, ?w);
+    t.w    = opened.ok;
+    t.made = 1;
+    val up: err[gfx.Error] = gfx.renderer_init(?t.r, ?t.w);
     if (sel up.err) {
-        print.eprintlnf("skipped: no renderer: {}", gfx.error_message(up.err));
+        print.eprintlnf("no renderer: the CPU alone runs: {}", gfx.error_message(up.err));
         ret 0;
     }
-    var a: allo.Allocator;
-    page.make(?a);
-
-    var cpu_world: Sim;
-    var gpu_world: Sim;
-    val m1:        err[allo.Error] = init(?cpu_world, ?a);
-    if (sel m1.err) { ret 1; }
-    val m2: err[allo.Error] = init(?gpu_world, ?a);
-    if (sel m2.err) { ret 2; }
-    seed_world(?cpu_world);
-    seed_world(?gpu_world);
-
+    t.made = 2;
     var heat: [1024]f32;
     var age:  [1024]f32;
-    var g:    gpu.Gpu;
-    val made: err[gfx.Error] = gpu.init(?g, ?a, ?r, gpu_world.space.cap, ?heat[0], ?age[0]);
+    val made: err[gfx.Error] = gpu.init(?t.g, ?t.a, ?t.r, t.gpu.space.cap, ?heat[0], ?age[0]);
     if (sel made.err) { ret 3; }
-    if (!g.stepping) {
-        print.eprintln("skipped: the compute stages were refused");
+    t.made = 3;
+    if (!t.g.stepping) {
+        print.eprintln("the compute stages were refused: the CPU alone runs");
         ret 0;
     }
-    attach(?gpu_world, ?g);
+    attach(?t.gpu, ?t.g);
+    t.on = true;
+    ret 0;
+}
+
+# advance both worlds n generations
+#[testing]
+pub fun rig_step(t: *Rig, n: u64) {
+    var i: u64 = 0;
+    for (i < n) {
+        step(?t.cpu);
+        step(?t.gpu);
+        i = i + 1;
+    }
+}
+
+# let the GPU record every generation owed and go idle, its cells left on the
+# device and the host's staging behind them
+#[testing]
+pub fun rig_settle(t: *Rig) bool {
+    if (!t.on)                                          { ret true; }
+    if (!settle_frames(?t.r, ?t.gpu, t.cpu.generation)) { ret false; }
+    gfx.renderer_wait_idle(?t.r);
+    ret true;
+}
+
+# settle the GPU and whether its world is the CPU's, cell for cell
+#[testing]
+pub fun rig_same(t: *Rig) bool {
+    if (!t.on)          { ret true; }
+    if (!rig_settle(t)) { ret false; }
+    val synced: err[gfx.Error] = sync(?t.gpu);
+    if (sel synced.err) { ret false; }
+    ret same_world(?t.cpu, ?t.gpu);
+}
+
+# release what rig_open made
+#[testing]
+pub fun rig_close(t: *Rig) {
+    if (t.made >= 3) { gpu.dnit(?t.g); }
+    dnit(?t.cpu);
+    dnit(?t.gpu);
+    if (t.made >= 2) { gfx.renderer_dnit(?t.r); }
+    if (t.made >= 1) { window.window_close(?t.w); }
+}
+
+test frame__steps_on_the_gpu_exactly_as_the_cpu_does {
+    var t:    Rig;
+    val code: i32 = rig_open(?t, seed_world);
+    if (code != 0) { ret code; }
+    if (!t.on) {
+        rig_close(?t);
+        ret 0;
+    }
 
     # blocks painted far apart grow the pool past what the GPU was built for
     var b: i64 = 0;
@@ -997,8 +1200,8 @@ test frame__steps_on_the_gpu_exactly_as_the_cpu_does {
         for (c < 4) {
             val x: i64 = b * 1000 + (c % 2)::i64;
             val y: i64 = 7000 + (c / 2)::i64;
-            paint(?cpu_world, x, y, 1);
-            paint(?gpu_world, x, y, 1);
+            paint(?t.cpu, x, y, 1);
+            paint(?t.gpu, x, y, 1);
             c = c + 1;
         }
         b = b + 1;
@@ -1006,46 +1209,28 @@ test frame__steps_on_the_gpu_exactly_as_the_cpu_does {
 
     # life for 60 generations, then a wide weighted rule for 30 more
     var phase: usize = 0;
-    var gens:  u64   = 0;
     for (phase < 2) {
         var n: u64 = 60;
         if (phase == 1) {
             # the GPU runs on past the host's staging cells, and a bulk edit then
             # pulls the chunks it covers before writing them whole
-            var e: u64 = 0;
-            for (e < 5) {
-                step(?cpu_world);
-                step(?gpu_world);
-                e = e + 1;
-            }
-            gens = gens + 5;
-            if (!settle_frames(?r, ?gpu_world, gens)) { ret 4; }
-            gfx.renderer_wait_idle(?r);
-            bulk_edit(?cpu_world);
-            bulk_edit(?gpu_world);
-            n                = 30;
-            cpu_world.kernel = wide_rule();
-            gpu_world.kernel = wide_rule();
+            rig_step(?t, 5);
+            if (!rig_settle(?t)) { ret 4; }
+            bulk_edit(?t.cpu);
+            bulk_edit(?t.gpu);
+            n            = 30;
+            t.cpu.kernel = wide_rule();
+            t.gpu.kernel = wide_rule();
         }
-        var i: u64 = 0;
-        for (i < n) {
-            step(?cpu_world);
-            step(?gpu_world);
-            i = i + 1;
-        }
-        gens = gens + n;
-        if (!settle_frames(?r, ?gpu_world, gens)) { ret 4; }
-        gfx.renderer_wait_idle(?r);
-        val synced: err[gfx.Error] = sync(?gpu_world);
-        if (sel synced.err)                      { ret 5; }
-        if (!same_world(?cpu_world, ?gpu_world)) { ret 6 + phase::i32; }
+        rig_step(?t, n);
+        if (!rig_same(?t)) { ret 6 + phase::i32; }
         # the pyramids the draw reads below a pixel per cell hold what the cells do
-        if (!gpu.pyramids_hold(?g, ?gpu_world.space)) { ret 14; }
+        if (!gpu.pyramids_hold(?t.g, ?t.gpu.space)) { ret 14; }
         # the census the GPU's readout and graph read agrees with the CPU's
-        if (population(?cpu_world) != population(?gpu_world))                                             { ret 9; }
-        if (history.pop_at(?gpu_world.history, gpu_world.history.len - 1) != population(?cpu_world)::u64) { ret 10; }
-        val cb: opt[space.Box] = bounds(?cpu_world);
-        val gb: opt[space.Box] = bounds(?gpu_world);
+        if (population(?t.cpu) != population(?t.gpu))                                         { ret 9; }
+        if (history.pop_at(?t.gpu.history, t.gpu.history.len - 1) != population(?t.cpu)::u64) { ret 10; }
+        val cb: opt[space.Box] = bounds(?t.cpu);
+        val gb: opt[space.Box] = bounds(?t.gpu);
         if (sel cb.none) { ret 11; }
         if (sel gb.none) { ret 12; }
         if (cb.some.x0 != gb.some.x0 || cb.some.y0 != gb.some.y0 || cb.some.x1 != gb.some.x1 || cb.some.y1 != gb.some.y1) {
@@ -1053,13 +1238,8 @@ test frame__steps_on_the_gpu_exactly_as_the_cpu_does {
         }
         phase = phase + 1;
     }
-    if (population(?cpu_world) == 0) { ret 8; }
-
-    gpu.dnit(?g);
-    dnit(?cpu_world);
-    dnit(?gpu_world);
-    gfx.renderer_dnit(?r);
-    window.window_close(?w);
+    if (population(?t.cpu) == 0) { ret 8; }
+    rig_close(?t);
     ret 0;
 }
 
