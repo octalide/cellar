@@ -1,0 +1,159 @@
+# applies the queued commands to the world and its files
+#
+# the one place a command's effect happens. the frame calls run once, before it
+# collects or records anything, so the world a save reads is the world the
+# command was issued against.
+
+use cellar.app;
+use cellar.command;
+use cellar.paths;
+use cellar.pattern;
+use cellar.persist;
+use cellar.sim;
+use cellar.text;
+use cellar.world;
+use allo: std.allocator;
+use std.allocator.page;
+use fs: std.filesystem;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.size.usize;
+use std.types.string.str;
+
+# what a command needs beyond the world
+# ---
+# a: allocator for file buffers
+# p: the data directory
+pub rec Deps {
+    a: *allo.Allocator;
+    p: *paths.Paths;
+}
+
+# save or load with the outcome flashed
+fun report(a: *app.App, ok: str, e: err[persist.Error]) {
+    if (sel e.err) {
+        app.say(a, persist.error_message(e.err));
+        ret;
+    }
+    app.say(a, ok);
+}
+
+# the file a command reads or writes, or false when no directory is known
+fun file(d: *Deps, name: str, out: *u8, a: *app.App) bool {
+    if (!d.p.ok) {
+        app.say(a, "no user data directory is known");
+        ret false;
+    }
+    paths.file(d.p, name, out);
+    ret true;
+}
+
+# apply one command
+fun apply(c: *command.Command, a: *app.App, s: *sim.Sim, d: *Deps) {
+    if (sel c.toggle)    { world.toggle(s); }
+    if (sel c.step)      { world.step(s); }
+    if (sel c.clear)     { world.clear(s); }
+    if (sel c.randomize) { world.randomize(s, c.randomize); }
+    if (sel c.paint)     { world.paint(s, c.paint.x, c.paint.y, c.paint.v); }
+    if (sel c.line)      { world.line(s, c.line.x0, c.line.y0, c.line.x1, c.line.y1, c.line.v); }
+    if (sel c.stamp)     { world.stamp(s, ?c.stamp.p, c.stamp.x, c.stamp.y); }
+    if (sel c.rule)      { s.kernel = c.rule; }
+
+    var path: [1088]u8;
+    if (sel c.save_world && file(d, paths.WORLD, ?path[0], a)) {
+        report(a, "world saved", persist.save_world(d.a, s, ?path[0]));
+    }
+    if (sel c.load_world && file(d, paths.WORLD, ?path[0], a)) {
+        report(a, "world loaded", persist.load_world(d.a, s, ?path[0]));
+    }
+    if (sel c.save_pattern && file(d, paths.CUSTOM, ?path[0], a)) {
+        report(a, "custom pattern saved", persist.save_pattern(d.a, ?a.custom, ?path[0]));
+    }
+    if (sel c.load_pattern && file(d, paths.CUSTOM, ?path[0], a)) {
+        report(a, "custom pattern loaded", persist.load_pattern(d.a, ?a.custom, ?path[0]));
+        a.pattern_sel = pattern.BUILTIN_COUNT;
+    }
+}
+
+# apply every waiting command in order and empty the queue
+# ---
+# a: application state, which owns the queue
+# s: the simulation, locked by the caller and not yet recorded into
+# d: what the commands need
+pub fun run(a: *app.App, s: *sim.Sim, d: *Deps) {
+    var i: usize = 0;
+    for (i < a.queue.items.len) {
+        apply(?a.queue.items.data[i], a, s, d);
+        i = i + 1;
+    }
+    command.clear(?a.queue);
+}
+
+test run__applies_in_order_and_a_save_sees_the_edits_before_it {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    var ap: app.App;
+    app.init(?ap);
+    val shown: err[allo.Error] = app.attach(?ap, ?a);
+    if (sel shown.err) { ret 1; }
+    var p: paths.Paths;
+    p.ok                                          = true;
+    p.dir[text.buf_str(?p.dir[0], 0, "out/test")] = 0;
+    var d: Deps = Deps{a: ?a, p: ?p};
+
+    app.submit(?ap, command.Command.paint{command.Paint{x: 1, y: 2, v: 1}});
+    app.submit(?ap, command.Command.line{command.Line{x0: 10, y0: 10, x1: 14, y1: 10, v: 1}});
+    # the glider's five cells, stamped well clear of the rest
+    app.stamp(?ap, ?ap.library[0], 0, 100, 100);
+    app.submit(?ap, command.Command.save_world{});
+    app.submit(?ap, command.Command.clear{});
+    if (ap.queue.items.len != 5) { ret 2; }
+    run(?ap, ?s, ?d);
+    if (ap.queue.items.len != 0) { ret 3; }
+    if (sim.population(?s) != 0) { ret 4; }
+
+    app.submit(?ap, command.Command.load_world{});
+    run(?ap, ?s, ?d);
+    if (sim.population(?s) != 11)                       { ret 5; }
+    if (!sim.alive(?s, 1, 2) || !sim.alive(?s, 14, 10)) { ret 6; }
+
+    var path: [1088]u8;
+    fs.remove_file(paths.file(?p, paths.WORLD, ?path[0]));
+    app.dnit(?ap);
+    sim.dnit(?s);
+    ret 0;
+}
+
+test run__applies_every_command_however_many_a_frame_holds {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    var ap: app.App;
+    app.init(?ap);
+    val shown: err[allo.Error] = app.attach(?ap, ?a);
+    if (sel shown.err) { ret 1; }
+    var d: Deps;
+
+    var i: i64 = 0;
+    for (i < 300) {
+        app.submit(?ap, command.Command.paint{command.Paint{x: i, y: 0, v: 1}});
+        i = i + 1;
+    }
+    # a later command overrides an earlier one
+    app.submit(?ap, command.Command.paint{command.Paint{x: 7, y: 0, v: 0}});
+    if (ap.queue.items.len != 301) { ret 2; }
+    run(?ap, ?s, ?d);
+    if (sim.population(?s) != 299)                     { ret 3; }
+    if (sim.alive(?s, 7, 0) || !sim.alive(?s, 299, 0)) { ret 4; }
+
+    app.dnit(?ap);
+    sim.dnit(?s);
+    ret 0;
+}

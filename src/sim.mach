@@ -130,23 +130,27 @@ pub fun attach(s: *Sim, g: *gpu.Gpu) {
     if (g.stepping) { space.set_stepped(?s.space, false); }
 }
 
-# advance one generation, or ask the GPU for one
+# advance one generation, or ask the GPU for one. a step the pool could not hold
+# is not counted
 # ---
 # s: simulation
 pub fun step(s: *Sim) {
+    if (s.full) { ret; }
     if (on_gpu(s)) {
         if (s.pending < MAX_PENDING) { s.pending = s.pending + 1; }
         ret;
     }
-    if (s.full)                                  { ret; }
-    if (!cpu.step(?s.space, ?s.kernel, ?s.team)) { overflow(s); }
+    if (!cpu.step(?s.space, ?s.kernel, ?s.team)) {
+        overflow(s);
+        ret;
+    }
     s.generation = s.generation + 1;
 }
 
-# stop for good once a chunk the world needs could not be made: a pattern
-# reaching past the pool would be stepped as if it met dead space
+# stop until the world is cleared once a chunk it needs could not be made: a
+# pattern reaching past the pool would be stepped as if it met dead space.
+# the simulation only holds the state, and the game layer reports it.
 fun overflow(s: *Sim) {
-    if (!s.full) { print.eprintln("the world outgrew its pool of chunks; stepping stopped"); }
     s.full    = true;
     s.running = 0;
     s.pending = 0;
@@ -172,9 +176,9 @@ pub fun collect(s: *Sim) {
 # ret:      ok, or why the frame could not be recorded
 pub fun record(s: *Sim, uncapped: bool, look: *gpu.Look) err[gfx.Error] {
     var want: usize = s.pending;
-    val fast: bool  = uncapped && s.running != 0 && on_gpu(s);
-    if (fast)       { want = gpu.stride(s.gpu); }
-    if (!on_gpu(s)) { want = 0; }
+    val fast: bool  = uncapped && s.running != 0 && on_gpu(s) && !s.full;
+    if (fast)                 { want = gpu.stride(s.gpu); }
+    if (!on_gpu(s) || s.full) { want = 0; }
     val done: res[usize, gfx.Error] = gpu.frame(s.gpu, ?s.space, ?s.kernel, want, look);
     if (sel done.err) { ret err[gfx.Error].err{done.err}; }
     s.generation = s.generation + done.ok::u64;
@@ -414,6 +418,9 @@ pub fun edit_run(s: *Sim, x: i64, y: i64, n: usize, v: u8) bool {
 
 # close the open edit: count the chunks it wrote, surround the live ones, and
 # hand the change to the GPU, all once
+#
+# a dropped cell or a pool too small for the edit marks the world full, as a
+# step that outgrows the pool does.
 # ---
 # s:   simulation
 # ret: false when no edit was open, a cell was dropped for lack of a chunk, or
@@ -439,6 +446,7 @@ pub fun edit_end(s: *Sim) bool {
             }
         }
         if (s.gpu != nil) { gpu.note_edit(s.gpu); }
+        if (e.lost)       { overflow(s); }
         ret !e.lost;
     }
     var sl: usize = 0;
@@ -447,8 +455,8 @@ pub fun edit_end(s: *Sim) bool {
         sl = sl + 1;
     }
     ok = space.settle(sp, sp.census, sp.hi, false);
-    if (s.gpu != nil) { gpu.note_edit(s.gpu); }
-    if (!ok)          { overflow(s); }
+    if (s.gpu != nil)  { gpu.note_edit(s.gpu); }
+    if (!ok || e.lost) { overflow(s); }
     ret ok && !e.lost;
 }
 
@@ -495,7 +503,33 @@ pub fun population(s: *Sim) usize {
 # ---
 # s: simulation
 pub fun toggle_running(s: *Sim) {
+    if (s.full) {
+        s.running = 0;
+        ret;
+    }
     s.running = 1 - s.running;
+}
+
+test overflow__gates_step_and_running_until_clear {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    Sim;
+    val made: err[allo.Error] = init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    paint(?s, 0, 0, 1);
+    toggle_running(?s);
+    if (s.running != 1) { ret 2; }
+    overflow(?s);
+    if (!s.full || s.running != 0) { ret 3; }
+    val gen: u64 = s.generation;
+    step(?s);
+    toggle_running(?s);
+    if (s.generation != gen || s.running != 0) { ret 4; }
+    clear(?s);
+    toggle_running(?s);
+    if (s.full || s.running != 1) { ret 5; }
+    dnit(?s);
+    ret 0;
 }
 
 test step__blinker_oscillates_with_period_two {
