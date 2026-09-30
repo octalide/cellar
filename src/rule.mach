@@ -1,0 +1,470 @@
+# the rule a world runs, as a tag over rule families, and the preset table
+#
+# a family is a kind of rule: its own rule string, cell word, CPU step and GPU
+# step stage. the rest of cellar reaches a rule only through this module, so it
+# never learns what a family's rule holds or what its cell word means. a family
+# is a module under cellar.rules that provides, for its rule type R:
+#
+#   parse(s: str) res[R, str]        read its rule string, or say what is wrong
+#   format(r: *R, buf: *u8) str      write the string parse reads back as r
+#   FORMAT_MAX: usize                the longest string format writes
+#   display(r: *R, buf: *u8) str     a short form for the readout, at most
+#                                    DISPLAY_MAX bytes
+#   same_rule(a: *R, b: *R) bool     whether two rules step alike
+#   states(r: *R) u32                how many states a cell can be in
+#   word_of(r: *R, state: u32) u32   the word a fresh cell of a state holds
+#   state_of(c: u32) u32             the state a word holds
+#   sense() layout.Sense             how shared code reads the word
+#   radius(r: *R) usize              how far one generation reaches
+#   caps(r: *R) Caps                 what the rule can do (see Caps)
+#   step_chunk(r, b, t)              one chunk's CPU step from generation
+#                                    b.gen (see space.Block)
+#   pack(r: *R, w: *u32)             its rule, into layout.RULE words of the
+#                                    meta head, for its stage
+#   stage(len: *usize) *u8           its step stage's SPIR-V
+#   SAMPLE_COUNT, sample(i) str      rule strings the per-family tests run
+#
+# and a case of Rule and a line in each function below. a function that finds
+# no case for its rule panics, since every case is handled above it, and the
+# test that runs every function over every family's samples finds a missed line.
+#
+# the states and their words belong to the rule, not only its family: a
+# generations rule has as many states as its string names, and its words show
+# where each state lies among them.
+#
+# changing a world's rule to one whose words differ, one of another family or
+# of the same family with other states, re-encodes its cells: each word becomes
+# the new rule's word for the state the old rule reads in it, word(new,
+# state(old, c)), and a state the new rule lacks becomes state 0, the quiescent
+# background, the one mapping safe between any two rules. a family that needs
+# a smarter mapping can later offer adopt(state, from) u32 as the extension
+# point. sim.set_rule does this. word zero is always the quiescent background
+# (see cellar.layout), and a family's step keeps it: a chunk of zeros with none
+# live around it steps to zeros under every rule. a rule that births on 0 would
+# flip the unbounded background, so its family holds the world's complement on
+# the generations it flips, and says so through caps.b0: the draw shows those
+# generations inverted and the simulation's edits and reads see the world
+# through them.
+#
+# a family whose rule does not fit layout.RULE words, a rule table, needs a
+# rule buffer of its own bound to its stage, which boom's four storage bindings
+# leave no room for yet.
+
+use cellar.layout;
+use cellar.rules.generations;
+use cellar.rules.weighted;
+use cellar.space;
+use std.system.panic;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string;
+use std.types.string.str;
+
+# a rule of one family
+# ---
+# weighted:    a weighted outer-totalistic kernel, the Life family and its
+#              radius, weight and range generalizations
+# generations: a Life-like rule whose cells die through dying states
+pub tag Rule: u8 {
+    weighted:    weighted.Kernel;
+    generations: generations.Rule;
+}
+
+# rule families this version runs
+pub val FAMILIES: usize = 2;
+
+# the longest rule string any family's format writes, less its NUL
+pub val FORMAT_MAX: usize = weighted.FORMAT_MAX;
+
+# what a rule can do, which engines and features ask before taking it on
+# ---
+# b0:        a dead cell with no live neighbour is born and the background
+#            flips each generation: odd generations' cells hold the world's
+#            complement, drawn and edited inverted
+# isotropic: it treats every rotation and reflection of a pattern alike
+# hashlife:  a quadtree engine can run it
+# bounded:   it can run on a bounded grid
+# life_like: it is a Life-like rule, two states on the radius-1 Moore
+#            neighbourhood, outer totalistic, the rules whose patterns
+#            Catagolue's apgcodes name, and not one that births on 0, whose
+#            held cells are the world's complement
+pub rec Caps {
+    b0:        bool;
+    isotropic: bool;
+    hashlife:  bool;
+    bounded:   bool;
+    life_like: bool;
+}
+
+# the id family i's rule strings are recorded under, in world and settings files
+pub fun family_id(i: usize) str {
+    if (i == 1) { ret "generations"; }
+    ret "weighted";
+}
+
+# the family a recorded id names
+# ---
+# id:  the id, as family_id gave it
+# ret: the family, or none for one this version does not run
+pub fun family_named(id: str) opt[usize] {
+    var i: usize = 0;
+    for (i < FAMILIES) {
+        if (string.str_equals(family_id(i), id)) { ret opt[usize].some{i}; }
+        i = i + 1;
+    }
+    ret opt[usize].none{};
+}
+
+# the family a rule belongs to
+pub fun family_of(r: *Rule) usize {
+    if (sel r.weighted)    { ret 0; }
+    if (sel r.generations) { ret 1; }
+    unmatched();
+    ret 0;
+}
+
+# a rule of a case no function below handles, which cannot be
+fun unmatched() {
+    panic.panic("cellar.rule: a rule of no family");
+}
+
+# family i's step stage, as SPIR-V
+# ---
+# i:   the family
+# len: receives its length in bytes
+# ret: its first byte
+pub fun stage(i: usize, len: *usize) *u8 {
+    if (i == 1) { ret generations.stage(len); }
+    ret weighted.stage(len);
+}
+
+# how many sample rule strings family i gives its tests
+pub fun sample_count(i: usize) usize {
+    if (i == 1) { ret generations.SAMPLE_COUNT; }
+    ret weighted.SAMPLE_COUNT;
+}
+
+# family i's sample rule string n
+pub fun sample(i: usize, n: usize) str {
+    if (i == 1) { ret generations.sample(n); }
+    ret weighted.sample(n);
+}
+
+# read a rule string as family i's
+# ---
+# i:   the family
+# s:   NUL-terminated rule text
+# ret: the rule, or what is wrong with s
+pub fun parse_as(i: usize, s: str) res[Rule, str] {
+    if (i == 1) {
+        val g: res[generations.Rule, str] = generations.parse(s);
+        if (sel g.err) { ret res[Rule, str].err{g.err}; }
+        ret res[Rule, str].ok{Rule.generations{g.ok}};
+    }
+    val k: res[weighted.Kernel, str] = weighted.parse(s);
+    if (sel k.err) { ret res[Rule, str].err{k.err}; }
+    ret res[Rule, str].ok{Rule.weighted{k.ok}};
+}
+
+# read a rule string as whichever family's it is, trying each in turn
+# ---
+# s:   NUL-terminated rule text
+# ret: the rule, or what the first family found wrong with s
+pub fun parse(s: str) res[Rule, str] {
+    val first: res[Rule, str] = parse_as(0, s);
+    if (sel first.ok) { ret first; }
+    var i: usize = 1;
+    for (i < FAMILIES) {
+        val r: res[Rule, str] = parse_as(i, s);
+        if (sel r.ok) { ret r; }
+        i = i + 1;
+    }
+    ret first;
+}
+
+# write a rule's string in its family's form, which parse_as reads back as it
+# ---
+# r:   the rule
+# buf: at least FORMAT_MAX + 1 bytes
+# ret: buf
+pub fun format(r: *Rule, buf: *u8) str {
+    if (sel r.weighted)    { ret weighted.format(?r.weighted, buf); }
+    if (sel r.generations) { ret generations.format(?r.generations, buf); }
+    unmatched();
+    ret buf;
+}
+
+# the most bytes a family's display form takes, less its NUL
+pub val DISPLAY_MAX: usize = 199;
+
+# write a rule's short form for the readout, which need not name it whole
+# ---
+# r:   the rule
+# buf: at least DISPLAY_MAX + 1 bytes
+# ret: buf
+pub fun display(r: *Rule, buf: *u8) str {
+    if (sel r.weighted)    { ret weighted.display(?r.weighted, buf); }
+    if (sel r.generations) { ret generations.display(?r.generations, buf); }
+    unmatched();
+    ret buf;
+}
+
+# whether two rules step alike, families included
+pub fun same(a: *Rule, b: *Rule) bool {
+    if (sel a.weighted) {
+        if (sel b.weighted) { ret weighted.same_rule(?a.weighted, ?b.weighted); }
+    }
+    if (sel a.generations) {
+        if (sel b.generations) { ret generations.same_rule(?a.generations, ?b.generations); }
+    }
+    ret false;
+}
+
+# how many states a cell of the rule can be in
+pub fun states(r: *Rule) u32 {
+    if (sel r.weighted)    { ret weighted.states(?r.weighted); }
+    if (sel r.generations) { ret generations.states(?r.generations); }
+    unmatched();
+    ret 0;
+}
+
+# the word a fresh cell of a state is written as
+# ---
+# r:     the rule
+# state: below states(r)
+# ret:   the word
+pub fun word(r: *Rule, state: u32) u32 {
+    if (sel r.weighted)    { ret weighted.word_of(?r.weighted, state); }
+    if (sel r.generations) { ret generations.word_of(?r.generations, state); }
+    unmatched();
+    ret 0;
+}
+
+# the state a cell's word holds, its display channels aside
+pub fun state(r: *Rule, c: u32) u32 {
+    if (sel r.weighted)    { ret weighted.state_of(c); }
+    if (sel r.generations) { ret generations.state_of(c); }
+    unmatched();
+    ret 0;
+}
+
+# how shared code reads the rule's cell word: the census, the pool and the draw
+pub fun sense(r: *Rule) layout.Sense {
+    var none: layout.Sense;
+    if (sel r.weighted)    { ret weighted.sense(); }
+    if (sel r.generations) { ret generations.sense(); }
+    unmatched();
+    ret none;
+}
+
+# how far one generation reaches, in cells
+pub fun radius(r: *Rule) usize {
+    if (sel r.weighted)    { ret weighted.radius(?r.weighted); }
+    if (sel r.generations) { ret generations.radius(?r.generations); }
+    unmatched();
+    ret 0;
+}
+
+# what the rule can do
+pub fun caps(r: *Rule) Caps {
+    if (sel r.weighted) {
+        val c: weighted.Caps = weighted.caps(?r.weighted);
+        ret Caps{b0: c.b0, isotropic: c.isotropic, hashlife: c.hashlife, bounded: c.bounded, life_like: c.life_like};
+    }
+    if (sel r.generations) {
+        val c: generations.Caps = generations.caps(?r.generations);
+        ret Caps{b0: c.b0, isotropic: c.isotropic, hashlife: c.hashlife, bounded: c.bounded, life_like: c.life_like};
+    }
+    unmatched();
+    var none: Caps;
+    ret none;
+}
+
+# step one chunk on the CPU
+# ---
+# r: the rule
+# b: the chunk's block and back cells
+# t: the tally the step keeps of what it writes, reading cells by sense(r)
+pub fun step_chunk(r: *Rule, b: *space.Block, t: *space.Tally) {
+    if (sel r.weighted) {
+        weighted.step_chunk(?r.weighted, b, t);
+        ret;
+    }
+    if (sel r.generations) {
+        generations.step_chunk(?r.generations, b, t);
+        ret;
+    }
+    unmatched();
+}
+
+# pack the rule into the family's window of the meta head
+# ---
+# r: the rule
+# w: layout.RULE words
+pub fun pack(r: *Rule, w: *u32) {
+    if (sel r.weighted) {
+        weighted.pack(?r.weighted, w);
+        ret;
+    }
+    if (sel r.generations) {
+        generations.pack(?r.generations, w);
+        ret;
+    }
+    unmatched();
+}
+
+# a built-in rule
+# ---
+# label:      its display name
+# rulestring: its rule, as parse reads it
+pub rec Preset {
+    label:      str;
+    rulestring: str;
+}
+
+# built-in rules
+pub val PRESET_COUNT: usize = 6;
+
+val PRESETS: [6]Preset = [6]Preset{
+    Preset{label: "Life", rulestring: "B3/S23"},
+    Preset{label: "HighLife", rulestring: "B36/S23"},
+    Preset{label: "Seeds", rulestring: "B2/S"},
+    Preset{label: "Day & Night", rulestring: "B3678/S34678"},
+    Preset{label: "Brian's Brain", rulestring: "B2/S/C3"},
+    Preset{label: "Star Wars", rulestring: "B2/S345/C4"},
+};
+
+# built-in rule i
+pub fun preset(i: usize) Preset {
+    ret PRESETS[i];
+}
+
+# the rule of built-in i
+pub fun preset_rule(i: usize) Rule {
+    # every preset parses, which the tests hold to
+    var out: Rule;
+    val r:   res[Rule, str] = parse(PRESETS[i].rulestring);
+    if (sel r.ok) { out = r.ok; }
+    ret out;
+}
+
+# the built-in whose rule r applies, if any
+pub fun match_preset(r: *Rule) opt[usize] {
+    var i: usize = 0;
+    for (i < PRESET_COUNT) {
+        var p: Rule = preset_rule(i);
+        if (same(r, ?p)) { ret opt[usize].some{i}; }
+        i = i + 1;
+    }
+    ret opt[usize].none{};
+}
+
+# a rule's display name: its preset's label, or "custom"
+pub fun label(r: *Rule) str {
+    val m: opt[usize] = match_preset(r);
+    if (sel m.some) { ret PRESETS[m.some].label; }
+    ret "custom";
+}
+
+test preset__every_rule_string_parses_and_round_trips {
+    var b: [1101]u8;
+    var i: usize = 0;
+    for (i < PRESET_COUNT) {
+        val r: res[Rule, str] = parse(PRESETS[i].rulestring);
+        if (!sel r.ok) { ret 1; }
+        val again: res[Rule, str] = parse_as(family_of(?r.ok), format(?r.ok, ?b[0]));
+        if (!sel again.ok)           { ret 2; }
+        if (!same(?again.ok, ?r.ok)) { ret 3; }
+        val m: opt[usize] = match_preset(?r.ok);
+        if (!sel m.some) { ret 4; }
+        if (m.some != i) { ret 4; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test match_preset__names_a_preset_rule_and_nothing_else {
+    var r: Rule = preset_rule(1);
+    if (!string.str_equals(label(?r), "HighLife")) { ret 1; }
+    if (sel r.weighted)                            { r.weighted.birth = weighted.toggle_bit(r.weighted.birth, 5); }
+    val n: opt[usize] = match_preset(?r);
+    if (sel n.some)                              { ret 2; }
+    if (!string.str_equals(label(?r), "custom")) { ret 3; }
+    ret 0;
+}
+
+test dispatch__every_function_handles_every_family {
+    var own: [4096]u32;
+    var out: [4096]u32;
+    var buf: [1101]u8;
+    var win: [112]u32;
+    var f:   usize = 0;
+    for (f < FAMILIES) {
+        val named: opt[usize] = family_named(family_id(f));
+        if (sel named.none)  { ret 1; }
+        if (named.some != f) { ret 1; }
+        var len: usize = 0;
+        if (stage(f, ?len) == nil || len == 0) { ret 2; }
+        var n: usize = 0;
+        for (n < sample_count(f)) {
+            val got: res[Rule, str] = parse_as(f, sample(f, n));
+            if (sel got.err) { ret 3; }
+            var r: Rule = got.ok;
+            if (family_of(?r) != f || !same(?r, ?r)) { ret 4; }
+            val back: res[Rule, str] = parse_as(f, format(?r, ?buf[0]));
+            if (sel back.err)                 { ret 5; }
+            if (!same(?back.ok, ?r))          { ret 5; }
+            if (display(?r, ?buf[0])[0] == 0) { ret 6; }
+            # word 0 is the quiescent background, and every state survives a round trip
+            if (states(?r) < 2 || word(?r, 0) != 0 || state(?r, 0) != 0) { ret 7; }
+            var st: u32 = 0;
+            for (st < states(?r)) {
+                if (state(?r, word(?r, st)) != st) { ret 8; }
+                st = st + 1;
+            }
+            val sn: layout.Sense = sense(?r);
+            if (layout.live(0, sn.live_mask, sn.live_lo, sn.live_hi) != 0) { ret 9; }
+            if (radius(?r) == 0)                                           { ret 10; }
+            caps(?r);
+            pack(?r, ?win[0]);
+            label(?r);
+            match_preset(?r);
+            # a busy step of an empty chunk alone leaves it empty, at either parity
+            var i: usize = 0;
+            for (i < 4096) {
+                own[i] = 0;
+                out[i] = 1;
+                i      = i + 1;
+            }
+            var b: space.Block;
+            var k: usize = 0;
+            for (k < 9) {
+                b.nb[k] = nil;
+                k       = k + 1;
+            }
+            b.nb[4] = ?own[0];
+            b.out   = ?out[0];
+            b.busy  = true;
+            var p: u64 = 0;
+            for (p < 2) {
+                b.gen = p;
+                var t: space.Tally = space.tally(sn);
+                step_chunk(?r, ?b, ?t);
+                i = 0;
+                for (i < 4096) {
+                    if (out[i] != 0) { ret 11; }
+                    i = i + 1;
+                }
+                if (t.live != 0) { ret 12; }
+                p = p + 1;
+            }
+            n = n + 1;
+        }
+        f = f + 1;
+    }
+    ret 0;
+}

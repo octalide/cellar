@@ -1,7 +1,8 @@
 # the heads-up readout, flashed messages and the key reference
 #
 # the readout sits in the world's top-left corner in small type: whether the
-# world runs, its generation, population, rule and speed. it fades back when
+# world runs, its generation, population, the size of the box its live cells
+# span, rule and speed. it fades back when
 # the cursor comes near, so it never hides the cells under it. the cell under
 # the cursor and the zoom sit in the bottom-left corner, messages flash at the
 # bottom centre, and the key reference opens over everything.
@@ -9,6 +10,7 @@
 use cellar.app;
 use cellar.render;
 use cellar.sim;
+use cellar.space;
 use cellar.text;
 use cellar.theme;
 use cellar.ui;
@@ -54,19 +56,28 @@ pub fun readout(u: *ui.Ui, a: *app.App, s: *sim.Sim, pt: render.Port) {
     gen[buf_grouped(?gen[0], 0, world.generation(s))] = 0;
     var pop: [32]u8;
     pop[buf_grouped(?pop[0], 0, world.population(s)::u64)] = 0;
+    var bx: [64]u8;
+    var bo: usize          = text.buf_str(?bx[0], 0, "-");
+    val b:  opt[space.Box] = world.bounds(s);
+    if (sel b.some) {
+        bo = buf_grouped(?bx[0], 0, (b.some.x1 - b.some.x0)::u64);
+        bo = text.buf_str(?bx[0], bo, " x ");
+        bo = buf_grouped(?bx[0], bo, (b.some.y1 - b.some.y0)::u64);
+    }
+    bx[bo] = 0;
     var rb:   [200]u8;
-    val rule: str        = world.rule_string(s, ?rb[0]);
-    var name: str        = "custom";
-    val m:    opt[usize] = world.rule_preset(s);
-    if (sel m.some) { name = world.preset_label(m.some); }
-    var sp: [32]u8;
-    var so: usize = 0;
+    val rule: str   = world.rule_string(s, ?rb[0]);
+    val name: str   = world.rule_label(s);
+    var sp:   [32]u8;
+    var so:   usize = 0;
     if (a.uncapped != 0) { so = text.buf_str(?sp[0], 0, "max"); }
     or {
         so = text.buf_u64(?sp[0], 0, (a.speed + 0.5)::u64);
         so = text.buf_str(?sp[0], so, "/s");
     }
     sp[so] = 0;
+    var extra: str = "";
+    if (world.full(s)) { extra = "pool full"; }
 
     val m0: f32 = ui.px(u, 12.0);
     val h:  f32 = ui.px(u, 30.0);
@@ -77,9 +88,11 @@ pub fun readout(u: *ui.Ui, a: *app.App, s: *sim.Sim, pt: render.Port) {
     var w:  f32 = pd * 2.0 + ui.px(u, 22.0);
     w = w + ui.measure(u.small, "gen") + ui.measure(u.small, ?gen[0]);
     w = w + ui.measure(u.small, "pop") + ui.measure(u.small, ?pop[0]);
+    w = w + ui.measure(u.small, "box") + ui.measure(u.small, ?bx[0]);
     w = w + ui.measure(u.small, rule) + ui.measure(u.small, name);
     w = w + ui.measure(u.small, "speed") + ui.measure(u.small, ?sp[0]);
-    w = w + ui.px(u, 5.0 * 4.0 + 14.0 * 4.0) - ui.px(u, 14.0);
+    w = w + ui.px(u, 5.0 * 5.0 + 14.0 * 5.0) - ui.px(u, 14.0);
+    if (world.full(s)) { w = w + ui.measure(u.small, extra) + ui.px(u, 14.0); }
     val x1: f32 = x0 + w;
 
     # fade back while the cursor is near, so the cells under it stay visible
@@ -99,8 +112,10 @@ pub fun readout(u: *ui.Ui, a: *app.App, s: *sim.Sim, pt: render.Port) {
     x = x + ui.px(u, 22.0);
     x = pair(u, x, y0, y1, "gen", ?gen[0], alpha);
     x = pair(u, x, y0, y1, "pop", ?pop[0], alpha);
+    x = pair(u, x, y0, y1, "box", ?bx[0], alpha);
     x = pair(u, x, y0, y1, name, rule, alpha);
-    pair(u, x, y0, y1, "speed", ?sp[0], alpha);
+    x = pair(u, x, y0, y1, "speed", ?sp[0], alpha);
+    if (world.full(s)) { ui.text_mid(u, u.small, extra, x, y0, y1, theme.ACCENT, alpha); }
 }
 
 # the cell under the cursor and the zoom, in the bottom-left corner
@@ -144,6 +159,21 @@ fun signed(buf: *u8, off: usize, v: i64) usize {
     ret text.buf_u64(buf, off, v::u64);
 }
 
+# the selection, tinted and outlined over the cells with its size beside it
+pub fun selection(u: *ui.Ui, a: *app.App, cam: render.Camera) {
+    if (!a.selected) { ret; }
+    val r: render.Span = render.span(cam, a.area);
+    ui.rect(u, r.x0, r.y0, r.x1, r.y1, theme.ACCENT, 0.12);
+    ui.frame(u, r.x0 - 1.0, r.y0 - 1.0, r.x1 + 1.0, r.y1 + 1.0, ui.px(u, 1.5), theme.ACCENT, 0.9);
+    var b: [64]u8;
+    var o: usize = text.buf_u64(?b[0], 0, (a.area.x1 - a.area.x0)::u64);
+    o    = text.buf_str(?b[0], o, " x ");
+    o    = text.buf_u64(?b[0], o, (a.area.y1 - a.area.y0)::u64);
+    b[o] = 0;
+    val m: f32 = ui.px(u, 4.0);
+    ui.text(u, u.small, ?b[0], r.x0, r.y0 - m - ui.line(u.small), theme.ACCENT, 0.9);
+}
+
 # the flashed message, fading out over its last half second
 pub fun toast(u: *ui.Ui, a: *app.App, pt: render.Port) {
     if (a.toast_t <= 0 || a.toast[0] == 0) { ret; }
@@ -167,8 +197,8 @@ pub fun help(u: *ui.Ui, a: *app.App, sw: f32, sh: f32) {
     if (hh.clicked) { a.help = 0; }
     ui.rect(u, 0.0, 0.0, sw, sh, theme.BG, 0.7);
 
-    var keys: [18]str;
-    var what: [18]str;
+    var keys: [29]str;
+    var what: [29]str;
     keys[0]  = "Space";
     what[0]  = "play or pause";
     keys[1]  = "S";
@@ -177,33 +207,57 @@ pub fun help(u: *ui.Ui, a: *app.App, sw: f32, sh: f32) {
     what[2]  = "randomize";
     keys[3]  = "C";
     what[3]  = "clear";
-    keys[4]  = "D  E  T";
-    what[4]  = "draw, erase or stamp tool";
-    keys[5]  = "Left mouse";
-    what[5]  = "use the tool";
-    keys[6]  = "Right drag";
-    what[6]  = "pan (middle drag too)";
-    keys[7]  = "Arrows";
-    what[7]  = "pan";
-    keys[8]  = "Scroll";
-    what[8]  = "zoom toward the cursor";
-    keys[9]  = "F";
-    what[9]  = "fit the world to the view";
-    keys[10] = "M";
-    what[10] = "next colour mode";
-    keys[11] = "G";
-    what[11] = "grid lines";
-    keys[12] = "Tab";
-    what[12] = "show or hide the panel";
-    keys[13] = "F11";
-    what[13] = "fullscreen";
-    keys[14] = "F12";
-    what[14] = "screenshot";
-    keys[15] = "H  F1";
-    what[15] = "this reference";
-    keys[16] = "Esc";
-    what[16] = "close this, or quit";
-    val n: usize = 17;
+    keys[4]  = "D  E  T  V";
+    what[4]  = "draw, erase, stamp, select";
+    keys[5]  = "Z  X";
+    what[5]  = "rotate or flip the stamp";
+    keys[6]  = "Left mouse";
+    what[6]  = "use the tool";
+    keys[7]  = "Right drag";
+    what[7]  = "pan (middle drag too)";
+    keys[8]  = "Arrows";
+    what[8]  = "pan";
+    keys[9]  = "Scroll";
+    what[9]  = "zoom toward the cursor";
+    keys[10] = "F";
+    what[10] = "fit the world to the view";
+    keys[11] = "M";
+    what[11] = "next colour mode";
+    keys[12] = "G";
+    what[12] = "grid lines";
+    keys[13] = "Tab";
+    what[13] = "show or hide the panel";
+    keys[14] = "F11";
+    what[14] = "fullscreen";
+    keys[15] = "F12";
+    what[15] = "screenshot";
+    keys[16] = "H  F1";
+    what[16] = "this reference";
+    keys[17] = "Ctrl C  Ctrl X";
+    what[17] = "copy or cut to the stamp, as RLE";
+    keys[18] = "Delete";
+    what[18] = "clear the selection";
+    keys[19] = "Shift Delete";
+    what[19] = "clear outside it";
+    keys[20] = "Ctrl R";
+    what[20] = "fill it at random";
+    keys[21] = "I";
+    what[21] = "invert it";
+    keys[22] = "B";
+    what[22] = "shrink it to live cells";
+    keys[23] = "Esc";
+    what[23] = "close this, deselect, or quit";
+    keys[24] = "Backspace";
+    what[24] = "reset to where play started";
+    keys[25] = "Ctrl V";
+    what[25] = "paste a pattern as the stamp";
+    keys[26] = "Ctrl Shift V";
+    what[26] = "paste, taking its rule";
+    keys[27] = "Ctrl Z";
+    what[27] = "undo";
+    keys[28] = "Ctrl Shift Z";
+    what[28] = "redo (Ctrl Y too)";
+    val n: usize = 29;
 
     val lh: f32 = ui.line(u.body) + ui.px(u, 6.0);
     val pd: f32 = ui.px(u, 24.0);

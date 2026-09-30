@@ -5,9 +5,16 @@
 # layer of its own. widgets are placed down a column cursor and report their
 # interaction as they are drawn. a press is owned by the widget it began on
 # until the button comes up, so a drag that leaves a slider keeps moving it.
-# every size is multiplied by the interface scale.
+# every size is multiplied by the interface scale. a text field takes the
+# keyboard while it has focus, which the interface holds, so the caller can
+# keep its own key bindings quiet while someone types.
 
+use boom.event.Event;
+use boom.event.KeyAction;
+use boom.event.KeyEvent;
+use boom.event.TextEvent;
 use gfx: boom.graphics;
+use inp: boom.input;
 use gm:  boom.math;
 use cellar.theme;
 use std.types.bool.bool;
@@ -15,6 +22,7 @@ use std.types.bool.false;
 use std.types.bool.true;
 use std.types.option.opt;
 use std.types.size.usize;
+use std.types.string;
 use std.types.string.str;
 
 # unscaled row height, gap between rows and panel padding
@@ -40,6 +48,8 @@ pub val PAD: f32 = 14.0;
 # x:        the column's left edge
 # y:        the column's cursor, the top of the next row
 # w:        the column's width
+# focus:    the text field the keyboard goes to, nil for none
+# focus_on: the focused field was drawn this frame
 pub rec Ui {
     pass:     *gfx.Pass;
     body:     *gfx.Font;
@@ -57,6 +67,8 @@ pub rec Ui {
     x:        f32;
     y:        f32;
     w:        f32;
+    focus:    *Field;
+    focus_on: bool;
 }
 
 # what a widget's rectangle is doing this frame
@@ -98,11 +110,14 @@ pub fun begin(u: *Ui, pass: *gfx.Pass, mx: f32, my: f32, down: bool) {
     u.down     = down;
     u.next     = 1;
     u.over     = false;
+    u.focus_on = false;
 }
 
-# finish a frame, letting go of a press once the button is up
+# finish a frame, letting go of a press once the button is up, and of the
+# keyboard when the focused field was not drawn
 pub fun end(u: *Ui) {
-    if (!u.down) { u.active = 0; }
+    if (!u.down)                       { u.active = 0; }
+    if (u.focus != nil && !u.focus_on) { u.focus = nil; }
 }
 
 # a scaled length
@@ -387,6 +402,359 @@ pub fun heading(u: *Ui, title: str, open: *u8) bool {
     ret @open != 0;
 }
 
+# the most bytes a text field holds, less its terminator: enough for any
+# family's rule string (see cellar.rule.FORMAT_MAX)
+pub val FIELD_CAP: usize = 1151;
+
+# what a text field did since it was last drawn, the later of two winning
+# ---
+# FIELD_NONE:    nothing
+# FIELD_EDITED:  its text changed
+# FIELD_ENTERED: enter ended the edit
+# FIELD_ESCAPED: escape ended the edit
+pub val FIELD_NONE:    u8 = 0;
+pub val FIELD_EDITED:  u8 = 1;
+pub val FIELD_ENTERED: u8 = 2;
+pub val FIELD_ESCAPED: u8 = 3;
+
+# glfw's modifier bits, which boom's key events carry as they came
+val MOD_SHIFT: i32 = 1;
+val MOD_CTRL:  i32 = 2;
+
+# an editable line of text
+#
+# the text is UTF-8 and every offset sits on a character boundary. a field is
+# edited through the focus (see feed) and drawn by text_field, which also
+# reports what the edits came to.
+# ---
+# buf:    the text, NUL-terminated
+# len:    bytes of text
+# caret:  byte offset of the caret
+# anchor: the selection's other end, equal to caret when nothing is selected
+# first:  byte offset of the first character shown, so the caret stays in view
+# max:    the most bytes the text may take, at most FIELD_CAP
+# accept: whether a typed codepoint belongs in the field, nil for any printable one
+# did:    a FIELD_* the edits came to since text_field last reported
+pub rec Field {
+    buf:    [1152]u8;
+    len:    usize;
+    caret:  usize;
+    anchor: usize;
+    first:  usize;
+    max:    usize;
+    accept: fun(u32) bool;
+    did:    u8;
+}
+
+# make an empty field
+# ---
+# f:      the field
+# max:    the most bytes it takes, capped at FIELD_CAP
+# accept: which typed codepoints it takes, nil for any printable one
+pub fun field_init(f: *Field, max: usize, accept: fun(u32) bool) {
+    f.buf[0] = 0;
+    f.len    = 0;
+    f.caret  = 0;
+    f.anchor = 0;
+    f.first  = 0;
+    f.max    = max;
+    if (max > FIELD_CAP) { f.max = FIELD_CAP; }
+    f.accept = accept;
+    f.did    = FIELD_NONE;
+}
+
+# the field's text
+pub fun field_text(f: *Field) str {
+    ret ?f.buf[0];
+}
+
+# replace the text, cut to the field's length on a character boundary, with the caret at its end
+pub fun field_set(f: *Field, s: str) {
+    var n: usize = 0;
+    for (s[n] != 0 && n < f.max) {
+        f.buf[n] = s[n];
+        n        = n + 1;
+    }
+    for (n > 0 && (f.buf[n] & 0xc0) == 0x80) { n = n - 1; }
+    # a lead byte whose continuation was cut goes too
+    if (n > 0 && s[n] != 0 && f.buf[n - 1] >= 0xc0) { n = n - 1; }
+    f.buf[n] = 0;
+    f.len    = n;
+    f.caret  = n;
+    f.anchor = n;
+    f.first  = 0;
+}
+
+# whether some text is selected
+pub fun field_selected(f: *Field) bool {
+    ret f.caret != f.anchor;
+}
+
+fun sel_lo(f: *Field) usize {
+    if (f.caret < f.anchor) { ret f.caret; }
+    ret f.anchor;
+}
+
+fun sel_hi(f: *Field) usize {
+    if (f.caret > f.anchor) { ret f.caret; }
+    ret f.anchor;
+}
+
+# the character boundary before i
+fun before(f: *Field, i: usize) usize {
+    if (i == 0) { ret 0; }
+    var j: usize = i - 1;
+    for (j > 0 && (f.buf[j] & 0xc0) == 0x80) { j = j - 1; }
+    ret j;
+}
+
+# the character boundary after i
+fun after(f: *Field, i: usize) usize {
+    if (i >= f.len) { ret f.len; }
+    var j: usize = i + 1;
+    for (j < f.len && (f.buf[j] & 0xc0) == 0x80) { j = j + 1; }
+    ret j;
+}
+
+# remove the bytes [lo, hi), leaving the caret at lo
+fun remove(f: *Field, lo: usize, hi: usize) {
+    var i: usize = hi;
+    for (i <= f.len) {
+        f.buf[lo + i - hi] = f.buf[i];
+        i                  = i + 1;
+    }
+    f.len    = f.len - (hi - lo);
+    f.caret  = lo;
+    f.anchor = lo;
+    if (f.first > lo) { f.first = lo; }
+}
+
+# note what an edit came to, a later outcome winning over an earlier one
+fun did(f: *Field, r: u8) {
+    if (r > f.did) { f.did = r; }
+}
+
+# a codepoint as UTF-8 into out; ret its length, 0 for no scalar value
+fun utf8(cp: u32, out: *u8) usize {
+    if (cp < 0x80) {
+        out[0] = cp::u8;
+        ret 1;
+    }
+    if (cp < 0x800) {
+        out[0] = (0xc0 | (cp >> 6))::u8;
+        out[1] = (0x80 | (cp & 0x3f))::u8;
+        ret 2;
+    }
+    if (cp >= 0xd800 && cp < 0xe000) { ret 0; }
+    if (cp < 0x10000) {
+        out[0] = (0xe0 | (cp >> 12))::u8;
+        out[1] = (0x80 | ((cp >> 6) & 0x3f))::u8;
+        out[2] = (0x80 | (cp & 0x3f))::u8;
+        ret 3;
+    }
+    if (cp < 0x110000) {
+        out[0] = (0xf0 | (cp >> 18))::u8;
+        out[1] = (0x80 | ((cp >> 12) & 0x3f))::u8;
+        out[2] = (0x80 | ((cp >> 6) & 0x3f))::u8;
+        out[3] = (0x80 | (cp & 0x3f))::u8;
+        ret 4;
+    }
+    ret 0;
+}
+
+# whether a codepoint is text rather than a control
+fun printable(cp: u32) bool {
+    ret cp >= 0x20 && (cp < 0x7f || cp >= 0xa0);
+}
+
+# type a codepoint at the caret over any selection
+# ---
+# f:   the field
+# cp:  a unicode scalar value
+# ret: whether the text changed; false when the field refuses it or is full
+pub fun field_type(f: *Field, cp: u32) bool {
+    if (!printable(cp))                   { ret false; }
+    if (f.accept != nil && !f.accept(cp)) { ret false; }
+    var b: [4]u8;
+    val n: usize = utf8(cp, ?b[0]);
+    if (n == 0) { ret false; }
+    val lo: usize = sel_lo(f);
+    val hi: usize = sel_hi(f);
+    if (f.len - (hi - lo) + n > f.max) { ret false; }
+    if (hi > lo)                       { remove(f, lo, hi); }
+    var i: usize = f.len + 1;
+    for (i > lo) {
+        i            = i - 1;
+        f.buf[i + n] = f.buf[i];
+    }
+    var k: usize = 0;
+    for (k < n) {
+        f.buf[lo + k] = b[k];
+        k             = k + 1;
+    }
+    f.len    = f.len + n;
+    f.caret  = lo + n;
+    f.anchor = f.caret;
+    did(f, FIELD_EDITED);
+    ret true;
+}
+
+# move the caret to i, extending the selection when shift is held
+fun move_to(f: *Field, i: usize, shift: bool) {
+    f.caret = i;
+    if (!shift) { f.anchor = i; }
+}
+
+# apply an editing key: backspace, delete, left and right (shift selects), ctrl+A
+# selects all, and enter and escape end the edit
+# ---
+# f:    the field
+# k:    the key
+# mods: glfw modifier bits
+# ret:  the FIELD_* it came to
+pub fun field_key(f: *Field, k: inp.Key, mods: i32) u8 {
+    val shift: bool = (mods & MOD_SHIFT) != 0;
+    var r:     u8   = FIELD_NONE;
+    if (k == inp.KEY_ENTER)  { r = FIELD_ENTERED; }
+    if (k == inp.KEY_ESCAPE) { r = FIELD_ESCAPED; }
+    if (k == inp.KEY_A && (mods & MOD_CTRL) != 0) {
+        f.anchor = 0;
+        f.caret  = f.len;
+    }
+    if (k == inp.KEY_BACKSPACE || k == inp.KEY_DELETE) {
+        var lo: usize = sel_lo(f);
+        var hi: usize = sel_hi(f);
+        if (lo == hi && k == inp.KEY_BACKSPACE) { lo = before(f, lo); }
+        if (lo == hi && k == inp.KEY_DELETE)    { hi = after(f, hi); }
+        if (hi > lo) {
+            remove(f, lo, hi);
+            r = FIELD_EDITED;
+        }
+    }
+    if (k == inp.KEY_LEFT) {
+        if (field_selected(f) && !shift) { move_to(f, sel_lo(f), false); }
+        or                               { move_to(f, before(f, f.caret), shift); }
+    }
+    if (k == inp.KEY_RIGHT) {
+        if (field_selected(f) && !shift) { move_to(f, sel_hi(f), false); }
+        or                               { move_to(f, after(f, f.caret), shift); }
+    }
+    did(f, r);
+    ret r;
+}
+
+# give a field the keyboard, or take it away with nil; a field given it after
+# it was drawn keeps it past this frame's end
+pub fun focus(u: *Ui, f: *Field) {
+    u.focus    = f;
+    u.focus_on = f != nil;
+}
+
+# whether a text field has the keyboard, so other key bindings should stay quiet
+pub fun typing(u: *Ui) bool {
+    ret u.focus != nil;
+}
+
+# hand an input event to the focused field; enter and escape give the keyboard back
+# ---
+# u: the interface
+# e: an event from boom's queue, in the order it arrived
+pub fun feed(u: *Ui, e: Event) {
+    if (u.focus == nil) { ret; }
+    if (sel e.text) {
+        field_type(u.focus, e.text.codepoint);
+        ret;
+    }
+    if (!sel e.key)               { ret; }
+    if (sel e.key.action.release) { ret; }
+    val r: u8 = field_key(u.focus, e.key.key, e.key.mods);
+    if (r == FIELD_ENTERED || r == FIELD_ESCAPED) { u.focus = nil; }
+}
+
+# the width of the field's bytes [lo, hi) in a face
+fun span(fnt: *gfx.Font, f: *Field, lo: usize, hi: usize) f32 {
+    if (hi <= lo) { ret 0.0; }
+    val keep: u8 = f.buf[hi];
+    f.buf[hi] = 0;
+    val w: f32 = measure(fnt, ?f.buf[lo]);
+    f.buf[hi] = keep;
+    ret w;
+}
+
+# scroll the shown text so the caret is in view in w pixels, and shows as much as fits
+fun keep_in_view(fnt: *gfx.Font, f: *Field, w: f32) {
+    if (f.first > f.caret) { f.first = f.caret; }
+    for (f.first < f.caret && span(fnt, f, f.first, f.caret) > w) { f.first = after(f, f.first); }
+    for (f.first > 0 && span(fnt, f, before(f, f.first), f.len) <= w) { f.first = before(f, f.first); }
+}
+
+# a one-line text field across the column
+#
+# a press on it gives it the keyboard and puts the caret under the cursor; a
+# press elsewhere, or a frame it is not drawn in, takes the keyboard back.
+# ---
+# u:    the interface
+# f:    the field
+# hint: dim text shown while it is empty and unfocused
+# ret:  the FIELD_* its edits came to since it was last drawn
+pub fun text_field(u: *Ui, f: *Field, hint: str) u8 {
+    val h:   f32 = px(u, ROW);
+    val x0:  f32 = u.x;
+    val y0:  f32 = u.y;
+    val x1:  f32 = u.x + u.w;
+    val y1:  f32 = u.y + h;
+    val pad: f32 = px(u, 8.0);
+    val tx:  f32 = x0 + pad;
+    val tw:  f32 = x1 - x0 - pad * 2.0;
+    val hh:  Hit = region(u, x0, y0, x1, y1);
+    if (u.pressed && hh.hot) {
+        u.focus = f;
+        keep_in_view(u.body, f, tw);
+        var i: usize = f.first;
+        for (i < f.len) {
+            val n: usize = after(f, i);
+            if (u.mx < tx + span(u.body, f, f.first, i) + span(u.body, f, i, n) / 2.0) { brk; }
+            i = n;
+        }
+        move_to(f, i, false);
+    }
+    or (u.pressed && u.focus == f) { u.focus = nil; }
+    val on: bool = u.focus == f;
+    if (on) { u.focus_on = true; }
+
+    var back: u32 = theme.WORLD;
+    if (hh.hot && !on) { back = theme.CONTROL_HOT; }
+    rect(u, x0, y0, x1, y1, back, 1.0);
+    if (on) { frame(u, x0, y0, x1, y1, px(u, 1.0), theme.ACCENT, 1.0); }
+    or      { frame(u, x0, y0, x1, y1, px(u, 1.0), theme.CONTROL_ON, 1.0); }
+
+    keep_in_view(u.body, f, tw);
+    var e: usize = f.len;
+    for (e > f.first && span(u.body, f, f.first, e) > tw) { e = before(f, e); }
+    if (f.len == 0 && !on) { text_mid(u, u.body, hint, tx, y0, y1, theme.TEXT_FAINT, 1.0); }
+    if (on && field_selected(f)) {
+        var lo: usize = sel_lo(f);
+        var hi: usize = sel_hi(f);
+        if (lo < f.first) { lo = f.first; }
+        if (hi > e)       { hi = e; }
+        val sx0: f32 = tx + span(u.body, f, f.first, lo);
+        val sx1: f32 = tx + span(u.body, f, f.first, hi);
+        rect(u, sx0, y0 + px(u, 4.0), sx1, y1 - px(u, 4.0), theme.ACCENT, 0.35);
+    }
+    val keep: u8 = f.buf[e];
+    f.buf[e] = 0;
+    text_mid(u, u.body, ?f.buf[f.first], tx, y0, y1, theme.TEXT, 1.0);
+    f.buf[e] = keep;
+    if (on) {
+        val cx: f32 = tx + span(u.body, f, f.first, f.caret);
+        rect(u, cx, y0 + px(u, 5.0), cx + px(u, 1.5), y1 - px(u, 5.0), theme.TEXT, 1.0);
+    }
+    advance(u, h);
+    val r: u8 = f.did;
+    f.did = FIELD_NONE;
+    ret r;
+}
+
 test hit__a_press_belongs_to_its_widget_until_release {
     var u: Ui;
     u.mx      = 5.0;
@@ -407,5 +775,66 @@ test hit__a_press_belongs_to_its_widget_until_release {
     u.released = true;
     val d: Hit = hit(?u, 1, 0.0, 0.0, 10.0, 10.0);
     if (d.clicked) { ret 4; }
+    ret 0;
+}
+
+# a field that takes digits only
+#[testing]
+fun digits(cp: u32) bool {
+    ret cp >= '0' && cp <= '9';
+}
+
+test field__edits_at_the_caret_within_its_length {
+    var f: Field;
+    field_init(?f, 6, nil);
+    field_type(?f, 'a');
+    field_type(?f, 'c');
+    field_key(?f, inp.KEY_LEFT, 0);
+    field_type(?f, 'b');
+    if (!string.str_equals(field_text(?f), "abc") || f.caret != 2) { ret 1; }
+    # a two-byte codepoint moves and deletes as one character
+    field_type(?f, 0xe9);
+    if (f.len != 5 || f.caret != 4) { ret 2; }
+    field_key(?f, inp.KEY_LEFT, 0);
+    if (f.caret != 2) { ret 3; }
+    field_key(?f, inp.KEY_DELETE, 0);
+    if (!string.str_equals(field_text(?f), "abc")) { ret 4; }
+    # full: the six-byte cap refuses what does not fit
+    field_type(?f, 'x');
+    field_type(?f, 'y');
+    field_type(?f, 'z');
+    if (field_type(?f, 'w') || f.len != 6) { ret 5; }
+    # shift selects, typing replaces the selection, backspace takes a selection whole
+    field_key(?f, inp.KEY_A, MOD_CTRL);
+    field_type(?f, 'q');
+    if (!string.str_equals(field_text(?f), "q")) { ret 6; }
+    field_type(?f, 'r');
+    field_key(?f, inp.KEY_LEFT, MOD_SHIFT);
+    field_key(?f, inp.KEY_BACKSPACE, 0);
+    if (!string.str_equals(field_text(?f), "q"))          { ret 7; }
+    if (field_key(?f, inp.KEY_ENTER, 0) != FIELD_ENTERED) { ret 8; }
+    if (f.did != FIELD_ENTERED)                           { ret 9; }
+    # the filter and control characters are refused
+    var d: Field;
+    field_init(?d, 8, digits);
+    if (field_type(?d, 'a') || field_type(?d, 0x08) || !field_type(?d, '7')) { ret 10; }
+    field_set(?d, "123456789");
+    if (d.len != 8 || d.caret != 8) { ret 11; }
+    ret 0;
+}
+
+test feed__enter_and_escape_give_the_keyboard_back {
+    var u: Ui;
+    var f: Field;
+    field_init(?f, 16, nil);
+    focus(?u, ?f);
+    feed(?u, Event.text{TextEvent{codepoint: 'k'}});
+    feed(?u, Event.key{KeyEvent{key: inp.KEY_S, action: KeyAction.release{}, mods: 0}});
+    if (!typing(?u) || f.len != 1) { ret 1; }
+    feed(?u, Event.key{KeyEvent{key: inp.KEY_ESCAPE, action: KeyAction.press{}, mods: 0}});
+    if (typing(?u)) { ret 2; }
+    # nothing reaches a field that lost the keyboard
+    feed(?u, Event.text{TextEvent{codepoint: 'j'}});
+    if (f.len != 1) { ret 3; }
     ret 0;
 }

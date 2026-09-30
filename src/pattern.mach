@@ -1,236 +1,411 @@
-# fixed-capacity cell patterns and stamping them onto the world
+# heap-backed cell patterns and placing them onto the world
 #
-# the library holds the built-in patterns and the user-drawn custom one. a pattern is a small dense w x h grid of 0/1 cells held in a fixed [CAP] buffer,
-# so any pattern with w*h <= CAP fits regardless of its side lengths. the built-ins
-# are described as rows of '#'/'.' text and parsed once on demand; stamping places
-# a pattern's live cells onto the unbounded world, centered on a target cell.
+# a pattern is a dense w x h grid of u8 states of any size, plus the metadata
+# a pattern file carries: a name, a rule string, free comments and an origin. state 0
+# is dead and any other state is live, which leaves room for multi-state rules.
+# readers fill cells through set or a whole row at a time, writers walk a row as
+# runs of equal states with run, and place writes a pattern onto the unbounded
+# world through the simulation's bulk edit, so a large pattern costs one edit.
 
 use cellar.sim;
 use allo: std.allocator;
 use std.allocator.page;
+use mem: std.memory;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
 use std.types.error.err;
+use std.types.result.res;
 use std.types.size.usize;
+use std.types.string;
+use std.types.string.OwnedString;
 use std.types.string.str;
 
-# cell-buffer capacity; a pattern is valid while w*h <= CAP
-pub val CAP: usize = 1024;
+# the longest side a pattern may have, so w * h never overflows
+pub val MAX_SIDE: usize = 1073741824;
+# the most cells a pattern may hold, a byte each, so a gigabyte as the world's
+# host pool is
+pub val MAX_CELLS: usize = 1073741824;
 
-# number of patterns reachable through builtin()/builtin_name()
-pub val BUILTIN_COUNT: usize = 7;
-
-# a small dense grid of 0/1 cells with a display name
+# a dense grid of u8 states with metadata, owning its cells and text
 # ---
-# cells: row-major 0/1 cells, length w*h, capacity CAP
-# w:     width in cells
-# h:     height in cells, with w*h <= CAP
-# name:  short display label
+# a:        allocator backing the cells and text; nil before init
+# cells:    row-major states, length w*h, nil when empty
+# w:        width in cells
+# h:        height in cells
+# x:        the world column the source placed the top-left cell at, 0 when it gave none
+# y:        the world row the source placed the top-left cell at, 0 when it gave none
+# name:     short display label
+# rule:     the rule string the source named, empty when none
+# comments: free text the source carried, empty when none
 pub rec Pattern {
-    cells: [1024]u8;
-    w:     usize;
-    h:     usize;
-    name:  str;
+    a:        *allo.Allocator;
+    cells:    *u8;
+    w:        usize;
+    h:        usize;
+    x:        i64;
+    y:        i64;
+    name:     OwnedString;
+    rule:     OwnedString;
+    comments: OwnedString;
 }
 
-# set a pattern's dimensions and name and zero its cells
+# an empty-text view of an owned string
+fun text_of(o: *OwnedString) str {
+    if (o.data == nil) { ret ""; }
+    ret o.data;
+}
+
+# replace an owned string with a copy of s
+fun assign(a: *allo.Allocator, o: *OwnedString, s: str) err[allo.Error] {
+    val d: res[OwnedString, allo.Error] = string.owned_dup(a, s);
+    if (sel d.err) { ret err[allo.Error].err{d.err}; }
+    string.owned_release(o);
+    @o = d.ok;
+    ret err[allo.Error].ok{};
+}
+
+# make a pattern of w x h dead cells with a name
 # ---
-# p:    pattern to initialize
-# w:    width in cells
-# h:    height in cells (w*h must not exceed CAP)
-# name: display label
-pub fun init(p: *Pattern, w: usize, h: usize, name: str) {
-    p.w    = w;
-    p.h    = h;
-    p.name = name;
-    clear(p);
+# p:    pattern to initialize; it owns what it allocates until dnit
+# a:    allocator for the cells and text, which must outlive the pattern
+# w:    width in cells, see holds
+# h:    height in cells, see holds
+# name: display label, copied
+# ret:  ok, or the allocator's refusal, leaving p empty
+pub fun init(p: *Pattern, a: *allo.Allocator, w: usize, h: usize, name: str) err[allo.Error] {
+    p.a        = a;
+    p.cells    = nil;
+    p.w        = 0;
+    p.h        = 0;
+    p.x        = 0;
+    p.y        = 0;
+    p.name     = string.owned_adopt(a, nil, 0, 0);
+    p.rule     = string.owned_adopt(a, nil, 0, 0);
+    p.comments = string.owned_adopt(a, nil, 0, 0);
+    val e: err[allo.Error] = resize(p, w, h);
+    if (sel e.err) { ret e; }
+    val n: err[allo.Error] = set_name(p, name);
+    if (sel n.err) {
+        dnit(p);
+        ret n;
+    }
+    ret err[allo.Error].ok{};
 }
 
-# zero every cell, preserving the pattern's dimensions and name
+# release everything a pattern owns
+pub fun dnit(p: *Pattern) {
+    if (p.a == nil)     { ret; }
+    if (p.cells != nil) { allo.deallocate[u8](p.a, p.cells, p.w * p.h); }
+    string.owned_release(?p.name);
+    string.owned_release(?p.rule);
+    string.owned_release(?p.comments);
+    p.cells = nil;
+    p.w     = 0;
+    p.h     = 0;
+    p.a     = nil;
+}
+
+# whether a pattern may be w by h: each side at most MAX_SIDE and the cells at most MAX_CELLS
+pub fun holds(w: u64, h: u64) bool {
+    if (w > MAX_SIDE::u64 || h > MAX_SIDE::u64) { ret false; }
+    ret w == 0 || h <= MAX_CELLS::u64 / w;
+}
+
+# give a pattern new dimensions with every cell dead, keeping its metadata
+# ---
+# p:   pattern
+# w:   new width, see holds
+# h:   new height, see holds
+# ret: ok, or the allocator's refusal, leaving p as it was
+pub fun resize(p: *Pattern, w: usize, h: usize) err[allo.Error] {
+    if (!holds(w::u64, h::u64)) { ret err[allo.Error].err{allo.Error.invalid{}}; }
+    var fresh: *u8 = nil;
+    if (w * h != 0) {
+        val r: res[*u8, allo.Error] = allo.zallocate[u8](p.a, w * h);
+        if (sel r.err) { ret err[allo.Error].err{r.err}; }
+        fresh = r.ok;
+    }
+    if (p.cells != nil) { allo.deallocate[u8](p.a, p.cells, p.w * p.h); }
+    p.cells = fresh;
+    p.w     = w;
+    p.h     = h;
+    ret err[allo.Error].ok{};
+}
+
+# copy a pattern's cells, dimensions and metadata into dst
+# ---
+# dst: pattern to initialize; it owns the copy until dnit
+# a:   allocator for the copy
+# src: pattern to copy
+# ret: ok, or the allocator's refusal, leaving dst empty
+pub fun clone(dst: *Pattern, a: *allo.Allocator, src: *Pattern) err[allo.Error] {
+    val e: err[allo.Error] = init(dst, a, src.w, src.h, name(src));
+    if (sel e.err)        { ret e; }
+    if (src.cells != nil) { mem.copy[u8](dst.cells, src.cells, src.w * src.h); }
+    dst.x = src.x;
+    dst.y = src.y;
+    val r: err[allo.Error] = set_rule(dst, rule(src));
+    if (sel r.err) {
+        dnit(dst);
+        ret r;
+    }
+    val c: err[allo.Error] = set_comments(dst, comments(src));
+    if (sel c.err) {
+        dnit(dst);
+        ret c;
+    }
+    ret err[allo.Error].ok{};
+}
+
+# the display label, empty when none
+pub fun name(p: *Pattern) str {
+    ret text_of(?p.name);
+}
+
+# the rule string the source named, empty when none
+pub fun rule(p: *Pattern) str {
+    ret text_of(?p.rule);
+}
+
+# the comments the source carried, empty when none
+pub fun comments(p: *Pattern) str {
+    ret text_of(?p.comments);
+}
+
+# replace the display label with a copy of s
+pub fun set_name(p: *Pattern, s: str) err[allo.Error] {
+    ret assign(p.a, ?p.name, s);
+}
+
+# replace the rule string with a copy of s
+pub fun set_rule(p: *Pattern, s: str) err[allo.Error] {
+    ret assign(p.a, ?p.rule, s);
+}
+
+# replace the comments with a copy of s
+pub fun set_comments(p: *Pattern, s: str) err[allo.Error] {
+    ret assign(p.a, ?p.comments, s);
+}
+
+# kill every cell, preserving the pattern's dimensions and metadata
 # ---
 # p: pattern to clear
 pub fun clear(p: *Pattern) {
-    val n: usize = p.w * p.h;
-    var i: usize = 0;
-    for (i < n) {
-        p.cells[i] = 0;
-        i          = i + 1;
-    }
+    if (p.cells != nil) { mem.zero[u8](p.cells, p.w * p.h); }
 }
 
-# the cell at (x, y). caller guarantees x < w and y < h
+# the state at (x, y). caller guarantees x < w and y < h
 # ---
 # p:   pattern
 # x:   column in [0, w)
 # y:   row in [0, h)
-# ret: 0 or 1
+# ret: the state, 0 when dead
 pub fun get(p: *Pattern, x: usize, y: usize) u8 {
     ret p.cells[y * p.w + x];
 }
 
-# write v to the cell at (x, y)
+# write state v to the cell at (x, y)
 # ---
 # p: pattern
 # x: column in [0, w)
 # y: row in [0, h)
-# v: new value (0 or 1)
+# v: new state
 pub fun set(p: *Pattern, x: usize, y: usize, v: u8) {
     p.cells[y * p.w + x] = v;
 }
 
-# build a pattern from h row strings of w chars each, '#' live and any
-# other char dead.
+# the state at (x, y) and how many cells from there along the row share it
+#
+# walking a row as runs lets a writer of a run-length format, or a placement onto
+# the world, handle a long stretch of equal cells at once
 # ---
-# name: display label
-# w:    width in cells
-# h:    height in cells
-# rows: pointer to an array of h row strings (pass ?arr[0])
-# ret:  the parsed pattern
-fun from_rows(name: str, w: usize, h: usize, rows: *str) Pattern {
-    var p: Pattern;
-    p.w    = w;
-    p.h    = h;
-    p.name = name;
+# p:   pattern
+# x:   column in [0, w)
+# y:   row in [0, h)
+# n:   receives the run's length, at least 1, reaching no further than the row's end
+# ret: the state the run holds
+pub fun run(p: *Pattern, x: usize, y: usize, n: *usize) u8 {
+    val row: *u8   = ?p.cells[y * p.w];
+    val v:   u8    = row[x];
+    var i:   usize = x + 1;
+    for (i < p.w && row[i] == v) { i = i + 1; }
+    @n = i - x;
+    ret v;
+}
+
+# write a pattern onto the world with its top-left at (ox, oy), in one bulk edit
+#
+# runs of live cells are written as runs. with replace the pattern's dead cells
+# erase what they cover, otherwise they leave the world untouched and the
+# pattern overlays it. a state is written as live whatever its value.
+# ---
+# s:       simulation to write onto
+# p:       pattern to place
+# ox:      world column of the pattern's left edge
+# oy:      world row of the pattern's top edge
+# replace: dead pattern cells erase
+# ret:     false when the edit could not be made or the pool could not hold it all
+pub fun place(s: *sim.Sim, p: *Pattern, ox: i64, oy: i64, replace: bool) bool {
+    if (p.w == 0 || p.h == 0)                                     { ret true; }
+    if (!sim.edit_begin(s, ox, oy, ox + p.w::i64, oy + p.h::i64)) { ret false; }
     var y: usize = 0;
-    for (y < h) {
-        val row: str   = rows[y];
-        var x:   usize = 0;
-        for (x < w) {
-            var v: u8 = 0;
-            if (row[x] == '#') { v = 1; }
-            p.cells[y * w + x] = v;
-            x                  = x + 1;
+    for (y < p.h) {
+        var x: usize = 0;
+        for (x < p.w) {
+            var n: usize = 0;
+            val v: u8    = run(p, x, y, ?n);
+            if (v != 0 || replace) { sim.edit_run(s, ox + x::i64, oy + y::i64, n, v); }
+            x = x + n;
         }
         y = y + 1;
     }
-    ret p;
+    ret sim.edit_end(s);
 }
 
-# the classic 3x3 diagonal spaceship
-fun glider() Pattern {
-    var r: [3]str;
-    r[0] = ".#.";
-    r[1] = "..#";
-    r[2] = "###";
-    ret from_rows("glider", 3, 3, ?r[0]);
-}
-
-# the period-two 3x1 oscillator
-fun blinker() Pattern {
-    var r: [1]str;
-    r[0] = "###";
-    ret from_rows("blinker", 3, 1, ?r[0]);
-}
-
-# the 2x2 still life
-fun block() Pattern {
-    var r: [2]str;
-    r[0] = "##";
-    r[1] = "##";
-    ret from_rows("block", 2, 2, ?r[0]);
-}
-
-# the 4x3 still life
-fun beehive() Pattern {
-    var r: [3]str;
-    r[0] = ".##.";
-    r[1] = "#..#";
-    r[2] = ".##.";
-    ret from_rows("beehive", 4, 3, ?r[0]);
-}
-
-# the lightweight spaceship, a 5x4 orthogonal glider
-fun lwss() Pattern {
-    var r: [4]str;
-    r[0] = ".#..#";
-    r[1] = "#....";
-    r[2] = "#...#";
-    r[3] = "####.";
-    ret from_rows("lwss", 5, 4, ?r[0]);
-}
-
-# the 13x13 period-three oscillator
-fun pulsar() Pattern {
-    var r: [13]str;
-    r[0]  = "..###...###..";
-    r[1]  = ".............";
-    r[2]  = "#....#.#....#";
-    r[3]  = "#....#.#....#";
-    r[4]  = "#....#.#....#";
-    r[5]  = "..###...###..";
-    r[6]  = ".............";
-    r[7]  = "..###...###..";
-    r[8]  = "#....#.#....#";
-    r[9]  = "#....#.#....#";
-    r[10] = "#....#.#....#";
-    r[11] = ".............";
-    r[12] = "..###...###..";
-    ret from_rows("pulsar", 13, 13, ?r[0]);
-}
-
-# the Gosper glider gun, a 36x9 emitter of gliders
-fun gun() Pattern {
-    var r: [9]str;
-    r[0] = "........................#...........";
-    r[1] = "......................#.#...........";
-    r[2] = "............##......##............##";
-    r[3] = "...........#...#....##............##";
-    r[4] = "##........#.....#...##..............";
-    r[5] = "##........#...#.##....#.#...........";
-    r[6] = "..........#.....#.......#...........";
-    r[7] = "...........#...#....................";
-    r[8] = "............##......................";
-    ret from_rows("gosper gun", 36, 9, ?r[0]);
-}
-
-# the i-th built-in pattern, for i in [0, BUILTIN_COUNT)
-# ---
-# i:   built-in index
-# ret: the pattern (the gun for any out-of-range index)
-pub fun builtin(i: usize) Pattern {
-    if (i == 0) { ret glider(); }
-    if (i == 1) { ret blinker(); }
-    if (i == 2) { ret block(); }
-    if (i == 3) { ret beehive(); }
-    if (i == 4) { ret lwss(); }
-    if (i == 5) { ret pulsar(); }
-    ret gun();
-}
-
-# the display label of the i-th built-in, for dropdown options
-# ---
-# i:   built-in index
-# ret: the label
-pub fun builtin_name(i: usize) str {
-    if (i == 0) { ret "glider"; }
-    if (i == 1) { ret "blinker"; }
-    if (i == 2) { ret "block"; }
-    if (i == 3) { ret "beehive"; }
-    if (i == 4) { ret "lwss"; }
-    if (i == 5) { ret "pulsar"; }
-    ret "gosper gun";
-}
-
-# place a pattern's live cells onto the world, centered on cell (cx, cy)
+# read the cells of [x0, x1) by [y0, y1) into a pattern, the reverse of place
 #
-# the pattern's top-left lands at (cx - w/2, cy - h/2). only live pattern cells
-# are written (via sim.paint, keeping age/heat consistent); dead pattern cells
-# leave the world untouched, so a stamp overlays rather than erases.
+# the pattern takes the area's size and its origin, keeping its metadata, and
+# the cells are read through the simulation's open read, which must cover the area.
+# ---
+# p:   pattern to fill, initialized
+# s:   simulation with a read open over the area
+# x0:  first column
+# y0:  first row
+# x1:  column after the last
+# y1:  row after the last
+# ret: ok, or the allocator's refusal or invalid when the area is too large or
+#      no read covers it, leaving p as it was or emptied
+pub fun capture(p: *Pattern, s: *sim.Sim, x0: i64, y0: i64, x1: i64, y1: i64) err[allo.Error] {
+    var w: usize = 0;
+    var h: usize = 0;
+    if (x1 > x0 && y1 > y0) {
+        if ((x1 - x0)::u64 > MAX_SIDE::u64 || (y1 - y0)::u64 > MAX_SIDE::u64) { ret err[allo.Error].err{allo.Error.invalid{}}; }
+        w = (x1 - x0)::usize;
+        h = (y1 - y0)::usize;
+    }
+    val e: err[allo.Error] = resize(p, w, h);
+    if (sel e.err) { ret e; }
+    p.x = x0;
+    p.y = y0;
+    var y: usize = 0;
+    for (y < h) {
+        if (!sim.read_run(s, x0, y0 + y::i64, w, ?p.cells[y * w])) {
+            resize(p, 0, 0);
+            ret err[allo.Error].err{allo.Error.invalid{}};
+        }
+        y = y + 1;
+    }
+    ret err[allo.Error].ok{};
+}
+
+# an orientation is one of the eight ways to lay a pattern down: the pattern is
+# mirrored left to right when ORIENT_FLIP is set, then turned clockwise by
+# (o & ORIENT_TURNS) quarter turns. 0 is the pattern as drawn.
+pub val ORIENT_COUNT: u8 = 8;
+pub val ORIENT_FLIP:  u8 = 4;
+pub val ORIENT_TURNS: u8 = 3;
+
+# the next orientation after a quarter turn clockwise, keeping the mirroring
+pub fun orient_turn(o: u8) u8 {
+    ret (o & ORIENT_FLIP) | ((o + 1) & ORIENT_TURNS);
+}
+
+# the orientation of the shape o shows, mirrored left to right
+#
+# the mirror composes outside the turns, so it also reverses their direction
+pub fun orient_flip(o: u8) u8 {
+    ret (o ^ ORIENT_FLIP) & ~ORIENT_TURNS | ((4 - (o & ORIENT_TURNS)) & ORIENT_TURNS);
+}
+
+# the width of a pattern laid down in orientation o
+pub fun width(p: *Pattern, o: u8) usize {
+    if ((o & 1) != 0) { ret p.h; }
+    ret p.w;
+}
+
+# the height of a pattern laid down in orientation o
+pub fun height(p: *Pattern, o: u8) usize {
+    if ((o & 1) != 0) { ret p.w; }
+    ret p.h;
+}
+
+# the state at (x, y) of a pattern laid down in orientation o
+# ---
+# p:   pattern
+# o:   orientation, below ORIENT_COUNT
+# x:   column in [0, width(p, o))
+# y:   row in [0, height(p, o))
+# ret: the state, 0 when dead
+pub fun get_oriented(p: *Pattern, o: u8, x: usize, y: usize) u8 {
+    # undo the turns to find the cell in the mirrored pattern, then undo the mirror
+    val t:  u8    = o & ORIENT_TURNS;
+    var sx: usize = x;
+    var sy: usize = y;
+    if (t == 1) {
+        sx = y;
+        sy = p.h - 1 - x;
+    }
+    or (t == 2) {
+        sx = p.w - 1 - x;
+        sy = p.h - 1 - y;
+    }
+    or (t == 3) {
+        sx = p.w - 1 - y;
+        sy = x;
+    }
+    if ((o & ORIENT_FLIP) != 0) { sx = p.w - 1 - sx; }
+    ret get(p, sx, sy);
+}
+
+# make dst the pattern p laid down in orientation o, with p's metadata
+# ---
+# dst: pattern to initialize; it owns the copy until dnit
+# a:   allocator for the copy
+# p:   pattern to copy
+# o:   orientation, below ORIENT_COUNT
+# ret: ok, or the allocator's refusal, leaving dst empty
+pub fun orient(dst: *Pattern, a: *allo.Allocator, p: *Pattern, o: u8) err[allo.Error] {
+    val e: err[allo.Error] = clone(dst, a, p);
+    if (sel e.err) { ret e; }
+    val w: usize           = width(p, o);
+    val h: usize           = height(p, o);
+    val r: err[allo.Error] = resize(dst, w, h);
+    if (sel r.err) {
+        dnit(dst);
+        ret r;
+    }
+    var y: usize = 0;
+    for (y < h) {
+        var x: usize = 0;
+        for (x < w) {
+            set(dst, x, y, get_oriented(p, o, x, y));
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    ret err[allo.Error].ok{};
+}
+
+# the world cell a pattern of size w x h is placed at when centered on a cell
+# ---
+# c: the cell's column or row
+# n: the pattern's width or height there
+pub fun corner(c: i64, n: usize) i64 {
+    ret c - (n / 2)::i64;
+}
+
+# overlay a pattern onto the world, centered on cell (cx, cy)
+#
+# the pattern's top-left lands at (cx - w/2, cy - h/2). dead pattern cells leave
+# the world untouched, so a stamp overlays rather than erases.
 # ---
 # s:  simulation to stamp onto
 # p:  pattern to place
 # cx: target column the pattern is centered on
 # cy: target row the pattern is centered on
 pub fun stamp(s: *sim.Sim, p: *Pattern, cx: i64, cy: i64) {
-    val ox: i64   = cx - (p.w / 2)::i64;
-    val oy: i64   = cy - (p.h / 2)::i64;
-    var y:  usize = 0;
-    for (y < p.h) {
-        var x: usize = 0;
-        for (x < p.w) {
-            if (get(p, x, y) != 0) { sim.paint(s, ox + x::i64, oy + y::i64, 1); }
-            x = x + 1;
-        }
-        y = y + 1;
-    }
+    place(s, p, corner(cx, p.w), corner(cy, p.h), false);
 }
 
 test stamp__places_a_glider_centered {
@@ -241,7 +416,14 @@ test stamp__places_a_glider_centered {
     val made: err[allo.Error] = sim.init(?s, ?a);
     if (sel made.err) { ret 1; }
 
-    var g: Pattern = glider();
+    var g: Pattern;
+    val b: err[allo.Error] = init(?g, ?a, 3, 3, "glider");
+    if (sel b.err) { ret 1; }
+    set(?g, 1, 0, 1);
+    set(?g, 2, 1, 1);
+    set(?g, 0, 2, 1);
+    set(?g, 1, 2, 1);
+    set(?g, 2, 2, 1);
     # centered on (0, 0): top-left at (-1, -1), across four chunks
     stamp(?s, ?g, 0, 0);
 
@@ -256,13 +438,68 @@ test stamp__places_a_glider_centered {
     if (sim.alive(?s, -1, -1))   { ret 1; }
     if (sim.population(?s) != 5) { ret 1; }
 
+    dnit(?g);
+    sim.dnit(?s);
+    ret 0;
+}
+
+test stamp__writes_a_large_pattern_and_replace_erases {
+    var a: allo.Allocator;
+    page.make(?a);
+
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+
+    # 400 x 300 with every third cell live, across many chunks
+    var p:   Pattern;
+    val big: err[allo.Error] = init(?p, ?a, 400, 300, "big");
+    if (sel big.err) { ret 2; }
+    var y: usize = 0;
+    for (y < 300) {
+        var x: usize = 0;
+        for (x < 400) {
+            if ((x + y) % 3 == 0) { set(?p, x, y, 1); }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    var live: usize = 0;
+    y = 0;
+    for (y < 300) {
+        var x: usize = 0;
+        for (x < 400) {
+            var n: usize = 0;
+            if (run(?p, x, y, ?n) != 0) { live = live + n; }
+            x = x + n;
+        }
+        y = y + 1;
+    }
+
+    if (!place(?s, ?p, -200, -150, false))                       { ret 3; }
+    if (sim.population(?s) != live)                              { ret 4; }
+    if (!sim.alive(?s, -200, -150) || sim.alive(?s, -199, -150)) { ret 5; }
+
+    # a pattern of dead cells replaces what it covers
+    var z:    Pattern;
+    val zero: err[allo.Error] = init(?z, ?a, 300, 200, "hole");
+    if (sel zero.err)                     { ret 6; }
+    if (!place(?s, ?z, -200, -150, true)) { ret 7; }
+    if (sim.alive(?s, -200, -150))        { ret 8; }
+    if (sim.population(?s) >= live)       { ret 9; }
+
+    dnit(?p);
+    dnit(?z);
     sim.dnit(?s);
     ret 0;
 }
 
 test set__toggles_custom_cells_in_place {
-    var p: Pattern;
-    init(?p, 16, 16, "custom");
+    var a: allo.Allocator;
+    page.make(?a);
+    var p:    Pattern;
+    val made: err[allo.Error] = init(?p, ?a, 16, 16, "custom");
+    if (sel made.err)       { ret 1; }
     if (get(?p, 3, 4) != 0) { ret 1; }
     set(?p, 3, 4, 1);
     if (get(?p, 3, 4) != 1) { ret 1; }
@@ -270,5 +507,126 @@ test set__toggles_custom_cells_in_place {
     if (get(?p, 3, 4) != 0) { ret 1; }
     # dimensions survive a clear
     if (p.w != 16 || p.h != 16) { ret 1; }
+    dnit(?p);
+    ret 0;
+}
+
+test clone__copies_cells_and_metadata {
+    var a: allo.Allocator;
+    page.make(?a);
+    var p:    Pattern;
+    val made: err[allo.Error] = init(?p, ?a, 5, 2, "src");
+    if (sel made.err) { ret 1; }
+    set(?p, 4, 1, 7);
+    set_rule(?p, "B36/S23");
+    set_comments(?p, "two lines");
+    p.x = -3;
+    var q: Pattern;
+    val c: err[allo.Error] = clone(?q, ?a, ?p);
+    if (sel c.err) { ret 2; }
+    dnit(?p);
+    if (get(?q, 4, 1) != 7 || q.w != 5 || q.h != 2 || q.x != -3)                        { ret 3; }
+    if (!string.str_equals(name(?q), "src") || !string.str_equals(rule(?q), "B36/S23")) { ret 4; }
+    if (!string.str_equals(comments(?q), "two lines"))                                  { ret 5; }
+    var n: usize = 0;
+    if (run(?q, 0, 1, ?n) != 0 || n != 4) { ret 6; }
+    dnit(?q);
+    ret 0;
+}
+
+test orient__all_eight_stamp_what_get_oriented_shows {
+    var a: allo.Allocator;
+    page.make(?a);
+
+    # the f-pentomino has no symmetry, so its eight orientations are all different
+    var p:    Pattern;
+    val made: err[allo.Error] = init(?p, ?a, 3, 3, "f");
+    if (sel made.err) { ret 1; }
+    set(?p, 1, 0, 1);
+    set(?p, 2, 0, 1);
+    set(?p, 0, 1, 1);
+    set(?p, 1, 1, 1);
+    set(?p, 1, 2, 1);
+
+    var seen: [8]u32;
+    var o:    u8 = 0;
+    for (o < ORIENT_COUNT) {
+        val w: usize = width(?p, o);
+        val h: usize = height(?p, o);
+
+        var s:  sim.Sim;
+        val sm: err[allo.Error] = sim.init(?s, ?a);
+        if (sel sm.err) { ret 2; }
+        var q:  Pattern;
+        val oe: err[allo.Error] = orient(?q, ?a, ?p, o);
+        if (sel oe.err) { ret 3; }
+        stamp(?s, ?q, 10, -7);
+        dnit(?q);
+
+        var sig: u32   = 0;
+        var y:   usize = 0;
+        for (y < h) {
+            var x: usize = 0;
+            for (x < w) {
+                val shown: bool = get_oriented(?p, o, x, y) != 0;
+                if (shown != sim.alive(?s, corner(10, w) + x::i64, corner(-7, h) + y::i64)) { ret 4; }
+                if (shown)                                                                  { sig = sig | (1::u32 << (y * 3 + x)::u32); }
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        if (sim.population(?s) != 5) { ret 5; }
+
+        var k: u8 = 0;
+        for (k < o) {
+            if (seen[k::usize] == sig) { ret 6; }
+            k = k + 1;
+        }
+        seen[o::usize] = sig;
+        sim.dnit(?s);
+        o = o + 1;
+    }
+
+    # four turns come back to the start, and a flip is its own inverse
+    var t: u8 = 5;
+    t = orient_turn(orient_turn(orient_turn(orient_turn(t))));
+    if (t != 5 || orient_flip(orient_flip(t)) != t) { ret 7; }
+    dnit(?p);
+    ret 0;
+}
+
+test orient__keys_act_on_the_shape_on_screen {
+    var a: allo.Allocator;
+    page.make(?a);
+    var p:    Pattern;
+    val made: err[allo.Error] = init(?p, ?a, 3, 2, "asym");
+    if (sel made.err) { ret 1; }
+    set(?p, 0, 0, 1);
+    set(?p, 1, 0, 1);
+    set(?p, 2, 1, 1);
+
+    var o: u8 = 0;
+    for (o < ORIENT_COUNT) {
+        val w: usize = width(?p, o);
+        val h: usize = height(?p, o);
+        val f: u8    = orient_flip(o);
+        val t: u8    = orient_turn(o);
+        if (width(?p, f) != w || height(?p, f) != h) { ret 2; }
+        if (width(?p, t) != h || height(?p, t) != w) { ret 3; }
+        var y: usize = 0;
+        for (y < h) {
+            var x: usize = 0;
+            for (x < w) {
+                # mirrored left to right
+                if (get_oriented(?p, f, x, y) != get_oriented(?p, o, w - 1 - x, y)) { ret 4; }
+                # turned clockwise, the new (y, h-1-x) cell is the old (x, y)
+                if (get_oriented(?p, t, h - 1 - y, x) != get_oriented(?p, o, x, y)) { ret 5; }
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        o = o + 1;
+    }
+    dnit(?p);
     ret 0;
 }

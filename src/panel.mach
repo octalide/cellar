@@ -1,7 +1,8 @@
 # the side panel: every control, grouped by task into collapsible sections
 #
-# run for stepping and speed, draw for the tool and the patterns, rule for the
-# kernel, view for colour and the camera, and files for saving and loading.
+# run for stepping, speed and the population graph, draw for the tool and the patterns, rule for the
+# kernel, view for colour and the camera, and files for the named worlds and
+# patterns in the data directory.
 # the panel is docked to the right edge and scrolls when its sections are
 # taller than the window. on a narrow window it floats over the world rather
 # than squeezing it.
@@ -9,21 +10,24 @@
 use gfx: boom.graphics;
 use cellar.app;
 use cellar.arrange;
+use cellar.command;
+use cellar.history;
 use cellar.kedit;
 use cellar.paths;
 use cellar.pattern;
-use cellar.persist;
 use cellar.render;
+use cellar.saves;
 use cellar.sim;
 use cellar.text;
 use cellar.theme;
 use cellar.ui;
 use cellar.world;
-use allo: std.allocator;
+use fs: std.filesystem;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
+use std.types.option.opt;
 use std.types.size.usize;
 use std.types.string.str;
 
@@ -32,19 +36,10 @@ val WIDTH:  f32 = 300.0;
 val HEADER: f32 = 48.0;
 # below this many unscaled pixels of window, the panel floats over the world
 val DOCK_MIN: f32 = 760.0;
+# unscaled height of the population graph
+val GRAPH: f32 = 64.0;
 # the version shown in the header
 val VERSION: str = $mach.project.version;
-
-# what the panel needs from the frame, and asks of it
-# ---
-# a:    allocator for file buffers
-# p:    the data directory
-# shot: set when a screenshot was asked for
-pub rec Deps {
-    a:    *allo.Allocator;
-    p:    *paths.Paths;
-    shot: bool;
-}
 
 # the panel's width in pixels for a window sw wide
 fun width(u: *ui.Ui, sw: f32) f32 {
@@ -89,13 +84,39 @@ fun areas(u: *ui.Ui, a: *app.App) {
     }
 }
 
-# save or load with the outcome flashed
-fun report(a: *app.App, ok: str, e: err[persist.Error]) {
-    if (sel e.err) {
-        app.say(a, persist.error_message(e.err));
-        ret;
+# the population over the recent samples, each held until the generation of
+# the next, and scaled so the largest fills the height
+fun graph(u: *ui.Ui, s: *sim.Sim) {
+    val h:  *history.History = world.recent(s);
+    val x0: f32              = u.x;
+    val x1: f32              = u.x + u.w;
+    val y0: f32              = u.y;
+    val y1: f32              = u.y + ui.px(u, GRAPH);
+    ui.rect(u, x0, y0, x1, y1, theme.WORLD, 1.0);
+    val peak: u64 = history.peak(h);
+    if (h.len != 0 && peak != 0) {
+        val pad:   f32   = ui.px(u, 4.0);
+        val first: u64   = history.gen_at(h, 0);
+        val span:  f32   = (history.gen_at(h, h.len - 1) - first + 1)::f32;
+        val gw:    f32   = (x1 - x0 - pad * 2.0) / span;
+        val gh:    f32   = y1 - y0 - pad * 2.0;
+        var i:     usize = 0;
+        for (i < h.len) {
+            var end: f32 = span;
+            if (i + 1 < h.len) { end = (history.gen_at(h, i + 1) - first)::f32; }
+            val l:   f32 = x0 + pad + (history.gen_at(h, i) - first)::f32 * gw;
+            val r:   f32 = x0 + pad + end * gw;
+            val top: f32 = y1 - pad - gh * history.pop_at(h, i)::f32 / peak::f32;
+            ui.rect(u, l, top, r, y1 - pad, theme.ACCENT, 0.8);
+            i = i + 1;
+        }
     }
-    app.say(a, ok);
+    ui.advance(u, y1 - y0);
+    var rd: [48]u8;
+    var o:  usize = text.buf_str(?rd[0], 0, "Population, peak ");
+    o     = text.buf_u64(?rd[0], o, peak);
+    rd[o] = 0;
+    ui.note(u, ?rd[0]);
 }
 
 fun run(u: *ui.Ui, a: *app.App, s: *sim.Sim) {
@@ -103,9 +124,11 @@ fun run(u: *ui.Ui, a: *app.App, s: *sim.Sim) {
     val h:  f32 = ui.px(u, ui.ROW);
     var go: str = "Play";
     if (world.running(s))                                                                              { go = "Pause"; }
-    if (ui.button_at(u, go, ui.cell_x0(u, 0, 2), u.y, ui.cell_x1(u, 0, 2), u.y + h, world.running(s))) { world.toggle(s); }
-    if (ui.button_at(u, "Step", ui.cell_x0(u, 1, 2), u.y, ui.cell_x1(u, 1, 2), u.y + h, false))        { world.step(s); }
+    if (ui.button_at(u, go, ui.cell_x0(u, 0, 3), u.y, ui.cell_x1(u, 0, 3), u.y + h, world.running(s))) { app.submit(a, command.Command.toggle{}); }
+    if (ui.button_at(u, "Step", ui.cell_x0(u, 1, 3), u.y, ui.cell_x1(u, 1, 3), u.y + h, false))        { app.submit(a, command.Command.step{}); }
+    if (ui.button_at(u, "Reset", ui.cell_x0(u, 2, 3), u.y, ui.cell_x1(u, 2, 3), u.y + h, false))       { app.submit(a, command.Command.reset{}); }
     ui.advance(u, h);
+    graph(u, s);
 
     var rd: [32]u8;
     var o:  usize = 0;
@@ -122,8 +145,8 @@ fun run(u: *ui.Ui, a: *app.App, s: *sim.Sim) {
     acts[0] = "Randomize";
     acts[1] = "Clear";
     val hit: usize = ui.buttons(u, ?acts[0], 2);
-    if (hit == 0) { world.randomize(s, app.bounds_size(a.bounds_idx)); }
-    if (hit == 1) { world.clear(s); }
+    if (hit == 0) { app.submit(a, command.Command.randomize{app.bounds_size(a.bounds_idx)}); }
+    if (hit == 1) { app.submit(a, command.Command.clear{}); }
     ui.note(u, "Randomize fills a square this wide");
     areas(u, a);
 }
@@ -164,7 +187,7 @@ fun look(u: *ui.Ui, a: *app.App) {
     scales[3] = "200%";
     ui.segmented(u, ?scales[0], app.SCALE_COUNT, ?a.scale_idx);
 
-    if (ui.button(u, "Frame the randomize area", false)) { a.refit = true; }
+    if (ui.button(u, "Frame the randomize area", false)) { app.frame_area(a); }
 }
 
 # show as much of the end of a long string as fits in w pixels
@@ -174,35 +197,86 @@ fun tail(f: *gfx.Font, s: str, w: f32) str {
     ret t;
 }
 
-fun files(u: *ui.Ui, a: *app.App, s: *sim.Sim, d: *Deps) {
+# save the world or the custom pattern under the typed name
+fun save(a: *app.App, p: *paths.Paths, kind: u8) {
+    val name: str = ui.field_text(?a.name);
+    if (!saves.usable(name)) {
+        app.say(a, "type a name to save under");
+        ret;
+    }
+    var fname: [80]u8;
+    var path:  [1152]u8;
+    paths.file(p, saves.file_name(name, kind, ?fname[0]), ?path[0]);
+    val f: opt[command.File] = app.file(a, ?path[0]);
+    if (sel f.none)               { ret; }
+    if (kind == saves.KIND_WORLD) { app.submit(a, command.Command.save_world{f.some}); }
+    or                            { app.submit(a, command.Command.save_pattern{f.some}); }
+}
+
+# load a listed file, a world as the world and a pattern as the custom pattern,
+# and take its name as the one to save under
+fun load(a: *app.App, p: *paths.Paths, e: *saves.Entry) {
+    var name: [80]u8;
+    ui.field_set(?a.name, saves.stem(e.name, ?name[0]));
+    var path: [1152]u8;
+    paths.file(p, e.name, ?path[0]);
+    val f: opt[command.File] = app.file(a, ?path[0]);
+    if (sel f.none)                 { ret; }
+    if (e.kind == saves.KIND_WORLD) { app.submit(a, command.Command.load_world{f.some}); }
+    or                              { app.submit(a, command.Command.load_pattern{f.some}); }
+}
+
+# a listed file as a row, its kind at the right; ret whether it was clicked
+fun entry(u: *ui.Ui, e: *saves.Entry) bool {
+    val h:    f32    = ui.px(u, 24.0);
+    val x0:   f32    = u.x;
+    val y0:   f32    = u.y;
+    val x1:   f32    = u.x + u.w;
+    val y1:   f32    = u.y + h;
+    val hh:   ui.Hit = ui.region(u, x0, y0, x1, y1);
+    val pad:  f32    = ui.px(u, 8.0);
+    var kind: str    = "pattern";
+    if (e.kind == saves.KIND_WORLD) { kind = "world"; }
+    if (hh.hot || hh.held)          { ui.rect(u, x0, y0, x1, y1, ui.fill(hh, false), 1.0); }
+    val kw: f32 = ui.measure(u.small, kind);
+    ui.text_mid(u, u.body, tail(u.body, e.name, x1 - x0 - kw - pad * 3.0), x0 + pad, y0, y1, theme.TEXT, 1.0);
+    ui.text_mid(u, u.small, kind, x1 - pad - kw, y0, y1, theme.TEXT_DIM, 1.0);
+    u.y = y1 + ui.px(u, 2.0);
+    ret hh.clicked;
+}
+
+fun files(u: *ui.Ui, a: *app.App, p: *paths.Paths) {
+    val was: u8 = a.open_files;
     if (!ui.heading(u, "FILES", ?a.open_files)) { ret; }
-    if (!d.p.ok) {
+    if (!p.ok) {
         ui.note(u, "no user data directory is known");
         ret;
     }
-    var world_path:  [1088]u8;
-    var custom_path: [1088]u8;
-    paths.file(d.p, paths.WORLD, ?world_path[0]);
-    paths.file(d.p, paths.CUSTOM, ?custom_path[0]);
-
-    var wl: [2]str;
-    wl[0] = "Save world";
-    wl[1] = "Load world";
-    val w: usize = ui.buttons(u, ?wl[0], 2);
-    if (w == 0) { report(a, "world saved", persist.save_world(d.a, s, ?world_path[0])); }
-    if (w == 1) { report(a, "world loaded", persist.load_world(d.a, s, ?world_path[0])); }
-
-    var pl: [2]str;
-    pl[0] = "Save pattern";
-    pl[1] = "Load pattern";
-    val q: usize = ui.buttons(u, ?pl[0], 2);
-    if (q == 0) { report(a, "custom pattern saved", persist.save_pattern(d.a, ?a.custom, ?custom_path[0])); }
-    if (q == 1) {
-        report(a, "custom pattern loaded", persist.load_pattern(d.a, ?a.custom, ?custom_path[0]));
-        a.pattern_sel = pattern.BUILTIN_COUNT;
+    # read the directory as the section opens and after each save
+    if (was == 0) { a.saves.stale = true; }
+    if (a.saves.stale) {
+        val listed: err[fs.FsError] = saves.refresh(?a.saves, paths.dir(p));
+        if (sel listed.err) { app.say(a, "the data directory could not be read"); }
     }
-    if (ui.button(u, "Screenshot", false)) { d.shot = true; }
-    ui.note(u, tail(u.small, paths.dir(d.p), u.w));
+
+    ui.text_field(u, ?a.name, "Name to save as");
+    var sl: [2]str;
+    sl[0] = "Save world";
+    sl[1] = "Save pattern";
+    val w: usize = ui.buttons(u, ?sl[0], 2);
+    if (w == 0) { save(a, p, saves.KIND_WORLD); }
+    if (w == 1) { save(a, p, saves.KIND_PATTERN); }
+
+    if (a.saves.items.len == 0) { ui.note(u, "No saved worlds or patterns yet"); }
+    or                          { ui.note(u, "Click a world to load it, a pattern to edit it"); }
+    var i: usize = 0;
+    for (i < a.saves.items.len) {
+        if (entry(u, ?a.saves.items.data[i])) { load(a, p, ?a.saves.items.data[i]); }
+        i = i + 1;
+    }
+    ui.space(u, 4.0);
+    if (ui.button(u, "Screenshot", false)) { a.shot = true; }
+    ui.note(u, tail(u.small, paths.dir(p), u.w));
 }
 
 # the header: name, version, and the help and hide buttons
@@ -234,10 +308,10 @@ fun restore(u: *ui.Ui, a: *app.App, sw: f32) {
 # u:  the interface
 # a:  application state
 # s:  the simulation, locked by the caller
-# d:  what the panel needs from the frame
+# p:  the data directory
 # sw: window width in pixels
 # sh: window height in pixels
-pub fun draw(u: *ui.Ui, a: *app.App, s: *sim.Sim, d: *Deps, sw: f32, sh: f32) {
+pub fun draw(u: *ui.Ui, a: *app.App, s: *sim.Sim, p: *paths.Paths, sw: f32, sh: f32) {
     if (a.panel == 0) {
         a.side_x0 = sw;
         restore(u, a, sw);
@@ -260,9 +334,9 @@ pub fun draw(u: *ui.Ui, a: *app.App, s: *sim.Sim, d: *Deps, sw: f32, sh: f32) {
     ui.column(u, x0 + pad, y0, sw - x0 - pad * 2.0);
     run(u, a, s);
     arrange.section(u, a);
-    kedit.section(u, s, ?a.open_rule);
+    kedit.section(u, a, s);
     look(u, a);
-    files(u, a, s, d);
+    files(u, a, p);
     a.content = u.y - y0 + ui.px(u, 12.0);
 
     # drawn last, so content scrolled up passes under it

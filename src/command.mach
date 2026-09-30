@@ -1,0 +1,219 @@
+# the world's pending edits, as data
+#
+# the panel, the keys and the tools never touch the simulation or the files
+# themselves. they push a command here and the frame applies the queue once, at
+# its start, before anything is recorded: a save reads the GPU's cells back,
+# which is only valid before the frame records, and an edit applied after it
+# would wait a frame on the GPU anyway. a command owns everything it needs, so
+# a queue of them is also a history that can be replayed or undone.
+
+use cellar.pattern;
+use cellar.rule;
+use cellar.space;
+use allo: std.allocator;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.types.bool.bool;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string;
+use std.types.string.OwnedString;
+use std.types.string.str;
+
+# a cell set live or dead
+# ---
+# x: column
+# y: row
+# v: 1 live, 0 dead
+pub rec Paint {
+    x: i64;
+    y: i64;
+    v: u8;
+}
+
+# every cell on the line from (x0, y0) to (x1, y1) set live or dead
+pub rec Line {
+    x0: i64;
+    y0: i64;
+    x1: i64;
+    y1: i64;
+    v:  u8;
+}
+
+# a pattern overlaid centred on (x, y)
+pub rec Stamp {
+    p: pattern.Pattern;
+    x: i64;
+    y: i64;
+}
+
+# copy the rectangle into the custom pattern and make it the stamp
+pub val AREA_COPY: u8 = 0;
+# copy the rectangle, then kill its cells
+pub val AREA_CUT: u8 = 1;
+# kill the rectangle's cells
+pub val AREA_CLEAR: u8 = 2;
+# kill every cell outside the rectangle
+pub val AREA_CLEAR_OUTSIDE: u8 = 3;
+# replace the rectangle with a random soup
+pub val AREA_FILL: u8 = 4;
+# flip every cell in the rectangle
+pub val AREA_INVERT: u8 = 5;
+# shrink the selection to the box its live cells span
+pub val AREA_SHRINK: u8 = 6;
+# say what the rectangle's pattern is: a still life, oscillator or spaceship
+pub val AREA_IDENTIFY: u8 = 7;
+# number of area operations
+pub val AREA_COUNT: u8 = 8;
+
+# an operation on a rectangle of the world, the selection it was asked on
+# ---
+# op:  what to do (AREA_*)
+# box: the rectangle, half-open
+pub rec Area {
+    op:  u8;
+    box: space.Box;
+}
+
+# a file a command reads or writes
+# ---
+# path: the file's path, owned by the command
+pub rec File {
+    path: OwnedString;
+}
+
+# text pasted from the clipboard, read as a pattern to stamp
+# ---
+# text: the clipboard's text, owned by the command
+# rule: also take the pattern's rule, when it names one cellar can run
+pub rec Paste {
+    text: OwnedString;
+    rule: bool;
+}
+
+# files dropped on the window, the first of which is opened
+# ---
+# file:    the first file, opened as open opens one
+# ignored: how many more were dropped with it and left alone
+pub rec Drop {
+    file:    File;
+    ignored: usize;
+}
+
+# one change to the world or to its files
+# ---
+# toggle:       start or pause stepping
+# step:         advance one generation
+# clear:        kill every cell
+# randomize:    replace the world with a random square this many cells across
+# paint:        set one cell
+# line:         set the cells along a line
+# stamp:        overlay a pattern
+# rule:         replace the rule
+# area:         operate on a rectangle
+# reset:        return to the world as it was when play last started
+# save_world:   write the world and the view to a file
+# load_world:   replace the world with a world file's
+# save_pattern: write the custom pattern to a file
+# load_pattern: replace the custom pattern with a pattern file's
+# open:         load a world file as the world, or stamp a pattern file of any
+#               format centred on the origin, taking its rule
+# undo:         put back what the newest change replaced (cellar.journal)
+# redo:         make the change undone last again
+# paste:        read clipboard text as a pattern and make it the stamp
+# drop:         open the first of the files dropped on the window
+pub tag Command: u8 {
+    toggle;
+    step;
+    clear;
+    randomize: usize;
+    paint:     Paint;
+    line:      Line;
+    stamp:     Stamp;
+    rule:      rule.Rule;
+    area:      Area;
+    reset;
+    save_world:   File;
+    load_world:   File;
+    save_pattern: File;
+    load_pattern: File;
+    open:         File;
+    undo;
+    redo;
+    paste: Paste;
+    drop:  Drop;
+}
+
+# commands waiting for the frame, oldest first
+#
+# the queue owns what its commands own, so every command leaves it through
+# release exactly once: clear frees what was applied, dnit what never was.
+# ---
+# items: the commands
+pub rec Queue {
+    items: Vector[Command];
+}
+
+# make an empty queue
+# ---
+# q: the queue
+# a: allocator for the commands and what they own, outliving the queue
+pub fun init(q: *Queue, a: *allo.Allocator) {
+    q.items = vector.init[Command](a);
+}
+
+# a file with its own copy of a path
+# ---
+# a:    allocator for the copy
+# path: the path
+# ret:  the file, or the allocator's refusal
+pub fun file(a: *allo.Allocator, path: str) res[File, allo.Error] {
+    val o: res[OwnedString, allo.Error] = string.owned_dup(a, path);
+    if (sel o.err) { ret res[File, allo.Error].err{o.err}; }
+    ret res[File, allo.Error].ok{File{path: o.ok}};
+}
+
+# the path a file names
+pub fun path(f: *File) str {
+    ret f.path.data;
+}
+
+# free what a command owns
+pub fun release(c: *Command) {
+    if (sel c.stamp)        { pattern.dnit(?c.stamp.p); }
+    if (sel c.save_world)   { string.owned_release(?c.save_world.path); }
+    if (sel c.load_world)   { string.owned_release(?c.load_world.path); }
+    if (sel c.save_pattern) { string.owned_release(?c.save_pattern.path); }
+    if (sel c.load_pattern) { string.owned_release(?c.load_pattern.path); }
+    if (sel c.open)         { string.owned_release(?c.open.path); }
+    if (sel c.paste)        { string.owned_release(?c.paste.text); }
+    if (sel c.drop)         { string.owned_release(?c.drop.file.path); }
+}
+
+# add a command to the end, which then owns it
+# ---
+# q:   the queue
+# c:   the command, whose owned data moves into the queue on success
+# ret: ok, or the allocator's refusal, leaving c with the caller
+pub fun push(q: *Queue, c: Command) err[allo.Error] {
+    val r: res[usize, allo.Error] = vector.push[Command](?q.items, c);
+    if (sel r.err) { ret err[allo.Error].err{r.err}; }
+    ret err[allo.Error].ok{};
+}
+
+# release every command and empty the queue, keeping its storage
+pub fun clear(q: *Queue) {
+    var i: usize = 0;
+    for (i < q.items.len) {
+        release(?q.items.data[i]);
+        i = i + 1;
+    }
+    vector.clear[Command](?q.items);
+}
+
+# release every command and the queue's storage
+pub fun dnit(q: *Queue) {
+    clear(q);
+    vector.dnit[Command](?q.items);
+}

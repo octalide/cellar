@@ -2,16 +2,17 @@
 #
 # the reference the GPU stages are checked against, and the engine where no
 # usable GPU exists. each chunk's cells are computed from the front cells of
-# its 3 by 3 block into its own back cells, and its census is written as it
-# goes, so no two jobs write the same memory. a cell well inside its chunk reads
-# its footprint from the chunk alone; one near an edge goes through the page
-# table, where a missing neighbour reads as dead. the rule is the one the step
-# stage applies, word for word.
+# its 3 by 3 block into its own back cells by the rule's family, and its census
+# is written as it goes, so no two jobs write the same memory.
 #
-# a chunk with no live cell in its 3 by 3 block as the step began only cools,
-# so it skips the footprint, and one that is also cold only clears.
+# a chunk with no live cell in its 3 by 3 block as the step began is stepped
+# as not busy, which lets its family skip the footprint, and one that is also
+# cold only clears. every family keeps the pool's background dead, a rule that
+# births on 0 included (see cellar.rule), so this holds under every rule.
 
-use cellar.kernel;
+use cellar.layout;
+use cellar.rule;
+use cellar.rules.weighted;
 use cellar.space;
 use cellar.team;
 use allo: std.allocator;
@@ -24,140 +25,38 @@ use std.types.error.err;
 use std.types.size.usize;
 
 rec Round {
-    sp: *space.Space;
-    k:  *kernel.Kernel;
-}
-
-# the next value of a cell given its value and the weighted sum around it
-# ---
-# k:   the rule
-# c:   the cell, age << 8 | heat
-# sum: the weighted count of live cells in its footprint
-# ret: the cell one generation on
-pub fun next(k: *kernel.Kernel, c: u32, sum: i32) u32 {
-    var live: u8 = 0;
-    if (c >= 256) { live = 1; }
-    if (kernel.next_state(k, live, sum) != 0) {
-        var age: u32 = (c >> 8) + 1;
-        if (age > space.AGE_MAX) { age = space.AGE_MAX; }
-        ret (age << 8) | 255;
-    }
-    val heat: u32 = c & 255;
-    if (heat > space.DECAY) { ret heat - space.DECAY; }
-    ret 0;
+    sp:   *space.Space;
+    r:    *rule.Rule;
+    gen:  u64;
+    sens: layout.Sense;
 }
 
 fun step_slot(arg: *u8, s: usize) {
-    val rd: *Round         = arg::*Round;
-    val sp: *space.Space   = rd.sp;
-    val k:  *kernel.Kernel = rd.k;
-    val e:  *u32           = ?sp.table[s * space.ENTRY];
-    val cn: *u32           = ?sp.census[s * space.CENSUS];
+    val rd: *Round       = arg::*Round;
+    val sp: *space.Space = rd.sp;
+    val e:  *u32         = ?sp.table[s * space.ENTRY];
+    val cn: *u32         = ?sp.census[s * space.CENSUS];
     if (e[11] == 0) { ret; }
     val out: *u32 = ?sp.back[s * space.CELLS];
 
     # the census as the step began says whether anything nearby is alive
-    # a rule that births from nothing (B0) touches every cell regardless
-    var busy: bool  = (k.birth & 1) != 0;
-    var q:    usize = 0;
+    var b: space.Block;
+    b.busy = false;
+    b.gen  = rd.gen;
+    var q: usize = 0;
     for (q < 9) {
-        if (e[q] != space.NONE && sp.before[e[q]::usize * space.CENSUS] != 0) { busy = true; }
+        b.nb[q] = nil;
+        if (e[q] != space.NONE) {
+            b.nb[q] = ?sp.cells[e[q]::usize * space.CELLS];
+            if (sp.before[e[q]::usize * space.CENSUS] != 0) { b.busy = true; }
+        }
         q = q + 1;
     }
-    if (!busy) {
-        val src:  *u32  = ?sp.cells[s * space.CELLS];
-        var warm: u32   = 0;
-        var i:    usize = 0;
-        if (sp.before[s * space.CENSUS + 1] == 0) { mem.zero[u32](out, space.CELLS); }
-        or {
-            for (i < space.CELLS) {
-                val heat: u32 = src[i] & 255;
-                out[i] = 0;
-                if (heat > space.DECAY) {
-                    out[i] = heat - space.DECAY;
-                    warm   = 1;
-                }
-                i = i + 1;
-            }
-        }
-        cn[0] = 0;
-        cn[1] = warm;
-        cn[2] = e[11];
-        cn[3] = 0;
-        ret;
-    }
-
-    # the front cells of the 3 by 3 block, nil where a chunk does not exist
-    var nb: [9]*u32;
-    var j:  usize = 0;
-    for (j < 9) {
-        nb[j] = nil;
-        if (e[j] != space.NONE) { nb[j] = ?sp.cells[e[j]::usize * space.CELLS]; }
-        j = j + 1;
-    }
-    val own:   *u32 = nb[4];
-    val r:     i64  = k.radius::i64;
-    val width: i64  = 2 * r + 1;
-    var live:  u32  = 0;
-    var warm:  u32  = 0;
-    var ly:    i64  = 0;
-    for (ly < 64) {
-        var lx: i64 = 0;
-        for (lx < 64) {
-            var sum:    i32  = 0;
-            val inside: bool = lx >= r && lx < 64 - r && ly >= r && ly < 64 - r;
-            var dy:     i64  = 0 - r;
-            for (dy <= r) {
-                var dx: i64 = 0 - r;
-                for (dx <= r) {
-                    val w: i32 = k.weights[((dy + r) * width + dx + r)::usize];
-                    if (w != 0) {
-                        var x: i64 = lx + dx;
-                        var y: i64 = ly + dy;
-                        var c: u32 = 0;
-                        if (inside) { c = own[(y * 64 + x)::usize]; }
-                        or {
-                            var cx: usize = 1;
-                            var cy: usize = 1;
-                            if (x < 0) {
-                                x  = x + 64;
-                                cx = 0;
-                            }
-                            or (x >= 64) {
-                                x  = x - 64;
-                                cx = 2;
-                            }
-                            if (y < 0) {
-                                y  = y + 64;
-                                cy = 0;
-                            }
-                            or (y >= 64) {
-                                y  = y - 64;
-                                cy = 2;
-                            }
-                            val src: *u32 = nb[cy * 3 + cx];
-                            if (src != nil) { c = src[(y * 64 + x)::usize]; }
-                        }
-                        if (c >= 256) { sum = sum + w; }
-                    }
-                    dx = dx + 1;
-                }
-                dy = dy + 1;
-            }
-            val i: usize = (ly * 64 + lx)::usize;
-            val v: u32   = next(k, own[i], sum);
-            out[i] = v;
-            if (v >= 256)       { live = live + 1; }
-            if ((v & 255) != 0) { warm = 1; }
-            lx = lx + 1;
-        }
-        ly = ly + 1;
-    }
-    cn[0] = live;
-    cn[1] = warm;
-    cn[2] = e[11];
-    cn[3] = 0;
-    if (live != 0) { cn[3] = space.MASK_ALL; }
+    b.out = out;
+    var t: space.Tally = space.tally(rd.sens);
+    if (!b.busy && sp.before[s * space.CENSUS + 1] == 0) { mem.zero[u32](out, space.CELLS); }
+    or                                                   { rule.step_chunk(rd.r, ?b, ?t); }
+    space.tally_census(?t, cn, e[11]);
 }
 
 # advance the pool one generation and reshape it around the result
@@ -166,14 +65,17 @@ fun step_slot(arg: *u8, s: usize) {
 # step wrote settles the pool, so the next generation again finds every live
 # chunk surrounded.
 # ---
-# sp:  the pool, with back cells
-# k:   the rule
+# sp:  the pool, with back cells, whose sense is the rule's
+# r:   the rule
+# gen: the generation the pool's cells hold
 # t:   the team to split the chunks across
 # ret: false when the pool could not hold a chunk the world grew into
-pub fun step(sp: *space.Space, k: *kernel.Kernel, t: *team.Team) bool {
+pub fun step(sp: *space.Space, r: *rule.Rule, gen: u64, t: *team.Team) bool {
     var rd: Round;
-    rd.sp = sp;
-    rd.k  = k;
+    rd.sp   = sp;
+    rd.r    = r;
+    rd.gen  = gen;
+    rd.sens = sp.sense;
     mem.copy[u32](sp.before, sp.census, sp.hi * space.CENSUS);
     team.run(t, step_slot, (?rd)::*u8, sp.hi);
     val front: *u32 = sp.cells;
@@ -190,23 +92,24 @@ test step__a_glider_crosses_chunk_borders_and_the_pool_follows {
     if (sel made.err) { ret 1; }
     var t: team.Team;
     team.start(?t);
-    var k: kernel.Kernel = kernel.life();
+    var r: rule.Rule = rule.Rule.weighted{weighted.life()};
+    sp.sense = rule.sense(?r);
 
     # a south-east glider just west and north of the origin's chunk corner
     val s: usize = space.alloc(?sp, -1, -1)::usize;
     val c: *u32  = ?sp.cells[s * space.CELLS];
-    c[60 * 64 + 61] = space.BORN;
-    c[61 * 64 + 62] = space.BORN;
-    c[62 * 64 + 60] = space.BORN;
-    c[62 * 64 + 61] = space.BORN;
-    c[62 * 64 + 62] = space.BORN;
+    c[60 * 64 + 61] = rule.word(?r, 1);
+    c[61 * 64 + 62] = rule.word(?r, 1);
+    c[62 * 64 + 60] = rule.word(?r, 1);
+    c[62 * 64 + 61] = rule.word(?r, 1);
+    c[62 * 64 + 62] = rule.word(?r, 1);
     space.recount(?sp, s);
     space.settle(?sp, sp.census, sp.hi, false);
 
     # 4 generations move it one cell diagonally; after 40 it lies inside (0, 0)
     var g: usize = 0;
     for (g < 40) {
-        if (!step(?sp, ?k, ?t)) { ret 2; }
+        if (!step(?sp, ?r, g::u64, ?t)) { ret 2; }
         g = g + 1;
     }
     if (space.population(?sp) != 5) { ret 3; }
@@ -214,8 +117,8 @@ test step__a_glider_crosses_chunk_borders_and_the_pool_follows {
     if (o == space.NONE) { ret 4; }
     # the glider's cells shifted by (10, 10) from where it started
     val d: *u32 = ?sp.cells[o::usize * space.CELLS];
-    if (d[6 * 64 + 7] < 256 || d[7 * 64 + 8] < 256 || d[8 * 64 + 6] < 256) { ret 5; }
-    if (d[8 * 64 + 7] < 256 || d[8 * 64 + 8] < 256)                        { ret 6; }
+    if (!space.live(?sp, d[6 * 64 + 7]) || !space.live(?sp, d[7 * 64 + 8]) || !space.live(?sp, d[8 * 64 + 6])) { ret 5; }
+    if (!space.live(?sp, d[8 * 64 + 7]) || !space.live(?sp, d[8 * 64 + 8]))                                    { ret 6; }
     # the chunk it started in is cold and empty by now, and its far corner freed
     if (space.find(?sp, -2, -2) != space.NONE) { ret 7; }
     team.stop(?t);

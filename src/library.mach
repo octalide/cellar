@@ -1,0 +1,405 @@
+# the bundled pattern library: classic Life patterns embedded as RLE
+#
+# each category is one file under res/patterns holding its patterns one after
+# another as ordinary RLE, see res/patterns/README.md. a pattern ends at its
+# body's '!', so adding one is appending its RLE to a file. adding a category
+# is its file and a row in category(). nothing else here knows a pattern.
+#
+# init indexes every pattern once, validating it through the format registry,
+# refusing one a pattern.Pattern cannot hold, and keeping its name. load decodes
+# one into a pattern.Pattern on demand through formats.load, which plans the
+# pattern sink before opening it.
+
+use cellar.format;
+use cellar.formats;
+use cellar.formats.adapt;
+use cellar.pattern;
+use allo: std.allocator;
+use std.allocator.page;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string;
+use std.types.string.OwnedString;
+use std.types.string.str;
+
+#[embed("../res/patterns/still-lifes.rle")]
+val STILL_LIFES: [_]u8;
+#[embed("../res/patterns/oscillators.rle")]
+val OSCILLATORS: [_]u8;
+#[embed("../res/patterns/spaceships.rle")]
+val SPACESHIPS:  [_]u8;
+#[embed("../res/patterns/guns.rle")]
+val GUNS:        [_]u8;
+#[embed("../res/patterns/puffers.rle")]
+val PUFFERS:     [_]u8;
+#[embed("../res/patterns/methuselahs.rle")]
+val METHUSELAHS: [_]u8;
+#[embed("../res/patterns/growth.rle")]
+val GROWTH:      [_]u8;
+
+# number of categories reachable through category()
+pub val CATEGORY_COUNT: usize = 7;
+
+# one category's file
+# ---
+# name: display label
+# p:    the file's bytes
+# n:    how many
+pub rec Category {
+    name: str;
+    p:    *u8;
+    n:    usize;
+}
+
+# the c-th category, for c in [0, CATEGORY_COUNT)
+pub fun category(c: usize) Category {
+    if (c == 1) { ret Category{name: "Oscillators", p: ?OSCILLATORS[0], n: $length_of(OSCILLATORS)}; }
+    if (c == 2) { ret Category{name: "Spaceships", p: ?SPACESHIPS[0], n: $length_of(SPACESHIPS)}; }
+    if (c == 3) { ret Category{name: "Guns", p: ?GUNS[0], n: $length_of(GUNS)}; }
+    if (c == 4) { ret Category{name: "Puffers", p: ?PUFFERS[0], n: $length_of(PUFFERS)}; }
+    if (c == 5) { ret Category{name: "Methuselahs", p: ?METHUSELAHS[0], n: $length_of(METHUSELAHS)}; }
+    if (c == 6) { ret Category{name: "Growth", p: ?GROWTH[0], n: $length_of(GROWTH)}; }
+    ret Category{name: "Still lifes", p: ?STILL_LIFES[0], n: $length_of(STILL_LIFES)};
+}
+
+# one indexed pattern
+# ---
+# cat:  its category
+# p:    its RLE, inside the category's bytes
+# n:    how many bytes
+# name: its name, owned by the library
+pub rec Entry {
+    cat:  usize;
+    p:    *u8;
+    n:    usize;
+    name: OwnedString;
+}
+
+# every bundled pattern, in category order and within one in its file's order
+# ---
+# a:     allocator behind the names and the vector
+# items: the entries
+pub rec Library {
+    a:     *allo.Allocator;
+    items: Vector[Entry];
+}
+
+fun is_blank(b: u8) bool {
+    ret b == ' ' || b == '\t' || b == '\r' || b == '\n';
+}
+
+# find the next pattern in a category's bytes
+#
+# a pattern starts at its first non-blank byte and ends with the line holding
+# the '!' that ends its body, after the "x = " header. one left unterminated
+# runs to the end of the file, for the decoder to refuse.
+# ---
+# p:     the bytes
+# n:     how many
+# at:    where to look from, left after the pattern
+# start: receives the pattern's first byte
+# len:   receives its length
+# ret:   whether there is one
+pub fun next_record(p: *u8, n: usize, at: *usize, start: *usize, len: *usize) bool {
+    var i: usize = @at;
+    for (i < n && is_blank(p[i])) { i = i + 1; }
+    if (i >= n) {
+        @at = n;
+        ret false;
+    }
+    @start = i;
+    var header: bool = false;
+    for (i < n) {
+        var e: usize = i;
+        for (e < n && p[e] != '\n') { e = e + 1; }
+        var f: usize = i;
+        for (f < e && is_blank(p[f])) { f = f + 1; }
+        if (!header) {
+            if (f < e && (p[f] == 'x' || p[f] == 'X')) { header = true; }
+        }
+        or {
+            var k: usize = f;
+            for (k < e && p[k] != '!') { k = k + 1; }
+            if (k < e) {
+                @len = e - @start;
+                @at  = e;
+                ret true;
+            }
+        }
+        i = e + 1;
+    }
+    @len = n - @start;
+    @at  = n;
+    ret true;
+}
+
+# the RLE format, from the registry
+fun rle() format.Format {
+    var f: format.Format;
+    formats.by_id("rle", ?f);
+    ret f;
+}
+
+# index every bundled pattern, validating each
+# ---
+# l:   library to initialize; it owns what it allocates until dnit
+# a:   allocator for the index, which must outlive it
+# ret: ok, or why a pattern was refused, leaving l empty
+pub fun init(l: *Library, a: *allo.Allocator) err[format.Error] {
+    l.a     = a;
+    l.items = vector.init[Entry](a);
+    var f: format.Format = rle();
+    var c: usize         = 0;
+    for (c < CATEGORY_COUNT) {
+        val k:  Category = category(c);
+        var at: usize    = 0;
+        var s:  usize    = 0;
+        var n:  usize    = 0;
+        for (next_record(k.p, k.n, ?at, ?s, ?n)) {
+            var info: format.Info;
+            format.info_init(?info, a);
+            val v: err[format.Error] = formats.validate(a, ?f, ?k.p[s], n, ?info);
+            if (sel v.err) {
+                format.info_dnit(?info);
+                dnit(l);
+                ret v;
+            }
+            # a pattern the library lists must fit a pattern.Pattern, as load plans it
+            if (info.bounded && !pattern.holds((info.x1 - info.x0)::u64, (info.y1 - info.y0)::u64)) {
+                format.info_dnit(?info);
+                dnit(l);
+                ret err[format.Error].err{format.Error.range{}};
+            }
+            val d: res[OwnedString, allo.Error] = string.owned_dup(a, format.text_of(?info.name));
+            format.info_dnit(?info);
+            if (sel d.err) {
+                dnit(l);
+                ret err[format.Error].err{format.Error.alloc{d.err}};
+            }
+            var e: Entry                  = Entry{cat: c, p: ?k.p[s], n: n, name: d.ok};
+            val r: res[usize, allo.Error] = vector.push[Entry](?l.items, e);
+            if (sel r.err) {
+                string.owned_release(?e.name);
+                dnit(l);
+                ret err[format.Error].err{format.Error.alloc{r.err}};
+            }
+        }
+        c = c + 1;
+    }
+    ret err[format.Error].ok{};
+}
+
+# release everything a library owns
+pub fun dnit(l: *Library) {
+    if (l.a == nil) { ret; }
+    var i: usize = 0;
+    for (i < l.items.len) {
+        string.owned_release(?l.items.data[i].name);
+        i = i + 1;
+    }
+    vector.dnit[Entry](?l.items);
+    l.a = nil;
+}
+
+# make a library that holds nothing, until init
+pub fun empty(l: *Library) {
+    l.a = nil;
+}
+
+# how many patterns the library holds, 0 before init
+pub fun count(l: *Library) usize {
+    if (l.a == nil) { ret 0; }
+    ret l.items.len;
+}
+
+# the i-th pattern's name, for i < count
+pub fun name(l: *Library, i: usize) str {
+    val o: *OwnedString = ?l.items.data[i].name;
+    if (o.data == nil) { ret ""; }
+    ret o.data;
+}
+
+# the i-th pattern's category, for i < count
+pub fun category_of(l: *Library, i: usize) usize {
+    ret l.items.data[i].cat;
+}
+
+# the index of the pattern with a name, compared without regard to case, or count when none has it
+pub fun find(l: *Library, s: str) usize {
+    var i: usize = 0;
+    for (i < count(l)) {
+        if (fold_equals(name(l, i), s)) { ret i; }
+        i = i + 1;
+    }
+    ret count(l);
+}
+
+# decode the i-th pattern into p
+# ---
+# l:   library
+# i:   index, below count
+# p:   initialized pattern, resized to the pattern and given its name and rule
+# ret: ok, or why it could not be decoded, leaving p holding what it held
+pub fun load(l: *Library, i: usize, p: *pattern.Pattern) err[format.Error] {
+    val e:    *Entry        = ?l.items.data[i];
+    var f:    format.Format = rle();
+    var ps:   adapt.PatternSink;
+    var info: format.Info;
+    format.info_init(?info, l.a);
+    val r: err[format.Error] = formats.load(l.a, ?f, e.p, e.n, adapt.pattern_sink(?ps, p), ?info);
+    format.info_dnit(?info);
+    ret r;
+}
+
+fun lower(c: u8) u8 {
+    if (c >= 'A' && c <= 'Z') { ret c + 32; }
+    ret c;
+}
+
+fun fold_equals(a: str, b: str) bool {
+    var i: usize = 0;
+    for (a[i] != 0 && lower(a[i]) == lower(b[i])) { i = i + 1; }
+    ret a[i] == 0 && b[i] == 0;
+}
+
+# whether text holds a query, compared without regard to case; an empty query is held by anything
+pub fun holds(text: str, query: str) bool {
+    if (query[0] == 0) { ret true; }
+    var i: usize = 0;
+    for (text[i] != 0) {
+        var k: usize = 0;
+        for (query[k] != 0 && text[i + k] != 0 && lower(text[i + k]) == lower(query[k])) { k = k + 1; }
+        if (query[k] == 0) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# whether the i-th pattern is listed: with a query, when its name holds it, and
+# with none, when it is in the category being browsed
+# ---
+# l:     library
+# i:     index, below count
+# query: the search text, empty for none
+# cat:   the category browsed while there is no query
+pub fun listed(l: *Library, i: usize, query: str, cat: usize) bool {
+    if (query[0] == 0) { ret category_of(l, i) == cat; }
+    ret holds(name(l, i), query);
+}
+
+test library__every_bundled_pattern_decodes {
+    var a: allo.Allocator;
+    page.make(?a);
+    var l: Library;
+    val m: err[format.Error] = init(?l, ?a);
+    if (sel m.err)       { ret 1; }
+    if (count(?l) < 250) { ret 2; }
+
+    var per: [7]usize;
+    var c:   usize = 0;
+    for (c < CATEGORY_COUNT) {
+        per[c] = 0;
+        c      = c + 1;
+    }
+    var p:  pattern.Pattern;
+    val pm: err[allo.Error] = pattern.init(?p, ?a, 0, 0, "");
+    if (sel pm.err) { ret 3; }
+    var i: usize = 0;
+    for (i < count(?l)) {
+        if (name(?l, i)[0] == 0) { ret 4; }
+        val r: err[format.Error] = load(?l, i, ?p);
+        if (sel r.err)                                         { ret 5; }
+        if (p.w == 0 || p.h == 0)                              { ret 6; }
+        if (!string.str_equals(pattern.name(?p), name(?l, i))) { ret 7; }
+        if (!string.str_equals(pattern.rule(?p), "B3/S23"))    { ret 8; }
+        # the box is tight: the first row and column hold a live cell
+        var top:  bool  = false;
+        var left: bool  = false;
+        var k:    usize = 0;
+        for (k < p.w) {
+            if (pattern.get(?p, k, 0) != 0) { top = true; }
+            k = k + 1;
+        }
+        k = 0;
+        for (k < p.h) {
+            if (pattern.get(?p, 0, k) != 0) { left = true; }
+            k = k + 1;
+        }
+        if (!top || !left) { ret 9; }
+        per[category_of(?l, i)] = per[category_of(?l, i)] + 1;
+        i                       = i + 1;
+    }
+    c = 0;
+    for (c < CATEGORY_COUNT) {
+        if (per[c] == 0) { ret 10; }
+        c = c + 1;
+    }
+
+    # the glider comes out as the classic three by three
+    val g: usize = find(?l, "glider");
+    if (g == count(?l)) { ret 11; }
+    val gl: err[format.Error] = load(?l, g, ?p);
+    if (sel gl.err)                                         { ret 12; }
+    if (p.w != 3 || p.h != 3 || pattern.get(?p, 1, 0) != 1) { ret 13; }
+    pattern.dnit(?p);
+    dnit(?l);
+    ret 0;
+}
+
+test library__search_filters_by_name {
+    var a: allo.Allocator;
+    page.make(?a);
+    var l: Library;
+    val m: err[format.Error] = init(?l, ?a);
+    if (sel m.err) { ret 1; }
+
+    # a query lists exactly the names holding it, whatever their case or category
+    var guns: usize = 0;
+    var cats: usize = 0;
+    var i:    usize = 0;
+    for (i < count(?l)) {
+        val shown: bool = listed(?l, i, "GLIDER gun", 0);
+        if (shown != holds(name(?l, i), "glider gun")) { ret 2; }
+        if (shown) {
+            guns = guns + 1;
+            if (category_of(?l, i) != 3) { cats = cats + 1; }
+        }
+        i = i + 1;
+    }
+    if (guns < 10 || guns >= count(?l))                          { ret 3; }
+    if (!listed(?l, find(?l, "Gosper glider gun"), "gosper", 0)) { ret 4; }
+
+    # no query lists the category browsed, and a query nothing holds lists nothing
+    var browsed: usize = 0;
+    i = 0;
+    for (i < count(?l)) {
+        if (listed(?l, i, "", 2))                              { browsed = browsed + 1; }
+        if (listed(?l, i, "", 2) != (category_of(?l, i) == 2)) { ret 5; }
+        if (listed(?l, i, "no such pattern", 0))               { ret 6; }
+        i = i + 1;
+    }
+    if (browsed == 0)                                                                                       { ret 7; }
+    if (!holds("Lightweight spaceship", "") || holds("", "x") || !holds("abc", "BC") || holds("ab", "abc")) { ret 8; }
+    dnit(?l);
+    ret 0;
+}
+
+test next_record__splits_on_the_body_end {
+    val text: str   = "\n#N one\r\n#C a ! in a comment\r\nx = 1, y = 1\r\no!\r\n#N two\nx = 2, y = 1\nb\no!\n\n\n";
+    val n:    usize = string.str_len(text);
+    var at:   usize = 0;
+    var s:    usize = 0;
+    var k:    usize = 0;
+    if (!next_record(text::*u8, n, ?at, ?s, ?k))      { ret 1; }
+    if (s != 1 || text[s + k - 1] != '\r')            { ret 2; }
+    if (!next_record(text::*u8, n, ?at, ?s, ?k))      { ret 3; }
+    if (text[s + 1] != 'N' || text[s + k - 1] != '!') { ret 4; }
+    if (next_record(text::*u8, n, ?at, ?s, ?k))       { ret 5; }
+    ret 0;
+}

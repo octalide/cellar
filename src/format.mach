@@ -1,0 +1,348 @@
+# the contract every pattern file format implements
+#
+# a format decodes bytes into a stream of cell runs and encodes a stream of cell
+# runs into bytes. it never touches a pattern or the world: decoded runs go to
+# an Emit, which forwards them to a Sink, and encoded runs come from a Source.
+# so a format that cannot hold its pattern in memory, such as a Macrocell
+# quadtree larger than the chunk pool, is as easy to write as a dense one.
+#
+# decoding runs more than once, see cellar.formats.load: a validating pass with
+# no sink that gathers the Info, a fitting pass that offers the runs to a sink
+# that measures them, and a writing pass that streams them into the sink once
+# the input is known to be good and to fit. so a decoder must be a pure function
+# of its bytes: same input, same runs, and no effect outside its Emit. it emits
+# only live cells, as runs of one nonzero state in any order that does not
+# overlap, with absolute coordinates, so a sink may rely on each cell arriving
+# at most once. dead cells are implicit.
+#
+# the validating pass has no sink to feed, so a decoder may fill the Info with
+# gather rather than emit its runs there, as long as the Info comes out as the
+# runs would have made it. a format whose runs can far outnumber its bytes, as
+# a quadtree's can, must, so validating a file costs no more than reading it.
+# on the other passes a decoder stops as soon as emit is refused, and a sink
+# that fits refuses once a pattern is past what it can hold, so no pass does
+# more than its sink can take.
+#
+# coordinates are i64 and a run's length a usize, so a format may describe
+# patterns far larger than memory. every number a decoder reads from its input
+# is bounded by LIMIT before it is used in arithmetic.
+#
+# an encoder reads its Source row by row, top to bottom and left to right within
+# a row, and may rewind it to read again, so a format that needs two passes over
+# the cells (a quadtree builder, a sizing pass) is expressible too.
+
+use allo: std.allocator;
+use std.collections.vector.Vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string;
+use std.types.string.OwnedString;
+use std.types.string.str;
+
+# the largest magnitude of any coordinate, count or side a format may accept, so
+# sums of a few of them never overflow an i64
+pub val LIMIT: i64 = 1099511627776;
+
+# Info.notes: the pattern has more than two states, which the simulation runs as live
+pub val NOTE_STATES: u32 = 1;
+
+# why a decode or encode did not complete
+# ---
+# alloc:       the allocator refused a buffer
+# malformed:   the bytes are not a valid file of this format
+# truncated:   the bytes end before the file does
+# range:       a number or coordinate is beyond LIMIT or the format's own bounds
+# sink:        the destination refused the pattern
+# unsupported: no format has this id, or it cannot write
+pub tag Error: u8 {
+    alloc: allo.Error;
+    malformed;
+    truncated;
+    range;
+    sink;
+    unsupported;
+}
+
+# a one-line description of a format failure
+# ---
+# e:   the failure
+# ret: static text naming the case
+pub fun error_message(e: Error) str {
+    if (sel e.alloc)     { ret "out of memory"; }
+    if (sel e.malformed) { ret "malformed pattern file"; }
+    if (sel e.truncated) { ret "truncated pattern file"; }
+    if (sel e.range)     { ret "number out of range"; }
+    if (sel e.sink)      { ret "pattern does not fit"; }
+    ret "unsupported format";
+}
+
+# what a pattern file says about itself, and the extent of its live cells
+# ---
+# a:        allocator backing the text; nil before info_init
+# name:     display label, empty when none
+# rule:     the rule string the file named, untouched, empty when none
+# comments: free text, lines joined by newlines, empty when none
+# states:   how many states the file uses, at least 2
+# bounded:  x0..y1 hold a box, false for an empty pattern
+# x0:       leftmost column of the box, inclusive
+# y0:       top row of the box, inclusive
+# x1:       right edge of the box, exclusive
+# y1:       bottom edge of the box, exclusive
+# live:     live cells emitted
+# notes:    NOTE_* flags, set once the decode is validated
+# at:       byte offset a failed decode stopped at
+pub rec Info {
+    a:        *allo.Allocator;
+    name:     OwnedString;
+    rule:     OwnedString;
+    comments: OwnedString;
+    states:   u32;
+    bounded:  bool;
+    x0:       i64;
+    y0:       i64;
+    x1:       i64;
+    y1:       i64;
+    live:     u64;
+    notes:    u32;
+    at:       usize;
+}
+
+# make an empty Info
+# ---
+# i: info to initialize; it owns what it allocates until info_dnit
+# a: allocator for its text, which must outlive it
+pub fun info_init(i: *Info, a: *allo.Allocator) {
+    i.a        = a;
+    i.name     = string.owned_adopt(a, nil, 0, 0);
+    i.rule     = string.owned_adopt(a, nil, 0, 0);
+    i.comments = string.owned_adopt(a, nil, 0, 0);
+    i.states   = 2;
+    i.bounded  = false;
+    i.x0       = 0;
+    i.y0       = 0;
+    i.x1       = 0;
+    i.y1       = 0;
+    i.live     = 0;
+    i.notes    = 0;
+    i.at       = 0;
+}
+
+# release everything an Info owns
+pub fun info_dnit(i: *Info) {
+    if (i.a == nil) { ret; }
+    string.owned_release(?i.name);
+    string.owned_release(?i.rule);
+    string.owned_release(?i.comments);
+    i.a = nil;
+}
+
+# an empty-text view of an owned string
+pub fun text_of(o: *OwnedString) str {
+    if (o.data == nil) { ret ""; }
+    ret o.data;
+}
+
+# replace an owned string with a copy of n bytes, cut short at a NUL
+# ---
+# a: allocator for the copy
+# o: string to replace
+# p: the bytes
+# n: how many
+pub fun set_text(a: *allo.Allocator, o: *OwnedString, p: *u8, n: usize) err[allo.Error] {
+    var len: usize = 0;
+    for (len < n && p[len] != 0) { len = len + 1; }
+    val r: res[*u8, allo.Error] = allo.allocate[u8](a, len + 1);
+    if (sel r.err) { ret err[allo.Error].err{r.err}; }
+    var i: usize = 0;
+    for (i < len) {
+        r.ok[i] = p[i];
+        i       = i + 1;
+    }
+    r.ok[len] = 0;
+    string.owned_release(o);
+    @o = string.owned_adopt(a, r.ok, len, len + 1);
+    ret err[allo.Error].ok{};
+}
+
+# replace an owned string with a copy of s
+pub fun set_str(a: *allo.Allocator, o: *OwnedString, s: str) err[allo.Error] {
+    ret set_text(a, o, s, string.str_len(s));
+}
+
+# widen an Info's box to hold [x0, x1) by [y0, y1), for a format that declares
+# an extent beyond its live cells
+pub fun cover(i: *Info, x0: i64, y0: i64, x1: i64, y1: i64) {
+    if (!i.bounded) {
+        i.bounded = true;
+        i.x0      = x0;
+        i.y0      = y0;
+        i.x1      = x1;
+        i.y1      = y1;
+        ret;
+    }
+    if (x0 < i.x0) { i.x0 = x0; }
+    if (y0 < i.y0) { i.y0 = y0; }
+    if (x1 > i.x1) { i.x1 = x1; }
+    if (y1 > i.y1) { i.y1 = y1; }
+}
+
+# set NOTE_* flags from what the decode gathered. the rule is not judged here, see cellar.rule.parse
+pub fun settle(i: *Info) {
+    i.notes = 0;
+    if (i.states > 2) { i.notes = i.notes | NOTE_STATES; }
+}
+
+fun lower(c: u8) u8 {
+    if (c >= 'A' && c <= 'Z') { ret c + 32; }
+    ret c;
+}
+
+# a place cells are written to, one run at a time
+#
+# a load asks the sink in order: plan with the validated Info, fit for every
+# live run when the sink fits, open, run for every live run, and close. plan
+# and fit only judge, and leave the destination as it was, so a pattern they
+# refuse costs nothing. open is the first step that changes the destination.
+# close is called once for every load plan accepted, whatever happened after,
+# and releases what plan and open took.
+# ---
+# ctx:   the sink's own state, passed back to each callback
+# plan:  the pattern is valid and lies inside info's box; false refuses it as
+#        one the sink cannot hold. nil when the box alone refuses nothing
+# fit:   n cells of state v from (x, y) rightward are coming; false refuses the
+#        pattern. nil when the sink needs only the box
+# open:  begin writing the pattern plan accepted; false when the destination
+#        cannot be written
+# run:   n cells of state v from (x, y) rightward; false when they cannot be kept
+# close: the load ended; false when the destination lost anything
+pub rec Sink {
+    ctx:   *u8;
+    plan:  fun(*u8, *Info) bool;
+    fit:   fun(*u8, i64, i64, usize, u8) bool;
+    open:  fun(*u8, *Info) bool;
+    run:   fun(*u8, i64, i64, usize, u8) bool;
+    close: fun(*u8) bool;
+}
+
+# the decoder's view of where its cells go
+# ---
+# sink: the destination, nil on the validating pass
+# info: what the decode gathers: metadata, bounds, counts
+# fits: the runs go to the sink's fit rather than its run
+pub rec Emit {
+    sink: *Sink;
+    info: *Info;
+    fits: bool;
+}
+
+# report n live cells of state v from (x, y) rightward
+#
+# a decoder calls this for every run and stops with Error.sink when it is false.
+# ---
+# e:   the decode's emit
+# x:   first column
+# y:   row
+# n:   cells
+# v:   state, 0 is ignored since dead cells are implicit
+# ret: false when the sink refused the run
+pub fun emit(e: *Emit, x: i64, y: i64, n: usize, v: u8) bool {
+    if (n == 0 || v == 0) { ret true; }
+    gather(e.info, x, y, x + n::i64, y + 1, n::u64, v);
+    if (e.sink == nil) { ret true; }
+    if (e.fits)        { ret e.sink.fit(e.sink.ctx, x, y, n, v); }
+    ret e.sink.run(e.sink.ctx, x, y, n, v);
+}
+
+# fold live cells into an Info as emitting them would, for a decoder that
+# knows their extent, count and highest state without listing them
+# ---
+# i:    the Info
+# x0:   leftmost live column, inclusive
+# y0:   top live row, inclusive
+# x1:   right edge, exclusive
+# y1:   bottom edge, exclusive
+# live: how many
+# top:  the highest state among them, nonzero
+pub fun gather(i: *Info, x0: i64, y0: i64, x1: i64, y1: i64, live: u64, top: u8) {
+    if (live == 0) { ret; }
+    cover(i, x0, y0, x1, y1);
+    if (top::u32 >= i.states) { i.states = top::u32 + 1; }
+    i.live = i.live + live;
+}
+
+# one run of live cells read from a Source
+# ---
+# x: first column
+# y: row
+# n: cells, at least 1
+# v: state, nonzero
+pub rec Run {
+    x: i64;
+    y: i64;
+    n: usize;
+    v: u8;
+}
+
+# the cells an encoder writes out
+#
+# runs come row by row from the top and left to right within a row, live cells
+# only, never overlapping, and rewind starts them again from the top.
+# ---
+# ctx:    the source's own state, passed back to each callback
+# x0:     left edge of the extent to write, inclusive
+# y0:     top edge, inclusive
+# x1:     right edge, exclusive
+# y1:     bottom edge, exclusive
+# states: how many states the cells use, at least 2
+# rewind: start over at the first run
+# next:   the next run, false when none remain
+pub rec Source {
+    ctx:    *u8;
+    x0:     i64;
+    y0:     i64;
+    x1:     i64;
+    y1:     i64;
+    states: u32;
+    rewind: fun(*u8);
+    next:   fun(*u8, *Run) bool;
+}
+
+# a pattern file format
+# ---
+# id:     short lowercase name, unique among formats
+# exts:   the file extensions it owns, lowercase without dots, space separated
+# sniff:  how likely the bytes are this format, 0 when certainly not, up to 100
+# decode: stream the file's live cells through an Emit, filling its Info. it
+#         allocates from the allocator it is given and frees it all before it returns
+# encode: write the source's cells to out, describing them with the Info's text.
+#         nil when the format is read only
+pub rec Format {
+    id:     str;
+    exts:   str;
+    sniff:  fun(*u8, usize) u32;
+    decode: fun(*allo.Allocator, *u8, usize, *Emit) err[Error];
+    encode: fun(*allo.Allocator, *Source, *Info, *Vector[u8]) err[Error];
+}
+
+# whether a format owns an extension
+# ---
+# f:   format
+# ext: extension without its dot, compared without regard to case
+pub fun has_ext(f: *Format, ext: str) bool {
+    var n: usize = 0;
+    for (ext[n] != 0) { n = n + 1; }
+    if (n == 0) { ret false; }
+    var i: usize = 0;
+    for (f.exts[i] != 0) {
+        var k: usize = 0;
+        for (k < n && f.exts[i + k] != 0 && f.exts[i + k] != ' ' && lower(f.exts[i + k]) == lower(ext[k])) { k = k + 1; }
+        if (k == n && (f.exts[i + k] == 0 || f.exts[i + k] == ' ')) { ret true; }
+        for (f.exts[i] != 0 && f.exts[i] != ' ') { i = i + 1; }
+        for (f.exts[i] == ' ') { i = i + 1; }
+    }
+    ret false;
+}

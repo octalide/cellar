@@ -1,0 +1,878 @@
+# what a pattern is: a still life, an oscillator or a spaceship, and its apgcode
+#
+# a copy of the pattern runs in a pool of its own, stepped on the CPU on the
+# caller's thread by the rule's family, so the user's world is never touched.
+# each generation the live cells' states, translated to their bounding box's
+# origin, are hashed, and the first generation whose form equals an earlier
+# one's, possibly moved, gives the period and the displacement. a form is known
+# by its size and two independent 64-bit hashes of its states, so two forms
+# that differ are told apart but for a chance of about 2^-128.
+#
+# a selection may hold several objects. cells farther apart than twice the
+# rule's radius share no neighbour, so they start out as separate objects; the
+# whole is still classified, and the count is reported alongside it.
+#
+# the API reads a pattern and a rule and writes a result, with no world, window
+# or GPU, so a headless run can use it as the app does.
+
+use cellar.cpu;
+use cellar.pattern;
+use cellar.rule;
+use cellar.rules.weighted;
+use cellar.space;
+use cellar.team;
+use cellar.text;
+use allo: std.allocator;
+use std.allocator.page;
+use mem: std.memory;
+use std.sync.atomic;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string;
+use std.types.string.str;
+
+# the most bytes an apgcode takes here, less its NUL: a prefix and eight strips
+# of forty columns
+pub val CODE_MAX: usize = 400;
+# the widest and tallest pattern given an apgcode, apgsearch's own bound
+pub val CODE_SIDE: usize = 40;
+# the most bytes describe writes, less its NUL
+pub val DESCRIBE_MAX: usize = 640;
+
+# how far a classification runs before giving up
+# ---
+# gens: generations to look for a repeat in
+# side: the widest or tallest the live cells may grow before the pattern is
+#       said to grow without repeating
+# stop: nil, or a flag another thread sets nonzero, atomically, to cancel the
+#       run, which is checked every generation
+pub rec Limits {
+    gens: u64;
+    side: usize;
+    stop: *i64;
+}
+
+# the limits the app classifies a selection under
+pub fun limits() Limits {
+    ret Limits{gens: 1024, side: 256, stop: nil};
+}
+
+# what became of the pattern
+# ---
+# empty:       nothing in it was alive
+# dies:        every cell was dead by generation at
+# still:       its form stays put from generation at on
+# oscillator:  its form returns in place every period generations from at on
+# spaceship:   its form returns moved by (dx, dy) every period generations
+# unsettled:   no earlier form returned within the generation limit
+# grows:       its live cells outgrew the side limit, or the pool, first
+# oversized:   its live cells span more than the side limit to begin with
+# cancelled:   the run was stopped through the limits' stop flag
+# unsupported: the rule cannot be classified here, as why says
+pub tag Fate: u8 {
+    empty;
+    dies;
+    still;
+    oscillator;
+    spaceship;
+    unsettled;
+    grows;
+    oversized;
+    cancelled;
+    unsupported;
+}
+
+# a classification
+# ---
+# fate:    what became of the pattern
+# at:      the generation it died, entered its cycle, or was given up on
+# period:  generations in a cycle, 1 for a still life
+# dx:      columns a cycle moves it, rightward
+# dy:      rows a cycle moves it, downward
+# objects: separate objects in the pattern as given
+# side:    the side limit it ran under
+# code:    the apgcode, NUL-terminated, empty when there is none
+# why:     why there is no apgcode for a cycle, or why the rule is unsupported
+pub rec Result {
+    fate:    Fate;
+    at:      u64;
+    period:  u64;
+    dx:      i64;
+    dy:      i64;
+    objects: usize;
+    side:    usize;
+    code:    [401]u8;
+    why:     str;
+}
+
+# a generation's form, as the search remembers it
+rec Seen {
+    h1: u64;
+    h2: u64;
+    x0: i64;
+    y0: i64;
+    w:  usize;
+    h:  usize;
+}
+
+# the copy being run, and the buffers reading it takes
+# ---
+# sp:   the pool
+# r:    the rule
+# grid: the current form, side * side states row-major
+# box:  where the current form lies
+# w:    its width
+# h:    its height
+# pop:  its live cells
+rec Run {
+    sp:   space.Space;
+    r:    *rule.Rule;
+    grid: *u8;
+    box:  space.Box;
+    w:    usize;
+    h:    usize;
+    pop:  usize;
+}
+
+# the box a pattern's live cells span, relative to its top-left corner
+fun live_box(p: *pattern.Pattern) opt[space.Box] {
+    var b:   space.Box = space.Box{x0: 0, y0: 0, x1: 0, y1: 0};
+    var any: bool      = false;
+    var y:   usize     = 0;
+    for (y < p.h) {
+        var x: usize = 0;
+        for (x < p.w) {
+            if (p.cells[y * p.w + x] != 0) {
+                val cx: i64 = x::i64;
+                val cy: i64 = y::i64;
+                if (!any || cx < b.x0)     { b.x0 = cx; }
+                if (!any || cy < b.y0)     { b.y0 = cy; }
+                if (!any || cx + 1 > b.x1) { b.x1 = cx + 1; }
+                if (!any || cy + 1 > b.y1) { b.y1 = cy + 1; }
+                any = true;
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    if (!any) { ret opt[space.Box].none{}; }
+    ret opt[space.Box].some{b};
+}
+
+# count the groups of live cells in a box of a pattern, two cells joining one
+# group when neither coordinate differs by more than reach
+# ---
+# a:     allocator for the search's marks
+# p:     the pattern
+# b:     the box its live cells span
+# reach: the distance across which cells can interact
+# ret:   the groups, or the allocator's refusal
+fun count_objects(a: *allo.Allocator, p: *pattern.Pattern, b: space.Box, reach: i64) res[usize, allo.Error] {
+    val w:  usize                = (b.x1 - b.x0)::usize;
+    val h:  usize                = (b.y1 - b.y0)::usize;
+    val rm: res[*u8, allo.Error] = allo.zallocate[u8](a, w * h);
+    if (sel rm.err) { ret res[usize, allo.Error].err{rm.err}; }
+    val rs: res[*u32, allo.Error] = allo.zallocate[u32](a, w * h);
+    if (sel rs.err) {
+        allo.deallocate[u8](a, rm.ok, w * h);
+        ret res[usize, allo.Error].err{rs.err};
+    }
+    val seen:  *u8   = rm.ok;
+    val stack: *u32  = rs.ok;
+    var n:     usize = 0;
+    var i:     usize = 0;
+    for (i < w * h) {
+        val px: usize = b.x0::usize + i % w;
+        val py: usize = b.y0::usize + i / w;
+        if (seen[i] == 0 && p.cells[py * p.w + px] != 0) {
+            n       = n + 1;
+            seen[i] = 1;
+            var top: usize = 1;
+            stack[0] = i::u32;
+            for (top > 0) {
+                top = top - 1;
+                val at: usize = stack[top]::usize;
+                val cx: i64   = (at % w)::i64;
+                val cy: i64   = (at / w)::i64;
+                var dy: i64   = 0 - reach;
+                for (dy <= reach) {
+                    var dx: i64 = 0 - reach;
+                    for (dx <= reach) {
+                        val x: i64 = cx + dx;
+                        val y: i64 = cy + dy;
+                        if (x >= 0 && y >= 0 && x < w::i64 && y < h::i64) {
+                            val j: usize = (y * w::i64 + x)::usize;
+                            if (seen[j] == 0 && p.cells[(b.y0 + y)::usize * p.w + (b.x0 + x)::usize] != 0) {
+                                seen[j]    = 1;
+                                stack[top] = j::u32;
+                                top        = top + 1;
+                            }
+                        }
+                        dx = dx + 1;
+                    }
+                    dy = dy + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    allo.deallocate[u8](a, seen, w * h);
+    allo.deallocate[u32](a, stack, w * h);
+    ret res[usize, allo.Error].ok{n};
+}
+
+# write the box of a pattern's live cells into the run's pool, its corner at the origin
+# ---
+# ret: false when the pool could not hold it
+fun load(run: *Run, p: *pattern.Pattern, b: space.Box) bool {
+    val sp: *space.Space = ?run.sp;
+    var y:  i64          = b.y0;
+    for (y < b.y1) {
+        var x: i64 = b.x0;
+        for (x < b.x1) {
+            val st: u8 = p.cells[y::usize * p.w + x::usize];
+            if (st != 0) {
+                val wx: i64 = x - b.x0;
+                val wy: i64 = y - b.y0;
+                val s:  u32 = space.alloc(sp, space.chunk_of(wx), space.chunk_of(wy));
+                if (s == space.NONE) { ret false; }
+                sp.cells[s::usize * space.CELLS + space.local_of(wy) * 64 + space.local_of(wx)] = rule.word(run.r, st::u32);
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    var s: usize = 0;
+    for (s < sp.hi) {
+        if (space.used(sp, s)) { space.recount(sp, s); }
+        s = s + 1;
+    }
+    ret space.settle(sp, sp.census, sp.hi, false);
+}
+
+# the box every cell in a state other than 0 spans, which for a family with
+# dying states is more than the live cells the census bounds: a dying cell
+# still decides where a birth can happen
+# ---
+# run: the run
+# ret: the box, or none when every cell is in state 0
+fun extent(run: *Run) opt[space.Box] {
+    val sp:  *space.Space = ?run.sp;
+    var b:   space.Box    = space.Box{x0: 0, y0: 0, x1: 0, y1: 0};
+    var any: bool         = false;
+    var s:   usize        = 0;
+    for (s < sp.hi) {
+        val cn: *u32 = ?sp.census[s * space.CENSUS];
+        # a chunk with no live or warm cell holds only state 0
+        if (space.used(sp, s) && (cn[0] != 0 || cn[1] != 0)) {
+            val ox: i64   = space.slot_x(sp, s) * space.SIDE;
+            val oy: i64   = space.slot_y(sp, s) * space.SIDE;
+            val c:  *u32  = ?sp.cells[s * space.CELLS];
+            var i:  usize = 0;
+            for (i < space.CELLS) {
+                if (c[i] != 0 && rule.state(run.r, c[i]) != 0) {
+                    val x: i64 = ox + (i & 63)::i64;
+                    val y: i64 = oy + (i >> 6)::i64;
+                    if (!any || x < b.x0)     { b.x0 = x; }
+                    if (!any || y < b.y0)     { b.y0 = y; }
+                    if (!any || x + 1 > b.x1) { b.x1 = x + 1; }
+                    if (!any || y + 1 > b.y1) { b.y1 = y + 1; }
+                    any = true;
+                }
+                i = i + 1;
+            }
+        }
+        s = s + 1;
+    }
+    if (!any) { ret opt[space.Box].none{}; }
+    ret opt[space.Box].some{b};
+}
+
+# read the run's current form into its grid, hashing it
+# ---
+# run:  the run, whose pool holds a cell in a state other than 0
+# side: the largest form the grid holds
+# f:    receives the form's place, size and hashes
+# ret:  false when the form is wider or taller than side
+fun read(run: *Run, side: usize, f: *Seen) bool {
+    val sp: *space.Space   = ?run.sp;
+    val ob: opt[space.Box] = extent(run);
+    if (sel ob.none) { ret false; }
+    val b: space.Box = ob.some;
+    val w: usize     = (b.x1 - b.x0)::usize;
+    val h: usize     = (b.y1 - b.y0)::usize;
+    if (w > side || h > side) { ret false; }
+    run.box = b;
+    run.w   = w;
+    run.h   = h;
+    run.pop = 0;
+    var h1: u64 = 0xcbf29ce484222325 ^ (w::u64 << 32) ^ h::u64;
+    var h2: u64 = 0x9e3779b97f4a7c15 + w::u64 * 0x100000001b3 + h::u64;
+    var y:  i64 = b.y0;
+    for (y < b.y1) {
+        val row: *u8 = ?run.grid[(y - b.y0)::usize * w];
+        var at:  i64 = b.x0;
+        for (at < b.x1) {
+            var stop: i64 = (space.chunk_of(at) + 1) * space.SIDE;
+            if (stop > b.x1) { stop = b.x1; }
+            val o:  usize = (at - b.x0)::usize;
+            val k:  usize = (stop - at)::usize;
+            val sl: u32   = space.find(sp, space.chunk_of(at), space.chunk_of(y));
+            if (sl == space.NONE) { mem.zero[u8](?row[o], k); }
+            or {
+                val c: *u32  = ?sp.cells[sl::usize * space.CELLS + space.local_of(y) * 64 + space.local_of(at)];
+                var i: usize = 0;
+                for (i < k) {
+                    row[o + i] = rule.state(run.r, c[i])::u8;
+                    i          = i + 1;
+                }
+            }
+            at = stop;
+        }
+        var x: usize = 0;
+        for (x < w) {
+            val v: u64 = row[x]::u64;
+            if (v != 0) { run.pop = run.pop + 1; }
+            h1 = (h1 ^ v) * 0x100000001b3;
+            h2 = (h2 ^ (v + 0x2d)) * 0xff51afd7ed558ccd;
+            h2 = h2 ^ (h2 >> 29);
+            x  = x + 1;
+        }
+        y = y + 1;
+    }
+    f.h1 = h1;
+    f.h2 = h2;
+    f.x0 = b.x0;
+    f.y0 = b.y0;
+    f.w  = w;
+    f.h  = h;
+    ret true;
+}
+
+# the extended Wechsler digits: a strip's column, or a count of blank ones
+val DIGITS: str = "0123456789abcdefghijklmnopqrstuvwxyz";
+
+# the state of the cell at (u, v) of a grid seen in orientation o: its axes
+# swapped when bit 0 is set, then mirrored left to right with bit 1 and top to
+# bottom with bit 2, which together are the eight symmetries of a rectangle
+fun oriented(g: *u8, w: usize, h: usize, o: usize, u: usize, v: usize) u8 {
+    var x: usize = u;
+    var y: usize = v;
+    if ((o & 1) != 0) {
+        x = v;
+        y = u;
+    }
+    if ((o & 2) != 0) { x = w - 1 - x; }
+    if ((o & 4) != 0) { y = h - 1 - y; }
+    ret g[y * w + x];
+}
+
+# encode a grid seen in one orientation in the extended Wechsler format
+#
+# the grid is cut into strips five rows tall, separated by z. each column of a
+# strip is one digit, 0 to v, its top row the least significant bit; a strip's
+# trailing blank columns are dropped, and a run of blank columns before a live
+# one is 0 for one, w for two, x for three and y then a digit for four to
+# thirty-nine. this is apgsearch's canonise_orientation, as the LifeWiki's
+# "Apgcode" page specifies the format (conwaylife.com/wiki/Apgcode).
+# ---
+# g:   the grid, w by h, row-major, at most CODE_SIDE on a side
+# o:   the orientation, as oriented reads it
+# out: receives the code, at least CODE_MAX bytes
+# ret: the bytes written, no NUL
+fun wechsler(g: *u8, w: usize, h: usize, o: usize, out: *u8) usize {
+    var cw: usize = w;
+    var ch: usize = h;
+    if ((o & 1) != 0) {
+        cw = h;
+        ch = w;
+    }
+    var n: usize = 0;
+    var v: usize = 0;
+    for (v * 5 < ch) {
+        if (v != 0) {
+            out[n] = 'z';
+            n      = n + 1;
+        }
+        var blank: usize = 0;
+        var u:     usize = 0;
+        for (u < cw) {
+            var col: usize = 0;
+            var k:   usize = 0;
+            for (k < 5 && v * 5 + k < ch) {
+                if (oriented(g, w, h, o, u, v * 5 + k) != 0) { col = col | ((1::usize) << k::u64); }
+                k = k + 1;
+            }
+            if (col == 0) { blank = blank + 1; }
+            or {
+                if (blank == 1) {
+                    out[n] = '0';
+                    n      = n + 1;
+                }
+                or (blank == 2) {
+                    out[n] = 'w';
+                    n      = n + 1;
+                }
+                or (blank == 3) {
+                    out[n] = 'x';
+                    n      = n + 1;
+                }
+                or (blank > 3) {
+                    out[n]     = 'y';
+                    out[n + 1] = DIGITS[blank - 4];
+                    n          = n + 2;
+                }
+                blank  = 0;
+                out[n] = DIGITS[col];
+                n      = n + 1;
+            }
+            u = u + 1;
+        }
+        v = v + 1;
+    }
+    ret n;
+}
+
+# whether code a, of na bytes, comes before code b in apgsearch's order:
+# shorter first, then the lesser in ASCII
+fun precedes(a: *u8, na: usize, b: *u8, nb: usize) bool {
+    if (na != nb) { ret na < nb; }
+    var i: usize = 0;
+    for (i < na) {
+        if (a[i] != b[i]) { ret a[i] < b[i]; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# fold the run's current form into the best body so far, over every orientation
+# ---
+# run:  the run, read
+# best: the best body so far, at least CODE_MAX bytes
+# nb:   its length, 0 while there is none
+fun canon_phase(run: *Run, best: *u8, nb: *usize) {
+    var t: [401]u8;
+    var o: usize = 0;
+    for (o < 8) {
+        val n: usize = wechsler(run.grid, run.w, run.h, o, ?t[0]);
+        if (@nb == 0 || precedes(?t[0], n, best, @nb)) {
+            mem.copy[u8](best, ?t[0], n);
+            @nb = n;
+        }
+        o = o + 1;
+    }
+}
+
+# the run's cycle's apgcode into out.code, or why there is none into out.why
+#
+# the canonical code is the least, in apgsearch's order, over every phase of
+# the cycle and every orientation of each, after a prefix naming the kind:
+# xs and the population for a still life, xp and the period for an
+# oscillator, xq and the period for a spaceship. the run's pool stands at the
+# cycle's first phase, and is left at its last.
+# ---
+# ret: false when the pool could not be stepped
+fun apgcode(run: *Run, t: *team.Team, out: *Result) bool {
+    var best: [401]u8;
+    var nb:   usize = 0;
+    var wide: bool  = false;
+    var f:    Seen;
+    var i:    u64   = 0;
+    for (i < out.period) {
+        # the pool stands at generation out.at + out.period as the cycle begins
+        if (i != 0 && !cpu.step(?run.sp, run.r, out.at + out.period + i - 1, t)) { ret false; }
+        if (!read(run, CODE_SIDE, ?f))                                           { wide = true; }
+        or                                                                       { canon_phase(run, ?best[0], ?nb); }
+        i = i + 1;
+    }
+    if (wide) {
+        out.why = "a phase is more than 40 cells across, beyond what apgcodes encode here";
+        ret true;
+    }
+    var o: usize = 0;
+    if (sel out.fate.still) {
+        o = text.buf_str(?out.code[0], o, "xs");
+        o = text.buf_u64(?out.code[0], o, run.pop::u64);
+    }
+    or (sel out.fate.oscillator) {
+        o = text.buf_str(?out.code[0], o, "xp");
+        o = text.buf_u64(?out.code[0], o, out.period);
+    }
+    or {
+        o = text.buf_str(?out.code[0], o, "xq");
+        o = text.buf_u64(?out.code[0], o, out.period);
+    }
+    out.code[o] = '_';
+    mem.copy[u8](?out.code[o + 1], ?best[0], nb);
+    out.code[o + 1 + nb] = 0;
+    ret true;
+}
+
+# classify a pattern under a rule by running a copy of it
+#
+# the pattern's states are the rule's (pattern.Pattern). an apgcode is given
+# for a cycle of one object under a Life-like rule, the rules Catagolue's
+# prefixes name; otherwise why says what stands in the way.
+# ---
+# a:   allocator for the copy and the search, released before return
+# r:   the rule
+# p:   the pattern
+# lim: how far to run
+# out: receives the classification
+# ret: ok, or the allocator's refusal, leaving out's fate unsupported
+pub fun classify(a: *allo.Allocator, r: *rule.Rule, p: *pattern.Pattern, lim: Limits, out: *Result) err[allo.Error] {
+    out.fate    = Fate.unsupported{};
+    out.at      = 0;
+    out.period  = 0;
+    out.dx      = 0;
+    out.dy      = 0;
+    out.objects = 0;
+    out.side    = lim.side;
+    out.code[0] = 0;
+    out.why     = "";
+    val caps: rule.Caps = rule.caps(r);
+    if (caps.b0) {
+        out.why = "the rule gives birth where nothing is alive, so no pattern stays finite";
+        ret err[allo.Error].ok{};
+    }
+    val lb: opt[space.Box] = live_box(p);
+    if (sel lb.none) {
+        out.fate = Fate.empty{};
+        ret err[allo.Error].ok{};
+    }
+    val b: space.Box = lb.some;
+    if ((b.x1 - b.x0)::usize > lim.side || (b.y1 - b.y0)::usize > lim.side) {
+        out.fate = Fate.oversized{};
+        ret err[allo.Error].ok{};
+    }
+    val objs: res[usize, allo.Error] = count_objects(a, p, b, 2 * rule.radius(r)::i64);
+    if (sel objs.err) { ret err[allo.Error].err{objs.err}; }
+    out.objects = objs.ok;
+
+    var run: Run;
+    run.r = r;
+    val made: err[allo.Error] = space.init(?run.sp, a, true);
+    if (sel made.err) { ret made; }
+    fin { space.dnit(?run.sp); }
+    run.sp.sense = rule.sense(r);
+    # a form side cells across spans side / 64 + 1 chunks, and the pool keeps a
+    # ring of chunks around those
+    val span: usize = lim.side / space.SIDE::usize + 3;
+    run.sp.max_slots = span * span;
+    val rg: res[*u8, allo.Error] = allo.zallocate[u8](a, lim.side * lim.side);
+    if (sel rg.err) { ret err[allo.Error].err{rg.err}; }
+    run.grid = rg.ok;
+    fin { allo.deallocate[u8](a, run.grid, lim.side * lim.side); }
+    val rs: res[*Seen, allo.Error] = allo.zallocate[Seen](a, (lim.gens + 1)::usize);
+    if (sel rs.err) { ret err[allo.Error].err{rs.err}; }
+    val seen: *Seen = rs.ok;
+    fin { allo.deallocate[Seen](a, seen, (lim.gens + 1)::usize); }
+    if (!load(?run, p, b)) {
+        out.fate = Fate.grows{};
+        ret err[allo.Error].ok{};
+    }
+
+    # a team with no helpers runs every job on the caller's thread
+    var t: team.Team;
+    t.helpers = 0;
+    var g: u64 = 0;
+    for {
+        if (lim.stop != nil && atomic.load(lim.stop) != 0) {
+            out.fate = Fate.cancelled{};
+            out.at   = g;
+            ret err[allo.Error].ok{};
+        }
+        val alive: opt[space.Box] = extent(?run);
+        if (sel alive.none) {
+            out.fate = Fate.dies{};
+            out.at   = g;
+            ret err[allo.Error].ok{};
+        }
+        var f: Seen;
+        if (!read(?run, lim.side, ?f)) {
+            out.fate = Fate.grows{};
+            out.at   = g;
+            ret err[allo.Error].ok{};
+        }
+        var j: u64 = 0;
+        for (j < g) {
+            val e: *Seen = ?seen[j::usize];
+            if (e.h1 == f.h1 && e.h2 == f.h2 && e.w == f.w && e.h == f.h) { brk; }
+            j = j + 1;
+        }
+        if (j < g) {
+            out.at     = j;
+            out.period = g - j;
+            out.dx     = f.x0 - seen[j::usize].x0;
+            out.dy     = f.y0 - seen[j::usize].y0;
+            if (out.dx != 0 || out.dy != 0) { out.fate = Fate.spaceship{}; }
+            or (out.period == 1)            { out.fate = Fate.still{}; }
+            or                              { out.fate = Fate.oscillator{}; }
+            if (out.objects > 1)            { out.why = "the selection holds more than one object, and an apgcode names one"; }
+            or (!caps.life_like)            { out.why = "apgcodes name patterns of Life-like rules only"; }
+            or (!apgcode(?run, ?t, out))    { out.why = "the copy outgrew its pool"; }
+            ret err[allo.Error].ok{};
+        }
+        seen[g::usize] = f;
+        if (g == lim.gens) {
+            out.fate = Fate.unsettled{};
+            out.at   = g;
+            ret err[allo.Error].ok{};
+        }
+        if (!cpu.step(?run.sp, r, g, ?t)) {
+            out.fate = Fate.grows{};
+            out.at   = g;
+            ret err[allo.Error].ok{};
+        }
+        g = g + 1;
+    }
+    ret err[allo.Error].ok{};
+}
+
+# the greatest common divisor of two counts
+fun gcd(a: u64, b: u64) u64 {
+    var x: u64 = a;
+    var y: u64 = b;
+    for (y != 0) {
+        val t: u64 = x % y;
+        x = y;
+        y = t;
+    }
+    ret x;
+}
+
+fun magnitude(v: i64) u64 {
+    if (v < 0) { ret (0 - v)::u64; }
+    ret v::u64;
+}
+
+# write a spaceship's speed, as kc/n reduced, and the way it travels
+fun speed(buf: *u8, off: usize, r: *Result) usize {
+    val ax: u64 = magnitude(r.dx);
+    val ay: u64 = magnitude(r.dy);
+    var k:  u64 = ax;
+    if (ay > k) { k = ay; }
+    val d:   u64   = gcd(k, r.period);
+    val num: u64   = k / d;
+    val den: u64   = r.period / d;
+    var o:   usize = off;
+    if (num != 1) { o = text.buf_u64(buf, o, num); }
+    o = text.buf_str(buf, o, "c");
+    if (den != 1) {
+        o = text.buf_str(buf, o, "/");
+        o = text.buf_u64(buf, o, den);
+    }
+    if (ax == 0 || ay == 0) { ret text.buf_str(buf, o, " orthogonal"); }
+    if (ax == ay)           { ret text.buf_str(buf, o, " diagonal"); }
+    ret text.buf_str(buf, o, " oblique");
+}
+
+# write a classification as one line of text, for a flash or a headless run
+# ---
+# r:   the classification
+# buf: at least DESCRIBE_MAX + 1 bytes
+# ret: buf
+pub fun describe(r: *Result, buf: *u8) str {
+    var o: usize = 0;
+    if (sel r.fate.empty) { o = text.buf_str(buf, o, "nothing is alive"); }
+    or (sel r.fate.dies) {
+        o = text.buf_str(buf, o, "dies out by generation ");
+        o = text.buf_u64(buf, o, r.at);
+    }
+    or (sel r.fate.unsettled) {
+        o = text.buf_str(buf, o, "no earlier form returns within ");
+        o = text.buf_u64(buf, o, r.at);
+        o = text.buf_str(buf, o, " generations");
+    }
+    or (sel r.fate.grows) {
+        o = text.buf_str(buf, o, "grows past ");
+        o = text.buf_u64(buf, o, r.side::u64);
+        o = text.buf_str(buf, o, " cells across by generation ");
+        o = text.buf_u64(buf, o, r.at);
+        o = text.buf_str(buf, o, " without repeating");
+    }
+    or (sel r.fate.oversized) {
+        o = text.buf_str(buf, o, "the live cells span more than ");
+        o = text.buf_u64(buf, o, r.side::u64);
+        o = text.buf_str(buf, o, " cells, too many to classify");
+    }
+    or (sel r.fate.cancelled) { o = text.buf_str(buf, o, "identifying was cancelled"); }
+    or (sel r.fate.unsupported) {
+        o = text.buf_str(buf, o, "cannot classify: ");
+        o = text.buf_str(buf, o, r.why);
+    }
+    or {
+        if (r.objects > 1) {
+            o = text.buf_u64(buf, o, r.objects::u64);
+            o = text.buf_str(buf, o, " separate objects, together ");
+        }
+        if (sel r.fate.still) { o = text.buf_str(buf, o, "a still life"); }
+        or (sel r.fate.oscillator) {
+            o = text.buf_str(buf, o, "a period ");
+            o = text.buf_u64(buf, o, r.period);
+            o = text.buf_str(buf, o, " oscillator");
+        }
+        or {
+            o = text.buf_str(buf, o, "a ");
+            o = speed(buf, o, r);
+            o = text.buf_str(buf, o, " spaceship moving (");
+            o = text.buf_i64(buf, o, r.dx);
+            o = text.buf_str(buf, o, ", ");
+            o = text.buf_i64(buf, o, r.dy);
+            o = text.buf_str(buf, o, ") every ");
+            o = text.buf_u64(buf, o, r.period);
+            o = text.buf_str(buf, o, " generations");
+        }
+        if (r.at != 0) {
+            o = text.buf_str(buf, o, " from generation ");
+            o = text.buf_u64(buf, o, r.at);
+        }
+        if (r.code[0] != 0) {
+            o = text.buf_str(buf, o, ", ");
+            o = text.buf_str(buf, o, ?r.code[0]);
+        }
+        or {
+            o = text.buf_str(buf, o, "; no apgcode: ");
+            o = text.buf_str(buf, o, r.why);
+        }
+    }
+    buf[o] = 0;
+    ret buf;
+}
+
+# a pattern from rows split by '/', O live, D the first dying state and
+# anything else dead
+#[testing]
+pub fun rows(p: *pattern.Pattern, a: *allo.Allocator, s: str) bool {
+    var w: usize = 0;
+    var h: usize = 0;
+    var n: usize = 0;
+    var i: usize = 0;
+    for {
+        if (s[i] == '/' || s[i] == 0) {
+            if (n > w) { w = n; }
+            h = h + 1;
+            n = 0;
+            if (s[i] == 0) { brk; }
+        }
+        or { n = n + 1; }
+        i = i + 1;
+    }
+    val made: err[allo.Error] = pattern.init(p, a, w, h, "test");
+    if (sel made.err) { ret false; }
+    var x: usize = 0;
+    var y: usize = 0;
+    i = 0;
+    for (s[i] != 0) {
+        if (s[i] == '/') {
+            x = 0;
+            y = y + 1;
+        }
+        or {
+            if (s[i] == 'O') { pattern.set(p, x, y, 1); }
+            if (s[i] == 'D') { pattern.set(p, x, y, 2); }
+            x = x + 1;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# classify rows under a rule, 0 when the result is as expected
+#[testing]
+fun expect(r: rule.Rule, s: str, fate: Fate, period: u64, dx: i64, dy: i64, code: str) i32 {
+    var a: allo.Allocator;
+    page.make(?a);
+    var p: pattern.Pattern;
+    if (!rows(?p, ?a, s)) { ret 1; }
+    var rr:  rule.Rule       = r;
+    var got: Result;
+    val ran: err[allo.Error] = classify(?a, ?rr, ?p, limits(), ?got);
+    pattern.dnit(?p);
+    if (sel ran.err) { ret 2; }
+    var line: [641]u8;
+    describe(?got, ?line[0]);
+    if (fate_id(got.fate) != fate_id(fate))                   { ret 3; }
+    if (got.period != period || got.dx != dx || got.dy != dy) { ret 4; }
+    if (!string.str_equals(?got.code[0], code))               { ret 5; }
+    if (code[0] == 0 && period != 0 && got.why[0] == 0)       { ret 6; }
+    ret 0;
+}
+
+# a fate's case as a number, for comparing two
+#[testing]
+pub fun fate_id(f: Fate) u8 {
+    if (sel f.empty)      { ret 0; }
+    if (sel f.dies)       { ret 1; }
+    if (sel f.still)      { ret 2; }
+    if (sel f.oscillator) { ret 3; }
+    if (sel f.spaceship)  { ret 4; }
+    if (sel f.unsettled)  { ret 5; }
+    if (sel f.grows)      { ret 6; }
+    if (sel f.oversized)  { ret 7; }
+    if (sel f.cancelled)  { ret 8; }
+    ret 9;
+}
+
+#[testing]
+pub fun life() rule.Rule {
+    ret rule.Rule.weighted{weighted.life()};
+}
+
+val PULSAR: str = "..OOO...OOO../............./O....O.O....O/O....O.O....O/O....O.O....O/..OOO...OOO../............./..OOO...OOO../O....O.O....O/O....O.O....O/O....O.O....O/............./..OOO...OOO..";
+
+test classify__names_still_lifes_and_oscillators_by_their_catagolue_codes {
+    if (expect(life(), "OO/OO", Fate.still{}, 1, 0, 0, "xs4_33") != 0)                                            { ret 1; }
+    if (expect(life(), ".OO./O..O/.OO.", Fate.still{}, 1, 0, 0, "xs6_696") != 0)                                  { ret 2; }
+    if (expect(life(), "OOO", Fate.oscillator{}, 2, 0, 0, "xp2_7") != 0)                                          { ret 3; }
+    if (expect(life(), ".OOO/OOO.", Fate.oscillator{}, 2, 0, 0, "xp2_7e") != 0)                                   { ret 4; }
+    if (expect(life(), PULSAR, Fate.oscillator{}, 3, 0, 0, "xp3_co9nas0san9oczgoldlo0oldlogz1047210127401") != 0) { ret 5; }
+    ret 0;
+}
+
+test classify__names_spaceships_with_their_displacement {
+    # this glider phase moves down and to the right, the LWSS to the left
+    if (expect(life(), ".O./..O/OOO", Fate.spaceship{}, 4, 1, 1, "xq4_153") != 0)               { ret 1; }
+    if (expect(life(), ".O..O/O..../O...O/OOOO.", Fate.spaceship{}, 4, -2, 0, "xq4_6frc") != 0) { ret 2; }
+    ret 0;
+}
+
+test classify__reports_several_objects_and_a_dying_pattern_honestly {
+    # a block and a blinker far enough apart to share no neighbour cycle together with period 2
+    var a: allo.Allocator;
+    page.make(?a);
+    var p: pattern.Pattern;
+    if (!rows(?p, ?a, "OO......./OO......./........./......OOO")) { ret 1; }
+    var r:   rule.Rule       = life();
+    var got: Result;
+    val ran: err[allo.Error] = classify(?a, ?r, ?p, limits(), ?got);
+    pattern.dnit(?p);
+    if (sel ran.err)                                 { ret 2; }
+    if (!sel got.fate.oscillator || got.period != 2) { ret 3; }
+    if (got.objects != 2 || got.code[0] != 0)        { ret 4; }
+    # a domino dies in one generation, and nothing at all is empty
+    if (expect(life(), "OO", Fate.dies{}, 0, 0, 0, "") != 0)   { ret 5; }
+    if (expect(life(), "...", Fate.empty{}, 0, 0, 0, "") != 0) { ret 6; }
+    ret 0;
+}
+
+test classify__gives_no_apgcode_under_a_rule_that_is_not_life_like {
+    # Life on a radius-2 footprint whose outer ring weighs nothing steps as Life does
+    var k: weighted.Kernel = weighted.life();
+    weighted.set_radius(?k, 2);
+    if (expect(rule.Rule.weighted{k}, "OOO", Fate.oscillator{}, 2, 0, 0, "") != 0) { ret 1; }
+    ret 0;
+}
+
+test classify__finds_a_spaceship_under_a_generations_rule {
+    # Brian's Brain's c/1 ship: two live cells with the two dying cells they left behind
+    val bb: res[rule.Rule, str] = rule.parse("B2/S/C3");
+    if (sel bb.err)                                                 { ret 1; }
+    if (expect(bb.ok, "DO/DO", Fate.spaceship{}, 1, 1, 0, "") != 0) { ret 2; }
+    ret 0;
+}
