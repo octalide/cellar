@@ -82,6 +82,15 @@ pub rec View {
     mode:  u8;
 }
 
+# what opening a file did
+# ---
+# world:   it was a world file, which replaced the world, rather than a pattern stamped onto it
+# foreign: the file names a rule this cellar cannot run, so the rule was left as it was
+pub rec Opened {
+    world:   bool;
+    foreign: bool;
+}
+
 # what a world load did beyond replacing the cells
 # ---
 # foreign: the file names a rule this cellar cannot run, so the rule was left as it was
@@ -581,15 +590,18 @@ fun read_pattern(a: *allo.Allocator, f: *format.Format, data: *Vector[u8], p: *p
 pub fun load_world(a: *allo.Allocator, s: *sim.Sim, v: *View, path: str) res[Loaded, Error] {
     val rr: res[Vector[u8], fs.FsError] = fs.read_bytes(a, path);
     if (sel rr.err) { ret res[Loaded, Error].err{Error.fs{rr.err}}; }
-    var data: Vector[u8] = rr.ok;
+    var data: Vector[u8]         = rr.ok;
+    val r:    res[Loaded, Error] = world_from(a, s, v, ?data);
+    vector.dnit[u8](?data);
+    ret r;
+}
 
-    val ver: u8 = world_version(?data);
+# replace the world with what a world file's bytes hold, as load_world does
+fun world_from(a: *allo.Allocator, s: *sim.Sim, v: *View, data: *Vector[u8]) res[Loaded, Error] {
+    val ver: u8 = world_version(data);
     if (ver != 0) {
-        var start: usize = next_line(?data, 0);
-        if (ver < OLDEST || ver > VERSION) {
-            vector.dnit[u8](?data);
-            ret res[Loaded, Error].err{Error.version{}};
-        }
+        var start: usize = next_line(data, 0);
+        if (ver < OLDEST || ver > VERSION) { ret res[Loaded, Error].err{Error.version{}}; }
         var h: Head;
         h.ruled      = false;
         h.rule       = opt[kernel.Kernel].none{};
@@ -598,16 +610,12 @@ pub fun load_world(a: *allo.Allocator, s: *sim.Sim, v: *View, path: str) res[Loa
         h.generation = 0;
         h.view       = @v;
         if (ver >= '3') {
-            val head: err[Error] = read_header(?data, start, ?start, ?h);
-            if (sel head.err) {
-                vector.dnit[u8](?data);
-                ret res[Loaded, Error].err{head.err};
-            }
+            val head: err[Error] = read_header(data, start, ?start, ?h);
+            if (sel head.err) { ret res[Loaded, Error].err{head.err}; }
         }
         var at:     Vector[i64] = vector.init[i64](a);
         var cells:  Vector[u8]  = vector.init[u8](a);
-        val parsed: err[Error]  = parse_sparse(?data, start, ?at, ?cells, s.space.max_slots);
-        vector.dnit[u8](?data);
+        val parsed: err[Error]  = parse_sparse(data, start, ?at, ?cells, s.space.max_slots);
         if (sel parsed.ok) {
             sim.fill_begin(s);
             var k: usize = 0;
@@ -635,18 +643,11 @@ pub fun load_world(a: *allo.Allocator, s: *sim.Sim, v: *View, path: str) res[Loa
 
     # an old dense world is a custom pattern, centred on the origin
     var old: format.Format;
-    if (!formats.by_id("custom", ?old)) {
-        vector.dnit[u8](?data);
-        ret res[Loaded, Error].err{Error.format{format.Error.unsupported{}}};
-    }
+    if (!formats.by_id("custom", ?old)) { ret res[Loaded, Error].err{Error.format{format.Error.unsupported{}}}; }
     var tmp:  pattern.Pattern;
     val made: err[allo.Error] = pattern.init(?tmp, a, 0, 0, "");
-    if (sel made.err) {
-        vector.dnit[u8](?data);
-        ret res[Loaded, Error].err{Error.alloc{made.err}};
-    }
-    val read: err[Error] = read_pattern(a, ?old, ?data, ?tmp);
-    vector.dnit[u8](?data);
+    if (sel made.err) { ret res[Loaded, Error].err{Error.alloc{made.err}}; }
+    val read: err[Error] = read_pattern(a, ?old, data, ?tmp);
     if (sel read.err) {
         pattern.dnit(?tmp);
         ret res[Loaded, Error].err{read.err};
@@ -666,6 +667,60 @@ pub fun load_world(a: *allo.Allocator, s: *sim.Sim, v: *View, path: str) res[Loa
     sim.fill_end(s);
     pattern.dnit(?tmp);
     ret res[Loaded, Error].ok{Loaded{foreign: false}};
+}
+
+# stamp a pattern file's bytes onto the world centred on the origin, in the
+# format the registry detects, taking its rule when kernel.parse reads it
+fun stamp_from(a: *allo.Allocator, s: *sim.Sim, data: *Vector[u8]) res[Opened, Error] {
+    var f: format.Format;
+    if (!formats.by_bytes(data.data, data.len, ?f)) { ret res[Opened, Error].err{Error.format{format.Error.malformed{}}}; }
+    var ws:   adapt.WorldSink;
+    var info: format.Info;
+    format.info_init(?info, a);
+    val r:       err[format.Error] = formats.load(a, ?f, data.data, data.len, adapt.centred_sink(?ws, s), ?info);
+    var foreign: bool              = false;
+    if (sel r.ok) {
+        val named: str = format.text_of(?info.rule);
+        if (named[0] != 0) {
+            val k: opt[kernel.Kernel] = kernel.parse(named);
+            if (sel k.some) { s.kernel = k.some; }
+            or              { foreign = true; }
+        }
+    }
+    format.info_dnit(?info);
+    if (sel r.err) { ret res[Opened, Error].err{from_format(r.err)}; }
+    ret res[Opened, Error].ok{Opened{world: false, foreign: foreign}};
+}
+
+# open a file of any kind cellar reads, dispatching on its bytes
+#
+# a world file (its first line "cellar <version>") replaces the world and the
+# view, as load_world does. anything else is read as a pattern in the format the
+# registry detects and stamped onto the world centred on the origin, its rule
+# replacing the simulation's when kernel.parse reads it. the whole file is
+# validated first, so a refusal leaves the world, the rule and the view as they
+# were.
+# ---
+# a:    allocator for the read and parse buffers
+# s:    simulation to load into
+# v:    the view, which a world file replaces
+# path: source file path
+# ret:  what the file was and did, or why nothing was loaded
+pub fun open_file(a: *allo.Allocator, s: *sim.Sim, v: *View, path: str) res[Opened, Error] {
+    val rr: res[Vector[u8], fs.FsError] = fs.read_bytes(a, path);
+    if (sel rr.err) { ret res[Opened, Error].err{Error.fs{rr.err}}; }
+    var data: Vector[u8] = rr.ok;
+    var r:    res[Opened, Error];
+    if (world_version(?data) != 0) { r = opened_world(world_from(a, s, v, ?data)); }
+    or                             { r = stamp_from(a, s, ?data); }
+    vector.dnit[u8](?data);
+    ret r;
+}
+
+# a world load's outcome as an open's
+fun opened_world(w: res[Loaded, Error]) res[Opened, Error] {
+    if (sel w.err) { ret res[Opened, Error].err{w.err}; }
+    ret res[Opened, Error].ok{Opened{world: true, foreign: w.ok.foreign}};
 }
 
 # copy a pattern's name, rule and comments into an Info
