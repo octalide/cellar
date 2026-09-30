@@ -18,6 +18,7 @@ use cellar.space;
 use cellar.team;
 use allo: std.allocator;
 use std.allocator.page;
+use mem: std.memory;
 use std.print;
 use std.rand;
 use std.types.bool.bool;
@@ -31,6 +32,28 @@ use std.types.size.usize;
 pub val DEFAULT_DENSITY: f32 = 0.30;
 # generations a GPU may be owed before further steps are dropped
 val MAX_PENDING: usize = 4096;
+# the most cells an edit's area may hold to be written cell by cell, where a
+# larger one is written chunk by chunk
+val SPARSE_CELLS: usize = 512;
+
+# the bounds of an open edit, in cells, half-open
+# ---
+# open:   between edit_begin and edit_end
+# sparse: the area is small, so cells are written singly rather than by chunk
+# lost:   a cell was dropped because the pool was full
+# x0:     first column
+# y0:     first row
+# x1:     column after the last
+# y1:     row after the last
+pub rec Edit {
+    open:   bool;
+    sparse: bool;
+    lost:   bool;
+    x0:     i64;
+    y0:     i64;
+    x1:     i64;
+    y1:     i64;
+}
 
 # cellular-automaton simulation state
 # ---
@@ -44,6 +67,7 @@ val MAX_PENDING: usize = 4096;
 # generation: completed steps since the last clear or randomize
 # running:    1 while auto-stepping, else 0
 # preset:     index of the active kernel preset
+# edit:       the open bulk edit, if any
 pub rec Sim {
     space:      space.Space;
     kernel:     kernel.Kernel;
@@ -55,6 +79,7 @@ pub rec Sim {
     generation: u64;
     running:    u8;
     preset:     usize;
+    edit:       Edit;
 }
 
 # an empty world stepped by the CPU, with the default kernel
@@ -74,6 +99,7 @@ pub fun init(s: *Sim, a: *allo.Allocator) err[allo.Error] {
     s.full       = false;
     s.generation = 0;
     s.running    = 0;
+    s.edit.open  = false;
     ret e;
 }
 
@@ -240,35 +266,205 @@ pub fun randomize(s: *Sim, density: f32, side: usize) {
     fill_end(s);
 }
 
+# the cell a state is written as: a live state starts at age 1 and full heat, a
+# dead one cold
+fun cell_of(v: u8) u32 {
+    if (v != 0) { ret space.BORN; }
+    ret 0;
+}
+
+# whether a chunk slot overlaps the open edit's area
+fun in_area(s: *Sim, sl: usize) bool {
+    val e:  *Edit = ?s.edit;
+    val cx: i64   = space.slot_x(?s.space, sl);
+    val cy: i64   = space.slot_y(?s.space, sl);
+    ret cx >= space.chunk_of(e.x0) && cx <= space.chunk_of(e.x1 - 1)
+        && cy >= space.chunk_of(e.y0) && cy <= space.chunk_of(e.y1 - 1);
+}
+
+# open a bulk edit of the cells in [x0, x1) by [y0, y1)
+#
+# cells inside the area are written with edit_set and edit_run and the rest of
+# the world is left alone. the chunks the area covers are pulled from the GPU
+# first, so writing them whole loses nothing, and an area of up to SPARSE_CELLS
+# cells skips that and is written cell by cell, recorded as small writes.
+# call outside a frame, or in one before gpu frame has recorded anything, and
+# between begin and end make no other edit.
+# ---
+# s:   simulation
+# x0:  first column
+# y0:  first row
+# x1:  column after the last
+# y1:  row after the last
+# ret: false when an edit is already open or the GPU's cells could not be read
+pub fun edit_begin(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64) bool {
+    if (s.edit.open) { ret false; }
+    val e: *Edit = ?s.edit;
+    e.x0 = x0;
+    e.y0 = y0;
+    e.x1 = x1;
+    e.y1 = y1;
+    if (x1 <= x0 || y1 <= y0) {
+        e.x1 = x0;
+        e.y1 = y0;
+    }
+    e.lost   = false;
+    e.sparse = e.x1 - e.x0 <= SPARSE_CELLS::i64 && e.y1 - e.y0 <= SPARSE_CELLS::i64
+        && (e.x1 - e.x0) * (e.y1 - e.y0) <= SPARSE_CELLS::i64;
+    e.open = true;
+    if (e.sparse) { ret true; }
+
+    val sp: *space.Space = ?s.space;
+    var sl: usize        = 0;
+    for (sl < sp.hi) {
+        if (!space.used(sp, sl) || !in_area(s, sl)) {
+            sl = sl + 1;
+            cnt;
+        }
+        var run: usize = 1;
+        for (sl + run < sp.hi && space.used(sp, sl + run) && in_area(s, sl + run)) { run = run + 1; }
+        if (on_gpu(s)) {
+            val pulled: err[gfx.Error] = gpu.pull_chunks(s.gpu, sp, sl, run);
+            if (sel pulled.err) {
+                e.open = false;
+                ret false;
+            }
+        }
+        var k: usize = 0;
+        for (k < run) {
+            sp.dirty[sl + k] = sp.dirty[sl + k] | space.DIRTY_CELLS;
+            k                = k + 1;
+        }
+        sl = sl + run;
+    }
+    ret true;
+}
+
+# write one cell of a small area, as a recorded write on the GPU
+fun put_sparse(s: *Sim, x: i64, y: i64, v: u8) bool {
+    val sp: *space.Space = ?s.space;
+    val cx: i64          = space.chunk_of(x);
+    val cy: i64          = space.chunk_of(y);
+    var sl: u32          = space.find(sp, cx, cy);
+    if (sl == space.NONE) {
+        if (v == 0) { ret true; }
+        sl = space.alloc(sp, cx, cy);
+        if (sl == space.NONE) { ret false; }
+    }
+    val slot: usize = sl::usize;
+    val i:    usize = space.local_of(y) * 64 + space.local_of(x);
+    sp.cells[slot * space.CELLS + i] = cell_of(v);
+    if (v != 0)    { space.surround(sp, slot); }
+    if (on_gpu(s)) { gpu.note_write(s.gpu, sp, slot, i); }
+    ret true;
+}
+
+# write a state to the cell at (x, y) in the open edit
+#
+# a live state starts at age 1 and full heat, a dead one cold.
+# ---
+# s:   simulation
+# x:   column
+# y:   row
+# v:   state, 0 dead and any other live
+# ret: false when the cell lies outside the area or the pool was full
+pub fun edit_set(s: *Sim, x: i64, y: i64, v: u8) bool {
+    ret edit_run(s, x, y, 1, v);
+}
+
+# write a state to n cells of a row in the open edit, from (x, y) rightward
+# ---
+# s:   simulation
+# x:   first column
+# y:   row
+# n:   cells to write
+# v:   state, 0 dead and any other live
+# ret: false when any cell lies outside the area or the pool was full
+pub fun edit_run(s: *Sim, x: i64, y: i64, n: usize, v: u8) bool {
+    val e: *Edit = ?s.edit;
+    if (!e.open || y < e.y0 || y >= e.y1 || x < e.x0 || x + n::i64 > e.x1) { ret false; }
+    var ok:  bool = true;
+    var at:  i64  = x;
+    val end: i64  = x + n::i64;
+    for (at < end) {
+        var stop: i64 = (space.chunk_of(at) + 1) * space.SIDE;
+        if (stop > end) { stop = end; }
+        if (e.sparse) {
+            var c: i64 = at;
+            for (c < stop) {
+                if (!put_sparse(s, c, y, v)) { ok = false; }
+                c = c + 1;
+            }
+        }
+        or {
+            var sl: u32 = space.find(?s.space, space.chunk_of(at), space.chunk_of(y));
+            if (sl == space.NONE && v != 0) { sl = space.alloc(?s.space, space.chunk_of(at), space.chunk_of(y)); }
+            if (sl != space.NONE) {
+                val i: usize = sl::usize * space.CELLS + space.local_of(y) * 64 + space.local_of(at);
+                mem.fill[u32](?s.space.cells[i], cell_of(v), (stop - at)::usize);
+                s.space.dirty[sl::usize] = s.space.dirty[sl::usize] | space.DIRTY_CELLS;
+            }
+            or (v != 0) { ok = false; }
+        }
+        at = stop;
+    }
+    if (!ok) { e.lost = true; }
+    ret ok;
+}
+
+# close the open edit: count the chunks it wrote, surround the live ones, and
+# hand the change to the GPU, all once
+# ---
+# s:   simulation
+# ret: false when no edit was open, a cell was dropped for lack of a chunk, or
+#      the pool could not hold the chunks the edit needs
+pub fun edit_end(s: *Sim) bool {
+    val e: *Edit = ?s.edit;
+    if (!e.open) { ret false; }
+    e.open = false;
+    val sp: *space.Space = ?s.space;
+    var ok: bool         = true;
+    if (e.sparse) {
+        # the GPU counts its own chunks, and the host counts the ones it steps
+        if (!on_gpu(s)) {
+            var cy: i64 = space.chunk_of(e.y0);
+            for (e.y1 > e.y0 && cy <= space.chunk_of(e.y1 - 1)) {
+                var cx: i64 = space.chunk_of(e.x0);
+                for (e.x1 > e.x0 && cx <= space.chunk_of(e.x1 - 1)) {
+                    val sl: u32 = space.find(sp, cx, cy);
+                    if (sl != space.NONE) { space.recount(sp, sl::usize); }
+                    cx = cx + 1;
+                }
+                cy = cy + 1;
+            }
+        }
+        if (s.gpu != nil) { gpu.note_edit(s.gpu); }
+        ret !e.lost;
+    }
+    var sl: usize = 0;
+    for (sl < sp.hi) {
+        if (space.used(sp, sl) && in_area(s, sl)) { space.recount(sp, sl); }
+        sl = sl + 1;
+    }
+    ok = space.settle(sp, sp.census, sp.hi, false);
+    if (s.gpu != nil) { gpu.note_edit(s.gpu); }
+    if (!ok)          { overflow(s); }
+    ret ok && !e.lost;
+}
+
 # set the cell at (x, y) to v, fresh: a live cell starts at age 1 and full
 # heat, a dead one cold
+#
+# a one-cell edit.
 # ---
 # s: simulation
 # x: column
 # y: row
 # v: value to write, 0 or 1
 pub fun paint(s: *Sim, x: i64, y: i64, v: u8) {
-    val sp: *space.Space = ?s.space;
-    val cx: i64          = space.chunk_of(x);
-    val cy: i64          = space.chunk_of(y);
-    var sl: u32          = space.find(sp, cx, cy);
-    if (sl == space.NONE) {
-        if (v == 0) { ret; }
-        sl = space.alloc(sp, cx, cy);
-        if (sl == space.NONE) { ret; }
-    }
-    val slot: usize = sl::usize;
-    val i:    usize = space.local_of(y) * 64 + space.local_of(x);
-    var c:    u32   = 0;
-    if (v != 0) { c = space.BORN; }
-    sp.cells[slot * space.CELLS + i] = c;
-    if (v != 0) { space.surround(sp, slot); }
-    if (on_gpu(s)) {
-        gpu.note_write(s.gpu, sp, slot, i);
-        gpu.note_edit(s.gpu);
-        ret;
-    }
-    space.recount(sp, slot);
+    if (!edit_begin(s, x, y, x + 1, y + 1)) { ret; }
+    edit_set(s, x, y, v);
+    edit_end(s);
 }
 
 # the cell at (x, y) as age << 8 | heat, from the host's cells
@@ -472,6 +668,37 @@ fun wide_rule() kernel.Kernel {
     ret k;
 }
 
+# bulk edits over the soup and over fresh ground: rows of live runs, every other
+# row erased in the middle of the soup where the world is full of live cells
+#[testing]
+fun bulk_edit(s: *Sim) {
+    edit_begin(s, -100, -80, 100, 80);
+    var y: i64 = -80;
+    for (y < 80) {
+        var x: i64 = -100;
+        for (x < 100) {
+            if ((y & 1) == 0) { edit_run(s, x, y, 7, 1); }
+            or                { edit_run(s, x + 3, y, 4, 0); }
+            x = x + 11;
+        }
+        y = y + 1;
+    }
+    edit_end(s);
+
+    # a second edit reaches chunks the GPU has never held, and one it has
+    edit_begin(s, 6900, 6990, 7300, 7090);
+    y = 6990;
+    for (y < 7090) {
+        var x: i64 = 6900;
+        for (x < 7300) {
+            edit_run(s, x, y, 5, 1);
+            x = x + 9;
+        }
+        y = y + 1;
+    }
+    edit_end(s);
+}
+
 test frame__steps_on_the_gpu_exactly_as_the_cpu_does {
     val opened: res[window.Window, window.WindowError] = window.window_open(64, 64, "cellar gpu test");
     if (sel opened.err) {
@@ -528,6 +755,19 @@ test frame__steps_on_the_gpu_exactly_as_the_cpu_does {
     for (phase < 2) {
         var n: u64 = 60;
         if (phase == 1) {
+            # the GPU runs on past the host's staging cells, and a bulk edit then
+            # pulls the chunks it covers before writing them whole
+            var e: u64 = 0;
+            for (e < 5) {
+                step(?cpu_world);
+                step(?gpu_world);
+                e = e + 1;
+            }
+            gens = gens + 5;
+            if (!settle_frames(?r, ?gpu_world, gens)) { ret 4; }
+            gfx.renderer_wait_idle(?r);
+            bulk_edit(?cpu_world);
+            bulk_edit(?gpu_world);
             n                = 30;
             cpu_world.kernel = wide_rule();
             gpu_world.kernel = wide_rule();

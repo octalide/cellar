@@ -20,6 +20,7 @@ use std.collections.vector;
 use std.collections.vector.Vector;
 use fs:       std.filesystem;
 use io_error: std.io.error;
+use mem:      std.memory;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -438,21 +439,23 @@ pub fun load_world(a: *allo.Allocator, s: *sim.Sim, path: str) err[Error] {
 }
 
 # serialize a pattern to path
+#
+# the file holds dead and live cells only, so every nonzero state is written live.
 # ---
 # a:    allocator backing the transient buffer
 # p:    pattern to save
 # path: destination file path
 # ret:  ok, or why the file was not written
 pub fun save_pattern(a: *allo.Allocator, p: *pattern.Pattern, path: str) err[Error] {
-    ret save_buffer(a, ?p.cells[0], p.w, p.h, path);
+    ret save_buffer(a, p.cells, p.w, p.h, path);
 }
 
 # read path into a pattern, resizing it to the stored dimensions
 #
-# the file is parsed into a copy first, so a refusal leaves p as it was.
+# the file is parsed into a scratch buffer first, so a refusal leaves p as it was.
 # ---
-# a:    allocator for the read buffer
-# p:    pattern to populate
+# a:    allocator for the read and parse buffers
+# p:    pattern to populate, keeping its name
 # path: source file path
 # ret:  ok, or why the pattern was not loaded
 pub fun load_pattern(a: *allo.Allocator, p: *pattern.Pattern, path: str) err[Error] {
@@ -463,17 +466,29 @@ pub fun load_pattern(a: *allo.Allocator, p: *pattern.Pattern, path: str) err[Err
     var w:     usize = 0;
     var h:     usize = 0;
     val start: usize = parse_header(?data, ?w, ?h);
-    if (w == 0 || h == 0 || w > pattern.CAP || h > pattern.CAP || w * h > pattern.CAP) {
+    if (w == 0 || h == 0 || w > MAX_DIM || h > MAX_DIM) {
         vector.dnit[u8](?data);
         ret err[Error].err{Error.dimensions{}};
     }
 
-    var q: pattern.Pattern;
-    pattern.init(?q, w, h, p.name);
-    val parsed: err[Error] = parse_body(?data, start, w, h, ?q.cells[0]);
+    val rc: res[*u8, allo.Error] = allo.allocate[u8](a, w * h);
+    if (sel rc.err) {
+        vector.dnit[u8](?data);
+        ret err[Error].err{Error.alloc{rc.err}};
+    }
+    val parsed: err[Error] = parse_body(?data, start, w, h, rc.ok);
     vector.dnit[u8](?data);
-    if (sel parsed.err) { ret parsed; }
-    @p = q;
+    if (sel parsed.err) {
+        allo.deallocate[u8](a, rc.ok, w * h);
+        ret parsed;
+    }
+    val sized: err[allo.Error] = pattern.resize(p, w, h);
+    if (sel sized.err) {
+        allo.deallocate[u8](a, rc.ok, w * h);
+        ret err[Error].err{Error.alloc{sized.err}};
+    }
+    mem.copy[u8](p.cells, rc.ok, w * h);
+    allo.deallocate[u8](a, rc.ok, w * h);
     ret err[Error].ok{};
 }
 
@@ -537,8 +552,9 @@ test load_pattern__round_trips {
     var a: allo.Allocator;
     page.make(?a);
 
-    var p: pattern.Pattern;
-    pattern.init(?p, 5, 3, "custom");
+    var p:     pattern.Pattern;
+    val made5: err[allo.Error] = pattern.init(?p, ?a, 5, 3, "custom");
+    if (sel made5.err) { ret 1; }
     pattern.set(?p, 0, 0, 1);
     pattern.set(?p, 4, 2, 1);
     pattern.set(?p, 2, 1, 1);
@@ -547,8 +563,9 @@ test load_pattern__round_trips {
     val saved4: err[Error] = save_pattern(?a, ?p, path);
     if (sel saved4.err) { ret 1; }
 
-    var q: pattern.Pattern;
-    pattern.init(?q, 1, 1, "custom");
+    var q:     pattern.Pattern;
+    val made6: err[allo.Error] = pattern.init(?q, ?a, 1, 1, "custom");
+    if (sel made6.err) { ret 1; }
     val loaded4: err[Error] = load_pattern(?a, ?q, path);
     if (sel loaded4.err) { ret 2; }
 
@@ -563,6 +580,8 @@ test load_pattern__round_trips {
         y = y + 1;
     }
 
+    pattern.dnit(?p);
+    pattern.dnit(?q);
     fs.remove_file(path);
     ret 0;
 }
@@ -581,13 +600,15 @@ test load_pattern__reads_by_length_past_an_embedded_nul {
     val wrote: err[fs.FsError] = fs.write_bytes(path, ?body[0], 9, FILE_MODE);
     if (sel wrote.err) { ret 3; }
 
-    var p: pattern.Pattern;
-    pattern.init(?p, 1, 1, "custom");
+    var p:     pattern.Pattern;
+    val made7: err[allo.Error] = pattern.init(?p, a, 1, 1, "custom");
+    if (sel made7.err) { ret 1; }
     val loaded: err[Error] = load_pattern(a, ?p, path);
     fs.remove_file(path);
     if (sel loaded.err)                                                                                     { ret 4; }
     if (p.w != 3 || pattern.get(?p, 0, 0) != 1 || pattern.get(?p, 1, 0) != 0 || pattern.get(?p, 2, 0) != 1) { ret 5; }
-    if (alloc_testing.leaked(?t))                                                                           { ret 6; }
+    pattern.dnit(?p);
+    if (alloc_testing.leaked(?t)) { ret 6; }
     alloc_testing.dnit(?t);
     ret 0;
 }
