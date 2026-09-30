@@ -170,7 +170,10 @@ rec Pool {
 # a:        allocator for host buffers
 # r:        the renderer
 # d:        its device
+# slots:    the most slots the device's storage buffers hold, the pool's ceiling
 # p:        the buffers sized to the pool
+# next:     the buffers a growth made room in, swapped in by the next frame
+# reserved: next holds buffers
 # old:      the buffers a growth replaced, kept until the frame copying out of
 #           them has run
 # retired:  old holds buffers
@@ -204,7 +207,10 @@ pub rec Gpu {
     a:        *allo.Allocator;
     r:        *gfx.Renderer;
     d:        *gfx.Device;
+    slots:    usize;
     p:        Pool;
+    next:     Pool;
+    reserved: bool;
     old:      Pool;
     retired:  bool;
     view:     gfx.StorageBuffer;
@@ -250,74 +256,111 @@ fun make(d: *gfx.Device, size: usize, out: *gfx.StorageBuffer) err[gfx.Error] {
     ret err[gfx.Error].ok{};
 }
 
-# the buffers sized for cap slots
-fun make_pool(g: *Gpu, cap: usize) err[gfx.Error] {
-    val e1: err[gfx.Error] = make(g.d, cap * space.CELLS * 4, ?g.p.cells[0]);
-    if (sel e1.err) { ret e1; }
-    val e2: err[gfx.Error] = make(g.d, cap * space.CELLS * 4, ?g.p.cells[1]);
-    if (sel e2.err) {
-        gfx.storage_buffer_delete(g.d, ?g.p.cells[0]);
-        ret e2;
-    }
-    val e3: err[gfx.Error] = make(g.d, (HEAD + cap * space.ENTRY) * 4, ?g.p.meta);
-    if (sel e3.err) {
-        gfx.storage_buffer_delete(g.d, ?g.p.cells[0]);
-        gfx.storage_buffer_delete(g.d, ?g.p.cells[1]);
-        ret e3;
-    }
-    val e4: err[gfx.Error] = make(g.d, status_bytes(cap), ?g.p.status);
-    if (sel e4.err) {
-        gfx.storage_buffer_delete(g.d, ?g.p.cells[0]);
-        gfx.storage_buffer_delete(g.d, ?g.p.cells[1]);
-        gfx.storage_buffer_delete(g.d, ?g.p.meta);
-        ret e4;
-    }
-    val e5: err[gfx.Error] = gfx.readback(?g.p.rb, g.d, status_bytes(cap));
-    if (sel e5.err) {
-        gfx.storage_buffer_delete(g.d, ?g.p.cells[0]);
-        gfx.storage_buffer_delete(g.d, ?g.p.cells[1]);
-        gfx.storage_buffer_delete(g.d, ?g.p.meta);
-        gfx.storage_buffer_delete(g.d, ?g.p.status);
-        ret e5;
-    }
-    val e5f: err[gfx.Error] = make(g.d, cap * 8, ?g.p.flags);
-    if (sel e5f.err) {
-        gfx.readback_delete(?g.p.rb, g.d);
-        gfx.storage_buffer_delete(g.d, ?g.p.cells[0]);
-        gfx.storage_buffer_delete(g.d, ?g.p.cells[1]);
-        gfx.storage_buffer_delete(g.d, ?g.p.meta);
-        gfx.storage_buffer_delete(g.d, ?g.p.status);
-        ret e5f;
-    }
-    val e5l: err[gfx.Error] = make(g.d, cap * 4, ?g.p.list);
-    if (sel e5l.err) {
-        gfx.storage_buffer_delete(g.d, ?g.p.flags);
-        gfx.readback_delete(?g.p.rb, g.d);
-        gfx.storage_buffer_delete(g.d, ?g.p.cells[0]);
-        gfx.storage_buffer_delete(g.d, ?g.p.cells[1]);
-        gfx.storage_buffer_delete(g.d, ?g.p.meta);
-        gfx.storage_buffer_delete(g.d, ?g.p.status);
-        ret e5l;
-    }
-    val rg: res[*u32, allo.Error] = allo.allocate[u32](g.a, status_bytes(cap) / 4);
-    if (sel rg.err) {
-        drop_pool(g, ?g.p);
-        ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.empty{}}};
-    }
-    g.p.got = rg.ok;
-    val ru: res[*u32, allo.Error] = allo.allocate[u32](g.a, cap * space.CENSUS);
-    if (sel ru.err) {
-        drop_pool(g, ?g.p);
-        ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.empty{}}};
-    }
-    g.p.landed = ru.ok;
-    g.p.cap    = cap;
-    # a readback of the old size may still land; nothing recorded before is wanted
+# n, or fewer: the most slots a buffer of words words holds, with head words
+# ahead of them and per words a slot
+fun fit(n: usize, words: usize, head: usize, per: usize) usize {
+    if (words < head) { ret 0; }
+    val m: usize = (words - head) / per;
+    if (m < n) { ret m; }
+    ret n;
+}
+
+# the most slots a pool may hold on a device with these limits
+#
+# every storage buffer make_pool creates is bound whole, so each must fit the
+# device's storage buffer range, and the tightest sets the ceiling, which is
+# the cells' at space.CELLS words a slot. the stages' arrays are declared for
+# layout.MAX_SLOTS, which caps it on a device that allows more.
+# ---
+# l:   the device's limits
+# ret: the ceiling, zero when the limits were never read
+pub fun ceiling(l: gfx.Limits) usize {
+    val words: usize = l.max_storage_buffer_range / 4;
+    var n:     usize = layout.MAX_SLOTS::usize;
+    # the cells, the meta, the status, the flags and the list
+    n = fit(n, words, 0, space.CELLS);
+    n = fit(n, words, HEAD, space.ENTRY);
+    n = fit(n, words, status_bytes(0) / 4, 3);
+    n = fit(n, words, 0, 2);
+    n = fit(n, words, 0, 1);
+    ret n;
+}
+
+# forget every census in flight: a readback of an old pool's size may still
+# land, and nothing recorded before is wanted
+fun forget_censuses(g: *Gpu) {
     var i: usize = 0;
     for (i < RING) {
         g.ring[i].id = 0;
         i            = i + 1;
     }
+}
+
+# the buffers sized for cap slots, into pp
+fun make_pool(g: *Gpu, pp: *Pool, cap: usize) err[gfx.Error] {
+    pp.got    = nil;
+    pp.landed = nil;
+    pp.cap    = 0;
+    val e1: err[gfx.Error] = make(g.d, cap * space.CELLS * 4, ?pp.cells[0]);
+    if (sel e1.err) { ret e1; }
+    val e2: err[gfx.Error] = make(g.d, cap * space.CELLS * 4, ?pp.cells[1]);
+    if (sel e2.err) {
+        gfx.storage_buffer_delete(g.d, ?pp.cells[0]);
+        ret e2;
+    }
+    val e3: err[gfx.Error] = make(g.d, (HEAD + cap * space.ENTRY) * 4, ?pp.meta);
+    if (sel e3.err) {
+        gfx.storage_buffer_delete(g.d, ?pp.cells[0]);
+        gfx.storage_buffer_delete(g.d, ?pp.cells[1]);
+        ret e3;
+    }
+    val e4: err[gfx.Error] = make(g.d, status_bytes(cap), ?pp.status);
+    if (sel e4.err) {
+        gfx.storage_buffer_delete(g.d, ?pp.cells[0]);
+        gfx.storage_buffer_delete(g.d, ?pp.cells[1]);
+        gfx.storage_buffer_delete(g.d, ?pp.meta);
+        ret e4;
+    }
+    val e5: err[gfx.Error] = gfx.readback(?pp.rb, g.d, status_bytes(cap));
+    if (sel e5.err) {
+        gfx.storage_buffer_delete(g.d, ?pp.cells[0]);
+        gfx.storage_buffer_delete(g.d, ?pp.cells[1]);
+        gfx.storage_buffer_delete(g.d, ?pp.meta);
+        gfx.storage_buffer_delete(g.d, ?pp.status);
+        ret e5;
+    }
+    val e5f: err[gfx.Error] = make(g.d, cap * 8, ?pp.flags);
+    if (sel e5f.err) {
+        gfx.readback_delete(?pp.rb, g.d);
+        gfx.storage_buffer_delete(g.d, ?pp.cells[0]);
+        gfx.storage_buffer_delete(g.d, ?pp.cells[1]);
+        gfx.storage_buffer_delete(g.d, ?pp.meta);
+        gfx.storage_buffer_delete(g.d, ?pp.status);
+        ret e5f;
+    }
+    val e5l: err[gfx.Error] = make(g.d, cap * 4, ?pp.list);
+    if (sel e5l.err) {
+        gfx.storage_buffer_delete(g.d, ?pp.flags);
+        gfx.readback_delete(?pp.rb, g.d);
+        gfx.storage_buffer_delete(g.d, ?pp.cells[0]);
+        gfx.storage_buffer_delete(g.d, ?pp.cells[1]);
+        gfx.storage_buffer_delete(g.d, ?pp.meta);
+        gfx.storage_buffer_delete(g.d, ?pp.status);
+        ret e5l;
+    }
+    val rg: res[*u32, allo.Error] = allo.allocate[u32](g.a, status_bytes(cap) / 4);
+    if (sel rg.err) {
+        drop_pool(g, pp);
+        ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.empty{}}};
+    }
+    pp.got = rg.ok;
+    val ru: res[*u32, allo.Error] = allo.allocate[u32](g.a, cap * space.CENSUS);
+    if (sel ru.err) {
+        drop_pool(g, pp);
+        ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.empty{}}};
+    }
+    pp.landed = ru.ok;
+    pp.cap    = cap;
     ret err[gfx.Error].ok{};
 }
 
@@ -344,7 +387,8 @@ fun drop_pool(g: *Gpu, p: *Pool) {
 # g:    the GPU side to build
 # a:    allocator for host buffers
 # r:    the renderer, initialized
-# cap:  slots to size the pool for, at least the host pool's capacity
+# cap:  slots to size the pool for, at least the host pool's capacity and no
+#       more than the device's ceiling
 # heat: SHADES entries of four floats, the heat palette
 # age:  SHADES entries of four floats, the age palette
 # ret:  ok, or why the pool or the draw could not be made
@@ -352,9 +396,11 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     g.a        = a;
     g.r        = r;
     g.d        = gfx.renderer_device(r);
+    g.slots    = ceiling(gfx.renderer_limits(r));
     g.p.got    = nil;
     g.p.landed = nil;
     g.p.cap    = 0;
+    g.reserved = false;
     g.retired  = false;
     g.hi       = 0;
     g.front    = 0;
@@ -399,8 +445,40 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     val e8: err[gfx.Error] = gfx.storage_buffer_upload(g.d, ?g.view, LOOK * 4, heat::*u8, SHADES * 16);
     if (sel e8.err) { ret e8; }
     val e9: err[gfx.Error] = gfx.storage_buffer_upload(g.d, ?g.view, (LOOK + SHADES * 4) * 4, age::*u8, SHADES * 16);
-    if (sel e9.err) { ret e9; }
-    ret make_pool(g, cap);
+    if (sel e9.err)    { ret e9; }
+    if (cap > g.slots) { ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.overrun{(cap * space.CELLS * 4)::u64}}}; }
+    forget_censuses(g);
+    ret make_pool(g, ?g.p, cap);
+}
+
+# make room for a pool of cap slots, ahead of the host's pool growing to it
+#
+# the buffers are made now, where a refusal can still turn the growth down,
+# and the next frame moves the world into them.
+# ---
+# g:   the GPU side
+# cap: slots the host's pool grows to
+# ret: false when the device refused the buffers
+pub fun reserve(g: *Gpu, cap: usize) bool {
+    if (cap <= g.p.cap || (g.reserved && cap <= g.next.cap)) { ret true; }
+    # nothing has been recorded into a pool made since the last frame
+    if (g.reserved) {
+        drop_pool(g, ?g.next);
+        g.reserved = false;
+    }
+    val made: err[gfx.Error] = make_pool(g, ?g.next, cap);
+    if (sel made.err) { ret false; }
+    g.reserved = true;
+    ret true;
+}
+
+fun reserve_for(ctx: *u8, cap: usize) bool {
+    ret reserve(ctx::*Gpu, cap);
+}
+
+# the GPU side as the host pool's mirror, which makes room before the pool grows
+pub fun mirror(g: *Gpu) space.Mirror {
+    ret space.Mirror{ctx: g::*u8, reserve: reserve_for};
 }
 
 # leave stepping to the CPU even though the compute stages were built, to
@@ -417,7 +495,8 @@ pub fun forgo_compute(g: *Gpu) {
 # release everything, waiting for the device first
 pub fun dnit(g: *Gpu) {
     gfx.renderer_wait_idle(g.r);
-    if (g.retired) { drop_pool(g, ?g.old); }
+    if (g.retired)  { drop_pool(g, ?g.old); }
+    if (g.reserved) { drop_pool(g, ?g.next); }
     drop_pool(g, ?g.p);
     gfx.storage_buffer_delete(g.d, ?g.view);
     gfx.shader_delete(?g.draw, g.d);
@@ -661,14 +740,15 @@ fun flush(g: *Gpu, sp: *space.Space) err[gfx.Error] {
         drop_pool(g, ?g.old);
         g.retired = false;
     }
-    val grew: bool = sp.cap > g.p.cap;
+    val grew: bool = g.reserved;
     if (grew) {
-        # the world moves into larger buffers on the GPU, and only the page
-        # table goes up again
-        g.old     = g.p;
-        g.retired = true;
-        val grown: err[gfx.Error] = make_pool(g, sp.cap);
-        if (sel grown.err) { ret grown; }
+        # the world moves into the larger buffers reserve made, and only the
+        # page table goes up again
+        g.old      = g.p;
+        g.retired  = true;
+        g.p        = g.next;
+        g.reserved = false;
+        forget_censuses(g);
         if (g.hi != 0 && g.stepping) {
             var gb: [4]*gfx.StorageBuffer;
             gb[0] = ?g.old.cells[g.front];
@@ -937,4 +1017,19 @@ pub fun draw(g: *Gpu, p: *gfx.Pass) {
     bufs[1] = ?g.p.meta;
     bufs[2] = ?g.view;
     gfx.pass_draw_storage(p, ?bufs[0], 3, 6, g.hi::u32, ?g.mat, ?g.xf, ?g.draw);
+}
+
+test ceiling__is_the_cells_share_of_the_storage_range {
+    var l: gfx.Limits;
+    mem.zero[u8]((?l)::*u8, $size_of(gfx.Limits));
+    if (ceiling(l) != 0) { ret 1; }
+    # the 128 MiB every device guarantees holds 8192 chunks of 16 KiB
+    l.max_storage_buffer_range = 134217728;
+    if (ceiling(l) != 8192) { ret 2; }
+    l.max_storage_buffer_range = 100 * 1048576;
+    if (ceiling(l) != 6400) { ret 3; }
+    # past what the stages' arrays are declared for, those cap it
+    l.max_storage_buffer_range = 4294967295;
+    if (ceiling(l) != layout.MAX_SLOTS::usize) { ret 4; }
+    ret 0;
 }
