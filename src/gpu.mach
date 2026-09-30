@@ -102,11 +102,8 @@ val WIDEN_MAX: u32 = 512;
 val NARROW_AFTER: u32 = 8;
 # a hold on the limit that is not in effect
 val NO_HOLD: u64 = 0xffffffffffffffff;
-# a frame this many microseconds apart from the last has missed its budget
-val SLOW_US: u64 = 24000;
-# a frame no more than this many microseconds apart from the last kept up with
-# the display, so frame time is not what bounds it
-val QUICK_US: u64 = 18000;
+# the refresh rate assumed when the display's cannot be read
+val FALLBACK_HZ: f32 = 60.0;
 # generations the first uncapped frame asks for, before pacing has adapted it
 val FIRST_PACE: usize = 16;
 # censuses in flight a frame can look back over
@@ -268,6 +265,7 @@ rec Pool {
 # pace:     generations the next uncapped frame asks for
 # last:     when the last uncapped frame was recorded
 # timed:    last holds an uncapped frame
+# pace_us:  the frame-time thresholds for the display
 # head:     the meta header staged for upload
 # built:    a pyramid built on the host, staged for upload
 pub rec Gpu {
@@ -324,8 +322,41 @@ pub rec Gpu {
     pace:     usize;
     last:     Instant;
     timed:    bool;
+    pace_us:  Pace;
     head:     [128]u32;
     built:    [layout.MIP]u32;
+}
+
+# how long frames may take against the display's refresh interval
+#
+# slow_us:  a frame this many microseconds apart from the last has missed its
+#           budget
+# quick_us: a frame no more than this many microseconds apart from the last
+#           kept up with the display, so frame time is not what bounds it
+pub rec Pace {
+    slow_us:  u64;
+    quick_us: u64;
+}
+
+# the frame-time thresholds for a display refreshing at hz, which fall back to
+# 60 Hz when hz is not a rate. a frame that keeps up is within 1.08 refresh
+# intervals and one that misses is past 1.44
+# ---
+# hz: the display's refresh rate in hertz, zero or less when unknown
+pub fun pace_for(hz: f32) Pace {
+    var rate: f32 = FALLBACK_HZ;
+    if (hz > 0.0) { rate = hz; }
+    val interval: u64 = (1000000.0 / rate + 0.5)::u64;
+    ret Pace{slow_us: interval * 36 / 25, quick_us: interval * 27 / 25};
+}
+
+# follow the display's refresh rate, which a window can change by moving to
+# another monitor
+# ---
+# g:  the GPU side
+# hz: the display's refresh rate in hertz, zero or less when unknown
+pub fun display(g: *Gpu, hz: f32) {
+    g.pace_us = pace_for(hz);
 }
 
 # the census id's four words, then a packed word and an extent per slot
@@ -545,6 +576,7 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     g.stamped  = vector.init[u32](a);
     g.pace     = FIRST_PACE;
     g.timed    = false;
+    g.pace_us  = pace_for(0.0);
     g.words    = 0;
     g.tabled   = false;
     g.packed   = vector.init[u32](a);
@@ -790,8 +822,8 @@ pub fun tune(g: *Gpu, asked: usize, done: usize) {
     var quick: bool = false;
     if (g.timed) {
         val us: u64 = (time.instant_sub(now.ok, g.last) / 1000)::u64;
-        quick = us <= QUICK_US;
-        if (us > SLOW_US) {
+        quick = us <= g.pace_us.quick_us;
+        if (us > g.pace_us.slow_us) {
             g.pace = g.pace - g.pace / 4;
             if (g.pace == 0) { g.pace = 1; }
         }
@@ -1445,6 +1477,18 @@ pub fun draw(g: *Gpu, p: *gfx.Pass) {
     bufs[2] = ?g.view;
     bufs[3] = ?g.p.mip;
     gfx.pass_draw_storage(p, ?bufs[0], 4, 6, g.hi::u32, ?g.mat, ?g.xf, ?g.draw);
+}
+
+test pace_for__follows_the_refresh_interval_and_falls_back_to_sixty {
+    val slow: Pace = pace_for(30.0);
+    if (slow.quick_us != 35999 || slow.slow_us != 47999) { ret 1; }
+    val base: Pace = pace_for(60.0);
+    if (base.quick_us != 18000 || base.slow_us != 24000) { ret 2; }
+    val fast: Pace = pace_for(144.0);
+    if (fast.quick_us != 7499 || fast.slow_us != 9999) { ret 3; }
+    val none: Pace = pace_for(0.0);
+    if (none.quick_us != base.quick_us || none.slow_us != base.slow_us) { ret 4; }
+    ret 0;
 }
 
 test ceiling__is_the_cells_share_of_the_storage_range {
