@@ -3025,31 +3025,42 @@ pub fun same_as_tree(p: *Sim, t: *Sim) bool {
 test hashlife__a_soup_runs_1000_generations_as_the_chunk_engine_does {
     var a: allo.Allocator;
     page.make(?a);
-    var p:  Sim;
-    var t:  Sim;
-    val m1: err[allo.Error] = init(?p, ?a);
-    if (sel m1.err) { ret 1; }
-    val m2: err[allo.Error] = init(?t, ?a);
-    if (sel m2.err) { ret 1; }
-    seed_world(?p);
-    seed_world(?t);
-    if (!use_hashlife(?t, true) || !on_tree(?t)) { ret 2; }
-    if (!same_as_tree(?p, ?t))                   { ret 3; }
-    var g: usize = 0;
-    for (g < 1000) {
+    # Life, then Brian's Brain and Star Wars, whose dying cells the tree keeps
+    # and steps as states of their own
+    val rules: [3]str = [3]str{"B3/S23", "B2/S/C3", "345/2/4"};
+    var k:     usize  = 0;
+    for (k < 3) {
+        val r: res[rule.Rule, str] = rule.parse(rules[k]);
+        if (sel r.err) { ret 1; }
+        var p:  Sim;
+        var t:  Sim;
+        val m1: err[allo.Error] = init(?p, ?a);
+        if (sel m1.err) { ret 1; }
+        val m2: err[allo.Error] = init(?t, ?a);
+        if (sel m2.err)                                 { ret 1; }
+        if (!set_rule(?p, r.ok) || !set_rule(?t, r.ok)) { ret 1; }
+        seed_world(?p);
+        seed_world(?t);
+        val base: i32 = (k * 10)::i32;
+        if (!use_hashlife(?t, true) || !on_tree(?t)) { ret base + 2; }
+        if (!same_as_tree(?p, ?t))                   { ret base + 3; }
+        var g: usize = 0;
+        for (g < 1000) {
+            step(?p);
+            g = g + 1;
+        }
+        # the distance as powers of two, 512 + 256 + 128 + 64 + 32 + 8
+        if (!jump(?t, 1000) || t.generation != 1000 || t.full) { ret base + 4; }
+        if (!same_as_tree(?p, ?t))                             { ret base + 5; }
+        # and single generations at the smallest step
+        set_exponent(?t, 0);
         step(?p);
-        g = g + 1;
+        step(?t);
+        if (t.generation != 1001 || !same_as_tree(?p, ?t)) { ret base + 6; }
+        dnit(?p);
+        dnit(?t);
+        k = k + 1;
     }
-    # the distance as powers of two, 512 + 256 + 128 + 64 + 32 + 8
-    if (!jump(?t, 1000) || t.generation != 1000 || t.full) { ret 4; }
-    if (!same_as_tree(?p, ?t))                             { ret 5; }
-    # and single generations at the smallest step
-    set_exponent(?t, 0);
-    step(?p);
-    step(?t);
-    if (t.generation != 1001 || !same_as_tree(?p, ?t)) { ret 6; }
-    dnit(?p);
-    dnit(?t);
     ret 0;
 }
 
@@ -3445,6 +3456,71 @@ test hashlife__a_zoomed_out_view_summarises_squares_of_the_tree {
     look = far_look();
     show_tree(?t, ?look);
     if (sp.dirty[space.find(sp, 0, 0)::usize] == 0) { ret 10; }
+    dnit(?t);
+    ret 0;
+}
+
+test hashlife__a_view_of_a_generations_rule_shows_dying_cells_as_the_pool_does {
+    var a: allo.Allocator;
+    page.make(?a);
+    var t: Sim;
+    val m: err[allo.Error] = init(?t, ?a);
+    if (sel m.err) { ret 1; }
+    val bb: res[rule.Rule, str] = rule.parse("B2/S/C3");
+    if (sel bb.err)                                      { ret 1; }
+    if (!set_rule(?t, bb.ok) || !use_hashlife(?t, true)) { ret 2; }
+    # a live cell and three dying ones in the square at the origin, and two
+    # dying cells alone in the square east of it
+    paint(?t, 0, 0, 1);
+    paint(?t, 1, 0, 2);
+    paint(?t, 0, 1, 2);
+    paint(?t, 1, 1, 2);
+    paint(?t, 9, 0, 2);
+    paint(?t, 12, 5, 2);
+    # dying cells are kept but, as on the pool, neither counted nor bound
+    if (population(?t) != 1) { ret 3; }
+    val b: opt[space.Box] = bounds(?t);
+    if (!(sel b.some))                                                      { ret 4; }
+    if (sel b.some && (b.some.x0 != 0 || b.some.y0 != 0 || b.some.x1 != 1)) { ret 4; }
+
+    # as the pool's pyramid summarises cells: the live ones as coverage, and
+    # the hottest heat of any, so a square of dying cells alone shows its trail
+    val sn:    layout.Sense = rule.sense(?t.rule);
+    val hot:   u32          = layout.texel_heat(rule.word(?t.rule, 1), sn.heat_shift, sn.heat_mask);
+    val dying: u32          = layout.texel_heat(rule.word(?t.rule, 2), sn.heat_shift, sn.heat_mask);
+    var look:  gpu.Look     = far_look();
+    look.mode = render.MODE_HEAT::u32;
+    show_tree(?t, ?look);
+    if (look.shift != 3 || look.mode != render.MODE_HEAT::u32) { ret 5; }
+    val sp: *space.Space = ?t.space;
+    val sl: u32          = space.find(sp, 0, 0);
+    if (sl == space.NONE)                                                               { ret 6; }
+    if (sp.cells[sl::usize * space.CELLS] != (255 / 64 | (hot << layout.SUMMARY_HEAT))) { ret 7; }
+    if (sp.cells[sl::usize * space.CELLS + 1] != (dying << layout.SUMMARY_HEAT))        { ret 8; }
+    if (dying == 0 || dying >= hot)                                                     { ret 9; }
+
+    # at a pixel a cell or more, a drawn cell is its cell's word
+    look     = far_look();
+    look.ppc = 2.0;
+    show_tree(?t, ?look);
+    val at: u32 = space.find(sp, 0, 0);
+    if (look.shift != 0 || at == space.NONE)                                      { ret 10; }
+    if (sp.cells[at::usize * space.CELLS] != rule.word(?t.rule, 1))               { ret 11; }
+    if (sp.cells[at::usize * space.CELLS + 65] != rule.word(?t.rule, 2))          { ret 12; }
+    if (sp.cells[at::usize * space.CELLS + 5 * 64 + 12] != rule.word(?t.rule, 2)) { ret 13; }
+
+    # a rule that words its states otherwise is shown as that rule's
+    val sw: res[rule.Rule, str] = rule.parse("345/2/4");
+    if (sel sw.err)                                                  { ret 14; }
+    if (!set_rule(?t, sw.ok) || !on_tree(?t) || population(?t) != 1) { ret 15; }
+    look      = far_look();
+    look.mode = render.MODE_HEAT::u32;
+    show_tree(?t, ?look);
+    val sn4:    layout.Sense = rule.sense(?t.rule);
+    val dying4: u32          = layout.texel_heat(rule.word(?t.rule, 2), sn4.heat_shift, sn4.heat_mask);
+    val at4:    u32          = space.find(sp, 0, 0);
+    if (dying4 == dying || at4 == space.NONE)                                      { ret 16; }
+    if (sp.cells[at4::usize * space.CELLS + 1] != (dying4 << layout.SUMMARY_HEAT)) { ret 17; }
     dnit(?t);
     ret 0;
 }
