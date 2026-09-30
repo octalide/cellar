@@ -314,8 +314,10 @@ fun refuse_tree(ctx: *Context, g: *Game) {
 # a file named on the command line is opened onto an empty world with the
 # first frame, like any other load; with none the world starts random. a
 # documentation capture shows the world a few generations in. HashLife, when
-# named, is moved onto after the file, which may bring the rule, so the file
-# opens and runs as it would without it.
+# named, is moved onto before the file when it runs the rule the world has, so
+# a file built as nodes (Macrocell) opens straight into the tree, and again
+# after it, since the file may bring a rule, so the file opens and runs as it
+# would without it.
 # ---
 # a:       application state, attached
 # s:       the simulation
@@ -324,13 +326,15 @@ fun refuse_tree(ctx: *Context, g: *Game) {
 # engine:  the args.ENGINE_* named
 # ret:     whether the first frame moves the world onto HashLife
 pub fun start_world(a: *app.App, s: *sim.Sim, open: str, capture: bool, engine: u8) bool {
+    val tree: bool = engine == args.ENGINE_HASHLIFE;
     if (open != nil) {
         val f: opt[command.File] = app.file(a, open);
-        if (sel f.some) { app.submit(a, command.Command.open{f.some}); }
+        if (sel f.some && tree && world.hashlife_runs(s)) { app.submit(a, command.Command.engine{true}); }
+        if (sel f.some)                                   { app.submit(a, command.Command.open{f.some}); }
     }
-    or                                  { world.randomize(s, app.bounds_size(a.bounds_idx)); }
-    if (capture)                        { world.toggle(s); }
-    if (engine != args.ENGINE_HASHLIFE) { ret false; }
+    or           { world.randomize(s, app.bounds_size(a.bounds_idx)); }
+    if (capture) { world.toggle(s); }
+    if (!tree)   { ret false; }
     app.submit(a, command.Command.engine{true});
     ret true;
 }
@@ -1038,6 +1042,42 @@ test start_world__a_file_opens_onto_an_empty_world_running_on_either_engine {
         e = e + args.ENGINE_HASHLIFE;
     }
     fs.remove_file("out/test/start_world/row.rle");
+    ret 0;
+}
+
+test start_world__a_macrocell_past_the_pool_opens_straight_into_hashlife_and_undo_takes_it_back {
+    var al: allo.Allocator;
+    page.make(?al);
+    # 65536 blocks, each in a chunk of its own, where the pool holds 32768 chunks
+    val body: str             = "[M2]\n#R B3/S23\n**$**$\n4 1 0 0 0\n5 2 0 0 0\n6 3 0 0 0\n7 4 0 0 0\n8 5 5 5 5\n9 6 6 6 6\n10 7 7 7 7\n11 8 8 8 8\n12 9 9 9 9\n13 10 10 10 10\n14 11 11 11 11\n15 12 12 12 12\n";
+    val dir:  err[fs.FsError] = persist.make_parent(?al, "out/test/start_tree/blocks.mc");
+    if (sel dir.err) { ret 1; }
+    fs.write_bytes("out/test/start_tree/blocks.mc", body, string.str_len(body), persist.FILE_MODE);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?al);
+    if (sel made.err) { ret 2; }
+    var a: app.App;
+    app.init(?a);
+    val shown: err[format.Error] = app.attach(?a, ?al);
+    if (sel shown.err) { ret 3; }
+    world.paint(?s, 3, 3, 1);
+    val tree: bool      = start_world(?a, ?s, "out/test/start_tree/blocks.mc", false, args.ENGINE_HASHLIFE);
+    var d:    exec.Deps = exec.Deps{a: ?al};
+    exec.run(?a, ?s, ?d);
+    if (!tree || !world.hashlife(?s))           { ret 4; }
+    if (sim.population(?s) != 262145 || s.full) { ret 5; }
+    if (!sim.alive(?s, 3, 3))                   { ret 6; }
+
+    # the load is one step, and the cell painted before it is all undo leaves
+    app.submit(?a, command.Command.undo{});
+    exec.run(?a, ?s, ?d);
+    if (sim.population(?s) != 1 || !sim.alive(?s, 3, 3) || !world.hashlife(?s)) { ret 7; }
+    app.submit(?a, command.Command.redo{});
+    exec.run(?a, ?s, ?d);
+    if (sim.population(?s) != 262145) { ret 8; }
+    app.dnit(?a);
+    sim.dnit(?s);
+    fs.remove_file("out/test/start_tree/blocks.mc");
     ret 0;
 }
 

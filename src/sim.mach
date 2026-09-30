@@ -6,13 +6,13 @@
 #
 #   step, collect, record, sync      advance the world and show it
 #   clear, fill_*, randomize         replace it
-#   read_*, edit_*, paint,           read and write cells by area
-#   clear_outside
+#   read_*, edit_*, paint,           read and write cells by area, or lay
+#   clear_outside, merge_*           the tree's own squares over it
 #   take, restore                    snapshot it and put a snapshot back
 #   cell, alive, population, bounds  ask after it
 #   chunks                           list its live chunks, for a save
 #   quadtree                         the tree itself, for a save that is one
-#   need_*, load_fits                judge a load before it is written
+#   need_*                           judge a load before it is written
 #
 # and caps says what else a member can do (Caps), which the interface and the
 # draw ask before offering it.
@@ -94,8 +94,8 @@ val MAX_PENDING: usize = 4096;
 # the most cells an edit's area may hold to be written cell by cell, where a
 # larger one is written chunk by chunk
 val SPARSE_CELLS: usize = 512;
-# the most live cells a load may bring into the tree, which writes them a
-# chunk at a time
+# the most live cells a load may bring into the tree as runs, which writes them
+# a chunk at a time. a load of the tree's own squares (merge_begin) has no cap
 pub val LOAD_CELLS: u64 = 67108864;
 # the most chunks a world file may bring into the tree
 val LOAD_CHUNKS: usize = 262144;
@@ -173,9 +173,9 @@ pub rec Seen {
 
 # what is shown the cells a change is about to write, so it can keep them
 #
-# wants is asked before an edit of a box writes anything, or before a clear or
-# a re-encoding rule change with whole set, and says whether the cells there
-# are wanted as they stand.
+# wants is asked before an edit of a box writes anything, or before a clear, a
+# re-encoding rule change or a merge into the tree with whole set, and says
+# whether the cells there are wanted as they stand.
 # when they are, the host's cells over the box, or everywhere with whole, are
 # brought level with the GPU's and keep is called before the change goes
 # ahead. current false tells keep they could not be read, and a clear goes
@@ -1440,6 +1440,62 @@ pub fun edit_chunk(s: *Sim, cx: i64, cy: i64, cells: *u32) bool {
     ret true;
 }
 
+# open an edit of the tree that lays squares of its own nodes over the cells
+# in [x0, x1) by [y0, y1), as a load of a file built as nodes does
+#
+# the watch is shown the world whole, whose image on the tree is its distinct
+# nodes, so an edit of any extent costs it what the tree does. squares are made
+# with merge_node and laid with edit_square, and edit_end closes it.
+# ---
+# s:   simulation
+# x0:  first column
+# y0:  first row
+# x1:  column after the last
+# y1:  row after the last
+# ret: false when the pool holds the world, an edit is already open, or the
+#      area passes the world's reach
+pub fun merge_begin(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64) bool {
+    if (!on_tree(s) || s.edit.open || !reaches(x0, y0, x1, y1)) { ret false; }
+    if (wanted(s, 0, 0, 0, 0, true))                            { kept(s, 0, 0, 0, 0, true, true); }
+    val e: *Edit = ?s.edit;
+    e.x0     = x0;
+    e.y0     = y0;
+    e.x1     = x1;
+    e.y1     = y1;
+    e.sparse = false;
+    e.lost   = false;
+    e.open   = true;
+    # the squares are made from the table's room, so what the world no longer reaches goes first
+    hashlife.tidy(?s.tree, hashlife.NONE);
+    ret true;
+}
+
+# the tree's node of four of one level, found or made, for an edit to lay
+# ---
+# s:   simulation, its world in the tree
+# ret: the node, or hashlife.NONE when a child is or the table is full
+pub fun merge_node(s: *Sim, nw: u32, ne: u32, sw: u32, se: u32) u32 {
+    ret hashlife.node(?s.tree, nw, ne, sw, se);
+}
+
+# lay a square of the tree's nodes over the world in the open edit, its live
+# cells replacing the world's and its dead ones leaving them
+# ---
+# s:   simulation, its world in the tree
+# n:   the square, made with merge_node
+# l:   its level
+# x:   its leftmost column, a multiple of 2^l
+# y:   its top row, a multiple of 2^l
+# ret: false when no edit is open on the tree, or the table could not hold it
+pub fun edit_square(s: *Sim, n: u32, l: u32, x: i64, y: i64) bool {
+    if (!s.edit.open || !on_tree(s)) { ret false; }
+    if (!hashlife.lay(?s.tree, n, l, x, y)) {
+        s.edit.lost = true;
+        ret false;
+    }
+    ret true;
+}
+
 # close the open edit: count the chunks it wrote, surround the live ones, and
 # hand the change to the GPU, all once, or graft the chunks it wrote into the tree
 #
@@ -1572,7 +1628,7 @@ rec ChunkAt {
 # wide every chunk two away, all exist once an edit ends, so those of them the
 # pool lacks are what the edit adds, and a pattern needing more than the pool
 # has room for can be refused before any of it is written. on the tree there
-# is no pool, and nothing is measured.
+# is no pool, and the live cells are counted instead, up to LOAD_CELLS.
 # ---
 # s:     simulation measured against
 # pool:  the world is in the pool, so the measure counts
@@ -1580,10 +1636,12 @@ rec ChunkAt {
 # room:  slots the pool may still take
 # last:  the chunk the last run ended in, whose block is already counted
 # any:   whether last holds one
+# cells: the live cells counted on the tree
 # spent: the measure ran out of room or memory
 pub rec Need {
     s:     *Sim;
     pool:  bool;
+    cells: u64;
     add:   Set[ChunkAt];
     room:  usize;
     last:  ChunkAt;
@@ -1600,6 +1658,7 @@ pub fun need_init(n: *Need, s: *Sim) {
     n.pool  = caps(s).pool;
     n.add   = set.init[ChunkAt](s.space.a);
     n.room  = 0;
+    n.cells = 0;
     n.any   = false;
     n.spent = false;
     if (s.space.max_slots > s.space.live) { n.room = s.space.max_slots - s.space.live; }
@@ -1613,10 +1672,14 @@ pub fun need_dnit(n: *Need) {
 # count n live cells from (x, y) rightward into a measure
 # ---
 # ret: false once the edit needs more chunks than the pool has room for, or
-#      the measure could not grow
+#      more cells than the tree takes as runs, or the measure could not grow
 pub fun need_run(n: *Need, x: i64, y: i64, count: usize) bool {
     if (n.spent) { ret false; }
-    if (!n.pool) { ret true; }
+    if (!n.pool) {
+        n.cells = n.cells + count::u64;
+        n.spent = n.cells > LOAD_CELLS;
+        ret !n.spent;
+    }
     # a cell off the grid is dropped, and needs nothing
     var x0: i64 = x;
     var x1: i64 = x + count::i64;
@@ -1656,14 +1719,6 @@ pub fun need_run(n: *Need, x: i64, y: i64, count: usize) bool {
         }
         cx = cx + 1;
     }
-    ret true;
-}
-
-# whether a load of this many live cells is one the world takes at all, before
-# the chunks it needs are measured: the pool measures them, and the tree takes
-# up to LOAD_CELLS
-pub fun load_fits(s: *Sim, live: u64) bool {
-    if (on_tree(s)) { ret live <= LOAD_CELLS; }
     ret true;
 }
 

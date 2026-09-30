@@ -30,17 +30,22 @@
 # edits and reads go through a cache of 64 by 64 chunks of states over the
 # tree: a chunk is copied out of the tree the first time an edit or a read
 # touches it, written in place, and grafted back as one node when the cache is
-# flushed or fills, so an edit costs what its chunks do, however far apart.
+# flushed or fills, so an edit costs what its chunks do, however far apart. a
+# square already made of nodes, such as a file's, is laid over the world whole
+# instead (lay), costing its nodes rather than its chunks.
 
 use cellar.rule;
 use allo: std.allocator;
 use std.allocator.page;
+use std.collections.map;
+use std.collections.map.Map;
 use std.collections.vector;
 use std.collections.vector.Vector;
 use mem: std.memory;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 
@@ -701,11 +706,11 @@ pub fun get(t: *Tree, x: i64, y: i64) u32 {
     ret n;
 }
 
-# pad the root until it holds the chunk at (cx, cy)
-fun reach_chunk(t: *Tree, cx: i64, cy: i64) bool {
+# pad the root until it holds the square of side cells with its corner at (x, y)
+fun reach(t: *Tree, x: i64, y: i64, side: i64) bool {
     for {
         val h: i64 = half(t);
-        if (cx * 64 >= 0 - h && cy * 64 >= 0 - h && cx * 64 + 64 <= h && cy * 64 + 64 <= h) { ret true; }
+        if (x >= 0 - h && y >= 0 - h && x + side <= h && y + side <= h) { ret true; }
         if (t.level >= MAX_LEVEL) {
             t.full = true;
             ret false;
@@ -713,6 +718,11 @@ fun reach_chunk(t: *Tree, cx: i64, cy: i64) bool {
         if (!pad_to(t, t.level + 1)) { ret false; }
     }
     ret true;
+}
+
+# pad the root until it holds the chunk at (cx, cy)
+fun reach_chunk(t: *Tree, cx: i64, cy: i64) bool {
+    ret reach(t, cx * 64, cy * 64, 64);
 }
 
 # the node of the chunk at (cx, cy)
@@ -1005,6 +1015,90 @@ pub fun keep_inside(t: *Tree, x0: i64, y0: i64, x1: i64, y1: i64) bool {
     val n: u32 = crop(t, t.root, t.level, 0 - h, 0 - h, ?b[0]);
     if (n == NONE) { ret false; }
     t.root = n;
+    ret true;
+}
+
+# two nodes of one level being laid one over the other
+rec Pair {
+    under: u32;
+    over:  u32;
+}
+
+# the node of over's live cells laid on under, over's dead cells leaving
+# under's, each pair worked out once
+fun overlay(t: *Tree, under: u32, over: u32, memo: *Map[Pair, u32]) u32 {
+    if (under == NONE || over == NONE) { ret NONE; }
+    if (pop(t, over) == 0)             { ret under; }
+    if (pop(t, under) == 0)            { ret over; }
+    if (level_of(t, over) == 0)        { ret over; }
+    var key:  Pair      = Pair{under: under, over: over};
+    val have: opt[*u32] = map.get[Pair, u32](memo, ?key);
+    if (sel have.some) { ret @have.some; }
+    var k: [4]u32;
+    var i: usize = 0;
+    for (i < 4) {
+        k[i] = overlay(t, kid(t, under, i), kid(t, over, i), memo);
+        i    = i + 1;
+    }
+    val n: u32 = node(t, k[0], k[1], k[2], k[3]);
+    if (n == NONE) { ret NONE; }
+    val put: res[bool, allo.Error] = map.insert[Pair, u32](memo, key, n);
+    if (sel put.err) {
+        t.full = true;
+        ret NONE;
+    }
+    ret n;
+}
+
+# a copy of n, of level l with its corner at (ox, oy), with the node c of
+# level cl laid over the square at (x, y)
+fun paste(t: *Tree, n: u32, l: u32, ox: i64, oy: i64, c: u32, cl: u32, x: i64, y: i64, memo: *Map[Pair, u32]) u32 {
+    if (l == cl) { ret overlay(t, n, c, memo); }
+    val s:  i64   = (1::i64) << (l - 1)::i64;
+    var q:  usize = 0;
+    var qx: i64   = ox;
+    var qy: i64   = oy;
+    if (x >= ox + s) {
+        q  = 1;
+        qx = ox + s;
+    }
+    if (y >= oy + s) {
+        q  = q + 2;
+        qy = oy + s;
+    }
+    var k: [4]u32;
+    var i: usize = 0;
+    for (i < 4) {
+        k[i] = kid(t, n, i);
+        i    = i + 1;
+    }
+    k[q] = paste(t, k[q], l - 1, qx, qy, c, cl, x, y, memo);
+    ret node(t, k[0], k[1], k[2], k[3]);
+}
+
+# lay a node over the world, its live cells replacing the world's and its dead
+# ones leaving them, the cache flushed first
+#
+# the cost follows the distinct pairs of the node's squares and the world's
+# it lands on, not the cells either holds.
+# ---
+# t:   the tree, made
+# n:   a node of the table
+# l:   its level
+# x:   its leftmost column, a multiple of 2^l
+# y:   its top row, a multiple of 2^l
+# ret: false when the table filled or the square lies past MAX_LEVEL, leaving
+#      the world as it was but for the cache's chunks, grafted back
+pub fun lay(t: *Tree, n: u32, l: u32, x: i64, y: i64) bool {
+    if (n == NONE || !flush(t))              { ret false; }
+    if (pop(t, n) == 0)                      { ret true; }
+    if (!reach(t, x, y, (1::i64) << l::i64)) { ret false; }
+    val h:    i64            = half(t);
+    var memo: Map[Pair, u32] = map.init[Pair, u32](t.a);
+    val r:    u32            = paste(t, t.root, t.level, 0 - h, 0 - h, n, l, x, y, ?memo);
+    map.dnit[Pair, u32](?memo);
+    if (r == NONE) { ret false; }
+    t.root = r;
     ret true;
 }
 

@@ -122,7 +122,9 @@ and a pattern in any format cellar reads (RLE, plaintext `.cells`, Life 1.05
 and 1.06, Golly's Macrocell `.mc`) is stamped onto an empty world centred on the
 origin and framed, taking its rule when cellar can run it. A file that cannot be
 read, or a pattern too large for the world to hold, leaves the world as it was
-and says why. Options may come before or after the file, and `--` ends
+and says why. With `--engine hashlife` a Macrocell file is built straight into
+HashLife's tree from its nodes, so a pattern far past the chunk pool opens in
+the time its file takes to read, and undo takes it back. Options may come before or after the file, and `--` ends
 them, so `cellar -- -x.rle` opens a file whose name starts with a dash.
 
 A file dropped on the window opens the same way, a pattern stamped onto the
