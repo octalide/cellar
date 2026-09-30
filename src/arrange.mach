@@ -1,13 +1,17 @@
-# the draw section: the tool, the pattern palette, and the custom-pattern editor
+# the draw section: the tool, the pattern library, and the custom-pattern editor
 #
 # the tool says what a press on the world does: paint live cells, erase them,
-# stamp the selected pattern, or drag out a selection. picking a pattern arms
-# the stamp. the custom pattern is drawn in place in a small grid editor, and
-# the select tool offers the operations on the selection.
+# or stamp the selected pattern, or drag out a selection. picking a pattern
+# arms the stamp. the library is browsed a category at a time, or searched by
+# name across all of them, and listed a page at a time. the custom pattern is
+# drawn in place in a small grid editor, and the select tool offers the
+# operations on the selection.
 
 use cellar.app;
 use cellar.command;
+use cellar.library;
 use cellar.pattern;
+use cellar.text;
 use cellar.theme;
 use cellar.ui;
 use std.types.bool.bool;
@@ -17,11 +21,12 @@ use std.types.string.str;
 
 # unscaled height of the pattern preview
 val PREVIEW: f32 = 96.0;
+# patterns the list shows a page at a time
+val PAGE_ROWS: usize = 10;
 
-# the selected pattern, built-in or custom
+# the selected pattern, from the library or custom
 pub fun active(a: *app.App) *pattern.Pattern {
-    if (a.pattern_sel >= pattern.BUILTIN_COUNT) { ret ?a.custom; }
-    ret ?a.library[a.pattern_sel];
+    ret app.chosen(a);
 }
 
 # ask to stamp the selected pattern in the current orientation centred on world (x, y)
@@ -91,6 +96,79 @@ fun editor(u: *ui.Ui, p: *pattern.Pattern) {
     ui.advance(u, y1 - y0);
 }
 
+# pick a pattern to stamp
+fun pick(a: *app.App, i: usize) {
+    a.pattern_sel = i;
+    a.tool        = app.TOOL_STAMP;
+}
+
+# the categories to browse, and the custom pattern, two to a row
+fun categories(u: *ui.Ui, a: *app.App) {
+    val h: f32   = ui.px(u, ui.ROW);
+    val n: usize = library.CATEGORY_COUNT + 1;
+    var i: usize = 0;
+    for (i < n) {
+        val col:  usize = i % 2;
+        var name: str   = "Custom";
+        var on:   bool  = a.pattern_sel == app.CUSTOM && a.tool == app.TOOL_STAMP;
+        if (i < library.CATEGORY_COUNT) {
+            name = library.category(i).name;
+            on   = a.browse == i;
+        }
+        if (ui.button_at(u, name, ui.cell_x0(u, col, 2), u.y, ui.cell_x1(u, col, 2), u.y + h, on)) {
+            if (i < library.CATEGORY_COUNT) {
+                a.browse = i;
+                a.page   = 0;
+            }
+            or { pick(a, app.CUSTOM); }
+        }
+        if (col == 1 || i + 1 == n) { ui.advance(u, h); }
+        i = i + 1;
+    }
+}
+
+# the listed patterns, a page at a time, with the pages to turn
+fun list(u: *ui.Ui, a: *app.App, query: str) {
+    val l:     *library.Library = ?a.library;
+    var total: usize            = 0;
+    var i:     usize            = 0;
+    for (i < library.count(l)) {
+        if (library.listed(l, i, query, a.browse)) { total = total + 1; }
+        i = i + 1;
+    }
+    if (total == 0) {
+        ui.note(u, "No pattern has that in its name");
+        ret;
+    }
+    val pages: usize = (total + PAGE_ROWS - 1) / PAGE_ROWS;
+    if (a.page >= pages) { a.page = pages - 1; }
+    val first: usize = a.page * PAGE_ROWS;
+    var k:     usize = 0;
+    i = 0;
+    for (i < library.count(l) && k < first + PAGE_ROWS) {
+        if (library.listed(l, i, query, a.browse)) {
+            val on: bool = a.pattern_sel == i && a.tool == app.TOOL_STAMP;
+            if (k >= first && ui.button(u, library.name(l, i), on)) { pick(a, i); }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    if (pages == 1) { ret; }
+    var at: [48]u8;
+    var o:  usize = text.buf_str(?at[0], 0, "Page ");
+    o     = text.buf_u64(?at[0], o, (a.page + 1)::u64);
+    o     = text.buf_str(?at[0], o, " of ");
+    o     = text.buf_u64(?at[0], o, pages::u64);
+    at[o] = 0;
+    ui.note(u, ?at[0]);
+    var turn: [2]str;
+    turn[0] = "Previous";
+    turn[1] = "Next";
+    val t: usize = ui.buttons(u, ?turn[0], 2);
+    if (t == 0 && a.page > 0)         { a.page = a.page - 1; }
+    if (t == 1 && a.page + 1 < pages) { a.page = a.page + 1; }
+}
+
 # the label of an area operation's button
 fun area_label(op: u8) str {
     if (op == command.AREA_COPY)          { ret "Copy"; }
@@ -137,29 +215,20 @@ pub fun section(u: *ui.Ui, a: *app.App) {
         ret;
     }
 
-    val h: f32   = ui.px(u, ui.ROW);
-    val n: usize = pattern.BUILTIN_COUNT + 1;
-    var i: usize = 0;
-    for (i < n) {
-        val col:  usize = i % 2;
-        var name: str   = "custom";
-        if (i < pattern.BUILTIN_COUNT) { name = pattern.name(?a.library[i]); }
-        val on: bool = a.pattern_sel == i && a.tool == app.TOOL_STAMP;
-        if (ui.button_at(u, name, ui.cell_x0(u, col, 2), u.y, ui.cell_x1(u, col, 2), u.y + h, on)) {
-            a.pattern_sel = i;
-            a.tool        = app.TOOL_STAMP;
-        }
-        if (col == 1 || i + 1 == n) { ui.advance(u, h); }
-        i = i + 1;
-    }
+    if (ui.text_field(u, ?a.search, "Search patterns") == ui.FIELD_EDITED) { a.page = 0; }
+    val query: str = ui.field_text(?a.search);
+    if (query[0] == 0) { categories(u, a); }
+    list(u, a, query);
 
-    if (a.pattern_sel == pattern.BUILTIN_COUNT) {
+    val p: *pattern.Pattern = active(a);
+    if (p == ?a.custom) {
         ui.note(u, "Custom pattern, click cells to edit");
         editor(u, ?a.custom);
         if (ui.button(u, "Clear pattern", false)) { pattern.clear(?a.custom); }
         ret;
     }
+    ui.note(u, pattern.name(p));
     val ph: f32 = ui.px(u, PREVIEW);
-    preview(u, active(a), u.x, u.y, u.x + u.w, u.y + ph);
+    preview(u, p, u.x, u.y, u.x + u.w, u.y + ph);
     ui.advance(u, ph);
 }
