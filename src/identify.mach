@@ -25,6 +25,7 @@ use cellar.text;
 use allo: std.allocator;
 use std.allocator.page;
 use mem: std.memory;
+use std.sync.atomic;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -48,14 +49,17 @@ pub val DESCRIBE_MAX: usize = 640;
 # gens: generations to look for a repeat in
 # side: the widest or tallest the live cells may grow before the pattern is
 #       said to grow without repeating
+# stop: nil, or a flag another thread sets nonzero, atomically, to cancel the
+#       run, which is checked every generation
 pub rec Limits {
     gens: u64;
     side: usize;
+    stop: *i64;
 }
 
 # the limits the app classifies a selection under
 pub fun limits() Limits {
-    ret Limits{gens: 1024, side: 256};
+    ret Limits{gens: 1024, side: 256, stop: nil};
 }
 
 # what became of the pattern
@@ -68,6 +72,7 @@ pub fun limits() Limits {
 # unsettled:   no earlier form returned within the generation limit
 # grows:       its live cells outgrew the side limit, or the pool, first
 # oversized:   its live cells span more than the side limit to begin with
+# cancelled:   the run was stopped through the limits' stop flag
 # unsupported: the rule cannot be classified here, as why says
 pub tag Fate: u8 {
     empty;
@@ -78,6 +83,7 @@ pub tag Fate: u8 {
     unsettled;
     grows;
     oversized;
+    cancelled;
     unsupported;
 }
 
@@ -537,6 +543,11 @@ pub fun classify(a: *allo.Allocator, r: *rule.Rule, p: *pattern.Pattern, lim: Li
     t.helpers = 0;
     var g: u64 = 0;
     for {
+        if (lim.stop != nil && atomic.load(lim.stop) != 0) {
+            out.fate = Fate.cancelled{};
+            out.at   = g;
+            ret err[allo.Error].ok{};
+        }
         val alive: opt[space.Box] = space.bounds(?run.sp);
         if (sel alive.none) {
             out.fate = Fate.dies{};
@@ -651,6 +662,7 @@ pub fun describe(r: *Result, buf: *u8) str {
         o = text.buf_u64(buf, o, r.side::u64);
         o = text.buf_str(buf, o, " cells, too many to classify");
     }
+    or (sel r.fate.cancelled) { o = text.buf_str(buf, o, "identifying was cancelled"); }
     or (sel r.fate.unsupported) {
         o = text.buf_str(buf, o, "cannot classify: ");
         o = text.buf_str(buf, o, r.why);
@@ -696,7 +708,7 @@ pub fun describe(r: *Result, buf: *u8) str {
 
 # a pattern from rows split by '/', O live and anything else dead
 #[testing]
-fun rows(p: *pattern.Pattern, a: *allo.Allocator, s: str) bool {
+pub fun rows(p: *pattern.Pattern, a: *allo.Allocator, s: str) bool {
     var w: usize = 0;
     var h: usize = 0;
     var n: usize = 0;
@@ -753,7 +765,7 @@ fun expect(r: rule.Rule, s: str, fate: Fate, period: u64, dx: i64, dy: i64, code
 
 # a fate's case as a number, for comparing two
 #[testing]
-fun fate_id(f: Fate) u8 {
+pub fun fate_id(f: Fate) u8 {
     if (sel f.empty)      { ret 0; }
     if (sel f.dies)       { ret 1; }
     if (sel f.still)      { ret 2; }
@@ -762,11 +774,12 @@ fun fate_id(f: Fate) u8 {
     if (sel f.unsettled)  { ret 5; }
     if (sel f.grows)      { ret 6; }
     if (sel f.oversized)  { ret 7; }
-    ret 8;
+    if (sel f.cancelled)  { ret 8; }
+    ret 9;
 }
 
 #[testing]
-fun life() rule.Rule {
+pub fun life() rule.Rule {
     ret rule.Rule.weighted{weighted.life()};
 }
 
