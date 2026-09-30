@@ -8,8 +8,12 @@
 # randomize, load and clear edit the host's pool either way, and the GPU picks
 # the edits up as the frame begins, and a read pulls an area's chunks from the
 # GPU before the host's cells there are read. outside the pool every cell is
-# dead, so a rule that births from nothing (B0) only acts inside the chunks
-# that exist.
+# dead. a rule whose background flips each generation (rule.Caps.b0) is held
+# as the world's complement on odd generations, which flipped says: the draw
+# shows those inverted, and edits and reads see the world through them, so a
+# cell painted live is live whatever the parity. the phase follows from the
+# rule and the generation, which snapshots and world files keep, so nothing
+# else records it. the population and bounds count the cells as held.
 
 use gfx: boom.graphics;
 use boom.window;
@@ -133,7 +137,11 @@ pub fun init(s: *Sim, a: *allo.Allocator) err[allo.Error] {
 # replace the rule the world runs
 #
 # the cells are kept as they are, so a rule of another family must read them
-# alike, which holds while there is one family.
+# alike, which holds while there is one family. a change between rules held in
+# different forms (see rule.Caps.b0 and cellar.rules.weighted) keeps the held
+# cells too, so at a generation where one holds the complement and the other
+# does not, the world reads as the held cells' complement from then on: the
+# world before it had an unbounded live background no pool can hold.
 # ---
 # s: simulation
 # r: the rule
@@ -183,7 +191,7 @@ pub fun step(s: *Sim) {
         if (s.pending < MAX_PENDING) { s.pending = s.pending + 1; }
         ret;
     }
-    if (!cpu.step(?s.space, ?s.rule, ?s.team)) {
+    if (!cpu.step(?s.space, ?s.rule, s.generation, ?s.team)) {
         overflow(s);
         ret;
     }
@@ -234,7 +242,7 @@ pub fun record(s: *Sim, uncapped: bool, look: *gpu.Look) err[gfx.Error] {
     val fast: bool  = uncapped && s.running != 0 && on_gpu(s) && !s.full;
     if (fast)                 { want = gpu.stride(s.gpu); }
     if (!on_gpu(s) || s.full) { want = 0; }
-    val done: res[usize, gfx.Error] = gpu.frame(s.gpu, ?s.space, ?s.rule, want, look);
+    val done: res[usize, gfx.Error] = gpu.frame(s.gpu, ?s.space, ?s.rule, s.generation, want, look);
     if (sel done.err) { ret err[gfx.Error].err{done.err}; }
     s.generation = s.generation + done.ok::u64;
     if (fast)                 { gpu.tune(s.gpu, want, done.ok); }
@@ -389,7 +397,22 @@ pub fun restore(s: *Sim, sn: *snapshot.Snapshot) bool {
     ret ok;
 }
 
-# the word a state is written as, fresh
+# whether the cells hold the world's complement this generation, which the
+# draw shows inverted and edits and reads see through: the rule's background
+# flips each generation and the generation is odd
+pub fun flipped(s: *Sim) bool {
+    ret rule.caps(?s.rule).b0 && (s.generation & 1) != 0;
+}
+
+# the state the pool holds for a state of the world, or the world's for a held
+# one: the same but swapped this generation when flipped, whose rules hold two
+# states
+fun held(s: *Sim, v: u8) u8 {
+    if (flipped(s)) { ret 1 - v; }
+    ret v;
+}
+
+# the word a held state is written as, fresh
 fun cell_of(s: *Sim, v: u8) u32 {
     ret rule.word(?s.rule, v::u32);
 }
@@ -480,7 +503,7 @@ pub fun read_begin(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64) bool {
 # x:   first column
 # y:   row
 # n:   cells to read
-# out: receives n states, as the rule reads them
+# out: receives n states of the world, as the rule reads them
 # ret: false when any cell lies outside the area, leaving out untouched
 pub fun read_run(s: *Sim, x: i64, y: i64, n: usize, out: *u8) bool {
     val r: *Read = ?s.read;
@@ -494,12 +517,12 @@ pub fun read_run(s: *Sim, x: i64, y: i64, n: usize, out: *u8) bool {
         val o:  usize = (at - x)::usize;
         val k:  usize = (stop - at)::usize;
         val sl: u32   = space.find(sp, space.chunk_of(at), space.chunk_of(y));
-        if (sl == space.NONE) { mem.zero[u8](?out[o], k); }
+        if (sl == space.NONE) { mem.fill[u8](?out[o], held(s, 0), k); }
         or {
             val row: *u32  = ?sp.cells[sl::usize * space.CELLS + space.local_of(y) * 64 + space.local_of(at)];
             var i:   usize = 0;
             for (i < k) {
-                out[o + i] = rule.state(?s.rule, row[i])::u8;
+                out[o + i] = held(s, rule.state(?s.rule, row[i])::u8);
                 i          = i + 1;
             }
         }
@@ -602,10 +625,11 @@ pub fun edit_set(s: *Sim, x: i64, y: i64, v: u8) bool {
 # x:   first column
 # y:   row
 # n:   cells to write
-# v:   state, below the rule's states
+# w:   state of the world, below the rule's states
 # ret: false when any cell lies outside the area or the pool was full
-pub fun edit_run(s: *Sim, x: i64, y: i64, n: usize, v: u8) bool {
+pub fun edit_run(s: *Sim, x: i64, y: i64, n: usize, w: u8) bool {
     val e: *Edit = ?s.edit;
+    val v: u8    = held(s, w);
     if (!e.open || y < e.y0 || y >= e.y1 || x < e.x0 || x + n::i64 > e.x1) { ret false; }
     var ok:  bool = true;
     var at:  i64  = x;
@@ -784,9 +808,9 @@ pub fun cell(s: *Sim, x: i64, y: i64) u32 {
     ret s.space.cells[sl::usize * space.CELLS + space.local_of(y) * 64 + space.local_of(x)];
 }
 
-# whether the cell at (x, y) is live, from the host's cells
+# whether the cell at (x, y) of the world is live, from the host's cells
 pub fun alive(s: *Sim, x: i64, y: i64) bool {
-    ret space.live(?s.space, cell(s, x, y));
+    ret space.live(?s.space, cell(s, x, y)) != flipped(s);
 }
 
 # live cells in the world, as of the last step or census

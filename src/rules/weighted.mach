@@ -10,6 +10,20 @@
 # its rule string is B/S notation for a Life-like kernel and the whole kernel
 # (structure) for any other, and parse reads either. its cell word is
 # cellar.rules.weighted.word's, and its step stage is weighted_comp.
+#
+# a rule that births on 0 (B0) would flip the whole unbounded background, which
+# no pool of chunks can hold, so it runs as Golly runs it and the cells the pool
+# holds always keep a dead background. a B0 rule that does not survive at the
+# all-live sum T, the footprint's total weight (S-max), strobes: even
+# generations are the world's cells, odd ones its complement, drawn inverted.
+# stepping from a world generation stores the complement of the rule's result,
+# and stepping from a complement one reads a cell's state inverted and its sum
+# as T - n, so a dead cell of the complement is born where a live one of the
+# world would survive and a live one survives where a dead one would be born.
+# a B0 rule with S-max has no valid strobe: once flipped its background stays
+# live, so like Golly it runs as its complement rule every generation and the
+# cells are shown as they are held, the world's live and dead swapped. which of
+# the three forms a rule runs in is word.PLAIN, word.STROBE or word.COMPLEMENT.
 
 use cellar.layout;
 use cellar.rules.weighted.word;
@@ -28,7 +42,8 @@ val STAGE: [_]u8;
 
 # what the family's capabilities come to for one kernel
 # ---
-# b0:        a dead cell with no live neighbour is born
+# b0:        the background flips each generation, so odd generations hold
+#            the world's complement: the STROBE form
 # isotropic: the footprint's weights are the same under every rotation and
 #            reflection of the square
 # hashlife:  a quadtree engine can run it: radius 1 and no birth on 0
@@ -487,8 +502,28 @@ pub fun radius(k: *Kernel) usize {
 
 # the capabilities the family has for a kernel
 pub fun caps(k: *Kernel) Caps {
-    val b0: bool = (k.birth & 1) != 0;
-    ret Caps{b0: b0, isotropic: isotropic(k), hashlife: k.radius == 1 && !b0, bounded: true};
+    val born: bool = (k.birth & 1) != 0;
+    ret Caps{b0: form(k) == word.STROBE, isotropic: isotropic(k), hashlife: k.radius == 1 && !born, bounded: true};
+}
+
+# the sum of every footprint weight, negatives included: a cell's weighted sum
+# when every cell of its footprint is live, wrapped as a step's sums wrap
+pub fun total(k: *Kernel) i32 {
+    val n: usize = (2 * k.radius + 1) * (2 * k.radius + 1);
+    var t: i64   = 0;
+    var i: usize = 0;
+    for (i < n) {
+        t = t + k.weights[i]::i64;
+        i = i + 1;
+    }
+    ret t::i32;
+}
+
+# the form a kernel runs in: PLAIN, STROBE or COMPLEMENT (cellar.rules.weighted.word)
+pub fun form(k: *Kernel) u32 {
+    if ((k.birth & 1) == 0)              { ret word.PLAIN; }
+    if (next_state(k, 1, total(k)) != 0) { ret word.COMPLEMENT; }
+    ret word.STROBE;
 }
 
 # whether every rotation and reflection of the footprint has the same weights
@@ -507,16 +542,28 @@ fun isotropic(k: *Kernel) bool {
     ret true;
 }
 
-# the next word of a cell given its word and the weighted sum around it
+# the next word of a cell given its word and the weighted sum around it, both
+# as the pool holds them
+#
+# a cell held inverted reads as its complement, its sum as t less the held
+# one, and the result is held inverted when inv_out is set.
 # ---
-# k:   the rule
-# c:   the cell, age << 8 | heat
-# sum: the weighted count of live cells in its footprint
-# ret: the cell one generation on
-pub fun next(k: *Kernel, c: u32, sum: i32) u32 {
-    var live: u8 = 0;
+# k:       the rule
+# c:       the cell, age << 8 | heat
+# sum:     the weighted count of held live cells in its footprint
+# t:       the footprint's total weight
+# inv_in:  1 when the cells stepped from hold the world's complement
+# inv_out: 1 when the cells stepped to hold it
+# ret:     the cell one generation on, as held
+pub fun next(k: *Kernel, c: u32, sum: i32, t: i32, inv_in: u32, inv_out: u32) u32 {
+    var live: u8  = 0;
+    var s:    i32 = sum;
     if (c >= word.LIVE) { live = 1; }
-    if (next_state(k, live, sum) != 0) {
+    if (inv_in != 0) {
+        live = 1 - live;
+        s    = (t::i64 - sum::i64)::i32;
+    }
+    if ((next_state(k, live, s) ^ inv_out::u8) != 0) {
         var age: u32 = (c >> word.AGE_SHIFT) + 1;
         if (age > word.AGE_MAX) { age = word.AGE_MAX; }
         ret (age << word.AGE_SHIFT) | word.HEAT_MASK;
@@ -533,12 +580,13 @@ fun cool(c: u32) u32 {
 
 # step one chunk on the CPU, the rule the family's stage applies word for word
 #
-# a chunk with nothing alive nearby only cools. a cell well inside the chunk
+# a chunk with nothing alive nearby only cools, which holds in every form,
+# since the held background steps to itself. a cell well inside the chunk
 # reads its footprint from the chunk alone, and one near an edge from the
 # block, where a chunk that does not exist reads as dead.
 # ---
 # k: the rule
-# b: the chunk's block and back cells
+# b: the chunk's block and back cells, at generation b.gen
 # t: the tally of the cells written
 pub fun step_chunk(k: *Kernel, b: *space.Block, t: *space.Tally) {
     val own: *u32 = b.nb[4];
@@ -553,9 +601,13 @@ pub fun step_chunk(k: *Kernel, b: *space.Block, t: *space.Tally) {
         }
         ret;
     }
-    val r:     i64 = k.radius::i64;
-    val width: i64 = 2 * r + 1;
-    var ly:    i64 = 0;
+    val r:       i64 = k.radius::i64;
+    val width:   i64 = 2 * r + 1;
+    val f:       u32 = form(k);
+    val all:     i32 = total(k);
+    val inv_in:  u32 = word.inverted(f, (b.gen & 1)::u32);
+    val inv_out: u32 = word.inverted(f, ((b.gen + 1) & 1)::u32);
+    var ly:      i64 = 0;
     for (ly < 64) {
         var lx: i64 = 0;
         for (lx < 64) {
@@ -600,7 +652,7 @@ pub fun step_chunk(k: *Kernel, b: *space.Block, t: *space.Tally) {
                 dy = dy + 1;
             }
             val i: usize = (ly * 64 + lx)::usize;
-            val v: u32   = next(k, own[i], sum);
+            val v: u32   = next(k, own[i], sum, all, inv_in, inv_out);
             out[i] = v;
             space.note(t, v, lx::u32, ly::u32);
             lx = lx + 1;
@@ -629,6 +681,8 @@ pub fun pack(k: *Kernel, w: *u32) {
         w[word.WEIGHTS_AT::usize + i] = (k.weights[i] + word.WEIGHT_BIAS::i32)::u32;
         i                             = i + 1;
     }
+    w[word.FORM_AT]  = form(k);
+    w[word.TOTAL_AT] = total(k):~u32;
 }
 
 # the family's step stage, as SPIR-V
@@ -641,12 +695,14 @@ pub fun stage(len: *usize) *u8 {
 }
 
 # rule strings that exercise the family, for the tests that run every family:
-# life, then a radius-2 kernel of uneven weights
-pub val SAMPLE_COUNT: usize = 2;
+# life, a radius-2 kernel of uneven weights, then life's inverse, a B0 rule
+# with S-max that runs in the COMPLEMENT form
+pub val SAMPLE_COUNT: usize = 3;
 
 # the sample rule string i
 pub fun sample(i: usize) str {
     if (i == 1) { ret "2 896 1472 1 1 1 1 1 1 2 2 2 1 1 2 0 2 1 1 2 2 2 1 1 1 1 1 1"; }
+    if (i == 2) { ret "B0123478/S01234678"; }
     ret "B3/S23";
 }
 
