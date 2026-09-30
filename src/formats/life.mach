@@ -1,0 +1,323 @@
+# Alan Hensel's Life 1.05 and 1.06, the formats of his PC Life and of many older collections
+#
+# a file opens with a "#Life 1.05" or "#Life 1.06" line. in 1.05 the cells come
+# in blocks: "#P <x> <y>" puts a block's top-left corner, and each row after it
+# is '.' for a dead cell and '*' for a live one, one row below the last. a "#P"
+# with no numbers carries on where the rows left off, and rows before any "#P"
+# start at (0, 0). in 1.06 every other line is the "<x> <y>" of one live cell.
+# in both, "#D" and "#C" lines are comments, "#N" names Conway's Life, kept as
+# "B3/S23", "#R <rule>" names a rule, whose first word is kept untouched, blank
+# lines are skipped and any other '#' line is ignored. blocks may overlap and
+# cells may repeat, so the cells are gathered, sorted and merged before any is
+# emitted. the format is read only.
+
+use cellar.format;
+use cellar.text;
+use allo: std.allocator;
+use std.collections.sort;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+# the rule "#N" names
+val CONWAY: str = "B3/S23";
+
+# a horizontal run of live cells gathered from the file
+# ---
+# y: row
+# x: first column
+# n: cells
+rec Seg {
+    y: i64;
+    x: i64;
+    n: i64;
+}
+
+# a read position in the file
+# ---
+# p: the bytes
+# n: how many
+# i: the next byte
+rec Cur {
+    p: *u8;
+    n: usize;
+    i: usize;
+}
+
+fun peek(c: *Cur) u8 {
+    ret text.byte_at(c.p, c.n, c.i);
+}
+
+fun is_blank(b: u8) bool {
+    ret b == ' ' || b == '\t' || b == '\r' || b == '\n';
+}
+
+fun is_digit(b: u8) bool {
+    ret b >= '0' && b <= '9';
+}
+
+fun skip_spaces(c: *Cur, end: usize) {
+    for (c.i < end && (c.p[c.i] == ' ' || c.p[c.i] == '\t')) { c.i = c.i + 1; }
+}
+
+# the end of the line at the read position, past its trailing blanks
+# ---
+# c:    read position at the line's first byte
+# next: receives where the next line starts
+fun line_end(c: *Cur, next: *usize) usize {
+    var e: usize = c.i;
+    for (e < c.n && c.p[e] != '\n') { e = e + 1; }
+    @next = e + 1;
+    if (e >= c.n) { @next = c.n; }
+    for (e > c.i && is_blank(c.p[e - 1])) { e = e - 1; }
+    ret e;
+}
+
+# read an optionally negative decimal number
+# ---
+# c:   read position, left after the digits
+# end: the line's end
+# out: receives the value
+# ret: ok, malformed when no digits are there, range beyond format.LIMIT
+fun read_int(c: *Cur, end: usize, out: *i64) err[format.Error] {
+    var neg: bool = false;
+    if (c.i < end && c.p[c.i] == '-') {
+        neg = true;
+        c.i = c.i + 1;
+    }
+    if (c.i >= end || !is_digit(c.p[c.i])) { ret err[format.Error].err{format.Error.malformed{}}; }
+    var v: i64 = 0;
+    for (c.i < end && is_digit(c.p[c.i])) {
+        v = v * 10 + (c.p[c.i] - '0')::i64;
+        if (v > format.LIMIT) { ret err[format.Error].err{format.Error.range{}}; }
+        c.i = c.i + 1;
+    }
+    if (neg) { v = 0 - v; }
+    @out = v;
+    ret err[format.Error].ok{};
+}
+
+# the version a "#Life 1.0x" line names, 5 or 6, or 0 when the line is not one
+# ---
+# c:   read position at the line
+# end: the line's end
+fun version(c: *Cur, end: usize) u8 {
+    val head: str   = "#Life 1.0";
+    var k:    usize = 0;
+    for (head[k] != 0) {
+        if (c.i + k >= end || c.p[c.i + k] != head[k]) { ret 0; }
+        k = k + 1;
+    }
+    if (c.i + k + 1 != end) { ret 0; }
+    val v: u8 = c.p[c.i + k];
+    if (v == '5') { ret 5; }
+    if (v == '6') { ret 6; }
+    ret 0;
+}
+
+fun add(segs: *Vector[Seg], y: i64, x: i64, n: i64) err[format.Error] {
+    val r: res[usize, allo.Error] = vector.push[Seg](segs, Seg{y: y, x: x, n: n});
+    if (sel r.err) { ret err[format.Error].err{format.Error.alloc{r.err}}; }
+    ret err[format.Error].ok{};
+}
+
+# the state of a whole read: where the next 1.05 row goes, and what was gathered
+# ---
+# x:    left edge of the current block
+# y:    row the next block row lands on
+# segs: the live runs so far
+# com:  the comments so far
+rec Read {
+    x:    i64;
+    y:    i64;
+    segs: *Vector[Seg];
+    com:  *Vector[u8];
+}
+
+# read one '#' line after the header
+# ---
+# c:   read position at the '#'
+# end: the line's end
+# st:  the read, whose block corner a "#P" moves
+fun read_hash(a: *allo.Allocator, c: *Cur, end: usize, st: *Read, info: *format.Info) err[format.Error] {
+    val tag: u8 = text.byte_at(c.p, end, c.i + 1);
+    c.i = c.i + 2;
+    if (c.i > end) { c.i = end; }
+    skip_spaces(c, end);
+    if (tag == 'P') {
+        if (c.i >= end) { ret err[format.Error].ok{}; }
+        val x: err[format.Error] = read_int(c, end, ?st.x);
+        if (sel x.err) { ret x; }
+        skip_spaces(c, end);
+        val y: err[format.Error] = read_int(c, end, ?st.y);
+        if (sel y.err)  { ret y; }
+        if (c.i != end) { ret err[format.Error].err{format.Error.malformed{}}; }
+    }
+    or (tag == 'N') {
+        val r: err[allo.Error] = format.set_str(a, ?info.rule, CONWAY);
+        if (sel r.err) { ret err[format.Error].err{format.Error.alloc{r.err}}; }
+    }
+    or (tag == 'R') {
+        # the rule is the first word, as Golly reads it
+        var w: usize = c.i;
+        for (w < end && !is_blank(c.p[w])) { w = w + 1; }
+        val r: err[allo.Error] = format.set_text(a, ?info.rule, ?c.p[c.i], w - c.i);
+        if (sel r.err) { ret err[format.Error].err{format.Error.alloc{r.err}}; }
+    }
+    or (tag == 'D' || tag == 'C') {
+        if (st.com.len != 0) {
+            val nl: res[usize, allo.Error] = vector.push[u8](st.com, '\n');
+            if (sel nl.err) { ret err[format.Error].err{format.Error.alloc{nl.err}}; }
+        }
+        for (c.i < end) {
+            val r: res[usize, allo.Error] = vector.push[u8](st.com, c.p[c.i]);
+            if (sel r.err) { ret err[format.Error].err{format.Error.alloc{r.err}}; }
+            c.i = c.i + 1;
+        }
+    }
+    ret err[format.Error].ok{};
+}
+
+# gather the live runs of a 1.05 row, then step the block down a row
+fun read_row(c: *Cur, end: usize, st: *Read) err[format.Error] {
+    if (st.y > format.LIMIT || st.y < 0 - format.LIMIT) { ret err[format.Error].err{format.Error.range{}}; }
+    if (st.x + (end - c.i)::i64 > format.LIMIT)         { ret err[format.Error].err{format.Error.range{}}; }
+    val from: usize = c.i;
+    for (c.i < end) {
+        if (c.p[c.i] == '.') {
+            c.i = c.i + 1;
+            cnt;
+        }
+        if (c.p[c.i] != '*') { ret err[format.Error].err{format.Error.malformed{}}; }
+        val at: usize = c.i;
+        for (c.i < end && c.p[c.i] == '*') { c.i = c.i + 1; }
+        val r: err[format.Error] = add(st.segs, st.y, st.x + (at - from)::i64, (c.i - at)::i64);
+        if (sel r.err) { ret r; }
+    }
+    st.y = st.y + 1;
+    ret err[format.Error].ok{};
+}
+
+# gather the cell a 1.06 "<x> <y>" line names
+fun read_cell(c: *Cur, end: usize, st: *Read) err[format.Error] {
+    var x: i64               = 0;
+    var y: i64               = 0;
+    val a: err[format.Error] = read_int(c, end, ?x);
+    if (sel a.err) { ret a; }
+    val gap: usize = c.i;
+    skip_spaces(c, end);
+    if (c.i == gap) { ret err[format.Error].err{format.Error.malformed{}}; }
+    val b: err[format.Error] = read_int(c, end, ?y);
+    if (sel b.err)  { ret b; }
+    if (c.i != end) { ret err[format.Error].err{format.Error.malformed{}}; }
+    ret add(st.segs, y, x, 1);
+}
+
+# row then column order
+fun order(a: *Seg, b: *Seg) i64 {
+    if (a.y < b.y) { ret -1; }
+    if (a.y > b.y) { ret 1; }
+    if (a.x < b.x) { ret -1; }
+    if (a.x > b.x) { ret 1; }
+    ret 0;
+}
+
+# sort the gathered runs and emit them with overlapping and touching ones merged
+fun flush(segs: *Vector[Seg], e: *format.Emit) err[format.Error] {
+    sort.sort_by[Seg](segs.data, segs.len, order);
+    var i: usize = 0;
+    for (i < segs.len) {
+        val y:   i64 = segs.data[i].y;
+        val x:   i64 = segs.data[i].x;
+        var end: i64 = x + segs.data[i].n;
+        i = i + 1;
+        for (i < segs.len && segs.data[i].y == y && segs.data[i].x <= end) {
+            if (segs.data[i].x + segs.data[i].n > end) { end = segs.data[i].x + segs.data[i].n; }
+            i = i + 1;
+        }
+        if (!format.emit(e, x, y, (end - x)::usize, 1)) { ret err[format.Error].err{format.Error.sink{}}; }
+    }
+    ret err[format.Error].ok{};
+}
+
+# read one line after the header that is not blank
+# ---
+# v: the file's version, 5 or 6
+fun read_line(a: *allo.Allocator, c: *Cur, end: usize, v: u8, st: *Read, info: *format.Info) err[format.Error] {
+    if (c.p[c.i] == '#') { ret read_hash(a, c, end, st, info); }
+    if (v == 5)          { ret read_row(c, end, st); }
+    ret read_cell(c, end, st);
+}
+
+fun read_all(a: *allo.Allocator, p: *u8, n: usize, e: *format.Emit, st: *Read) err[format.Error] {
+    var c: Cur;
+    c.p = p;
+    c.n = n;
+    c.i = 0;
+    for (c.i < c.n && is_blank(c.p[c.i])) { c.i = c.i + 1; }
+    var next: usize = 0;
+    val v:    u8    = version(?c, line_end(?c, ?next));
+    if (v == 0) {
+        e.info.at = c.i;
+        ret err[format.Error].err{format.Error.malformed{}};
+    }
+    c.i = next;
+    for (c.i < c.n) {
+        e.info.at = c.i;
+        val end: usize = line_end(?c, ?next);
+        if (end != c.i) {
+            val r: err[format.Error] = read_line(a, ?c, end, v, st, e.info);
+            if (sel r.err) { ret r; }
+        }
+        c.i = next;
+    }
+    val f: err[format.Error] = flush(st.segs, e);
+    if (sel f.err) { ret f; }
+    val m: err[allo.Error] = format.set_text(a, ?e.info.comments, st.com.data, st.com.len);
+    if (sel m.err) { ret err[format.Error].err{format.Error.alloc{m.err}}; }
+    ret err[format.Error].ok{};
+}
+
+# decode a Life 1.05 or 1.06 file
+fun decode(a: *allo.Allocator, p: *u8, n: usize, e: *format.Emit) err[format.Error] {
+    var segs: Vector[Seg] = vector.init[Seg](a);
+    var com:  Vector[u8]  = vector.init[u8](a);
+    var st:   Read;
+    st.x    = 0;
+    st.y    = 0;
+    st.segs = ?segs;
+    st.com  = ?com;
+    val r: err[format.Error] = read_all(a, p, n, e, ?st);
+    vector.dnit[Seg](?segs);
+    vector.dnit[u8](?com);
+    ret r;
+}
+
+# how likely the bytes are Life 1.05 or 1.06: the header line says so
+fun sniff(p: *u8, n: usize) u32 {
+    var c: Cur;
+    c.p = p;
+    c.n = n;
+    c.i = 0;
+    for (c.i < c.n && is_blank(c.p[c.i])) { c.i = c.i + 1; }
+    var next: usize = 0;
+    if (version(?c, line_end(?c, ?next)) != 0) { ret 100; }
+    ret 0;
+}
+
+# the Life 1.05 and 1.06 format's registry record
+pub fun make() format.Format {
+    var f: format.Format;
+    f.id     = "life";
+    f.exts   = "lif life";
+    f.sniff  = sniff;
+    f.decode = decode;
+    f.encode = nil;
+    ret f;
+}

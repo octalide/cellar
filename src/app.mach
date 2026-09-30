@@ -3,12 +3,21 @@
 # the simulation owns the cells and the rule. this owns the camera, the tool,
 # the colours, the panel and what it shows, and the messages it flashes.
 
+use cellar.command;
 use cellar.pattern;
 use cellar.render;
+use cellar.saves;
+use cellar.space;
+use cellar.text;
 use cellar.theme;
+use cellar.ui;
+use allo: std.allocator;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 
@@ -32,6 +41,10 @@ pub val SCALE_COUNT: usize = 4;
 # ticks a message stays up
 pub val TOAST_TICKS: i32 = 150;
 
+# clamp on the user zoom multiplier, from a whole large world to a few cells
+pub val ZOOM_MIN: f32 = 0.005;
+pub val ZOOM_MAX: f32 = 16.0;
+
 # all interactive state not owned by the simulation
 # ---
 # speed:       generations per second when not uncapped
@@ -42,11 +55,13 @@ pub val TOAST_TICKS: i32 = 150;
 # bounds_idx:  index into the power-of-two randomize-area table
 # pattern_sel: selected pattern; pattern.BUILTIN_COUNT selects the custom one
 # custom:      the user-drawn custom pattern
+# orient:      how the stamp is laid down (pattern.ORIENT_*)
 # solid:       live-cell colour in solid mode, sRGB hex
 # zoom:        zoom multiplier, render.BASE_PPC pixels per cell at 1
 # pan_x:       world column at the view's centre
 # pan_y:       world row at the view's centre
-# refit:       frame the randomize area on the next frame
+# refit:       frame fit, or the randomize area, on the next frame
+# fit:         the cells to frame, none for the randomize area
 # panel:       1 while the side panel is shown
 # open_run:    the run section is expanded
 # open_draw:   the draw section is expanded
@@ -58,12 +73,18 @@ pub val TOAST_TICKS: i32 = 150;
 # content:     the panel content's height last frame
 # side_x0:     the panel's left edge last frame, or the window width when hidden
 # help:        1 while the key reference is shown
+# full_said:   the full pool was reported, until the world is cleared
 # toast:       the message being flashed
 # toast_t:     ticks it has left
+# said:        the text of a message built at run time
+# name:        the name the files section saves under
+# saves:       the worlds and patterns in the data directory
 # stroke:      a paint stroke is under way
 # last_x:      the cell the stroke last painted
 # last_y:      the cell the stroke last painted
 # shot:        a screenshot of the next frame is wanted
+# alloc:       allocator behind the patterns and the queue, once attach has run
+# queue:       edits to the world, applied at the start of the next frame
 pub rec App {
     speed:       f32;
     mode:        usize;
@@ -72,12 +93,15 @@ pub rec App {
     tool:        usize;
     bounds_idx:  usize;
     pattern_sel: usize;
+    library:     [7]pattern.Pattern;
     custom:      pattern.Pattern;
+    orient:      u8;
     solid:       u32;
     zoom:        f32;
-    pan_x:       f32;
-    pan_y:       f32;
+    pan_x:       f64;
+    pan_y:       f64;
     refit:       bool;
+    fit:         opt[space.Box];
     panel:       u8;
     open_run:    u8;
     open_draw:   u8;
@@ -89,12 +113,18 @@ pub rec App {
     content:     f32;
     side_x0:     f32;
     help:        u8;
+    full_said:   bool;
     toast:       str;
     toast_t:     i32;
+    said:        [256]u8;
+    name:        ui.Field;
+    saves:       saves.Saves;
     stroke:      bool;
     last_x:      i64;
     last_y:      i64;
     shot:        bool;
+    alloc:       *allo.Allocator;
+    queue:       command.Queue;
 }
 
 # the randomize area's side length (cells) for a bounds-table index
@@ -114,10 +144,139 @@ pub fun scale(i: usize) f32 {
     ret 1.0;
 }
 
+# a zoom multiplier brought within ZOOM_MIN and ZOOM_MAX
+pub fun clamp_zoom(z: f32) f32 {
+    if (z < ZOOM_MIN) { ret ZOOM_MIN; }
+    if (z > ZOOM_MAX) { ret ZOOM_MAX; }
+    ret z;
+}
+
+# frame the randomize area on the next frame
+pub fun frame_area(a: *App) {
+    a.fit   = opt[space.Box].none{};
+    a.refit = true;
+}
+
+# frame a box of cells on the next frame
+pub fun frame_box(a: *App, b: space.Box) {
+    a.fit   = opt[space.Box].some{b};
+    a.refit = true;
+}
+
+# the cells the next framing shows: the box asked for, or the randomize area
+# as big as it is when the frame comes
+pub fun fit_box(a: *App) space.Box {
+    if (sel a.fit.some) { ret a.fit.some; }
+    val h: i64 = (bounds_size(a.bounds_idx) / 2)::i64;
+    ret space.Box{x0: 0 - h, y0: 0 - h, x1: h, y1: h};
+}
+
 # flash a message
 pub fun say(a: *App, s: str) {
     a.toast   = s;
     a.toast_t = TOAST_TICKS;
+}
+
+# flash a message about something, as "what: why"
+# ---
+# a:    application state
+# what: what the message is about, such as a file name
+# why:  what happened to it
+pub fun say_why(a: *App, what: str, why: str) {
+    var o: usize = 0;
+    var i: usize = 0;
+    for (what[i] != 0 && o < 180) {
+        a.said[o] = what[i];
+        o         = o + 1;
+        i         = i + 1;
+    }
+    o = text.buf_str(?a.said[0], o, ": ");
+    i = 0;
+    for (why[i] != 0 && o < 254) {
+        a.said[o] = why[i];
+        o         = o + 1;
+        i         = i + 1;
+    }
+    a.said[o] = 0;
+    say(a, ?a.said[0]);
+}
+
+# flash the full pool once per fill, and rearm when the world is cleared
+pub fun note_full(a: *App, full: bool) {
+    if (!full) {
+        a.full_said = false;
+        ret;
+    }
+    if (a.full_said) { ret; }
+    a.full_said = true;
+    say(a, "the world outgrew its pool of chunks; clear it to run again");
+}
+
+# make the patterns the interface offers, once the allocator is up
+# ---
+# a:     application state
+# alloc: allocator backing the patterns, outliving the application
+# ret:   ok, or the allocator's refusal
+pub fun attach(a: *App, alloc: *allo.Allocator) err[allo.Error] {
+    a.alloc = alloc;
+    command.init(?a.queue, alloc);
+    saves.init(?a.saves, alloc);
+    var i: usize = 0;
+    for (i < pattern.BUILTIN_COUNT) {
+        val e: err[allo.Error] = pattern.builtin(?a.library[i], alloc, i);
+        if (sel e.err) { ret e; }
+        i = i + 1;
+    }
+    ret pattern.init(?a.custom, alloc, 16, 16, "custom");
+}
+
+# release the patterns attach made
+pub fun dnit(a: *App) {
+    var i: usize = 0;
+    for (i < pattern.BUILTIN_COUNT) {
+        pattern.dnit(?a.library[i]);
+        i = i + 1;
+    }
+    pattern.dnit(?a.custom);
+    command.dnit(?a.queue);
+    saves.dnit(?a.saves);
+}
+
+# ask for a change to the world, applied at the start of the next frame
+# ---
+# a: application state, which owns the queue and takes ownership of c
+# c: the command
+pub fun submit(a: *App, c: command.Command) {
+    var own:    command.Command = c;
+    val pushed: err[allo.Error] = command.push(?a.queue, own);
+    if (sel pushed.err) {
+        command.release(?own);
+        say(a, "out of memory");
+    }
+}
+
+# a file command's copy of a path, saying so when there is no memory for it
+pub fun file(a: *App, path: str) opt[command.File] {
+    val f: res[command.File, allo.Error] = command.file(a.alloc, path);
+    if (sel f.err) {
+        say(a, "out of memory");
+        ret opt[command.File].none{};
+    }
+    ret opt[command.File].some{f.ok};
+}
+
+# ask to stamp a pattern laid down in orientation o, centred on world (x, y), the
+# command keeping its own oriented copy
+pub fun stamp(a: *App, p: *pattern.Pattern, o: u8, x: i64, y: i64) {
+    var s: command.Stamp;
+    s.x = x;
+    s.y = y;
+    val cloned: err[allo.Error] = pattern.orient(?s.p, a.alloc, p, o);
+    if (sel cloned.err) {
+        say(a, "out of memory");
+        ret;
+    }
+    submit(a, command.Command.stamp{s});
 }
 
 # seed the application state
@@ -129,12 +288,12 @@ pub fun init(a: *App) {
     a.tool        = TOOL_DRAW;
     a.bounds_idx  = DEFAULT_BOUNDS;
     a.pattern_sel = 0;
-    pattern.init(?a.custom, 16, 16, "custom");
-    a.solid      = theme.swatch(0);
-    a.zoom       = 1.0;
-    a.pan_x      = 0.0;
-    a.pan_y      = 0.0;
-    a.refit      = true;
+    a.orient      = 0;
+    a.solid       = theme.swatch(0);
+    a.zoom        = 1.0;
+    a.pan_x       = 0.0;
+    a.pan_y       = 0.0;
+    frame_area(a);
     a.panel      = 1;
     a.open_run   = 1;
     a.open_draw  = 1;
@@ -146,10 +305,14 @@ pub fun init(a: *App) {
     a.content    = 0.0;
     a.side_x0    = 0.0;
     a.help       = 0;
+    a.full_said  = false;
     a.toast      = "";
     a.toast_t    = 0;
-    a.stroke     = false;
-    a.last_x     = 0;
-    a.last_y     = 0;
-    a.shot       = false;
+    a.said[0]    = 0;
+    ui.field_init(?a.name, saves.NAME_MAX, saves.name_char);
+    a.stroke = false;
+    a.last_x = 0;
+    a.last_y = 0;
+    a.shot   = false;
+    a.alloc  = nil;
 }

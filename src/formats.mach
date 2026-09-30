@@ -1,0 +1,554 @@
+# the registry of pattern file formats, and loading and saving through them
+#
+# a format is a cellar.format.Format record. to add one, write its module under
+# cellar/formats, give it a make function, and list it in at(). nothing else
+# changes: lookup, detection and the load and save here work on any record.
+#
+# bytes go in and out, not files, so a file, the clipboard and a drop all read
+# and write through the same calls. the destination of a load is a Sink and the
+# origin of a save a Source, see cellar.formats.adapt for ones onto patterns and
+# the world.
+
+use cellar.format;
+use cellar.formats.adapt;
+use cellar.formats.custom;
+use cellar.formats.life;
+use cellar.formats.plaintext;
+use cellar.formats.rle;
+use cellar.pattern;
+use cellar.sim;
+use allo: std.allocator;
+use std.allocator.page;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.size.usize;
+use std.types.string;
+use std.types.string.str;
+
+# number of formats reachable through at()
+pub val COUNT: usize = 4;
+
+# the i-th registered format, for i in [0, COUNT)
+pub fun at(i: usize) format.Format {
+    if (i == 1) { ret custom.make(); }
+    if (i == 2) { ret plaintext.make(); }
+    if (i == 3) { ret life.make(); }
+    ret rle.make();
+}
+
+# find a format by its id
+# ---
+# id:  the id, compared exactly
+# out: receives the record
+# ret: whether one has that id
+pub fun by_id(id: str, out: *format.Format) bool {
+    var i: usize = 0;
+    for (i < COUNT) {
+        val f: format.Format = at(i);
+        if (string.str_equals(f.id, id)) {
+            @out = f;
+            ret true;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# find the format that owns a file's extension
+# ---
+# path: a file name or path, whose last '.' starts the extension
+# out:  receives the record
+# ret:  whether one owns it
+pub fun by_path(path: str, out: *format.Format) bool {
+    val n:   usize = string.str_len(path);
+    var dot: usize = n;
+    var i:   usize = 0;
+    for (i < n) {
+        if (path[i] == '.')                    { dot = i; }
+        if (path[i] == '/' || path[i] == '\\') { dot = n; }
+        i = i + 1;
+    }
+    if (dot >= n) { ret false; }
+    i = 0;
+    for (i < COUNT) {
+        var f: format.Format = at(i);
+        if (format.has_ext(?f, ?path[dot + 1])) {
+            @out = f;
+            ret true;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# find the format whose sniff likes the bytes best
+# ---
+# p:   the bytes
+# n:   how many
+# out: receives the record
+# ret: whether any format recognised them
+pub fun by_bytes(p: *u8, n: usize, out: *format.Format) bool {
+    var best: u32   = 0;
+    var i:    usize = 0;
+    for (i < COUNT) {
+        val f: format.Format = at(i);
+        val s: u32           = f.sniff(p, n);
+        if (s > best) {
+            best = s;
+            @out = f;
+        }
+        i = i + 1;
+    }
+    ret best > 0;
+}
+
+# check that bytes are a whole valid file of a format, without applying them
+# ---
+# a:    allocator for the decoder's scratch
+# f:    the format
+# p:    the bytes
+# n:    how many
+# info: receives the file's metadata and bounds, with its notes settled
+# ret:  ok, or why the bytes were refused
+pub fun validate(a: *allo.Allocator, f: *format.Format, p: *u8, n: usize, info: *format.Info) err[format.Error] {
+    var e: format.Emit;
+    e.sink = nil;
+    e.info = info;
+    val r: err[format.Error] = f.decode(a, p, n, ?e);
+    if (sel r.err) { ret r; }
+    format.settle(info);
+    ret err[format.Error].ok{};
+}
+
+# decode bytes into a sink, validating the whole input before applying any of it
+#
+# the decoder runs once with no sink to validate and gather info, and only when
+# that passes does the sink open and receive the runs. so malformed or
+# truncated input is refused having written nothing. the sink can still refuse
+# a valid pattern, for lack of room, and is closed either way.
+# ---
+# a:    allocator for the decoder's scratch
+# f:    the format
+# p:    the bytes
+# n:    how many
+# sink: where the cells go
+# info: receives the file's metadata and bounds, with its notes settled
+# ret:  ok, or why the bytes were refused or not kept
+pub fun load(a: *allo.Allocator, f: *format.Format, p: *u8, n: usize, sink: *format.Sink, info: *format.Info) err[format.Error] {
+    val ok: err[format.Error] = validate(a, f, p, n, info);
+    if (sel ok.err)                 { ret ok; }
+    if (!sink.open(sink.ctx, info)) { ret err[format.Error].err{format.Error.sink{}}; }
+    var again: format.Info;
+    format.info_init(?again, a);
+    var e: format.Emit;
+    e.sink = sink;
+    e.info = ?again;
+    val r: err[format.Error] = f.decode(a, p, n, ?e);
+    format.info_dnit(?again);
+    val kept: bool = sink.close(sink.ctx);
+    if (sel r.err) { ret r; }
+    if (!kept)     { ret err[format.Error].err{format.Error.sink{}}; }
+    ret err[format.Error].ok{};
+}
+
+# encode a source to bytes
+# ---
+# a:    allocator for the encoder's scratch
+# f:    the format
+# src:  the cells to write
+# info: the name, rule and comments to write
+# out:  receives the file's bytes, appended
+# ret:  ok, or why it could not be written
+pub fun save(a: *allo.Allocator, f: *format.Format, src: *format.Source, info: *format.Info, out: *Vector[u8]) err[format.Error] {
+    if (f.encode == nil) { ret err[format.Error].err{format.Error.unsupported{}}; }
+    ret f.encode(a, src, info, out);
+}
+
+# whether two patterns hold the same cells, origin and text
+fun same(p: *pattern.Pattern, q: *pattern.Pattern) bool {
+    if (p.w != q.w || p.h != q.h || p.x != q.x || p.y != q.y) { ret false; }
+    var i: usize = 0;
+    for (i < p.w * p.h) {
+        if (p.cells[i] != q.cells[i]) { ret false; }
+        i = i + 1;
+    }
+    ret string.str_equals(pattern.rule(p), pattern.rule(q)) && string.str_equals(pattern.name(p), pattern.name(q)) && string.str_equals(pattern.comments(p), pattern.comments(q));
+}
+
+# write a pattern out in a format, read it back, and compare
+# ---
+# id:   the format
+# wrap: the longest line allowed, 0 for any
+# ret:  0 when it came back identical and was recognised as the format, else a step number
+fun roundtrip(a: *allo.Allocator, p: *pattern.Pattern, id: str, wrap: usize) u32 {
+    var f: format.Format;
+    if (!by_id(id, ?f)) { ret 1; }
+    var info: format.Info;
+    format.info_init(?info, a);
+    format.set_str(a, ?info.name, pattern.name(p));
+    format.set_str(a, ?info.comments, pattern.comments(p));
+    format.set_str(a, ?info.rule, pattern.rule(p));
+    var src: adapt.PatternSource;
+    var out: Vector[u8]        = vector.init[u8](a);
+    val w:   err[format.Error] = save(a, ?f, adapt.pattern_source(?src, p), ?info, ?out);
+    if (sel w.err) { ret 2; }
+
+    var line: usize = 0;
+    var i:    usize = 0;
+    for (i < out.len) {
+        if (out.data[i] == '\n')      { line = 0; }
+        or                            { line = line + 1; }
+        if (wrap != 0 && line > wrap) { ret 3; }
+        i = i + 1;
+    }
+    var g: format.Format;
+    if (!by_bytes(out.data, out.len, ?g) || !string.str_equals(g.id, id)) { ret 4; }
+
+    var q: pattern.Pattern;
+    val m: err[allo.Error] = pattern.init(?q, a, 0, 0, "");
+    if (sel m.err) { ret 5; }
+    var ps:  adapt.PatternSink;
+    var got: format.Info;
+    format.info_init(?got, a);
+    val r: err[format.Error] = load(a, ?f, out.data, out.len, adapt.pattern_sink(?ps, ?q), ?got);
+    if (sel r.err) { ret 6; }
+    var ok: u32 = 0;
+    if (!same(p, ?q))                      { ok = 7; }
+    or (got.notes != 0 && got.states <= 2) { ok = 8; }
+    pattern.dnit(?q);
+    format.info_dnit(?got);
+    format.info_dnit(?info);
+    vector.dnit[u8](?out);
+    ret ok;
+}
+
+test rle__round_trips_the_gosper_gun {
+    var a: allo.Allocator;
+    page.make(?a);
+    var g: pattern.Pattern;
+    val b: err[allo.Error] = pattern.builtin(?g, ?a, 6);
+    if (sel b.err)                         { ret 1; }
+    if (roundtrip(?a, ?g, "rle", 70) != 0) { ret 2; }
+    pattern.dnit(?g);
+    ret 0;
+}
+
+test rle__round_trips_a_soup_with_an_origin {
+    var a: allo.Allocator;
+    page.make(?a);
+    var p: pattern.Pattern;
+    val m: err[allo.Error] = pattern.init(?p, ?a, 97, 61, "soup");
+    if (sel m.err) { ret 1; }
+    p.x = -40;
+    p.y = 12;
+    pattern.set_comments(?p, "first\nsecond");
+    pattern.set_rule(?p, "B36/S23");
+    var seed: u32   = 12345;
+    var i:    usize = 0;
+    for (i < 97 * 61) {
+        seed = seed * 1103515245 + 12345;
+        if ((seed >> 16) % 3 == 0) { p.cells[i] = 1; }
+        i = i + 1;
+    }
+    # the corners are live, so the box is the pattern's whole extent
+    p.cells[0]           = 1;
+    p.cells[97 * 61 - 1] = 1;
+    if (roundtrip(?a, ?p, "rle", 70) != 0) { ret 2; }
+    pattern.dnit(?p);
+    ret 0;
+}
+
+test rle__round_trips_every_state {
+    var a: allo.Allocator;
+    page.make(?a);
+    var p: pattern.Pattern;
+    val m: err[allo.Error] = pattern.init(?p, ?a, 50, 12, "states");
+    if (sel m.err) { ret 1; }
+    var i: usize = 0;
+    for (i < 50 * 12) {
+        p.cells[i] = ((i * 7) % 256)::u8;
+        i          = i + 1;
+    }
+    p.cells[0]           = 255;
+    p.cells[50 * 12 - 1] = 24;
+    if (roundtrip(?a, ?p, "rle", 70) != 0) { ret 2; }
+    pattern.dnit(?p);
+    ret 0;
+}
+
+test rle__reads_a_canonical_file_and_flags_an_unknown_rule {
+    var a: allo.Allocator;
+    page.make(?a);
+    val text: str = "#N seeds\r\n#C one\n#O two\nx = 3, y = 2, rule = B2/S\r\n2o$b2o!\n";
+    var f:    format.Format;
+    if (!by_id("rle", ?f)) { ret 1; }
+    var q: pattern.Pattern;
+    val m: err[allo.Error] = pattern.init(?q, ?a, 0, 0, "");
+    if (sel m.err) { ret 2; }
+    var ps:   adapt.PatternSink;
+    var info: format.Info;
+    format.info_init(?info, ?a);
+    val r: err[format.Error] = load(?a, ?f, text::*u8, string.str_len(text), adapt.pattern_sink(?ps, ?q), ?info);
+    if (sel r.err)                                                                                                      { ret 3; }
+    if (!string.str_equals(format.text_of(?info.rule), "B2/S"))                                                         { ret 5; }
+    if (!string.str_equals(pattern.comments(?q), "one\ntwo"))                                                           { ret 6; }
+    if (!string.str_equals(pattern.name(?q), "seeds"))                                                                  { ret 7; }
+    if (q.w != 3 || q.h != 2 || pattern.get(?q, 1, 0) != 1 || pattern.get(?q, 0, 1) != 0 || pattern.get(?q, 2, 1) != 1) { ret 8; }
+    pattern.dnit(?q);
+    format.info_dnit(?info);
+    ret 0;
+}
+
+# load bytes into an empty world and report whether it took them and what it holds
+# ---
+# id:   the format to read them as
+# live: receives the live cells the decode reported
+fun world_takes(a: *allo.Allocator, s: *sim.Sim, id: str, p: *u8, n: usize, live: *u64) bool {
+    var f: format.Format;
+    if (!by_id(id, ?f)) { ret false; }
+    var ws:   adapt.WorldSink;
+    var info: format.Info;
+    format.info_init(?info, a);
+    val r: err[format.Error] = load(a, ?f, p, n, adapt.world_sink(?ws, s, 0, 0), ?info);
+    @live = info.live;
+    format.info_dnit(?info);
+    ret !(sel r.err);
+}
+
+# load every prefix of a file, and the file with each byte swapped for each junk
+# byte, into an empty world. refused input must leave the world empty, and
+# accepted input must hold exactly the cells its decode reported, so no run
+# overlapped another
+# ---
+# id:   the format
+# text: a valid file, at most 512 bytes
+# junk: the bytes to swap in
+# ret:  0, or a step number
+fun fuzz(a: *allo.Allocator, s: *sim.Sim, id: str, text: str, junk: *u8, jn: usize) u32 {
+    val n: usize = string.str_len(text);
+    if (n > 512) { ret 1; }
+    var live: u64   = 0;
+    var buf:  [512]u8;
+    var i:    usize = 0;
+    for (i <= n) {
+        if (world_takes(a, s, id, text::*u8, i, ?live)) {
+            if (sim.population(s)::u64 != live) { ret 2; }
+            sim.clear(s);
+        }
+        or (sim.population(s) != 0) { ret 3; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < n) {
+        var k: usize = 0;
+        for (k < jn) {
+            var j: usize = 0;
+            for (j < n) {
+                buf[j] = text[j];
+                j      = j + 1;
+            }
+            buf[i] = junk[k];
+            if (world_takes(a, s, id, ?buf[0], n, ?live)) {
+                if (sim.population(s)::u64 != live) { ret 4; }
+                sim.clear(s);
+            }
+            or (sim.population(s) != 0) { ret 5; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test load__refuses_truncated_and_mangled_rle_without_touching_the_world {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s: sim.Sim;
+    val m: err[allo.Error] = sim.init(?s, ?a);
+    if (sel m.err) { ret 1; }
+
+    val text: str   = "#N gun\nx = 36, y = 9, rule = B3/S23\n24bo$22bobo$12b2o6b2o12b2o$11bo3bo4b2o12b2o$2o8bo5bo3b2o$2o8bo3bob2o4bobo$10bo5bo7bo$11bo3bo$12b2o!\n";
+    val n:    usize = string.str_len(text);
+    var bang: usize = 0;
+    for (text[bang] != '!') { bang = bang + 1; }
+
+    # every cut before the terminator is refused
+    var live: u64   = 0;
+    var cut:  usize = 0;
+    for (cut < bang) {
+        if (world_takes(?a, ?s, "rle", text::*u8, cut, ?live)) { ret 2; }
+        cut = cut + 1;
+    }
+    val junk: str = "$!oB9#,=x\0z-";
+    if (fuzz(?a, ?s, "rle", text, junk::*u8, 12) != 0) { ret 3; }
+
+    # the whole file loads
+    if (!world_takes(?a, ?s, "rle", text::*u8, n, ?live)) { ret 5; }
+    if (sim.population(?s) != 36)                         { ret 6; }
+    sim.dnit(?s);
+    ret 0;
+}
+
+test load__refuses_mangled_plaintext_and_life_without_touching_the_world {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s: sim.Sim;
+    val m: err[allo.Error] = sim.init(?s, ?a);
+    if (sel m.err) { ret 1; }
+
+    val junk: str   = ".O*!#P-9 \n\0x";
+    val jn:   usize = 12;
+    if (fuzz(?a, ?s, "plaintext", "!Name: glider\n!by Guy\n.O\n..O\n\nOOO\n", junk::*u8, jn) != 0)                  { ret 2; }
+    if (fuzz(?a, ?s, "life", "#Life 1.05\n#D two blocks\n#N\n#P -1 -1\n.*\n..*\n#P 0 0\n**\n", junk::*u8, jn) != 0) { ret 3; }
+    if (fuzz(?a, ?s, "life", "#Life 1.06\n#R 23/3\n0 -1\n1 0\n-1 1\n0 1\n1 1\n1 1\n", junk::*u8, jn) != 0)          { ret 4; }
+    sim.dnit(?s);
+    ret 0;
+}
+
+# load bytes into a pattern through a format
+# ---
+# id:   the format
+# q:    the pattern to fill
+# info: receives the file's metadata
+# ret:  whether it loaded
+fun pattern_takes(a: *allo.Allocator, id: str, text: str, q: *pattern.Pattern, info: *format.Info) bool {
+    var f: format.Format;
+    if (!by_id(id, ?f)) { ret false; }
+    var ps: adapt.PatternSink;
+    val r:  err[format.Error] = load(a, ?f, text::*u8, string.str_len(text), adapt.pattern_sink(?ps, q), info);
+    ret !(sel r.err);
+}
+
+# whether a pattern's rows read as the given '.'/'O' rows, each ended by a newline
+fun looks(q: *pattern.Pattern, rows: str) bool {
+    var x: usize = 0;
+    var y: usize = 0;
+    var i: usize = 0;
+    for (rows[i] != 0) {
+        if (rows[i] == '\n') {
+            if (x != q.w) { ret false; }
+            x = 0;
+            y = y + 1;
+        }
+        or {
+            var v: u8 = 0;
+            if (rows[i] == 'O')                                    { v = 1; }
+            if (x >= q.w || y >= q.h || pattern.get(q, x, y) != v) { ret false; }
+            x = x + 1;
+        }
+        i = i + 1;
+    }
+    ret y == q.h;
+}
+
+test plaintext__reads_lifewiki_files_and_round_trips {
+    var a: allo.Allocator;
+    page.make(?a);
+    var q: pattern.Pattern;
+    val m: err[allo.Error] = pattern.init(?q, ?a, 0, 0, "");
+    if (sel m.err) { ret 1; }
+    var info: format.Info;
+    format.info_init(?info, ?a);
+
+    # as LifeWiki serves it, with short rows, CRLF and a dead row between live ones
+    val glider: str = "!Name: Glider\r\n!Author: Richard K. Guy\r\n!\r\n!The smallest spaceship.\r\n.O\r\n..O\r\n\r\nOOO\r\n\r\n";
+    if (!pattern_takes(?a, "plaintext", glider, ?q, ?info))                                            { ret 2; }
+    if (!string.str_equals(pattern.name(?q), "Glider"))                                                { ret 3; }
+    if (!string.str_equals(pattern.comments(?q), "Author: Richard K. Guy\n\nThe smallest spaceship.")) { ret 4; }
+    if (!looks(?q, ".O.\n..O\n...\nOOO\n"))                                                            { ret 5; }
+
+    format.info_dnit(?info);
+
+    # a '*' reads as live, as Golly reads it
+    format.info_init(?info, ?a);
+    if (!pattern_takes(?a, "plaintext", "*.*\n", ?q, ?info) || !looks(?q, "O.O\n")) { ret 6; }
+    format.info_dnit(?info);
+    format.info_init(?info, ?a);
+    if (pattern_takes(?a, "plaintext", ".O\nbo$\n", ?q, ?info)) { ret 7; }
+    format.info_dnit(?info);
+
+    # a written pattern reads back with its box, name and comments
+    q.x = 0;
+    q.y = 0;
+    pattern.set_rule(?q, "");
+    pattern.set_comments(?q, "first\n\nthird");
+    if (roundtrip(?a, ?q, "plaintext", 0) != 0) { ret 8; }
+    pattern.dnit(?q);
+    ret 0;
+}
+
+test life__reads_1_05_blocks_and_1_06_cells {
+    var a: allo.Allocator;
+    page.make(?a);
+    var q: pattern.Pattern;
+    val m: err[allo.Error] = pattern.init(?q, ?a, 0, 0, "");
+    if (sel m.err) { ret 1; }
+
+    # Golly's acorn.lif
+    var info: format.Info;
+    format.info_init(?info, ?a);
+    val acorn: str = "#Life 1.05\n#D Acorn\n#D The most vigorously growing 7-cell methuselah pattern.\n#D Found by Charles Corderman.\n#P\n.*\n...*\n**..***\n";
+    if (!pattern_takes(?a, "life", acorn, ?q, ?info))                                                                                           { ret 2; }
+    if (!looks(?q, ".O.....\n...O...\nOO..OOO\n") || q.x != 0 || q.y != 0)                                                                      { ret 3; }
+    if (info.live != 7 || format.text_of(?info.rule)[0] != 0)                                                                                   { ret 4; }
+    if (!string.str_equals(pattern.comments(?q), "Acorn\nThe most vigorously growing 7-cell methuselah pattern.\nFound by Charles Corderman.")) { ret 5; }
+    format.info_dnit(?info);
+
+    # overlapping blocks placed by #P, and the rule a #R names
+    format.info_init(?info, ?a);
+    val blocks: str = "#Life 1.05\n#R 23/36\n#P -2 -1\n**.*\n#P 0 -1\n**\n.*\n#P 5 5\n";
+    if (!pattern_takes(?a, "life", blocks, ?q, ?info))                   { ret 6; }
+    if (!looks(?q, "OOOO\n...O\n") || q.x != -2 || q.y != -1)            { ret 7; }
+    if (info.live != 5 || !string.str_equals(pattern.rule(?q), "23/36")) { ret 8; }
+    format.info_dnit(?info);
+
+    # a 1.06 glider with a repeated cell, and #N naming Conway's Life
+    format.info_init(?info, ?a);
+    val cells: str = "#Life 1.06\r\n#N\r\n0 -1\r\n1 0\r\n-1 1\r\n0 1\r\n1 1\r\n1 0\r\n";
+    if (!pattern_takes(?a, "life", cells, ?q, ?info))                     { ret 9; }
+    if (!looks(?q, ".O.\n..O\nOOO\n") || q.x != -1 || q.y != -1)          { ret 10; }
+    if (info.live != 5 || !string.str_equals(pattern.rule(?q), "B3/S23")) { ret 11; }
+    format.info_dnit(?info);
+
+    # a missing or mixed-up body is refused
+    format.info_init(?info, ?a);
+    if (pattern_takes(?a, "life", "#Life 1.07\n0 0\n", ?q, ?info)) { ret 12; }
+    if (pattern_takes(?a, "life", "#Life 1.06\n.*\n", ?q, ?info))  { ret 13; }
+    if (pattern_takes(?a, "life", "#Life 1.05\n0 0\n", ?q, ?info)) { ret 14; }
+    if (pattern_takes(?a, "life", "#Life 1.06\n5\n", ?q, ?info))   { ret 15; }
+    format.info_dnit(?info);
+    pattern.dnit(?q);
+    ret 0;
+}
+
+# the id of the format the bytes sniff as, or "" when none
+fun sniffs(text: str) str {
+    var f: format.Format;
+    if (!by_bytes(text::*u8, string.str_len(text), ?f)) { ret ""; }
+    ret f.id;
+}
+
+test registry__finds_formats_by_id_extension_and_content {
+    var f: format.Format;
+    if (!by_id("rle", ?f) || by_id("nope", ?f))                           { ret 1; }
+    if (!by_path("dir.d/gun.RLE", ?f) || by_path("gun", ?f))              { ret 2; }
+    if (by_path("dir.rle/gun", ?f) || by_path("w.cellar", ?f))            { ret 3; }
+    if (!by_path("g.cells", ?f) || !string.str_equals(f.id, "plaintext")) { ret 4; }
+    if (!by_path("g.lif", ?f) || !string.str_equals(f.id, "life"))        { ret 5; }
+    if (!by_path("g.life", ?f) || !string.str_equals(f.id, "life"))       { ret 6; }
+
+    if (!string.str_equals(sniffs("#C x\nX = 1, y = 1\no!"), "rle"))     { ret 7; }
+    if (!string.str_equals(sniffs("!Name: glider\n.O.\n"), "plaintext")) { ret 8; }
+    if (!string.str_equals(sniffs("!made by hand\n.O.\n"), "plaintext")) { ret 9; }
+    if (!string.str_equals(sniffs("\n.O.\n..O\nOOO\n"), "plaintext"))    { ret 10; }
+    if (!string.str_equals(sniffs("#Life 1.05\n#P 0 0\n.*\n"), "life"))  { ret 11; }
+    if (!string.str_equals(sniffs("#Life 1.06\n0 0\n"), "life"))         { ret 12; }
+    if (!string.str_equals(sniffs("3 1\n101\n"), "custom"))              { ret 13; }
+    if (!string.str_equals(sniffs("#N x\nbo$obo!"), ""))                 { ret 14; }
+    if (!string.str_equals(sniffs("hello"), ""))                         { ret 15; }
+    ret 0;
+}

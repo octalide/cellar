@@ -29,6 +29,7 @@
 use gfx: boom.graphics;
 use gm:  boom.math;
 use cellar.kernel;
+use cellar.layout;
 use cellar.space;
 use allo: std.allocator;
 use std.chrono.time;
@@ -57,7 +58,7 @@ val VERT_SPV:   [_]u8;
 val FRAG_SPV:   [_]u8;
 
 # words of the meta buffer ahead of the page table: the rule
-pub val HEAD: usize = 96;
+pub val HEAD: usize = layout.HEAD::usize;
 # words of the view buffer ahead of the palettes
 pub val LOOK: usize = 20;
 # entries in each palette
@@ -117,6 +118,7 @@ pub rec Look {
 # ---
 # id:     the census id
 # spread: cells of spread recorded up to it
+# gens:   generations recorded up to it
 # bulk:   the bulk-edit count then
 # edits:  the edit count then
 # cap:    slots the readback covers
@@ -124,6 +126,7 @@ pub rec Look {
 rec Snap {
     id:     u32;
     spread: u64;
+    gens:   u64;
     bulk:   u64;
     edits:  u64;
     cap:    usize;
@@ -167,7 +170,10 @@ rec Pool {
 # a:        allocator for host buffers
 # r:        the renderer
 # d:        its device
+# slots:    the most slots the device's storage buffers hold, the pool's ceiling
 # p:        the buffers sized to the pool
+# next:     the buffers a growth made room in, swapped in by the next frame
+# reserved: next holds buffers
 # old:      the buffers a growth replaced, kept until the frame copying out of
 #           them has run
 # retired:  old holds buffers
@@ -186,6 +192,7 @@ rec Pool {
 # ring:     recent censuses
 # id:       the last census id
 # spread:   cells of spread recorded since the world was made
+# gens:     generations recorded since the world was made
 # limit:    the spread the last settled census allows
 # bulk:     bulk edits: clears, fills
 # edits:    every edit, bulk or painted
@@ -200,7 +207,10 @@ pub rec Gpu {
     a:        *allo.Allocator;
     r:        *gfx.Renderer;
     d:        *gfx.Device;
+    slots:    usize;
     p:        Pool;
+    next:     Pool;
+    reserved: bool;
     old:      Pool;
     retired:  bool;
     view:     gfx.StorageBuffer;
@@ -218,6 +228,7 @@ pub rec Gpu {
     ring:     [8]Snap;
     id:       u32;
     spread:   u64;
+    gens:     u64;
     limit:    u64;
     bulk:     u64;
     edits:    u64;
@@ -230,9 +241,9 @@ pub rec Gpu {
     head:     [96]u32;
 }
 
-# the census id's four words, then a packed word and a mask per slot
+# the census id's four words, then a packed word, a mask and an extent per slot
 fun status_bytes(cap: usize) usize {
-    ret 16 + cap * 8;
+    ret 16 + cap * 12;
 }
 
 # a packed census word's incarnation bits
@@ -245,74 +256,111 @@ fun make(d: *gfx.Device, size: usize, out: *gfx.StorageBuffer) err[gfx.Error] {
     ret err[gfx.Error].ok{};
 }
 
-# the buffers sized for cap slots
-fun make_pool(g: *Gpu, cap: usize) err[gfx.Error] {
-    val e1: err[gfx.Error] = make(g.d, cap * space.CELLS * 4, ?g.p.cells[0]);
-    if (sel e1.err) { ret e1; }
-    val e2: err[gfx.Error] = make(g.d, cap * space.CELLS * 4, ?g.p.cells[1]);
-    if (sel e2.err) {
-        gfx.storage_buffer_delete(g.d, ?g.p.cells[0]);
-        ret e2;
-    }
-    val e3: err[gfx.Error] = make(g.d, (HEAD + cap * space.ENTRY) * 4, ?g.p.meta);
-    if (sel e3.err) {
-        gfx.storage_buffer_delete(g.d, ?g.p.cells[0]);
-        gfx.storage_buffer_delete(g.d, ?g.p.cells[1]);
-        ret e3;
-    }
-    val e4: err[gfx.Error] = make(g.d, status_bytes(cap), ?g.p.status);
-    if (sel e4.err) {
-        gfx.storage_buffer_delete(g.d, ?g.p.cells[0]);
-        gfx.storage_buffer_delete(g.d, ?g.p.cells[1]);
-        gfx.storage_buffer_delete(g.d, ?g.p.meta);
-        ret e4;
-    }
-    val e5: err[gfx.Error] = gfx.readback(?g.p.rb, g.d, status_bytes(cap));
-    if (sel e5.err) {
-        gfx.storage_buffer_delete(g.d, ?g.p.cells[0]);
-        gfx.storage_buffer_delete(g.d, ?g.p.cells[1]);
-        gfx.storage_buffer_delete(g.d, ?g.p.meta);
-        gfx.storage_buffer_delete(g.d, ?g.p.status);
-        ret e5;
-    }
-    val e5f: err[gfx.Error] = make(g.d, cap * 8, ?g.p.flags);
-    if (sel e5f.err) {
-        gfx.readback_delete(?g.p.rb, g.d);
-        gfx.storage_buffer_delete(g.d, ?g.p.cells[0]);
-        gfx.storage_buffer_delete(g.d, ?g.p.cells[1]);
-        gfx.storage_buffer_delete(g.d, ?g.p.meta);
-        gfx.storage_buffer_delete(g.d, ?g.p.status);
-        ret e5f;
-    }
-    val e5l: err[gfx.Error] = make(g.d, cap * 4, ?g.p.list);
-    if (sel e5l.err) {
-        gfx.storage_buffer_delete(g.d, ?g.p.flags);
-        gfx.readback_delete(?g.p.rb, g.d);
-        gfx.storage_buffer_delete(g.d, ?g.p.cells[0]);
-        gfx.storage_buffer_delete(g.d, ?g.p.cells[1]);
-        gfx.storage_buffer_delete(g.d, ?g.p.meta);
-        gfx.storage_buffer_delete(g.d, ?g.p.status);
-        ret e5l;
-    }
-    val rg: res[*u32, allo.Error] = allo.allocate[u32](g.a, status_bytes(cap) / 4);
-    if (sel rg.err) {
-        drop_pool(g, ?g.p);
-        ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.empty{}}};
-    }
-    g.p.got = rg.ok;
-    val ru: res[*u32, allo.Error] = allo.allocate[u32](g.a, cap * space.CENSUS);
-    if (sel ru.err) {
-        drop_pool(g, ?g.p);
-        ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.empty{}}};
-    }
-    g.p.landed = ru.ok;
-    g.p.cap    = cap;
-    # a readback of the old size may still land; nothing recorded before is wanted
+# n, or fewer: the most slots a buffer of words words holds, with head words
+# ahead of them and per words a slot
+fun fit(n: usize, words: usize, head: usize, per: usize) usize {
+    if (words < head) { ret 0; }
+    val m: usize = (words - head) / per;
+    if (m < n) { ret m; }
+    ret n;
+}
+
+# the most slots a pool may hold on a device with these limits
+#
+# every storage buffer make_pool creates is bound whole, so each must fit the
+# device's storage buffer range, and the tightest sets the ceiling, which is
+# the cells' at space.CELLS words a slot. the stages' arrays are declared for
+# layout.MAX_SLOTS, which caps it on a device that allows more.
+# ---
+# l:   the device's limits
+# ret: the ceiling, zero when the limits were never read
+pub fun ceiling(l: gfx.Limits) usize {
+    val words: usize = l.max_storage_buffer_range / 4;
+    var n:     usize = layout.MAX_SLOTS::usize;
+    # the cells, the meta, the status, the flags and the list
+    n = fit(n, words, 0, space.CELLS);
+    n = fit(n, words, HEAD, space.ENTRY);
+    n = fit(n, words, status_bytes(0) / 4, 3);
+    n = fit(n, words, 0, 2);
+    n = fit(n, words, 0, 1);
+    ret n;
+}
+
+# forget every census in flight: a readback of an old pool's size may still
+# land, and nothing recorded before is wanted
+fun forget_censuses(g: *Gpu) {
     var i: usize = 0;
     for (i < RING) {
         g.ring[i].id = 0;
         i            = i + 1;
     }
+}
+
+# the buffers sized for cap slots, into pp
+fun make_pool(g: *Gpu, pp: *Pool, cap: usize) err[gfx.Error] {
+    pp.got    = nil;
+    pp.landed = nil;
+    pp.cap    = 0;
+    val e1: err[gfx.Error] = make(g.d, cap * space.CELLS * 4, ?pp.cells[0]);
+    if (sel e1.err) { ret e1; }
+    val e2: err[gfx.Error] = make(g.d, cap * space.CELLS * 4, ?pp.cells[1]);
+    if (sel e2.err) {
+        gfx.storage_buffer_delete(g.d, ?pp.cells[0]);
+        ret e2;
+    }
+    val e3: err[gfx.Error] = make(g.d, (HEAD + cap * space.ENTRY) * 4, ?pp.meta);
+    if (sel e3.err) {
+        gfx.storage_buffer_delete(g.d, ?pp.cells[0]);
+        gfx.storage_buffer_delete(g.d, ?pp.cells[1]);
+        ret e3;
+    }
+    val e4: err[gfx.Error] = make(g.d, status_bytes(cap), ?pp.status);
+    if (sel e4.err) {
+        gfx.storage_buffer_delete(g.d, ?pp.cells[0]);
+        gfx.storage_buffer_delete(g.d, ?pp.cells[1]);
+        gfx.storage_buffer_delete(g.d, ?pp.meta);
+        ret e4;
+    }
+    val e5: err[gfx.Error] = gfx.readback(?pp.rb, g.d, status_bytes(cap));
+    if (sel e5.err) {
+        gfx.storage_buffer_delete(g.d, ?pp.cells[0]);
+        gfx.storage_buffer_delete(g.d, ?pp.cells[1]);
+        gfx.storage_buffer_delete(g.d, ?pp.meta);
+        gfx.storage_buffer_delete(g.d, ?pp.status);
+        ret e5;
+    }
+    val e5f: err[gfx.Error] = make(g.d, cap * 8, ?pp.flags);
+    if (sel e5f.err) {
+        gfx.readback_delete(?pp.rb, g.d);
+        gfx.storage_buffer_delete(g.d, ?pp.cells[0]);
+        gfx.storage_buffer_delete(g.d, ?pp.cells[1]);
+        gfx.storage_buffer_delete(g.d, ?pp.meta);
+        gfx.storage_buffer_delete(g.d, ?pp.status);
+        ret e5f;
+    }
+    val e5l: err[gfx.Error] = make(g.d, cap * 4, ?pp.list);
+    if (sel e5l.err) {
+        gfx.storage_buffer_delete(g.d, ?pp.flags);
+        gfx.readback_delete(?pp.rb, g.d);
+        gfx.storage_buffer_delete(g.d, ?pp.cells[0]);
+        gfx.storage_buffer_delete(g.d, ?pp.cells[1]);
+        gfx.storage_buffer_delete(g.d, ?pp.meta);
+        gfx.storage_buffer_delete(g.d, ?pp.status);
+        ret e5l;
+    }
+    val rg: res[*u32, allo.Error] = allo.allocate[u32](g.a, status_bytes(cap) / 4);
+    if (sel rg.err) {
+        drop_pool(g, pp);
+        ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.empty{}}};
+    }
+    pp.got = rg.ok;
+    val ru: res[*u32, allo.Error] = allo.allocate[u32](g.a, cap * space.CENSUS);
+    if (sel ru.err) {
+        drop_pool(g, pp);
+        ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.empty{}}};
+    }
+    pp.landed = ru.ok;
+    pp.cap    = cap;
     ret err[gfx.Error].ok{};
 }
 
@@ -339,7 +387,8 @@ fun drop_pool(g: *Gpu, p: *Pool) {
 # g:    the GPU side to build
 # a:    allocator for host buffers
 # r:    the renderer, initialized
-# cap:  slots to size the pool for, at least the host pool's capacity
+# cap:  slots to size the pool for, at least the host pool's capacity and no
+#       more than the device's ceiling
 # heat: SHADES entries of four floats, the heat palette
 # age:  SHADES entries of four floats, the age palette
 # ret:  ok, or why the pool or the draw could not be made
@@ -347,14 +396,17 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     g.a        = a;
     g.r        = r;
     g.d        = gfx.renderer_device(r);
+    g.slots    = ceiling(gfx.renderer_limits(r));
     g.p.got    = nil;
     g.p.landed = nil;
     g.p.cap    = 0;
+    g.reserved = false;
     g.retired  = false;
     g.hi       = 0;
     g.front    = 0;
     g.id       = 0;
     g.spread   = 0;
+    g.gens     = 0;
     g.limit    = REACH;
     g.bulk     = 0;
     g.edits    = 0;
@@ -393,8 +445,40 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     val e8: err[gfx.Error] = gfx.storage_buffer_upload(g.d, ?g.view, LOOK * 4, heat::*u8, SHADES * 16);
     if (sel e8.err) { ret e8; }
     val e9: err[gfx.Error] = gfx.storage_buffer_upload(g.d, ?g.view, (LOOK + SHADES * 4) * 4, age::*u8, SHADES * 16);
-    if (sel e9.err) { ret e9; }
-    ret make_pool(g, cap);
+    if (sel e9.err)    { ret e9; }
+    if (cap > g.slots) { ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.overrun{(cap * space.CELLS * 4)::u64}}}; }
+    forget_censuses(g);
+    ret make_pool(g, ?g.p, cap);
+}
+
+# make room for a pool of cap slots, ahead of the host's pool growing to it
+#
+# the buffers are made now, where a refusal can still turn the growth down,
+# and the next frame moves the world into them.
+# ---
+# g:   the GPU side
+# cap: slots the host's pool grows to
+# ret: false when the device refused the buffers
+pub fun reserve(g: *Gpu, cap: usize) bool {
+    if (cap <= g.p.cap || (g.reserved && cap <= g.next.cap)) { ret true; }
+    # nothing has been recorded into a pool made since the last frame
+    if (g.reserved) {
+        drop_pool(g, ?g.next);
+        g.reserved = false;
+    }
+    val made: err[gfx.Error] = make_pool(g, ?g.next, cap);
+    if (sel made.err) { ret false; }
+    g.reserved = true;
+    ret true;
+}
+
+fun reserve_for(ctx: *u8, cap: usize) bool {
+    ret reserve(ctx::*Gpu, cap);
+}
+
+# the GPU side as the host pool's mirror, which makes room before the pool grows
+pub fun mirror(g: *Gpu) space.Mirror {
+    ret space.Mirror{ctx: g::*u8, reserve: reserve_for};
 }
 
 # leave stepping to the CPU even though the compute stages were built, to
@@ -411,7 +495,8 @@ pub fun forgo_compute(g: *Gpu) {
 # release everything, waiting for the device first
 pub fun dnit(g: *Gpu) {
     gfx.renderer_wait_idle(g.r);
-    if (g.retired) { drop_pool(g, ?g.old); }
+    if (g.retired)  { drop_pool(g, ?g.old); }
+    if (g.reserved) { drop_pool(g, ?g.next); }
     drop_pool(g, ?g.p);
     gfx.storage_buffer_delete(g.d, ?g.view);
     gfx.shader_delete(?g.draw, g.d);
@@ -499,6 +584,17 @@ pub fun budget(g: *Gpu, radius: usize) usize {
     ret n::usize;
 }
 
+# what collect found
+# ---
+# fresh:  a census landed and the host's pool was settled from it
+# fits:   the pool held every chunk the world grew into
+# behind: generations recorded since that census was taken
+pub rec Landed {
+    fresh:  bool;
+    fits:   bool;
+    behind: u64;
+}
+
 # settle the host's pool from the newest census that has landed
 #
 # call once a frame after the frame begins and before anything is recorded, so
@@ -506,14 +602,15 @@ pub fun budget(g: *Gpu, radius: usize) usize {
 # ---
 # g:   the GPU side
 # sp:  the host's pool
-# ret: false when the pool could not hold a chunk the world grew into
-pub fun collect(g: *Gpu, sp: *space.Space) bool {
-    if (!g.stepping || g.p.cap == 0) { ret true; }
+# ret: whether a census was settled, how far behind it is, and whether it fit
+pub fun collect(g: *Gpu, sp: *space.Space) Landed {
+    val none: Landed = Landed{fresh: false, fits: true, behind: 0};
+    if (!g.stepping || g.p.cap == 0) { ret none; }
     val len: usize = status_bytes(g.p.cap);
-    if (!gfx.renderer_readback_take(g.r, ?g.p.rb, g.p.got::*u8, len)) { ret true; }
+    if (!gfx.renderer_readback_take(g.r, ?g.p.rb, g.p.got::*u8, len)) { ret none; }
     val id:   u32   = g.p.got[0];
     val snap: *Snap = ?g.ring[id::usize % RING];
-    if (snap.id != id || id == 0 || snap.cap != g.p.cap || snap.bulk != g.bulk) { ret true; }
+    if (snap.id != id || id == 0 || snap.cap != g.p.cap || snap.bulk != g.bulk) { ret none; }
     var n: usize = sp.hi;
     if (n > snap.hi) { n = snap.hi; }
     # a slot matches its report when the incarnation bits agree. fewer than
@@ -521,20 +618,21 @@ pub fun collect(g: *Gpu, sp: *space.Space) bool {
     # makes more than the pool holds, so bits that agree name the same chunk
     var s: usize = 0;
     for (s < n) {
-        val w:   u32  = g.p.got[4 + s * 2];
+        val w:   u32  = g.p.got[4 + s * 3];
         val c:   *u32 = ?g.p.landed[s * space.CENSUS];
         val inc: u32  = space.incarnation(sp, s);
         c[0] = w & 0x1fff;
         c[1] = (w >> 13) & 1;
         c[2] = 0;
         if (inc != 0 && (w >> 14) == (inc & TAG)) { c[2] = inc; }
-        c[3] = g.p.got[5 + s * 2];
+        c[3] = g.p.got[5 + s * 3];
+        c[4] = g.p.got[6 + s * 3];
         s    = s + 1;
     }
     val ok: bool = space.settle(sp, g.p.landed, n, snap.edits == g.edits);
     # a census the pool could not be settled from leaves the limit where it was
     if (ok && snap.spread + REACH > g.limit) { g.limit = snap.spread + REACH; }
-    ret ok;
+    ret Landed{fresh: true, fits: ok, behind: g.gens - snap.gens};
 }
 
 # read the GPU's cells into the host's staging cells
@@ -576,6 +674,54 @@ pub fun pull(g: *Gpu, sp: *space.Space) err[gfx.Error] {
     ret err[gfx.Error].ok{};
 }
 
+# read the GPU's cells of a run of slots into the host's staging cells, ahead
+# of an edit that writes the slots' cells whole
+#
+# a stall. a slot whose staging is newer than the GPU's keeps it. painted cells
+# not yet uploaded for the run's slots are applied to the staging and dropped,
+# since the edit uploads the slots whole and a late replay would undo it. call
+# outside a frame, or in one before frame has recorded anything.
+# ---
+# g:   the GPU side
+# sp:  the host's pool
+# lo:  first slot of the run
+# n:   slots in the run
+# ret: ok, or why the read failed
+pub fun pull_chunks(g: *Gpu, sp: *space.Space, lo: usize, n: usize) err[gfx.Error] {
+    if (!g.stepping) { ret err[gfx.Error].ok{}; }
+    var top: usize = lo + n;
+    if (g.hi < top)  { top = g.hi; }
+    if (sp.hi < top) { top = sp.hi; }
+    val newer: u8    = space.DIRTY_CELLS | space.DIRTY_ZERO;
+    var s:     usize = lo;
+    for (s < top) {
+        if ((sp.dirty[s] & newer) != 0) {
+            s = s + 1;
+            cnt;
+        }
+        var run: usize = 1;
+        for (s + run < top && (sp.dirty[s + run] & newer) == 0) { run = run + 1; }
+        val e: err[gfx.Error] = gfx.storage_buffer_read(g.d, ?g.p.cells[g.front], s * space.CELLS * 4,
+            (?sp.cells[s * space.CELLS])::*u8, run * space.CELLS * 4);
+        if (sel e.err) { ret e; }
+        s = s + run;
+    }
+    var keep: usize = 0;
+    var i:    usize = 0;
+    for (i < g.writes.len) {
+        val w:    Write = g.writes.data[i];
+        val slot: usize = w.at::usize / space.CELLS;
+        if (slot >= lo && slot < lo + n) { sp.cells[w.at::usize] = w.v; }
+        or {
+            g.writes.data[keep] = w;
+            keep                = keep + 1;
+        }
+        i = i + 1;
+    }
+    g.writes.len = keep;
+    ret err[gfx.Error].ok{};
+}
+
 # upload a run of whole chunks, stalled or recorded
 fun upload_cells(g: *Gpu, sp: *space.Space, s: usize, n: usize, stall: bool) err[gfx.Error] {
     val at:  usize = s * space.CELLS * 4;
@@ -594,14 +740,15 @@ fun flush(g: *Gpu, sp: *space.Space) err[gfx.Error] {
         drop_pool(g, ?g.old);
         g.retired = false;
     }
-    val grew: bool = sp.cap > g.p.cap;
+    val grew: bool = g.reserved;
     if (grew) {
-        # the world moves into larger buffers on the GPU, and only the page
-        # table goes up again
-        g.old     = g.p;
-        g.retired = true;
-        val grown: err[gfx.Error] = make_pool(g, sp.cap);
-        if (sel grown.err) { ret grown; }
+        # the world moves into the larger buffers reserve made, and only the
+        # page table goes up again
+        g.old      = g.p;
+        g.retired  = true;
+        g.p        = g.next;
+        g.reserved = false;
+        forget_censuses(g);
         if (g.hi != 0 && g.stepping) {
             var gb: [4]*gfx.StorageBuffer;
             gb[0] = ?g.old.cells[g.front];
@@ -781,9 +928,9 @@ fun write_head(g: *Gpu, k: *kernel.Kernel) {
     g.head[6] = g.hi::u32;
     g.head[7] = g.serial;
     var i: usize = 0;
-    for (i < 88) {
-        var w: u32 = 1024;
-        if (i < 81) { w = (k.weights[i] + 1024)::u32; }
+    for (i < layout.WEIGHTS::usize) {
+        var w: u32 = layout.WEIGHT_BIAS;
+        if (i < 81) { w = (k.weights[i] + layout.WEIGHT_BIAS::i32)::u32; }
         g.head[8 + i] = w;
         i             = i + 1;
     }
@@ -836,6 +983,7 @@ pub fun frame(g: *Gpu, sp: *space.Space, k: *kernel.Kernel, steps: usize, look: 
             g.front = 1 - g.front;
         }
         g.spread = g.spread + k.radius::u64;
+        g.gens   = g.gens + 1;
         i        = i + 1;
     }
 
@@ -853,6 +1001,7 @@ pub fun frame(g: *Gpu, sp: *space.Space, k: *kernel.Kernel, steps: usize, look: 
     val snap: *Snap = ?g.ring[g.id::usize % RING];
     snap.id     = g.id;
     snap.spread = g.spread;
+    snap.gens   = g.gens;
     snap.bulk   = g.bulk;
     snap.edits  = g.edits;
     snap.cap    = g.p.cap;
@@ -868,4 +1017,19 @@ pub fun draw(g: *Gpu, p: *gfx.Pass) {
     bufs[1] = ?g.p.meta;
     bufs[2] = ?g.view;
     gfx.pass_draw_storage(p, ?bufs[0], 3, 6, g.hi::u32, ?g.mat, ?g.xf, ?g.draw);
+}
+
+test ceiling__is_the_cells_share_of_the_storage_range {
+    var l: gfx.Limits;
+    mem.zero[u8]((?l)::*u8, $size_of(gfx.Limits));
+    if (ceiling(l) != 0) { ret 1; }
+    # the 128 MiB every device guarantees holds 8192 chunks of 16 KiB
+    l.max_storage_buffer_range = 134217728;
+    if (ceiling(l) != 8192) { ret 2; }
+    l.max_storage_buffer_range = 100 * 1048576;
+    if (ceiling(l) != 6400) { ret 3; }
+    # past what the stages' arrays are declared for, those cap it
+    l.max_storage_buffer_range = 4294967295;
+    if (ceiling(l) != layout.MAX_SLOTS::usize) { ret 4; }
+    ret 0;
 }

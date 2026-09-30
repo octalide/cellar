@@ -1,0 +1,229 @@
+# the named worlds and patterns in the data directory
+#
+# a file is a world when it ends in .cellar and a pattern when a registered
+# format owns its extension; anything else in the directory, the settings
+# among it, is not listed. a name the user types is a stem: a world gets
+# .cellar, and a pattern keeps an extension a format writes or gets .rle. so
+# the files earlier versions kept in single slots, world.cellar and custom.rle,
+# are entries like any other.
+
+use cellar.format;
+use cellar.formats;
+use allo: std.allocator;
+use std.collections.sort;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use fs: std.filesystem;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string;
+use std.types.string.str;
+
+# not a file cellar lists
+pub val KIND_NONE: u8 = 0;
+# a world file
+pub val KIND_WORLD: u8 = 1;
+# a pattern file in a registered format
+pub val KIND_PATTERN: u8 = 2;
+
+# the most bytes a typed name takes
+pub val NAME_MAX: usize = 64;
+# bytes a file name built from a name needs, its extension and terminator included
+pub val FILE_MAX: usize = 80;
+
+# the extension a world file has
+val WORLD_EXT: str = ".cellar";
+# the extension a pattern saved without one of its own gets
+val PATTERN_EXT: str = ".rle";
+
+# one listed file
+# ---
+# name: the file's name in the directory, owned by the list
+# kind: KIND_WORLD or KIND_PATTERN
+pub rec Entry {
+    name: str;
+    kind: u8;
+}
+
+# the listed files, sorted by name
+# ---
+# a:     allocator behind the names and the vector
+# items: the entries
+# stale: the directory may have changed since the list was read
+pub rec Saves {
+    a:     *allo.Allocator;
+    items: Vector[Entry];
+    stale: bool;
+}
+
+# make an empty list that wants reading
+pub fun init(s: *Saves, a: *allo.Allocator) {
+    s.a     = a;
+    s.items = vector.init[Entry](a);
+    s.stale = true;
+}
+
+# drop every entry, keeping the storage
+fun empty(s: *Saves) {
+    var i: usize = 0;
+    for (i < s.items.len) {
+        str_free(s.a, s.items.data[i].name);
+        i = i + 1;
+    }
+    vector.clear[Entry](?s.items);
+}
+
+# release the entries and the storage
+pub fun dnit(s: *Saves) {
+    empty(s);
+    vector.dnit[Entry](?s.items);
+}
+
+# the offset of a name's extension dot, or its length when it has none
+fun ext_at(name: str) usize {
+    val n:   usize = string.str_len(name);
+    var dot: usize = n;
+    var i:   usize = 0;
+    for (i < n) {
+        if (name[i] == '.' && i > 0) { dot = i; }
+        i = i + 1;
+    }
+    ret dot;
+}
+
+# whether a name ends with an extension, ignoring case
+fun ends_with(name: str, ext: str) bool {
+    val n: usize = string.str_len(name);
+    val e: usize = string.str_len(ext);
+    if (n <= e) { ret false; }
+    var i: usize = 0;
+    for (i < e) {
+        var c: u8 = name[n - e + i];
+        if (c >= 'A' && c <= 'Z') { c = c + 32; }
+        if (c != ext[i])          { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# what kind of file a name is
+pub fun kind_of(name: str) u8 {
+    if (name[0] == '.')             { ret KIND_NONE; }
+    if (ends_with(name, WORLD_EXT)) { ret KIND_WORLD; }
+    var f: format.Format;
+    if (formats.by_path(name, ?f)) { ret KIND_PATTERN; }
+    ret KIND_NONE;
+}
+
+# whether a codepoint may be typed into a name: printable ASCII that is not a
+# path separator or a character some platform forbids in file names
+pub fun name_char(c: u32) bool {
+    if (c < 0x20 || c >= 0x7f) { ret false; }
+    ret c != '/' && c != '\\' && c != ':' && c != '*' && c != '?' && c != '"' && c != '<' && c != '>' && c != '|';
+}
+
+# whether a typed name can name a file: something besides dots and spaces
+pub fun usable(name: str) bool {
+    var i: usize = 0;
+    for (name[i] != 0) {
+        if (name[i] != '.' && name[i] != ' ') { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the file name a typed name saves to
+# ---
+# name: the typed name, at most NAME_MAX bytes
+# kind: KIND_WORLD or KIND_PATTERN
+# out:  at least FILE_MAX bytes
+# ret:  out
+pub fun file_name(name: str, kind: u8, out: *u8) str {
+    var o: usize = 0;
+    for (name[o] != 0 && o < NAME_MAX) {
+        out[o] = name[o];
+        o      = o + 1;
+    }
+    out[o] = 0;
+    var ext: str = "";
+    if (kind == KIND_WORLD && !ends_with(out, WORLD_EXT)) { ext = WORLD_EXT; }
+    if (kind == KIND_PATTERN) {
+        var f: format.Format;
+        if (!formats.by_path(out, ?f) || f.encode == nil) { ext = PATTERN_EXT; }
+    }
+    var i: usize = 0;
+    for (ext[i] != 0) {
+        out[o] = ext[i];
+        o      = o + 1;
+        i      = i + 1;
+    }
+    out[o] = 0;
+    ret out;
+}
+
+# a file's name without its extension, as the name to type to save over it
+# ---
+# name: a file name
+# out:  at least NAME_MAX + 1 bytes
+# ret:  out
+pub fun stem(name: str, out: *u8) str {
+    val dot: usize = ext_at(name);
+    var i:   usize = 0;
+    for (i < dot && i < NAME_MAX) {
+        out[i] = name[i];
+        i      = i + 1;
+    }
+    out[i] = 0;
+    ret out;
+}
+
+fun by_name(x: *Entry, y: *Entry) i64 {
+    ret string.str_compare(x.name, y.name);
+}
+
+# read the directory again
+# ---
+# s:   the list, emptied first and left empty when the directory cannot be read
+# dir: the data directory
+# ret: ok, or why it could not be read
+pub fun refresh(s: *Saves, dir: str) err[fs.FsError] {
+    empty(s);
+    s.stale = false;
+    val got: res[Vector[str], fs.FsError] = fs.read_dir(s.a, dir);
+    if (sel got.err) { ret err[fs.FsError].err{got.err}; }
+    var names: Vector[str] = got.ok;
+    var i:     usize       = 0;
+    for (i < names.len) {
+        val n:    str  = names.data[i];
+        val k:    u8   = kind_of(n);
+        var kept: bool = false;
+        if (k != KIND_NONE) {
+            val pushed: res[usize, allo.Error] = vector.push[Entry](?s.items, Entry{name: n, kind: k});
+            kept = sel pushed.ok;
+        }
+        if (!kept) { str_free(s.a, n); }
+        i = i + 1;
+    }
+    vector.dnit[str](?names);
+    sort.sort_by[Entry](s.items.data, s.items.len, by_name);
+    ret err[fs.FsError].ok{};
+}
+
+test file_name__gives_worlds_and_patterns_their_extensions {
+    var b: [80]u8;
+    if (!string.str_equals(file_name("soup", KIND_WORLD, ?b[0]), "soup.cellar"))        { ret 1; }
+    if (!string.str_equals(file_name("soup.CELLAR", KIND_WORLD, ?b[0]), "soup.CELLAR")) { ret 2; }
+    if (!string.str_equals(file_name("gun", KIND_PATTERN, ?b[0]), "gun.rle"))           { ret 3; }
+    if (!string.str_equals(file_name("gun.cells", KIND_PATTERN, ?b[0]), "gun.cells"))   { ret 4; }
+    if (!string.str_equals(file_name("v1.2", KIND_PATTERN, ?b[0]), "v1.2.rle"))         { ret 5; }
+    if (kind_of("world.cellar") != KIND_WORLD || kind_of("custom.rle") != KIND_PATTERN) { ret 6; }
+    if (kind_of("cellar.config") != KIND_NONE || kind_of(".rle") != KIND_NONE)          { ret 7; }
+    if (!string.str_equals(stem("glider.rle", ?b[0]), "glider") || usable(" . "))       { ret 8; }
+    if (name_char('/') || !name_char('-'))                                              { ret 9; }
+    ret 0;
+}

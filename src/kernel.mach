@@ -7,6 +7,7 @@
 # unit Moore weights and a zero center, S is the classic live-neighbor count, so
 # B/S rules like Conway's Life are expressed exactly.
 
+use cellar.text;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -130,6 +131,192 @@ pub fun preset(i: usize) Kernel {
     if (i == 2) { ret seeds(); }
     if (i == 3) { ret daynight(); }
     ret life();
+}
+
+# lowercase an ASCII letter
+fun lower(c: u8) u8 {
+    if (c >= 'A' && c <= 'Z') { ret c + 32; }
+    ret c;
+}
+
+# read a count list, digits 0 to 8 with commas and blanks between, into a mask
+# ---
+# s:   the text
+# i:   read position, left after the list
+# out: receives the mask
+# ret: false when a digit is beyond the eight neighbours
+fun count_list(s: str, i: *usize, out: *u64) bool {
+    var m: u64 = 0;
+    for (s[@i] != 0 && s[@i] != '/') {
+        val c: u8 = s[@i];
+        if (c >= '0' && c <= '8')              { m = set_bit(m, (c - '0')::usize); }
+        or (c != ',' && c != ' ' && c != '\t') { ret false; }
+        @i = @i + 1;
+    }
+    @out = m;
+    ret true;
+}
+
+# read a Life-like rule string: "B3/S23" or "23/3" (survive then birth), in any case
+#
+# the rule runs on the radius-1 unit Moore kernel, so any B/S rule parses. a
+# string naming a topology or another family ("B3/S23:T20,30", "B3/S23/C4")
+# does not. a rule equal to a preset comes back as that preset, with its name.
+# ---
+# s:   NUL-terminated rule text
+# ret: the kernel, or none when s is not a Life-like rule
+pub fun parse(s: str) opt[Kernel] {
+    var i:       usize = 0;
+    var birth:   u64   = 0;
+    var survive: u64   = 0;
+    for (s[i] == ' ') { i = i + 1; }
+    val first: u8 = lower(s[i]);
+    if (first == 'b') {
+        i = i + 1;
+        if (!count_list(s, ?i, ?birth) || s[i] != '/') { ret opt[Kernel].none{}; }
+        i = i + 1;
+        if (lower(s[i]) != 's') { ret opt[Kernel].none{}; }
+        i = i + 1;
+        if (!count_list(s, ?i, ?survive) || s[i] != 0) { ret opt[Kernel].none{}; }
+    }
+    or {
+        if (!count_list(s, ?i, ?survive) || s[i] != '/') { ret opt[Kernel].none{}; }
+        i = i + 1;
+        if (!count_list(s, ?i, ?birth) || s[i] != 0) { ret opt[Kernel].none{}; }
+    }
+    var k: Kernel     = moore(birth, survive, "custom");
+    val m: opt[usize] = match_preset(?k);
+    if (sel m.some) { ret opt[Kernel].some{preset(m.some)}; }
+    ret opt[Kernel].some{k};
+}
+
+# whether a kernel is a Life-like rule, the radius-1 unit Moore kernel with
+# sums of at most eight, so that its B/S notation reads back through parse
+pub fun life_like(k: *Kernel) bool {
+    if ((k.birth | k.survive) >= (1::u64 << 9)) { ret false; }
+    var m: Kernel = moore(k.birth, k.survive, "");
+    ret same_rule(k, ?m);
+}
+
+# append a mask's set sums, comma separated when wide
+fun buf_mask(buf: *u8, off: usize, mask: u64, wide: bool) usize {
+    var o:     usize = off;
+    var n:     usize = 0;
+    var first: bool  = true;
+    for (n < 64) {
+        if (has_bit(mask, n) != 0) {
+            if (wide && !first) { o = text.buf_str(buf, o, ","); }
+            o     = text.buf_u64(buf, o, n::u64);
+            first = false;
+        }
+        n = n + 1;
+    }
+    ret o;
+}
+
+# write a kernel's masks as B.../S... notation into buf, NUL-terminated
+#
+# the notation names the masks only, so it is the whole rule just when
+# life_like holds.
+# ---
+# k:   the kernel
+# buf: at least 200 bytes
+# ret: buf
+pub fun notation(k: *Kernel, buf: *u8) str {
+    # one style for both halves: commas once either mask has a sum above nine
+    val wide: bool  = (k.birth | k.survive) >= (1::u64 << 10);
+    var o:    usize = text.buf_str(buf, 0, "B");
+    o      = buf_mask(buf, o, k.birth, wide);
+    o      = text.buf_str(buf, o, "/S");
+    o      = buf_mask(buf, o, k.survive, wide);
+    buf[o] = 0;
+    ret buf;
+}
+
+# bytes structure may write, less its NUL: radius, two masks and 81 weights
+pub val STRUCTURE_MAX: usize = 1100;
+
+# write a kernel whole as "<radius> <birth> <survive> <weights...>", the masks
+# as unsigned decimals and the (2r+1)^2 weights signed and row-major, into buf,
+# NUL-terminated
+#
+# unlike notation it holds any kernel, weighted or wide, and reads back exactly
+# through from_structure.
+# ---
+# k:   the kernel
+# buf: at least STRUCTURE_MAX + 1 bytes
+# ret: buf
+pub fun structure(k: *Kernel, buf: *u8) str {
+    var o: usize = text.buf_u64(buf, 0, k.radius::u64);
+    buf[o] = ' ';
+    o      = text.buf_u64(buf, o + 1, k.birth);
+    buf[o] = ' ';
+    o      = text.buf_u64(buf, o + 1, k.survive);
+    val n: usize = (2 * k.radius + 1) * (2 * k.radius + 1);
+    var i: usize = 0;
+    for (i < n) {
+        buf[o] = ' ';
+        o      = text.buf_i64(buf, o + 1, k.weights[i]::i64);
+        i      = i + 1;
+    }
+    buf[o] = 0;
+    ret buf;
+}
+
+# read a decimal of at most hi at s[@i], after any blanks, with a leading minus when neg_ok
+fun read_num(s: str, i: *usize, hi: u64, neg_ok: bool, out: *u64, neg: *bool) bool {
+    for (s[@i] == ' ' || s[@i] == '\t') { @i = @i + 1; }
+    @neg = false;
+    if (neg_ok && s[@i] == '-') {
+        @neg = true;
+        @i   = @i + 1;
+    }
+    if (s[@i] < '0' || s[@i] > '9') { ret false; }
+    var v: u64 = 0;
+    for (s[@i] >= '0' && s[@i] <= '9') {
+        val d: u64 = (s[@i] - '0')::u64;
+        if (v > (hi - d) / 10) { ret false; }
+        v  = v * 10 + d;
+        @i = @i + 1;
+    }
+    @out = v;
+    ret true;
+}
+
+# read a kernel structure wrote
+#
+# the kernel is named after the preset it matches, or "custom".
+# ---
+# s:   NUL-terminated text
+# ret: the kernel, or none when s is not one this version can run
+pub fun from_structure(s: str) opt[Kernel] {
+    var k: Kernel;
+    var i: usize = 0;
+    for (i < 81) {
+        k.weights[i] = 0;
+        i            = i + 1;
+    }
+    var p:   usize = 0;
+    var v:   u64   = 0;
+    var neg: bool  = false;
+    if (!read_num(s, ?p, MAX_RADIUS::u64, false, ?v, ?neg) || v < 1) { ret opt[Kernel].none{}; }
+    k.radius = v::usize;
+    if (!read_num(s, ?p, 0xffffffffffffffff, false, ?k.birth, ?neg))   { ret opt[Kernel].none{}; }
+    if (!read_num(s, ?p, 0xffffffffffffffff, false, ?k.survive, ?neg)) { ret opt[Kernel].none{}; }
+    val n: usize = (2 * k.radius + 1) * (2 * k.radius + 1);
+    i = 0;
+    for (i < n) {
+        if (!read_num(s, ?p, 2147483648, true, ?v, ?neg) || (!neg && v > 2147483647)) { ret opt[Kernel].none{}; }
+        k.weights[i] = v::i64::i32;
+        if (neg) { k.weights[i] = (0 - v::i64)::i32; }
+        i = i + 1;
+    }
+    for (s[p] == ' ' || s[p] == '\t') { p = p + 1; }
+    if (s[p] != 0) { ret opt[Kernel].none{}; }
+    k.name = "custom";
+    val m: opt[usize] = match_preset(?k);
+    if (sel m.some) { k.name = preset(m.some).name; }
+    ret opt[Kernel].some{k};
 }
 
 # whether two kernels apply the same rule, whatever they are called
@@ -324,5 +511,63 @@ test match_preset__names_a_preset_rule_and_nothing_else {
     k.birth = toggle_bit(k.birth, 5);
     val n: opt[usize] = match_preset(?k);
     if (sel n.some) { ret 3; }
+    ret 0;
+}
+
+test parse__reads_both_notations_in_any_case {
+    var hl: Kernel      = preset(1);
+    var lf: Kernel      = preset(0);
+    var sd: Kernel      = preset(2);
+    val a:  opt[Kernel] = parse("b36/s23");
+    if (!sel a.some)              { ret 1; }
+    if (!same_rule(?a.some, ?hl)) { ret 1; }
+    val b: opt[Kernel] = parse("23/3");
+    if (!sel b.some)              { ret 2; }
+    if (!same_rule(?b.some, ?lf)) { ret 2; }
+    val c: opt[Kernel] = parse("B2/S");
+    if (!sel c.some)              { ret 3; }
+    if (!same_rule(?c.some, ?sd)) { ret 3; }
+    val d: opt[Kernel] = parse("B35/S1");
+    if (!sel d.some)                                                                        { ret 4; }
+    if (d.some.birth != ((1::u64 << 3) | (1::u64 << 5)) || d.some.survive != (1::u64 << 1)) { ret 4; }
+    val e: opt[Kernel] = parse("B3/S23:T20,30");
+    val f: opt[Kernel] = parse("B3/S9");
+    val g: opt[Kernel] = parse("");
+    val h: opt[Kernel] = parse("B3");
+    if (sel e.some || sel f.some || sel g.some || sel h.some) { ret 5; }
+    ret 0;
+}
+
+test structure__round_trips_a_wide_weighted_kernel {
+    var k: Kernel = life();
+    set_radius(?k, 2);
+    set_weight(?k, -2, -2, -3);
+    set_weight(?k, 2, 1, 5);
+    k.birth   = set_bit(set_bit(0, 7), 40);
+    k.survive = set_bit(0, 63);
+    var b: [1101]u8;
+    val r: opt[Kernel] = from_structure(structure(?k, ?b[0]));
+    if (!sel r.some)                                   { ret 1; }
+    if (!same_rule(?r.some, ?k) || r.some.radius != 2) { ret 2; }
+    var lf: Kernel      = life();
+    val p:  opt[Kernel] = from_structure(structure(?lf, ?b[0]));
+    if (!sel p.some)              { ret 3; }
+    if (!same_rule(?p.some, ?lf)) { ret 3; }
+    val bad1: opt[Kernel] = from_structure("5 8 12 0");
+    val bad2: opt[Kernel] = from_structure("1 8 12 1 1 1 1 0 1 1 1");
+    val bad3: opt[Kernel] = from_structure("1 8 12 1 1 1 1 0 1 1 1 1 1");
+    val bad4: opt[Kernel] = from_structure("1 8 12 1 1 1 1 0 1 1 1 3000000000");
+    if (sel bad1.some || sel bad2.some || sel bad3.some || sel bad4.some) { ret 4; }
+    ret 0;
+}
+
+test life_like__holds_for_b_s_rules_only {
+    var k: Kernel = highlife();
+    if (!life_like(?k)) { ret 1; }
+    k.birth = set_bit(k.birth, 9);
+    if (life_like(?k)) { ret 2; }
+    k = life();
+    set_weight(?k, 1, 0, 2);
+    if (life_like(?k)) { ret 3; }
     ret 0;
 }

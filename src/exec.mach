@@ -1,0 +1,311 @@
+# applies the queued commands to the world and its files
+#
+# the one place a command's effect happens. the frame calls run once, before it
+# collects or records anything, so the world a save reads is the world the
+# command was issued against.
+
+use cellar.app;
+use cellar.command;
+use cellar.kernel;
+use cellar.pattern;
+use cellar.persist;
+use cellar.saves;
+use cellar.sim;
+use cellar.space;
+use cellar.world;
+use allo: std.allocator;
+use std.allocator.page;
+use fs: std.filesystem;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string;
+use std.types.string.str;
+
+# what a command needs beyond the world
+# ---
+# a: allocator for file buffers
+pub rec Deps {
+    a: *allo.Allocator;
+}
+
+# the view a world file keeps, as the app holds it
+fun view_of(a: *app.App) persist.View {
+    ret persist.View{pan_x: a.pan_x, pan_y: a.pan_y, zoom: a.zoom, mode: a.mode::u8};
+}
+
+# show a world file's view, its zoom brought within the app's limits
+fun take_view(a: *app.App, v: *persist.View) {
+    a.pan_x = v.pan_x;
+    a.pan_y = v.pan_y;
+    a.zoom  = app.clamp_zoom(v.zoom);
+    a.mode  = v.mode::usize;
+}
+
+# the last part of a path, what a message calls the file
+fun base(path: str) str {
+    var b: str   = path;
+    var i: usize = 0;
+    for (path[i] != 0) {
+        if (path[i] == '/' || path[i] == '\\') { b = ?path[i + 1]; }
+        i = i + 1;
+    }
+    ret b;
+}
+
+# flash how a save went, and have the files list read again once one is written
+fun saved(a: *app.App, path: str, e: err[persist.Error]) {
+    if (sel e.err) {
+        app.say_why(a, base(path), persist.error_message(e.err));
+        ret;
+    }
+    a.saves.stale = true;
+    app.say_why(a, base(path), "saved");
+}
+
+# save the world with the view
+fun save_world(a: *app.App, s: *sim.Sim, d: *Deps, path: str) {
+    var v: persist.View = view_of(a);
+    saved(a, path, persist.save_world(d.a, s, ?v, path));
+}
+
+# load the world and the view it was saved with, saying when its rule could not be taken
+fun load_world(a: *app.App, s: *sim.Sim, d: *Deps, path: str) {
+    var v:    persist.View                       = view_of(a);
+    val done: res[persist.Loaded, persist.Error] = persist.load_world(d.a, s, ?v, path);
+    if (sel done.err) {
+        app.say_why(a, base(path), persist.error_message(done.err));
+        ret;
+    }
+    take_view(a, ?v);
+    if (done.ok.foreign) {
+        app.say_why(a, base(path), "loaded, but its rule is not one cellar can run; the current rule is kept");
+        ret;
+    }
+    app.say_why(a, base(path), "loaded");
+}
+
+# load a file into the custom pattern and select it
+fun load_pattern(a: *app.App, d: *Deps, path: str) {
+    val done: err[persist.Error] = persist.load_pattern(d.a, ?a.custom, path);
+    if (sel done.err) {
+        app.say_why(a, base(path), persist.error_message(done.err));
+        ret;
+    }
+    a.pattern_sel = pattern.BUILTIN_COUNT;
+    app.say_why(a, base(path), "loaded as the custom pattern");
+}
+
+# open a world with the view it was saved with, or stamp a pattern and frame it
+fun open(a: *app.App, s: *sim.Sim, d: *Deps, path: str) {
+    var v:    persist.View                       = view_of(a);
+    val done: res[persist.Opened, persist.Error] = persist.open_file(d.a, s, ?v, path);
+    if (sel done.err) {
+        app.say_why(a, base(path), persist.error_message(done.err));
+        ret;
+    }
+    if (done.ok.world)        { take_view(a, ?v); }
+    if (sel done.ok.box.some) { app.frame_box(a, done.ok.box.some); }
+    if (done.ok.foreign) {
+        app.say_why(a, base(path), "opened, but its rule is not one cellar can run; the current rule is kept");
+        ret;
+    }
+    app.say_why(a, base(path), "opened");
+}
+
+# apply one command
+fun apply(c: *command.Command, a: *app.App, s: *sim.Sim, d: *Deps) {
+    if (sel c.toggle)     { world.toggle(s); }
+    if (sel c.step)       { world.step(s); }
+    if (sel c.clear)      { world.clear(s); }
+    if (sel c.randomize)  { world.randomize(s, c.randomize); }
+    if (sel c.paint)      { world.paint(s, c.paint.x, c.paint.y, c.paint.v); }
+    if (sel c.line)       { world.line(s, c.line.x0, c.line.y0, c.line.x1, c.line.y1, c.line.v); }
+    if (sel c.stamp)      { world.stamp(s, ?c.stamp.p, c.stamp.x, c.stamp.y); }
+    if (sel c.rule)       { s.kernel = c.rule; }
+    if (sel c.save_world) { save_world(a, s, d, command.path(?c.save_world)); }
+    if (sel c.load_world) { load_world(a, s, d, command.path(?c.load_world)); }
+    if (sel c.save_pattern) {
+        val path: str = command.path(?c.save_pattern);
+        saved(a, path, persist.save_pattern(d.a, ?a.custom, path));
+    }
+    if (sel c.load_pattern) { load_pattern(a, d, command.path(?c.load_pattern)); }
+    if (sel c.open)         { open(a, s, d, command.path(?c.open)); }
+}
+
+# apply every waiting command in order and empty the queue
+# ---
+# a: application state, which owns the queue
+# s: the simulation, locked by the caller and not yet recorded into
+# d: what the commands need
+pub fun run(a: *app.App, s: *sim.Sim, d: *Deps) {
+    var i: usize = 0;
+    for (i < a.queue.items.len) {
+        apply(?a.queue.items.data[i], a, s, d);
+        i = i + 1;
+    }
+    command.clear(?a.queue);
+}
+
+# a file command's copy of a path, which a test's allocator never refuses
+#[testing]
+fun file(ap: *app.App, path: str) command.File {
+    val f: opt[command.File] = app.file(ap, path);
+    if (sel f.some) { ret f.some; }
+    var none: command.File;
+    ret none;
+}
+
+test run__applies_in_order_and_a_save_sees_the_edits_before_it {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    var ap: app.App;
+    app.init(?ap);
+    val shown: err[allo.Error] = app.attach(?ap, ?a);
+    if (sel shown.err) { ret 1; }
+    var d: Deps = Deps{a: ?a};
+
+    app.submit(?ap, command.Command.paint{command.Paint{x: 1, y: 2, v: 1}});
+    app.submit(?ap, command.Command.line{command.Line{x0: 10, y0: 10, x1: 14, y1: 10, v: 1}});
+    # the glider's five cells, stamped well clear of the rest
+    app.stamp(?ap, ?ap.library[0], 0, 100, 100);
+    ap.pan_x = -40.5;
+    ap.zoom  = 99.0;
+    app.submit(?ap, command.Command.save_world{file(?ap, "out/test/exec/soup.cellar")});
+    app.submit(?ap, command.Command.clear{});
+    app.submit(?ap, command.Command.save_world{file(?ap, "out/test/exec/empty.cellar")});
+    if (ap.queue.items.len != 6) { ret 2; }
+    run(?ap, ?s, ?d);
+    if (ap.queue.items.len != 0) { ret 3; }
+    if (sim.population(?s) != 0) { ret 4; }
+
+    ap.pan_x = 0.0;
+    app.submit(?ap, command.Command.load_world{file(?ap, "out/test/exec/soup.cellar")});
+    run(?ap, ?s, ?d);
+    if (sim.population(?s) != 11)                       { ret 5; }
+    if (!sim.alive(?s, 1, 2) || !sim.alive(?s, 14, 10)) { ret 6; }
+    # the view comes back with it, its zoom within the app's limits
+    if (ap.pan_x != -40.5 || ap.zoom != app.ZOOM_MAX) { ret 7; }
+    # each name is its own world
+    app.submit(?ap, command.Command.load_world{file(?ap, "out/test/exec/empty.cellar")});
+    run(?ap, ?s, ?d);
+    if (sim.population(?s) != 0) { ret 8; }
+
+    # the custom pattern saves and loads under a name of its own too
+    pattern.set(?ap.custom, 3, 4, 1);
+    app.submit(?ap, command.Command.save_pattern{file(?ap, "out/test/exec/mine.rle")});
+    run(?ap, ?s, ?d);
+    pattern.clear(?ap.custom);
+    app.submit(?ap, command.Command.load_pattern{file(?ap, "out/test/exec/mine.rle")});
+    run(?ap, ?s, ?d);
+    var live: usize = 0;
+    var y:    usize = 0;
+    for (y < ap.custom.h) {
+        var x: usize = 0;
+        for (x < ap.custom.w) {
+            live = live + pattern.get(?ap.custom, x, y)::usize;
+            x    = x + 1;
+        }
+        y = y + 1;
+    }
+    if (live != 1 || ap.pattern_sel != pattern.BUILTIN_COUNT) { ret 9; }
+
+    # the files list finds all three, sorted, and nothing else
+    if (!ap.saves.stale) { ret 10; }
+    val listed: err[fs.FsError] = saves.refresh(?ap.saves, "out/test/exec");
+    if (sel listed.err || ap.saves.items.len != 3) { ret 11; }
+    val first: *saves.Entry = ?ap.saves.items.data[0];
+    val last:  *saves.Entry = ?ap.saves.items.data[2];
+    if (!string.str_equals(first.name, "empty.cellar") || first.kind != saves.KIND_WORLD)                  { ret 12; }
+    if (!string.str_equals(last.name, "soup.cellar") || ap.saves.items.data[1].kind != saves.KIND_PATTERN) { ret 13; }
+
+    fs.remove_file("out/test/exec/soup.cellar");
+    fs.remove_file("out/test/exec/empty.cellar");
+    fs.remove_file("out/test/exec/mine.rle");
+    app.dnit(?ap);
+    sim.dnit(?s);
+    ret 0;
+}
+
+test run__opens_a_pattern_with_its_rule_and_leaves_the_world_when_a_file_fails {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    var ap: app.App;
+    app.init(?ap);
+    val shown: err[allo.Error] = app.attach(?ap, ?a);
+    if (sel shown.err) { ret 1; }
+    var d:   Deps            = Deps{a: ?a};
+    val dir: err[fs.FsError] = persist.make_parent(?a, "out/test/open/x");
+    if (sel dir.err) { ret 1; }
+    val rle:  str = "x = 3, y = 1, rule = B36/S23\n3o!\n";
+    val junk: str = "this is not a pattern\n";
+    fs.write_bytes("out/test/open/row.rle", rle, string.str_len(rle), persist.FILE_MODE);
+    fs.write_bytes("out/test/open/junk.txt", junk, string.str_len(junk), persist.FILE_MODE);
+
+    # a row of three centred on the origin, under HighLife
+    world.paint(?s, 50, 50, 1);
+    app.submit(?ap, command.Command.open{file(?ap, "out/test/open/row.rle")});
+    run(?ap, ?s, ?d);
+    if (sim.population(?s) != 4)                                               { ret 2; }
+    if (!sim.alive(?s, -1, 0) || !sim.alive(?s, 0, 0) || !sim.alive(?s, 1, 0)) { ret 3; }
+    var high: kernel.Kernel = kernel.highlife();
+    var life: kernel.Kernel = kernel.life();
+    if (!kernel.same_rule(?s.kernel, ?high)) { ret 4; }
+    # the view is asked to frame the three cells
+    val fit: space.Box = app.fit_box(?ap);
+    if (!ap.refit || fit.x0 != -1 || fit.x1 != 2 || fit.y0 != 0 || fit.y1 != 1) { ret 9; }
+
+    # a file that is no pattern, and one that is not there, change nothing and say why
+    s.kernel = life;
+    app.submit(?ap, command.Command.open{file(?ap, "out/test/open/junk.txt")});
+    run(?ap, ?s, ?d);
+    if (sim.population(?s) != 4 || !kernel.same_rule(?s.kernel, ?life)) { ret 5; }
+    if (!string.str_starts_with(ap.toast, "junk.txt: "))                { ret 6; }
+    app.submit(?ap, command.Command.open{file(?ap, "out/test/open/missing.rle")});
+    run(?ap, ?s, ?d);
+    if (sim.population(?s) != 4)                            { ret 7; }
+    if (!string.str_starts_with(ap.toast, "missing.rle: ")) { ret 8; }
+
+    fs.remove_file("out/test/open/row.rle");
+    fs.remove_file("out/test/open/junk.txt");
+    app.dnit(?ap);
+    sim.dnit(?s);
+    ret 0;
+}
+
+test run__applies_every_command_however_many_a_frame_holds {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    var ap: app.App;
+    app.init(?ap);
+    val shown: err[allo.Error] = app.attach(?ap, ?a);
+    if (sel shown.err) { ret 1; }
+    var d: Deps;
+
+    var i: i64 = 0;
+    for (i < 300) {
+        app.submit(?ap, command.Command.paint{command.Paint{x: i, y: 0, v: 1}});
+        i = i + 1;
+    }
+    # a later command overrides an earlier one
+    app.submit(?ap, command.Command.paint{command.Paint{x: 7, y: 0, v: 0}});
+    if (ap.queue.items.len != 301) { ret 2; }
+    run(?ap, ?s, ?d);
+    if (sim.population(?s) != 299)                     { ret 3; }
+    if (sim.alive(?s, 7, 0) || !sim.alive(?s, 299, 0)) { ret 4; }
+
+    app.dnit(?ap);
+    sim.dnit(?s);
+    ret 0;
+}

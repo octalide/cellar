@@ -1,17 +1,16 @@
 # the narrow surface the interface reads and drives the simulation through
 #
 # the panels and the readout touch the simulation only here: its generation,
-# population and rule, whether it runs, and painting and stamping by world
-# coordinate. the camera and the cells' draw live in cellar.render and
+# population and its recent history, the box its live cells span, its rule,
+# whether it runs, and painting and stamping by world coordinate. the camera and the cells' draw live in cellar.render and
 # cellar.gpu, and the world has no edge, so nothing here names one.
 
+use cellar.history;
 use cellar.kernel;
 use cellar.pattern;
 use cellar.sim;
-use cellar.text;
+use cellar.space;
 use std.types.bool.bool;
-use std.types.bool.false;
-use std.types.bool.true;
 use std.types.option.opt;
 use std.types.size.usize;
 use std.types.string.str;
@@ -26,9 +25,24 @@ pub fun population(s: *sim.Sim) usize {
     ret sim.population(s);
 }
 
+# recent populations by generation, oldest first
+pub fun recent(s: *sim.Sim) *history.History {
+    ret ?s.history;
+}
+
+# the smallest box holding every live cell, or none when nothing is alive
+pub fun bounds(s: *sim.Sim) opt[space.Box] {
+    ret sim.bounds(s);
+}
+
 # whether the simulation is stepping on its own
 pub fun running(s: *sim.Sim) bool {
     ret s.running != 0;
+}
+
+# whether the world outgrew its pool and stepping stopped until it is cleared
+pub fun full(s: *sim.Sim) bool {
+    ret s.full;
 }
 
 # start or pause stepping
@@ -69,40 +83,50 @@ pub fun preset_label(i: usize) str {
     ret "Life";
 }
 
-# append a mask's set sums, comma separated once any exceeds nine
-fun buf_mask(buf: *u8, off: usize, mask: u64) usize {
-    var wide:  bool  = mask >= (1::u64 << 10);
-    var o:     usize = off;
-    var n:     usize = 0;
-    var first: bool  = true;
-    for (n < 64) {
-        if (kernel.has_bit(mask, n) != 0) {
-            if (wide && !first) { o = text.buf_str(buf, o, ","); }
-            o     = text.buf_u64(buf, o, n::u64);
-            first = false;
-        }
-        n = n + 1;
-    }
-    ret o;
-}
-
 # write the rule as B.../S... notation into buf, NUL-terminated
 # ---
 # s:   the simulation
 # buf: at least 200 bytes
 # ret: buf
 pub fun rule_string(s: *sim.Sim, buf: *u8) str {
-    var o: usize = text.buf_str(buf, 0, "B");
-    o      = buf_mask(buf, o, s.kernel.birth);
-    o      = text.buf_str(buf, o, "/S");
-    o      = buf_mask(buf, o, s.kernel.survive);
-    buf[o] = 0;
-    ret buf;
+    ret kernel.notation(?s.kernel, buf);
 }
 
 # set the cell at world (x, y) live (v = 1) or dead (v = 0)
 pub fun paint(s: *sim.Sim, x: i64, y: i64, v: u8) {
     sim.paint(s, x, y, v);
+}
+
+# set every cell on the line from (x0, y0) to (x1, y1), ends included
+pub fun line(s: *sim.Sim, x0: i64, y0: i64, x1: i64, y1: i64, v: u8) {
+    var dx: i64 = x1 - x0;
+    var dy: i64 = y1 - y0;
+    var sx: i64 = 1;
+    var sy: i64 = 1;
+    if (dx < 0) {
+        dx = 0 - dx;
+        sx = -1;
+    }
+    if (dy < 0) {
+        dy = 0 - dy;
+        sy = -1;
+    }
+    var e: i64 = dx - dy;
+    var x: i64 = x0;
+    var y: i64 = y0;
+    for {
+        sim.paint(s, x, y, v);
+        if (x == x1 && y == y1) { brk; }
+        val e2: i64 = e * 2;
+        if (e2 > 0 - dy) {
+            e = e - dy;
+            x = x + sx;
+        }
+        if (e2 < dx) {
+            e = e + dx;
+            y = y + sy;
+        }
+    }
 }
 
 # overlay a pattern's live cells centred on world (x, y)
@@ -120,5 +144,22 @@ test rule_string__writes_life_and_wide_rules {
     rule_string(?s, ?b[0]);
     # B3,12/S23
     if (b[2] != ',' || b[3] != '1' || b[4] != '2' || b[5] != '/') { ret 2; }
+    # survive 23 must take the commas birth needs: B3,12/S2,3
+    if (b[6] != 'S' || b[7] != '2' || b[8] != ',' || b[9] != '3' || b[10] != 0) { ret 3; }
+    ret 0;
+}
+
+test rule_string__round_trips_every_preset_through_parse {
+    var b: [200]u8;
+    var s: sim.Sim;
+    var i: usize = 0;
+    for (i < kernel.PRESET_COUNT) {
+        s.kernel = kernel.preset(i);
+        rule_string(?s, ?b[0]);
+        val k: opt[kernel.Kernel] = kernel.parse(?b[0]);
+        if (!sel k.some)                           { ret 1; }
+        if (!kernel.same_rule(?k.some, ?s.kernel)) { ret 1; }
+        i = i + 1;
+    }
     ret 0;
 }
