@@ -16,6 +16,7 @@ use cellar.formats.life;
 use cellar.formats.macrocell;
 use cellar.formats.plaintext;
 use cellar.formats.rle;
+use cellar.hashlife;
 use cellar.pattern;
 use cellar.sim;
 use cellar.space;
@@ -27,6 +28,8 @@ use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
 use std.types.size.usize;
 use std.types.string;
 use std.types.string.str;
@@ -198,6 +201,54 @@ fun same(p: *pattern.Pattern, q: *pattern.Pattern) bool {
     ret string.str_equals(pattern.rule(p), pattern.rule(q)) && string.str_equals(pattern.name(p), pattern.name(q)) && string.str_equals(pattern.comments(p), pattern.comments(q));
 }
 
+# write a pattern out in a format from a HashLife tree of its cells, not its
+# runs, read it back, and compare
+# ---
+# f:    the format
+# info: the text to write
+# ret:  whether it came back identical
+fun from_tree(a: *allo.Allocator, p: *pattern.Pattern, f: *format.Format, info: *format.Info) bool {
+    var t: hashlife.Tree;
+    hashlife.init(?t, a, hashlife.DEFAULT_MAX);
+    if (!hashlife.make(?t)) { ret false; }
+    var i: usize = 0;
+    for (i < p.w * p.h) {
+        if (p.cells[i] != 0) {
+            val x:  i64 = p.x + (i % p.w)::i64;
+            val y:  i64 = p.y + (i / p.w)::i64;
+            val cx: i64 = space.chunk_of(x);
+            val cy: i64 = space.chunk_of(y);
+            val c:  *u8 = hashlife.chunk(?t, cx, cy, true);
+            c[((y - cy * space.SIDE) * space.SIDE + x - cx * space.SIDE)::usize] = p.cells[i];
+            hashlife.wrote(?t, cx, cy);
+        }
+        i = i + 1;
+    }
+    var ok:   bool           = hashlife.flush(?t);
+    var src:  adapt.PatternSource;
+    var q:    format.Quadtree;
+    var out:  Vector[u8]     = vector.init[u8](a);
+    val from: *format.Source = adapt.pattern_source(?src, p);
+    from.tree = adapt.quadtree(?q, ?t);
+    val w: err[format.Error] = save(a, f, from, info, ?out);
+    if (sel w.err) { ok = false; }
+    var back: pattern.Pattern;
+    val m:    err[allo.Error] = pattern.init(?back, a, 0, 0, "");
+    if (sel m.err) { ok = false; }
+    var ps:  adapt.PatternSink;
+    var got: format.Info;
+    format.info_init(?got, a);
+    if (ok) {
+        val r: err[format.Error] = load(a, f, out.data, out.len, adapt.pattern_sink(?ps, ?back), ?got);
+        ok = sel r.ok && same(p, ?back);
+    }
+    if (!(sel m.err)) { pattern.dnit(?back); }
+    format.info_dnit(?got);
+    vector.dnit[u8](?out);
+    hashlife.dnit(?t);
+    ret ok;
+}
+
 # write a pattern out in a format, read it back, and compare
 # ---
 # id:   the format
@@ -236,8 +287,9 @@ fun roundtrip(a: *allo.Allocator, p: *pattern.Pattern, id: str, wrap: usize) u32
     val r: err[format.Error] = load(a, ?f, out.data, out.len, adapt.pattern_sink(?ps, ?q), ?got);
     if (sel r.err) { ret 6; }
     var ok: u32 = 0;
-    if (!same(p, ?q))                      { ok = 7; }
-    or (got.notes != 0 && got.states <= 2) { ok = 8; }
+    if (!same(p, ?q))                                                      { ok = 7; }
+    or (got.notes != 0 && got.states <= 2)                                 { ok = 8; }
+    or (string.str_equals(id, "macrocell") && !from_tree(a, p, ?f, ?info)) { ok = 9; }
     pattern.dnit(?q);
     format.info_dnit(?got);
     format.info_dnit(?info);
@@ -699,9 +751,10 @@ rec RunSource {
     source: format.Source;
 }
 
-fun runs_rewind(ctx: *u8) {
+fun runs_rewind(ctx: *u8) err[format.Error] {
     val s: *RunSource = ctx::*RunSource;
     s.i = 0;
+    ret err[format.Error].ok{};
 }
 
 fun runs_next(ctx: *u8, r: *format.Run) bool {
@@ -725,6 +778,7 @@ fun write_runs(a: *allo.Allocator, runs: *format.Run, n: usize, out: *Vector[u8]
     rs.source.x1     = format.LIMIT;
     rs.source.y1     = format.LIMIT;
     rs.source.states = 2;
+    rs.source.tree   = nil;
     rs.source.rewind = runs_rewind;
     rs.source.next   = runs_next;
     var f: format.Format;
@@ -781,6 +835,72 @@ fun sniffs(text: str) str {
     var f: format.Format;
     if (!by_bytes(text::*u8, string.str_len(text), ?f)) { ret ""; }
     ret f.id;
+}
+
+# an allocator that refuses any request past max bytes, over another
+# ---
+# base: the allocator it hands the rest to
+# max:  the largest request it takes
+rec Capped {
+    base: *allo.Allocator;
+    max:  usize;
+}
+
+fun capped_allocate(ctx: ptr, size: usize, align: usize) opt[ptr] {
+    val c: *Capped = ctx::*Capped;
+    if (size > c.max) { ret opt[ptr].none{}; }
+    ret c.base.fn_allocate(c.base.ctx, size, align);
+}
+
+fun capped_reallocate(ctx: ptr, p: ptr, old: usize, size: usize, align: usize) opt[ptr] {
+    val c: *Capped = ctx::*Capped;
+    if (size > c.max) { ret opt[ptr].none{}; }
+    ret c.base.fn_reallocate(c.base.ctx, p, old, size, align);
+}
+
+fun capped_deallocate(ctx: ptr, p: ptr, size: usize, align: usize) i64 {
+    val c: *Capped = ctx::*Capped;
+    ret c.base.fn_deallocate(c.base.ctx, p, size, align);
+}
+
+# save the world as RLE, reading it through an allocator
+fun save_world(a: *allo.Allocator, s: *sim.Sim, reads: *allo.Allocator, out: *Vector[u8]) err[format.Error] {
+    var f: format.Format;
+    if (!by_id("rle", ?f)) { ret err[format.Error].err{format.Error.unsupported{}}; }
+    var info: format.Info;
+    format.info_init(?info, a);
+    var ws:  adapt.WorldSource;
+    var r:   err[format.Error]                 = err[format.Error].ok{};
+    val src: res[*format.Source, format.Error] = adapt.world_source(?ws, s, reads);
+    if (sel src.err) { r = err[format.Error].err{src.err}; }
+    if (sel src.ok)  { r = save(a, ?f, src.ok, ?info, out); }
+    adapt.world_source_dnit(?ws);
+    format.info_dnit(?info);
+    ret r;
+}
+
+test save__fails_rather_than_write_a_world_short_without_the_memory_to_read_it {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s: sim.Sim;
+    val m: err[allo.Error] = sim.init(?s, ?a);
+    if (sel m.err) { ret 1; }
+    # a line across 20 chunks, whose row of chunks takes 80 KiB to read
+    val text: str = "x = 1280, y = 1, rule = B3/S23\n1280o!\n";
+    var live: u64 = 0;
+    if (!world_takes(?a, ?s, "rle", text::*u8, string.str_len(text), ?live) || live != 1280) { ret 2; }
+    var out: Vector[u8]        = vector.init[u8](?a);
+    val all: err[format.Error] = save_world(?a, ?s, ?a, ?out);
+    if (sel all.err || out.len == 0) { ret 3; }
+    vector.clear[u8](?out);
+    var cap:   Capped            = Capped{base: ?a, max: 32768};
+    var few:   allo.Allocator    = allo.Allocator{ctx: (?cap)::ptr, fn_allocate: capped_allocate, fn_reallocate: capped_reallocate, fn_deallocate: capped_deallocate, retains: false};
+    val short: err[format.Error] = save_world(?a, ?s, ?few, ?out);
+    if (!(sel short.err))                        { ret 4; }
+    if (sel short.err && !(sel short.err.alloc)) { ret 5; }
+    vector.dnit[u8](?out);
+    sim.dnit(?s);
+    ret 0;
 }
 
 test registry__finds_formats_by_id_extension_and_content {
