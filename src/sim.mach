@@ -122,33 +122,84 @@ pub fun init(s: *Sim, a: *allo.Allocator) err[allo.Error] {
     val e: err[allo.Error] = space.init(?s.space, a, true);
     if (sel e.err) { ret e; }
     team.start(?s.team);
-    set_rule(s, rule.preset_rule(0));
-    s.rng        = rand.init();
-    s.gpu        = nil;
-    s.pending    = 0;
-    s.full       = false;
-    s.generation = 0;
-    s.running    = 0;
-    s.edit.open  = false;
-    s.read.open  = false;
+    # an empty world has no cells to re-encode
+    s.rule        = rule.preset_rule(0);
+    s.space.sense = rule.sense(?s.rule);
+    s.rng         = rand.init();
+    s.gpu         = nil;
+    s.pending     = 0;
+    s.full        = false;
+    s.generation  = 0;
+    s.running     = 0;
+    s.edit.open   = false;
+    s.read.open   = false;
     history.clear(?s.history);
     ret e;
 }
 
 # replace the rule the world runs
 #
-# the cells are kept as they are, so a rule of another family must read them
-# alike, which holds while there is one family. a change between rules held in
-# different forms (see rule.Caps.b0 and cellar.rules.weighted) keeps the held
-# cells too, so at a generation where one holds the complement and the other
-# does not, the world reads as the held cells' complement from then on: the
-# world before it had an unbounded live background no pool can hold.
+# a rule whose words read as the old one's keeps the cells as they are, ages
+# and trails included. any other, of another family or with other states,
+# re-encodes every cell as the new rule's word for the state the old one reads
+# in it, a state the new rule lacks becoming 0 (see cellar.rule), pulling the
+# cells from the GPU first when it steps. call outside a frame, or in one
+# before gpu frame has recorded anything.
+# a rule held in another form (see rule.Caps.b0 and cellar.rules.weighted)
+# keeps the held cells too, so at a generation where one holds the complement
+# and the other does not, the world reads as the held cells' complement from
+# then on: the world before it had an unbounded live background no pool can
+# hold.
 # ---
-# s: simulation
-# r: the rule
-pub fun set_rule(s: *Sim, r: rule.Rule) {
+# s:   simulation
+# r:   the rule
+# ret: false when the GPU's cells could not be read, which leaves the rule as
+#      it was
+pub fun set_rule(s: *Sim, r: rule.Rule) bool {
+    var old:  rule.Rule = s.rule;
+    var new:  rule.Rule = r;
+    val same: bool      = alike(?old, ?new);
+    if (!same) {
+        val synced: err[gfx.Error] = sync(s);
+        if (sel synced.err) { ret false; }
+    }
     s.rule        = r;
     s.space.sense = rule.sense(?s.rule);
+    if (same) { ret true; }
+
+    val sp: *space.Space = ?s.space;
+    val n:  u32          = rule.states(?s.rule);
+    var sl: usize        = 0;
+    for (sl < sp.hi) {
+        if (space.used(sp, sl)) {
+            val c: *u32  = ?sp.cells[sl * space.CELLS];
+            var i: usize = 0;
+            for (i < space.CELLS) {
+                var st: u32 = rule.state(?old, c[i]);
+                if (st >= n) { st = 0; }
+                c[i] = rule.word(?s.rule, st);
+                i    = i + 1;
+            }
+            sp.dirty[sl] = sp.dirty[sl] | space.DIRTY_CELLS;
+        }
+        sl = sl + 1;
+    }
+    if (on_gpu(s)) { gpu.forget_writes(s.gpu, 0, sp.hi); }
+    # the live cells changed, so the census and the chunks around them follow
+    fill_end(s);
+    ret true;
+}
+
+# whether two rules write every state as the same word, so cells of one read
+# alike under the other
+fun alike(a: *rule.Rule, b: *rule.Rule) bool {
+    if (rule.family_of(a) != rule.family_of(b) || rule.states(a) != rule.states(b)) { ret false; }
+    var st: u32 = 0;
+    for (st < rule.states(a)) {
+        if (rule.word(a, st) != rule.word(b, st)) { ret false; }
+        st = st + 1;
+    }
+    ret true;
 }
 
 # stop the team and release the pool
@@ -941,6 +992,147 @@ test step__age_accumulates_and_heat_decays {
     paint(?s, 40, 40, 1);
     step(?s);
     if (cell(?s, 40, 40) != 255 - word.DECAY) { ret 4; }
+    dnit(?s);
+    ret 0;
+}
+
+# one generation of a generations rule over a side by side grid of states,
+# cells beyond its edge dead: the rule as Golly states it, written apart from
+# the family's own step
+#[testing]
+fun generations_reference(g: *u8, out: *u8, side: i64, birth: u32, survive: u32, n: u8) {
+    var y: i64 = 0;
+    for (y < side) {
+        var x: i64 = 0;
+        for (x < side) {
+            var count: u32 = 0;
+            var dy:    i64 = -1;
+            for (dy <= 1) {
+                var dx: i64 = -1;
+                for (dx <= 1) {
+                    val nx: i64 = x + dx;
+                    val ny: i64 = y + dy;
+                    if ((dx != 0 || dy != 0) && nx >= 0 && ny >= 0 && nx < side && ny < side && g[(ny * side + nx)::usize] == 1) {
+                        count = count + 1;
+                    }
+                    dx = dx + 1;
+                }
+                dy = dy + 1;
+            }
+            val c: u8 = g[(y * side + x)::usize];
+            var v: u8 = 0;
+            if (c == 0) {
+                if (((birth >> count) & 1) != 0) { v = 1; }
+            }
+            or (c == 1 && ((survive >> count) & 1) != 0) { v = 1; }
+            or (c + 1 < n)                               { v = c + 1; }
+            out[(y * side + x)::usize] = v;
+            x                          = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+test generations__brians_brain_and_star_wars_match_a_reference_stepper {
+    var a: allo.Allocator;
+    page.make(?a);
+    val side:    i64    = 160;
+    val strings: [2]str = [2]str{"B2/S/C3", "345/2/4"};
+    val survive: [2]u32 = [2]u32{0, 0x38};
+    val states:  [2]u8  = [2]u8{3, 4};
+    var g:       [25600]u8;
+    var h:       [25600]u8;
+    var k:       usize  = 0;
+    for (k < 2) {
+        var s:    Sim;
+        val made: err[allo.Error] = init(?s, ?a);
+        if (sel made.err) { ret 1; }
+        val r: res[rule.Rule, str] = rule.parse(strings[k]);
+        if (sel r.err)           { ret 2; }
+        if (!set_rule(?s, r.ok)) { ret 2; }
+        mem.zero[u8](?g[0], 25600);
+        s.rng = rand.seed(5, 6, 7, 8);
+        fill_begin(?s);
+        var y: i64 = -24;
+        for (y < 24) {
+            var x: i64 = -24;
+            for (x < 24) {
+                if (rand.range(?s.rng, 0, 1000) < 400) {
+                    fill_cell(?s, x, y, 1);
+                    g[((y + 80) * side + x + 80)::usize] = 1;
+                }
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        fill_end(?s);
+
+        # a pattern spreads at most a cell a generation, so 40 stay inside the grid
+        var gen: usize = 0;
+        for (gen < 40) {
+            step(?s);
+            generations_reference(?g[0], ?h[0], side, 4, survive[k], states[k]);
+            mem.copy[u8](?g[0], ?h[0], 25600);
+            gen = gen + 1;
+        }
+        var live:  usize = 0;
+        var dying: usize = 0;
+        y = 0;
+        for (y < side) {
+            var x: i64 = 0;
+            for (x < side) {
+                val want: u8 = g[(y * side + x)::usize];
+                if (rule.state(?s.rule, cell(?s, x - 80, y - 80)) != want::u32) {
+                    print.eprintlnf("{} differs at ({}, {})", strings[k], x - 80, y - 80);
+                    ret 3;
+                }
+                if (want == 1) { live = live + 1; }
+                if (want > 1)  { dying = dying + 1; }
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        # nothing lives outside the grid, and the soup kept both kinds of cell
+        if (population(?s) != live || live == 0 || dying == 0) { ret 4; }
+        dnit(?s);
+        k = k + 1;
+    }
+    ret 0;
+}
+
+test set_rule__re_encodes_the_cells_between_families {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    Sim;
+    val made: err[allo.Error] = init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    var life: rule.Rule           = rule.preset_rule(0);
+    val bb:   res[rule.Rule, str] = rule.parse("B2/S/C3");
+    if (sel bb.err) { ret 1; }
+    var brain: rule.Rule = bb.ok;
+
+    # a Life block, stepped so its cells carry an age
+    paint(?s, 0, 0, 1);
+    paint(?s, 1, 0, 1);
+    paint(?s, 0, 1, 1);
+    paint(?s, 1, 1, 1);
+    step(?s);
+    if (cell(?s, 0, 0) == rule.word(?s.rule, 1)) { ret 2; }
+
+    # live Life cells become live Brian's Brain cells
+    if (!set_rule(?s, brain))                                          { ret 3; }
+    if (cell(?s, 0, 0) != rule.word(?brain, 1) || population(?s) != 4) { ret 3; }
+
+    # every block cell has three live neighbours, so all start dying, and the
+    # cells beside the block's edges have two and are born
+    step(?s);
+    if (rule.state(?s.rule, cell(?s, 0, 0)) != 2 || !alive(?s, -1, 0)) { ret 4; }
+    val born: usize = population(?s);
+
+    # dying cells are a state Life lacks, so they become dead, and live ones live
+    if (!set_rule(?s, life))                                           { ret 5; }
+    if (cell(?s, 0, 0) != 0 || cell(?s, -1, 0) != rule.word(?life, 1)) { ret 5; }
+    if (population(?s) != born)                                        { ret 6; }
     dnit(?s);
     ret 0;
 }
