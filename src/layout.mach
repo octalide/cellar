@@ -14,8 +14,14 @@
 pub val SIDE: u32 = 64;
 # cells in a chunk
 pub val CELLS: u32 = 4096;
-# page-table words per slot
-pub val ENTRY: u32 = 12;
+# page-table words per slot (see Meta)
+pub val ENTRY: u32 = 22;
+# the entry's word of the slot's incarnation, zero while the slot is free
+pub val INCARNATION_AT: u32 = 11;
+# the entry's first link word, one per neighbour slot word in the same order
+pub val LINK_AT: u32 = 12;
+# the entry's edge word
+pub val EDGE_AT: u32 = 21;
 # the most slots any pool may hold: the stages' arrays are declared this long,
 # and a pool's own ceiling, the device's or the host's, lies at or below it
 pub val MAX_SLOTS: u32 = 32768;
@@ -162,11 +168,110 @@ pub rec Cells {
     v: [MAX_SLOTS * CELLS]u32;
 }
 
+# how a step reaches past a chunk, shared by the host and the step stages
+#
+# a chunk's frame is its own 64 by 64 cells, and a step reads cells up to a
+# rule's radius outside it. the edge word gives the window of the frame that
+# lies in the world, the whole frame unless a bounded grid's edge cuts through
+# it. a position outside the window lies to one of the eight sides of it,
+# edge_side, and the entry's neighbour slot and link word for that side say
+# where it is: the slot, and the transform taking the position into that
+# slot's frame. on the unbounded plane a link only moves a position by a
+# chunk; across a bounded grid's seam it wraps, and on a twisted seam it also
+# mirrors. a position the transform leaves outside the new frame's window is
+# taken on the same way, at most HOPS times, and a missing slot on the way
+# reads as zeros.
+#
+# a chunk whose 3 by 3 block lies whole in the world is not seamed: its links
+# only move by a chunk and every window is whole, so a step may read it the
+# plain way. a seamed chunk is read through the links and its cells outside
+# the window are held at zero.
+
+# the most links a position is taken through before it is found
+pub val HOPS: u32 = 4;
+
+# a link word: the transform swaps x and y, then negates x and y as the flip
+# bits say, then adds the offsets, each biased by LINK_BIAS
+pub val LINK_FLIP_X: u32 = 1;
+pub val LINK_FLIP_Y: u32 = 2;
+pub val LINK_SWAP:   u32 = 4;
+# the link crosses a bounded grid's seam, so it does not move by a chunk alone
+pub val LINK_SEAM: u32 = 8;
+pub val LINK_BIAS: i32 = 2048;
+val     LINK_OX:   u32 = 8;
+val     LINK_OY:   u32 = 20;
+
+# the link word for flip, swap and seam bits and the offsets
+pub fun link(bits: u32, ox: i32, oy: i32) u32 {
+    ret bits | (((ox + LINK_BIAS)::u32 & 0xfff) << LINK_OX) | (((oy + LINK_BIAS)::u32 & 0xfff) << LINK_OY);
+}
+
+# the link word toward side k (edge_side) of an unseamed chunk, a move of one
+# chunk
+pub fun plain_link(k: u32) u32 {
+    val dx: i32 = (k % 3)::i32 - 1;
+    val dy: i32 = (k / 3)::i32 - 1;
+    ret link(0, 0 - dx * SIDE::i32, 0 - dy * SIDE::i32);
+}
+
+# x of the position (x, y) taken through link word t
+pub fun hop_x(t: u32, x: i32, y: i32) i32 {
+    var a: i32 = x;
+    if ((t & LINK_SWAP) != 0)   { a = y; }
+    if ((t & LINK_FLIP_X) != 0) { a = 0 - a; }
+    ret a + ((t >> LINK_OX) & 0xfff)::i32 - LINK_BIAS;
+}
+
+# y of the position (x, y) taken through link word t
+pub fun hop_y(t: u32, x: i32, y: i32) i32 {
+    var b: i32 = y;
+    if ((t & LINK_SWAP) != 0)   { b = x; }
+    if ((t & LINK_FLIP_Y) != 0) { b = 0 - b; }
+    ret b + ((t >> LINK_OY) & 0xfff)::i32 - LINK_BIAS;
+}
+
+# the neighbour slot n that link word t names, as the draw sees it: the chunk
+# beside on the plain lattice, NONE across a seam
+pub fun beside(n: u32, t: u32) u32 {
+    if ((t & LINK_SEAM) != 0) { ret NONE; }
+    ret n;
+}
+
+# the edge word's seamed bit, above the window's four bounds of seven bits
+pub val EDGE_SEAMED: u32 = 0x80000000;
+# the edge word of a whole, unseamed chunk
+pub val EDGE_WHOLE: u32 = 0x8002000;
+
+# the edge word for the window [x0, x1) by [y0, y1) of a chunk's frame
+pub fun edge(x0: u32, x1: u32, y0: u32, y1: u32, seamed: u32) u32 {
+    var e: u32 = x0 | (x1 << 7) | (y0 << 14) | (y1 << 21);
+    if (seamed != 0) { e = e | EDGE_SEAMED; }
+    ret e;
+}
+
+# 1 when an edge word's chunk is seamed, else 0
+pub fun seamed(e: u32) u32 {
+    ret e >> 31;
+}
+
+# the side of an edge word's window the position (x, y) of the frame lies to,
+# row-major like the neighbour slots, 4 inside it
+pub fun edge_side(e: u32, x: i32, y: i32) u32 {
+    var sx: u32 = 1;
+    var sy: u32 = 1;
+    if (x < (e & 0x7f)::i32)          { sx = 0; }
+    or (x >= ((e >> 7) & 0x7f)::i32)  { sx = 2; }
+    if (y < ((e >> 14) & 0x7f)::i32)  { sy = 0; }
+    or (y >= ((e >> 21) & 0x7f)::i32) { sy = 2; }
+    ret sy * 3 + sx;
+}
+
 # the shared words, the rule family's window, then one page-table entry per
 # slot: the slots of the 3 by 3 block of chunks around it, its chunk
-# coordinates biased by 2^30, and its incarnation, zero while the slot is free.
-# the words from live_mask to age_mask are a Sense, in order, and gen and
-# strobe lie at GEN_AT and STROBE_AT
+# coordinates biased by 2^30, its incarnation, zero while the slot is free, a
+# link word per neighbour slot, and the edge word. the words from live_mask to
+# age_mask are a Sense, in order, and gen and strobe lie at GEN_AT and
+# STROBE_AT
 pub rec Meta {
     census:     u32;
     hi:         u32;
@@ -205,4 +310,19 @@ pub rec Table {
 # every slot's coverage pyramid
 pub rec Mip {
     v: [MAX_SLOTS * MIP]u32;
+}
+
+test link__takes_a_position_through_every_transform_and_back {
+    # a plain link east moves a chunk left in the neighbour's frame
+    if (hop_x(plain_link(5), 65, 3) != 1 || hop_y(plain_link(5), 65, 3) != 3) { ret 1; }
+    # a flip and a swap, as a sphere's seam would take
+    val t: u32 = link(LINK_SWAP | LINK_FLIP_X | LINK_SEAM, 63, -64);
+    if (hop_x(t, 5, 70) != -7 || hop_y(t, 5, 70) != -59)       { ret 2; }
+    if (beside(3, t) != NONE || beside(3, plain_link(1)) != 3) { ret 3; }
+    val e: u32 = edge(14, 64, 0, 50, 1);
+    if (seamed(e) != 1 || seamed(EDGE_WHOLE) != 0)                                          { ret 4; }
+    if (edge(0, 64, 0, 64, 0) != EDGE_WHOLE)                                                { ret 5; }
+    if (edge_side(e, 13, 0) != 3 || edge_side(e, 14, 49) != 4 || edge_side(e, 20, 50) != 7) { ret 6; }
+    if (edge_side(e, 64, -1) != 2)                                                          { ret 7; }
+    ret 0;
 }
