@@ -37,6 +37,21 @@ states (`345/2/4` for Star Wars), reads too. The trails colour mode shows each
 state in its own colour. Built-in: Brian's Brain (`B2/S/C3`) and Star Wars
 (`B2/S345/C4`).
 
+Rule tables are Golly's RuleLoader `.rule` files: a `@TABLE` of transitions
+over the von Neumann, Moore or hexagonal neighbourhood (Golly's, on the square
+grid) with its variables and symmetries, or a `@TREE`, of up to 256 states,
+coloured by the file's `@COLORS`. Open a `.rule` file with `cellar <file>`, by
+dropping it on the window, or from the files panel, and its rule runs on the
+world as it stands. A rule string naming a table is its name, as Golly writes
+it (`WireWorld`, `Langtons-Loops:T200,200`), and is looked up as
+`<name>.rule` in the data directory first, then among the tables opened this
+session, then among the built-in WireWorld and Langton's Loops (see
+`res/rules`). Opening a `.rule` file copies it into the data directory, so
+worlds, patterns and settings naming it find it in later sessions, and a file
+there is read again each time its name is set, so an edit takes effect then.
+Every state but 0 is live, and a table whose empty neighbourhood gives a live
+cell is refused, since it would flip the unbounded background.
+
 Any rule runs on a bounded grid named after it as Golly writes one:
 `B3/S23:T100,100` is a 100 by 100 torus, `:P` a plane with dead edges, `:K`
 a Klein bottle whose starred size (`:K100*,80`) is the edge joined with a
@@ -102,9 +117,11 @@ corner, and the side panel groups every control by task:
   whose cells cycle from 0 up to 4 and on through -4 to -1, and birth and
   survive toggles over the reachable sums
 - **view**: colour mode (a solid colour from a set of swatches, fading trails,
-  or colour by age), grid lines, and the interface size from 100 to 200 percent
+  or colour by age; a rule table's states show in its own colours in place of
+  the solid one), grid lines, and the interface size from 100 to 200 percent
 - **files**: named saves of the world and the custom pattern, a list of every
-  world and pattern in the data directory to load from, and screenshots
+  world, pattern and `.rule` file in the data directory to load or run, and
+  screenshots
 
 Settings and the rule are kept between runs. They, saved worlds and patterns,
 and screenshots live in the platform's user data directory:
@@ -118,7 +135,7 @@ brings over anything an older version left in
 `arrangements/` in the working directory.
 
 `cellar <file>` opens a file at startup: a `.cellar` world loads as the world,
-and a pattern in any format cellar reads (RLE, plaintext `.cells`, Life 1.05
+a `.rule` file's rule runs on the world, and a pattern in any format cellar reads (RLE, plaintext `.cells`, Life 1.05
 and 1.06, Golly's Macrocell `.mc`) is stamped onto an empty world centred on the
 origin and framed, taking its rule when cellar can run it. A file that cannot be
 read, or a pattern too large for the world to hold, leaves the world as it was

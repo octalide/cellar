@@ -1,0 +1,276 @@
+# the rule tables this process has read, and where a table's name is looked up
+#
+# a table can run to megabytes, so a rule does not hold one: it holds the id
+# of one kept here, and a rule stays a small value that copies, compares and
+# travels through snapshots, undo and the engines like any other. a table is
+# never changed once kept, and a table read again with the same name, tree and
+# colours is the one already kept, so two rules step alike exactly when their
+# ids match. tables are kept for the life of the process: a session reads few,
+# and an id handed out stays good for every rule that holds it.
+#
+# a rule string naming a table, "WireWorld" or "WireWorld:T64,64", is looked up
+# as Golly's RuleLoader looks one up, by the file <name>.rule:
+#
+#   1. in the directory search names, the data directory once the app has
+#      started (cellar.paths), so a file there is read again each time the
+#      name is, and an edited file takes effect the next time its rule is set
+#   2. among the tables this process has read, the latest of that name, so a
+#      .rule file opened from anywhere keeps resolving by its name
+#   3. among the tables built into cellar (res/rules)
+#
+# opening a .rule file (cellar.persist) reads it and copies it into the data
+# directory, so its name resolves in later sessions too.
+
+use cellar.rules.table.load;
+use cellar.text;
+use allo: std.allocator;
+use std.allocator.page;
+use std.collections.vector;
+use fs:       std.filesystem;
+use io_error: std.io.error;
+use mem:      std.memory;
+use std.sync.mutex;
+use std.system.panic;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string;
+use std.types.string.str;
+
+# the most tables a process keeps
+pub val MAX: usize = 1024;
+
+#[embed("../../../res/rules/WireWorld.rule")]
+val WIREWORLD: [_]u8;
+#[embed("../../../res/rules/Langtons-Loops.rule")]
+val LANGTON:   [_]u8;
+
+# the tables built into cellar, by name
+pub val BUILT_IN: usize = 2;
+
+fun built_in_name(i: usize) str {
+    if (i == 1) { ret "Langtons-Loops"; }
+    ret "WireWorld";
+}
+
+# the text of built-in table i, a .rule file
+# ---
+# i:   below BUILT_IN
+# len: receives its length in bytes
+# ret: its first byte
+pub fun built_in_text(i: usize, len: *usize) *u8 {
+    if (i == 1) {
+        @len = $length_of(LANGTON);
+        ret ?LANGTON[0];
+    }
+    @len = $length_of(WIREWORLD);
+    ret ?WIREWORLD[0];
+}
+
+var lock:   mutex.Mutex = 0;
+var heap:   allo.Allocator;
+var made:   bool        = false;
+var tables: [1024]*load.Table;
+var hashes: [1024]u64;
+var count:  usize       = 0;
+var dir:    [1025]u8;
+
+fun begin() {
+    mutex.lock(?lock);
+    if (!made) {
+        page.make(?heap);
+        made = true;
+    }
+}
+
+fun end() {
+    mutex.unlock(?lock);
+}
+
+# look for tables named in a directory, as a file <name>.rule there
+# ---
+# d: the directory, or nil or "" for none
+pub fun search(d: str) {
+    begin();
+    dir[0] = 0;
+    if (d != nil && string.str_len(d) < 1024) { mem.copy[u8](?dir[0], d, string.str_len(d) + 1); }
+    end();
+}
+
+# the table a rule's id names
+# ---
+# id:  an id intern or resolve gave
+# ret: the table, which is never changed or released
+pub fun get(id: u32) *load.Table {
+    if (id == 0 || id::usize > count) { panic.panic("cellar.rules.table.store: a table id never handed out"); }
+    ret tables[(id - 1)::usize];
+}
+
+fun hash_of(t: *load.Table) u64 {
+    var h: u64   = 0xcbf29ce484222325;
+    var i: usize = 0;
+    for (t.name[i] != 0) {
+        h = (h ^ t.name[i]::u64) * 0x100000001b3;
+        i = i + 1;
+    }
+    h = (h ^ t.states::u64) * 0x100000001b3;
+    h = (h ^ t.root::u64) * 0x100000001b3;
+    i = 0;
+    for (i < t.tree.len) {
+        h = (h ^ t.tree.data[i]::u64) * 0x100000001b3;
+        i = i + 1;
+    }
+    i = 0;
+    for (i < t.states::usize) {
+        h = (h ^ t.colours[i]::u64) * 0x100000001b3;
+        i = i + 1;
+    }
+    ret h;
+}
+
+fun same_table(a: *load.Table, b: *load.Table) bool {
+    if (!string.str_equals(?a.name[0], ?b.name[0]))                                         { ret false; }
+    if (a.states != b.states || a.inputs != b.inputs || a.root != b.root || a.iso != b.iso) { ret false; }
+    if (!mem.equal[u32](?a.at[0], ?b.at[0], 9))                                             { ret false; }
+    if (a.tree.len != b.tree.len || !mem.equal[u32](a.tree.data, b.tree.data, a.tree.len))  { ret false; }
+    ret mem.equal[u32](?a.colours[0], ?b.colours[0], 256);
+}
+
+# keep a table read from text, or find the one kept like it; call locked
+fun keep(p: *u8, n: usize) res[u32, load.Fault] {
+    var t: load.Table;
+    val f: opt[load.Fault] = load.read(?heap, p, n, ?t);
+    if (sel f.some) {
+        load.dnit(?t);
+        ret res[u32, load.Fault].err{f.some};
+    }
+    val h: u64   = hash_of(?t);
+    var i: usize = 0;
+    for (i < count) {
+        if (hashes[i] == h && same_table(tables[i], ?t)) {
+            load.dnit(?t);
+            ret res[u32, load.Fault].ok{(i + 1)::u32};
+        }
+        i = i + 1;
+    }
+    if (count == MAX) {
+        load.dnit(?t);
+        ret res[u32, load.Fault].err{load.Fault{why: "too many rule tables have been read this session", line: 0}};
+    }
+    val slot: res[*load.Table, allo.Error] = allo.allocate[load.Table](?heap, 1);
+    if (sel slot.err) {
+        load.dnit(?t);
+        ret res[u32, load.Fault].err{load.Fault{why: "out of memory", line: 0}};
+    }
+    @slot.ok      = t;
+    tables[count] = slot.ok;
+    hashes[count] = h;
+    count         = count + 1;
+    ret res[u32, load.Fault].ok{count::u32};
+}
+
+# read a .rule file's text and keep its table
+# ---
+# p:   the file's bytes
+# n:   how many
+# ret: the table's id, or why the text is not a rule cellar can run
+pub fun intern(p: *u8, n: usize) res[u32, load.Fault] {
+    begin();
+    val r: res[u32, load.Fault] = keep(p, n);
+    end();
+    ret r;
+}
+
+# the name a table is kept under
+pub fun name(id: u32) str {
+    ret ?get(id).name[0];
+}
+
+# the file <name>.rule in the search directory, its separators made underscores
+# as Golly makes them
+fun file_of(name: str, out: *u8) str {
+    var o: usize = text.buf_str(out, 0, ?dir[0]);
+    $if ($mach.build.os == $mach.os.windows) { o = text.buf_str(out, o, "\\"); }
+    $or                                      { o = text.buf_str(out, o, "/"); }
+    val at: usize = o;
+    o = text.buf_str(out, o, name);
+    var i: usize = at;
+    for (i < o) {
+        if (out[i] == '/' || out[i] == '\\') { out[i] = '_'; }
+        i = i + 1;
+    }
+    o      = text.buf_str(out, o, ".rule");
+    out[o] = 0;
+    ret out;
+}
+
+# look up a table by name
+# ---
+# nm:  the rule's name, as a rule string names it
+# ret: the table's id, or why none of that name can be run
+pub fun resolve(nm: str) res[u32, str] {
+    if (!load.name_ok(nm) || string.str_len(nm) > load.NAME_MAX) { ret res[u32, str].err{"not a rule name"}; }
+    begin();
+    fin { end(); }
+    if (dir[0] != 0) {
+        var path: [1100]u8;
+        file_of(nm, ?path[0]);
+        val is: res[bool, io_error.Error] = fs.is_file(?path[0]);
+        if (sel is.ok && is.ok) {
+            val got: res[vector.Vector[u8], fs.FsError] = fs.read_bytes(?heap, ?path[0]);
+            if (sel got.err) { ret res[u32, str].err{"the rule's .rule file could not be read"}; }
+            var data: vector.Vector[u8]    = got.ok;
+            val kept: res[u32, load.Fault] = keep(data.data, data.len);
+            vector.dnit[u8](?data);
+            if (sel kept.err)                                  { ret res[u32, str].err{kept.err.why}; }
+            if (!string.str_equals(?get(kept.ok).name[0], nm)) { ret res[u32, str].err{"the rule's .rule file names another rule"}; }
+            ret res[u32, str].ok{kept.ok};
+        }
+    }
+    var i: usize = count;
+    for (i > 0) {
+        if (string.str_equals(?tables[i - 1].name[0], nm)) { ret res[u32, str].ok{i::u32}; }
+        i = i - 1;
+    }
+    i = 0;
+    for (i < BUILT_IN) {
+        if (string.str_equals(built_in_name(i), nm)) {
+            var len:  usize                = 0;
+            val p:    *u8                  = built_in_text(i, ?len);
+            val kept: res[u32, load.Fault] = keep(p, len);
+            if (sel kept.err) { ret res[u32, str].err{kept.err.why}; }
+            ret res[u32, str].ok{kept.ok};
+        }
+        i = i + 1;
+    }
+    ret res[u32, str].err{"no rule of that name is known, and no .rule file of that name is in the data directory"};
+}
+
+# copy a kept table's .rule file into the search directory, as <name>.rule,
+# so its name resolves there in later sessions, as Golly installs a .rule
+# file it opens into the user's rules folder
+# ---
+# id:  the table read from the bytes
+# p:   the file's bytes
+# n:   how many
+# ret: whether the directory holds the file as given, false with no directory
+pub fun install(id: u32, p: *u8, n: usize) bool {
+    begin();
+    fin { end(); }
+    if (dir[0] == 0) { ret false; }
+    var path: [1100]u8;
+    file_of(?get(id).name[0], ?path[0]);
+    val had: res[vector.Vector[u8], fs.FsError] = fs.read_bytes(?heap, ?path[0]);
+    if (sel had.ok) {
+        var old:  vector.Vector[u8] = had.ok;
+        val same: bool              = old.len == n && mem.equal[u8](old.data, p, n);
+        vector.dnit[u8](?old);
+        if (same) { ret true; }
+    }
+    val wrote: err[fs.FsError] = fs.write_bytes(?path[0], p, n, 0o644);
+    ret sel wrote.ok;
+}
