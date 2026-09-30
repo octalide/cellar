@@ -69,7 +69,7 @@ val VERSION: u8 = '4';
 # the oldest sparse version load_world reads
 val OLDEST: u8 = '2';
 # bytes reserved for a world file's first line and header
-val HEAD_MAX: usize = 2048;
+val HEAD_MAX: usize = rule.FORMAT_MAX + 2048;
 # the longest header value read, less its NUL: the longest rule string
 val VALUE_MAX: usize = rule.FORMAT_MAX;
 # the most states a world file's cells may hold
@@ -702,16 +702,18 @@ fun world_from(a: *allo.Allocator, s: *sim.Sim, v: *View, data: *Vector[u8]) res
             val head: err[Error] = read_header(data, start, ?start, ?h);
             if (sel head.err) { ret res[Loaded, Error].err{head.err}; }
         }
-        var at:     Vector[i64] = vector.init[i64](a);
-        var cells:  Vector[u8]  = vector.init[u8](a);
-        val parsed: err[Error]  = parse_sparse(data, start, h.states, ?at, ?cells, sim.load_chunks(s));
+        # the world runs no rule of a family the GPU stepping it cannot step
+        var refused: bool        = false;
+        var at:      Vector[i64] = vector.init[i64](a);
+        var cells:   Vector[u8]  = vector.init[u8](a);
+        val parsed:  err[Error]  = parse_sparse(data, start, h.states, ?at, ?cells, sim.load_chunks(s));
         if (sel parsed.ok) {
             # the world empties first, so a rule the quadtree cannot run moves
             # nothing out of it, and the rule comes before the cells are written
             # as its words
             sim.fill_begin(s);
             val named: opt[rule.Rule] = head_rule(?h);
-            if (sel named.some) { sim.set_rule(s, named.some); }
+            if (sel named.some && !sim.set_rule(s, named.some)) { refused = true; }
             val have: u32   = rule.states(?s.rule);
             var k:    usize = 0;
             for (k < at.len / 2) {
@@ -733,7 +735,7 @@ fun world_from(a: *allo.Allocator, s: *sim.Sim, v: *View, data: *Vector[u8]) res
         vector.dnit[i64](?at);
         vector.dnit[u8](?cells);
         if (sel parsed.err) { ret res[Loaded, Error].err{parsed.err}; }
-        ret res[Loaded, Error].ok{Loaded{foreign: foreign(?h)}};
+        ret res[Loaded, Error].ok{Loaded{foreign: refused || foreign(?h)}};
     }
 
     # an old dense world is a custom pattern, centred on the origin
@@ -1036,11 +1038,13 @@ test load_world__round_trips_a_wide_weighted_kernel {
     var s:    sim.Sim;
     val made: err[allo.Error] = sim.init(?s, ?a);
     if (sel made.err) { ret 1; }
+    # wider than cellar 0.4 ran, with negative weights and a sum past 63
     var k: weighted.Kernel = weighted.life();
-    weighted.set_radius(?k, 2);
-    weighted.set_weight(?k, -2, 0, -4);
-    weighted.set_weight(?k, 1, 2, 3);
-    k.birth = weighted.set_bit(k.birth, 11);
+    weighted.set_radius(?k, 12);
+    weighted.set_weight(?k, -12, 0, -4);
+    weighted.set_weight(?k, 1, 12, 3);
+    weighted.set(?k.birth, 11);
+    weighted.set(?k.survive, 70);
     sim.set_rule(?s, rule.of(rule.Kind.weighted{k}));
     block(?s, 0, 0);
     var v: View = View{pan_x: 0.0, pan_y: 0.0, zoom: 1.0, mode: render.MODE_SOLID};
@@ -1053,10 +1057,10 @@ test load_world__round_trips_a_wide_weighted_kernel {
     if (sel made2.err) { ret 3; }
     val loaded: res[Loaded, Error] = load_world(?a, ?t, ?v, path);
     fs.remove_file(path);
-    if (sel loaded.err)                                 { ret 4; }
-    if (loaded.ok.foreign || rule.radius(?t.rule) != 2) { ret 5; }
-    if (!rule.same(?t.rule, ?s.rule))                   { ret 6; }
-    if (sim.population(?t) != 4)                        { ret 7; }
+    if (sel loaded.err)                                  { ret 4; }
+    if (loaded.ok.foreign || rule.radius(?t.rule) != 12) { ret 5; }
+    if (!rule.same(?t.rule, ?s.rule))                    { ret 6; }
+    if (sim.population(?t) != 4)                         { ret 7; }
     sim.dnit(?s);
     sim.dnit(?t);
     ret 0;
@@ -1376,13 +1380,13 @@ test load_world__reads_cellar_2_and_every_cellar_3_header {
     if (sel both.err)                                 { ret 12; }
     if (both.ok.foreign || !sel s.rule.kind.weighted) { ret 12; }
     if (sel s.rule.kind.weighted) {
-        if (s.rule.kind.weighted.birth != 64 || s.rule.kind.weighted.survive != 12) { ret 12; }
+        if (s.rule.kind.weighted.birth.w[0] != 64 || s.rule.kind.weighted.survive.w[0] != 12) { ret 12; }
     }
-    val wide: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v3_wide.cellar", "cellar 3\nrule B3/S23\nkernel 9 8 12 1\n\n");
+    val wide: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v3_wide.cellar", "cellar 3\nrule B3/S23\nkernel 17 8 12 1\n\n");
     if (sel wide.err)                                  { ret 13; }
     if (!wide.ok.foreign || !sel s.rule.kind.weighted) { ret 13; }
     if (sel s.rule.kind.weighted) {
-        if (s.rule.kind.weighted.birth != 64) { ret 13; }
+        if (s.rule.kind.weighted.birth.w[0] != 64) { ret 13; }
     }
 
     # a version from the future, a header that never ends, and a value that
