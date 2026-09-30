@@ -28,6 +28,8 @@ use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
 use std.types.size.usize;
 use std.types.string;
 use std.types.string.str;
@@ -833,6 +835,72 @@ fun sniffs(text: str) str {
     var f: format.Format;
     if (!by_bytes(text::*u8, string.str_len(text), ?f)) { ret ""; }
     ret f.id;
+}
+
+# an allocator that refuses any request past max bytes, over another
+# ---
+# base: the allocator it hands the rest to
+# max:  the largest request it takes
+rec Capped {
+    base: *allo.Allocator;
+    max:  usize;
+}
+
+fun capped_allocate(ctx: ptr, size: usize, align: usize) opt[ptr] {
+    val c: *Capped = ctx::*Capped;
+    if (size > c.max) { ret opt[ptr].none{}; }
+    ret c.base.fn_allocate(c.base.ctx, size, align);
+}
+
+fun capped_reallocate(ctx: ptr, p: ptr, old: usize, size: usize, align: usize) opt[ptr] {
+    val c: *Capped = ctx::*Capped;
+    if (size > c.max) { ret opt[ptr].none{}; }
+    ret c.base.fn_reallocate(c.base.ctx, p, old, size, align);
+}
+
+fun capped_deallocate(ctx: ptr, p: ptr, size: usize, align: usize) i64 {
+    val c: *Capped = ctx::*Capped;
+    ret c.base.fn_deallocate(c.base.ctx, p, size, align);
+}
+
+# save the world as RLE, reading it through an allocator
+fun save_world(a: *allo.Allocator, s: *sim.Sim, reads: *allo.Allocator, out: *Vector[u8]) err[format.Error] {
+    var f: format.Format;
+    if (!by_id("rle", ?f)) { ret err[format.Error].err{format.Error.unsupported{}}; }
+    var info: format.Info;
+    format.info_init(?info, a);
+    var ws:  adapt.WorldSource;
+    var r:   err[format.Error]                 = err[format.Error].ok{};
+    val src: res[*format.Source, format.Error] = adapt.world_source(?ws, s, reads);
+    if (sel src.err) { r = err[format.Error].err{src.err}; }
+    if (sel src.ok)  { r = save(a, ?f, src.ok, ?info, out); }
+    adapt.world_source_dnit(?ws);
+    format.info_dnit(?info);
+    ret r;
+}
+
+test save__fails_rather_than_write_a_world_short_without_the_memory_to_read_it {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s: sim.Sim;
+    val m: err[allo.Error] = sim.init(?s, ?a);
+    if (sel m.err) { ret 1; }
+    # a line across 20 chunks, whose row of chunks takes 80 KiB to read
+    val text: str = "x = 1280, y = 1, rule = B3/S23\n1280o!\n";
+    var live: u64 = 0;
+    if (!world_takes(?a, ?s, "rle", text::*u8, string.str_len(text), ?live) || live != 1280) { ret 2; }
+    var out: Vector[u8]        = vector.init[u8](?a);
+    val all: err[format.Error] = save_world(?a, ?s, ?a, ?out);
+    if (sel all.err || out.len == 0) { ret 3; }
+    vector.clear[u8](?out);
+    var cap:   Capped            = Capped{base: ?a, max: 32768};
+    var few:   allo.Allocator    = allo.Allocator{ctx: (?cap)::ptr, fn_allocate: capped_allocate, fn_reallocate: capped_reallocate, fn_deallocate: capped_deallocate, retains: false};
+    val short: err[format.Error] = save_world(?a, ?s, ?few, ?out);
+    if (!(sel short.err))                        { ret 4; }
+    if (sel short.err && !(sel short.err.alloc)) { ret 5; }
+    vector.dnit[u8](?out);
+    sim.dnit(?s);
+    ret 0;
 }
 
 test registry__finds_formats_by_id_extension_and_content {
