@@ -50,6 +50,7 @@ use cellar.rules.weighted;
 use cellar.runner;
 use cellar.shot;
 use cellar.sim;
+use cellar.sketch;
 use cellar.space;
 use cellar.theme;
 use cellar.topology;
@@ -114,6 +115,7 @@ val SMALL_PX: f32 = 14.0;
 # renderer_ok: renderer is initialized
 # gpu:         the world's side on the GPU
 # gpu_ok:      gpu is initialized
+# sketches:    the textures large patterns are drawn from
 # bench:       the measurement being run, args.BENCH_NONE for a normal session
 # bench_cpu:   the measurement steps on the CPU
 # bench_secs:  seconds the measurement runs for
@@ -147,6 +149,7 @@ pub rec Game {
     renderer_ok: bool;
     gpu:         gpu.Gpu;
     gpu_ok:      bool;
+    sketches:    sketch.Sketches;
     bench:       u8;
     bench_cpu:   bool;
     bench_secs:  f64;
@@ -233,6 +236,7 @@ pub fun on_init(ctx: *Context) {
     g.ui.body     = ?g.body;
     g.ui.small    = ?g.small;
     g.ui.s        = app.scale(g.app.scale_idx);
+    sketch.init(?g.sketches, ?g.a, gfx.renderer_device(?g.renderer));
     if (!faces(g)) {
         give_up(ctx, "could not load the interface font");
         ret;
@@ -647,6 +651,9 @@ fun hover(g: *Game, pt: render.Port, cam: render.Camera) {
 }
 
 # show where a stamp would land, the pattern's cells over the world under the cursor
+#
+# only the cells on screen are drawn, a rectangle each while there are few of
+# them and from the pattern's texture (cellar.sketch) otherwise
 fun ghost(g: *Game, pt: render.Port, cam: render.Camera) {
     val u: *ui.Ui   = ?g.ui;
     val a: *app.App = ?g.app;
@@ -666,10 +673,17 @@ fun ghost(g: *Game, pt: render.Port, cam: render.Camera) {
     val y0: f32 = render.screen_y(cam, oy::f64);
     val c:  f32 = cam.ppc;
     ui.frame(u, x0 - 1.0, y0 - 1.0, x0 + pw::f32 * c + 1.0, y0 + ph::f32 * c + 1.0, 1.0, theme.ACCENT, 0.5);
-    var y: usize = 0;
-    for (y < ph) {
-        var x: usize = 0;
-        for (x < pw) {
+    val vx: Shown = shown(x0, c, pw, pt.w);
+    val vy: Shown = shown(y0, c, ph, pt.h);
+    if (vx.lo >= vx.hi || vy.lo >= vy.hi) { ret; }
+    if (sketch.large(vx.hi - vx.lo, vy.hi - vy.lo)) {
+        sketch.draw(u, ?g.sketches, ?g.sketches.ghost, p, o, x0, y0, c, theme.ACCENT, 0.55);
+        ret;
+    }
+    var y: usize = vy.lo;
+    for (y < vy.hi) {
+        var x: usize = vx.lo;
+        for (x < vx.hi) {
             if (pattern.get_oriented(p, o, x, y) != 0) {
                 val qx: f32 = x0 + x::f32 * c;
                 val qy: f32 = y0 + y::f32 * c;
@@ -679,6 +693,26 @@ fun ghost(g: *Game, pt: render.Port, cam: render.Camera) {
         }
         y = y + 1;
     }
+}
+
+# the cells of a row or column on screen, [lo, hi)
+rec Shown {
+    lo: usize;
+    hi: usize;
+}
+
+# which of n cells from screen position p0, c pixels each, fall within [0, end)
+fun shown(p0: f32, c: f32, n: usize, end: f32) Shown {
+    var s: Shown = Shown{lo: 0, hi: n};
+    if (p0 < 0.0) {
+        val first: f32 = -p0 / c;
+        if (first >= n::f32) { s.lo = n; }
+        or                   { s.lo = first::usize; }
+    }
+    val last: f32 = (end - p0) / c;
+    if (last <= 0.0)         { s.hi = 0; }
+    or (last + 1.0 < n::f32) { s.hi = last::usize + 1; }
+    ret s;
 }
 
 # build the frame and submit it through one overlay pass
@@ -772,7 +806,7 @@ pub fun on_draw(ctx: *Context) {
     if (g.bench == args.BENCH_NONE) {
         hud.readout(u, a, ?g.sim, pt);
         hud.position(u, cam, pt, u.mx < a.side_x0 && ui.inside(u, 0.0, 0.0, pt.w, pt.h));
-        panel.draw(u, a, ?g.sim, ?g.paths, sw, sh);
+        panel.draw(u, a, ?g.sim, ?g.paths, ?g.sketches, sw, sh);
         hud.toast(u, a, pt);
         hud.help(u, a, sw, sh);
         edit_world(g, pt, cam);
@@ -851,6 +885,7 @@ pub fun on_dnit(ctx: *Context) {
     if (g.renderer_ok) {
         gfx.renderer_wait_idle(?g.renderer);
         if (g.gpu_ok) { gpu.dnit(?g.gpu); }
+        sketch.dnit(?g.sketches);
         faces_dnit(g);
         val down: err[gfx.Error] = gfx.renderer_dnit(?g.renderer);
         if (sel down.err) {
