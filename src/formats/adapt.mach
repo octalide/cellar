@@ -1,0 +1,189 @@
+# sinks and sources that connect the formats to patterns and the world
+#
+# each adapter is a record holding its own state and the Sink or Source that
+# points back at it, so it lives on the caller's stack and must not move while
+# in use.
+
+use cellar.format;
+use cellar.pattern;
+use cellar.sim;
+use allo: std.allocator;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.size.usize;
+
+# a sink that fills a heap pattern, sized to the file's box
+# ---
+# p:    the pattern to fill; it is resized, and named from the file, on open
+# sink: the sink to hand to formats.load
+pub rec PatternSink {
+    p:    *pattern.Pattern;
+    sink: format.Sink;
+}
+
+fun pattern_open(ctx: *u8, info: *format.Info) bool {
+    val s: *PatternSink = ctx::*PatternSink;
+    var w: i64          = 0;
+    var h: i64          = 0;
+    if (info.bounded) {
+        w = info.x1 - info.x0;
+        h = info.y1 - info.y0;
+    }
+    if (w > pattern.MAX_SIDE::i64 || h > pattern.MAX_SIDE::i64) { ret false; }
+    val r: err[allo.Error] = pattern.resize(s.p, w::usize, h::usize);
+    if (sel r.err) { ret false; }
+    s.p.x = info.x0;
+    s.p.y = info.y0;
+    val n: err[allo.Error] = pattern.set_name(s.p, format.text_of(?info.name));
+    if (sel n.err) { ret false; }
+    val u: err[allo.Error] = pattern.set_rule(s.p, format.text_of(?info.rule));
+    if (sel u.err) { ret false; }
+    val c: err[allo.Error] = pattern.set_comments(s.p, format.text_of(?info.comments));
+    ret !(sel c.err);
+}
+
+fun pattern_run(ctx: *u8, x: i64, y: i64, n: usize, v: u8) bool {
+    val s: *PatternSink = ctx::*PatternSink;
+    var i: usize        = 0;
+    for (i < n) {
+        pattern.set(s.p, (x - s.p.x)::usize + i, (y - s.p.y)::usize, v);
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun pattern_close(ctx: *u8) bool {
+    ret true;
+}
+
+# point a PatternSink at a pattern
+# ---
+# s: sink record
+# p: initialized pattern
+pub fun pattern_sink(s: *PatternSink, p: *pattern.Pattern) *format.Sink {
+    s.p          = p;
+    s.sink.ctx   = s::*u8;
+    s.sink.open  = pattern_open;
+    s.sink.run   = pattern_run;
+    s.sink.close = pattern_close;
+    ret ?s.sink;
+}
+
+# a sink that overlays the cells onto the world, offset, in one bulk edit
+# ---
+# s:      simulation to write onto
+# dx:     columns to shift every cell by
+# dy:     rows to shift every cell by
+# opened: whether the edit is open
+# sink:   the sink to hand to formats.load
+pub rec WorldSink {
+    s:      *sim.Sim;
+    dx:     i64;
+    dy:     i64;
+    opened: bool;
+    sink:   format.Sink;
+}
+
+fun world_open(ctx: *u8, info: *format.Info) bool {
+    val w: *WorldSink = ctx::*WorldSink;
+    if (!info.bounded) { ret true; }
+    w.opened = sim.edit_begin(w.s, info.x0 + w.dx, info.y0 + w.dy, info.x1 + w.dx, info.y1 + w.dy);
+    ret w.opened;
+}
+
+fun world_run(ctx: *u8, x: i64, y: i64, n: usize, v: u8) bool {
+    val w: *WorldSink = ctx::*WorldSink;
+    ret sim.edit_run(w.s, x + w.dx, y + w.dy, n, v);
+}
+
+fun world_close(ctx: *u8) bool {
+    val w: *WorldSink = ctx::*WorldSink;
+    if (!w.opened) { ret true; }
+    w.opened = false;
+    ret sim.edit_end(w.s);
+}
+
+# point a WorldSink at a simulation
+# ---
+# w:  sink record
+# s:  simulation
+# dx: columns to shift every cell by
+# dy: rows to shift every cell by
+pub fun world_sink(w: *WorldSink, s: *sim.Sim, dx: i64, dy: i64) *format.Sink {
+    w.s          = s;
+    w.dx         = dx;
+    w.dy         = dy;
+    w.opened     = false;
+    w.sink.ctx   = w::*u8;
+    w.sink.open  = world_open;
+    w.sink.run   = world_run;
+    w.sink.close = world_close;
+    ret ?w.sink;
+}
+
+# a source that reads a heap pattern, its live cells in rows
+# ---
+# p:      pattern to read
+# x:      cursor column, relative to the pattern
+# y:      cursor row
+# source: the source to hand to formats.save
+pub rec PatternSource {
+    p:      *pattern.Pattern;
+    x:      usize;
+    y:      usize;
+    source: format.Source;
+}
+
+fun pattern_rewind(ctx: *u8) {
+    val s: *PatternSource = ctx::*PatternSource;
+    s.x = 0;
+    s.y = 0;
+}
+
+fun pattern_next(ctx: *u8, r: *format.Run) bool {
+    val s: *PatternSource = ctx::*PatternSource;
+    for (s.y < s.p.h) {
+        for (s.x < s.p.w) {
+            var n:  usize = 0;
+            val v:  u8    = pattern.run(s.p, s.x, s.y, ?n);
+            val at: usize = s.x;
+            s.x = s.x + n;
+            if (v != 0) {
+                r.x = s.p.x + at::i64;
+                r.y = s.p.y + s.y::i64;
+                r.n = n;
+                r.v = v;
+                ret true;
+            }
+        }
+        s.x = 0;
+        s.y = s.y + 1;
+    }
+    ret false;
+}
+
+# point a PatternSource at a pattern
+# ---
+# s: source record
+# p: pattern to write out, placed at its own x and y
+pub fun pattern_source(s: *PatternSource, p: *pattern.Pattern) *format.Source {
+    s.p             = p;
+    s.x             = 0;
+    s.y             = 0;
+    s.source.ctx    = s::*u8;
+    s.source.x0     = p.x;
+    s.source.y0     = p.y;
+    s.source.x1     = p.x + p.w::i64;
+    s.source.y1     = p.y + p.h::i64;
+    s.source.states = 2;
+    var i: usize = 0;
+    for (i < p.w * p.h) {
+        if (p.cells[i]::u32 >= s.source.states) { s.source.states = p.cells[i]::u32 + 1; }
+        i = i + 1;
+    }
+    s.source.rewind = pattern_rewind;
+    s.source.next   = pattern_next;
+    ret ?s.source;
+}

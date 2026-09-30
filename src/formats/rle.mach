@@ -1,0 +1,508 @@
+# run length encoded patterns, the text format the Life community trades
+#
+# a file is '#' lines, a header "x = <w>, y = <h>, rule = <rule>" and a body of
+# run-counted tags ended by '!'. in the body 'b' or '.' is a dead cell, 'o' a
+# live one, '$' ends a row, and a multi-state file names the states 1..255 as
+# 'A'..'X' then 'pA'..'pX' up to 'yO'. a count before a tag repeats it. the '#'
+# lines read are #N (name), #C, #c and #O (comments, kept together), and #R and
+# #P (the top-left corner in the world, which offsets every cell); any other
+# '#' line is skipped. a header naming a rule other than Life is kept as the
+# Info's rule and flagged there, not refused. cells outside the declared width
+# and height are refused. the writer wraps its body at 70 columns.
+
+use cellar.format;
+use cellar.text;
+use allo: std.allocator;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string;
+use std.types.string.str;
+
+# the longest line the writer makes, not counting the newline
+val WRAP: usize = 70;
+# the rule the writer names when the pattern names none
+val LIFE: str = "B3/S23";
+
+# a read position in the file
+# ---
+# p: the bytes
+# n: how many
+# i: the next byte
+rec Cur {
+    p: *u8;
+    n: usize;
+    i: usize;
+}
+
+fun at_end(c: *Cur) bool {
+    ret c.i >= c.n;
+}
+
+fun peek(c: *Cur) u8 {
+    ret text.byte_at(c.p, c.n, c.i);
+}
+
+fun is_blank(b: u8) bool {
+    ret b == ' ' || b == '\t' || b == '\r' || b == '\n';
+}
+
+fun is_digit(b: u8) bool {
+    ret b >= '0' && b <= '9';
+}
+
+fun skip_blank(c: *Cur) {
+    for (c.i < c.n && is_blank(c.p[c.i])) { c.i = c.i + 1; }
+}
+
+fun skip_spaces(c: *Cur) {
+    for (c.i < c.n && (c.p[c.i] == ' ' || c.p[c.i] == '\t' || c.p[c.i] == '\r')) { c.i = c.i + 1; }
+}
+
+# the offset of the newline ending the line at the read position, or the length
+fun line_end(c: *Cur) usize {
+    var e: usize = c.i;
+    for (e < c.n && c.p[e] != '\n') { e = e + 1; }
+    ret e;
+}
+
+# read an unsigned or, when signed, optionally negative decimal number
+# ---
+# c:      read position, left after the digits
+# signed: whether a leading '-' is allowed
+# out:    receives the value
+# ret:    ok, malformed when no digits are there, range beyond format.LIMIT
+fun read_int(c: *Cur, signed: bool, out: *i64) err[format.Error] {
+    var neg: bool = false;
+    if (signed && peek(c) == '-') {
+        neg = true;
+        c.i = c.i + 1;
+    }
+    if (!is_digit(peek(c))) { ret err[format.Error].err{format.Error.malformed{}}; }
+    var v: i64 = 0;
+    for (is_digit(peek(c))) {
+        v = v * 10 + (c.p[c.i] - '0')::i64;
+        if (v > format.LIMIT) { ret err[format.Error].err{format.Error.range{}}; }
+        c.i = c.i + 1;
+    }
+    if (neg) { v = 0 - v; }
+    @out = v;
+    ret err[format.Error].ok{};
+}
+
+# set an Info text from the bytes [from, to) with trailing blanks dropped
+fun keep(a: *allo.Allocator, o: *string.OwnedString, c: *Cur, from: usize, to: usize) err[format.Error] {
+    var e: usize = to;
+    for (e > from && is_blank(c.p[e - 1])) { e = e - 1; }
+    val r: err[allo.Error] = format.set_text(a, o, ?c.p[from], e - from);
+    if (sel r.err) { ret err[format.Error].err{format.Error.alloc{r.err}}; }
+    ret err[format.Error].ok{};
+}
+
+# read one '#' line
+# ---
+# c:   read position at the '#', left at the next line
+# com: the comments so far, appended to
+# info, ox, oy: receive the name and the corner
+fun read_hash(a: *allo.Allocator, c: *Cur, com: *Vector[u8], info: *format.Info, ox: *i64, oy: *i64) err[format.Error] {
+    val end: usize = line_end(c);
+    val tag: u8    = text.byte_at(c.p, c.n, c.i + 1);
+    c.i = c.i + 2;
+    if (tag == 'R' || tag == 'P') {
+        skip_spaces(c);
+        val x: err[format.Error] = read_int(c, true, ox);
+        if (sel x.err) { ret x; }
+        skip_spaces(c);
+        val y: err[format.Error] = read_int(c, true, oy);
+        if (sel y.err) { ret y; }
+    }
+    or (tag == 'N') {
+        skip_spaces(c);
+        val k: err[format.Error] = keep(a, ?info.name, c, c.i, end);
+        if (sel k.err) { ret k; }
+    }
+    or (tag == 'C' || tag == 'c' || tag == 'O') {
+        skip_spaces(c);
+        var e: usize = end;
+        for (e > c.i && is_blank(c.p[e - 1])) { e = e - 1; }
+        if (com.len != 0) {
+            val nl: res[usize, allo.Error] = vector.push[u8](com, '\n');
+            if (sel nl.err) { ret err[format.Error].err{format.Error.alloc{nl.err}}; }
+        }
+        var i: usize = c.i;
+        for (i < e) {
+            val r: res[usize, allo.Error] = vector.push[u8](com, c.p[i]);
+            if (sel r.err) { ret err[format.Error].err{format.Error.alloc{r.err}}; }
+            i = i + 1;
+        }
+    }
+    c.i = end;
+    ret err[format.Error].ok{};
+}
+
+# read the "x = , y = , rule = " line
+# ---
+# c: read position at the line, left after it
+# w, h: receive the declared size
+fun read_header(a: *allo.Allocator, c: *Cur, info: *format.Info, w: *i64, h: *i64) err[format.Error] {
+    val end: usize = line_end(c);
+    var got: u32   = 0;
+    for (true) {
+        skip_spaces(c);
+        if (c.i >= end) { brk; }
+        val key: u8 = c.p[c.i] | 0x20;
+        for (c.i < end && c.p[c.i] != '=' && c.p[c.i] != ',' && !is_blank(c.p[c.i])) { c.i = c.i + 1; }
+        skip_spaces(c);
+        if (peek(c) != '=') { ret err[format.Error].err{format.Error.malformed{}}; }
+        c.i = c.i + 1;
+        skip_spaces(c);
+        if (key == 'x') {
+            val r: err[format.Error] = read_int(c, false, w);
+            if (sel r.err) { ret r; }
+            got = got | 1;
+        }
+        or (key == 'y') {
+            val r: err[format.Error] = read_int(c, false, h);
+            if (sel r.err) { ret r; }
+            got = got | 2;
+        }
+        or (key == 'r') {
+            # the rule runs to the end of the line, since it may hold commas
+            val k: err[format.Error] = keep(a, ?info.rule, c, c.i, end);
+            if (sel k.err) { ret k; }
+            c.i = end;
+        }
+        or {
+            for (c.i < end && c.p[c.i] != ',') { c.i = c.i + 1; }
+        }
+        skip_spaces(c);
+        if (peek(c) == ',') { c.i = c.i + 1; }
+    }
+    c.i = end;
+    if (got != 3) { ret err[format.Error].err{format.Error.malformed{}}; }
+    ret err[format.Error].ok{};
+}
+
+# the state a tag letter names, given the letter after a 'p'..'y' prefix or alone
+fun letter_state(b: u8) u32 {
+    ret (b - 'A')::u32 + 1;
+}
+
+# stream the body's live cells to the emit
+# ---
+# c: read position after the header
+# e: where the cells go
+# ox, oy: the world position of the pattern's top-left corner
+# w, h:   the declared size, which the cells must stay inside
+fun read_body(c: *Cur, e: *format.Emit, ox: i64, oy: i64, w: i64, h: i64) err[format.Error] {
+    var x:     i64  = 0;
+    var y:     i64  = 0;
+    var count: i64  = 0;
+    var has:   bool = false;
+    for (true) {
+        e.info.at = c.i;
+        if (at_end(c)) { ret err[format.Error].err{format.Error.truncated{}}; }
+        val ch: u8 = c.p[c.i];
+        c.i = c.i + 1;
+        if (is_blank(ch)) { cnt; }
+        if (is_digit(ch)) {
+            count = count * 10 + (ch - '0')::i64;
+            has   = true;
+            if (count > format.LIMIT) { ret err[format.Error].err{format.Error.range{}}; }
+            cnt;
+        }
+        if (ch == '!') {
+            if (has) { ret err[format.Error].err{format.Error.malformed{}}; }
+            ret err[format.Error].ok{};
+        }
+        var n: i64 = 1;
+        if (has) { n = count; }
+        count = 0;
+        has   = false;
+        if (ch == '$') {
+            y = y + n;
+            x = 0;
+            if (y > format.LIMIT) { ret err[format.Error].err{format.Error.range{}}; }
+            cnt;
+        }
+        if (ch == 'b' || ch == '.') {
+            x = x + n;
+            if (x > format.LIMIT) { ret err[format.Error].err{format.Error.range{}}; }
+            cnt;
+        }
+        var v: u32 = 0;
+        if (ch == 'o')              { v = 1; }
+        or (ch >= 'A' && ch <= 'X') { v = letter_state(ch); }
+        or (ch >= 'p' && ch <= 'y') {
+            if (at_end(c)) { ret err[format.Error].err{format.Error.truncated{}}; }
+            val l: u8 = c.p[c.i];
+            c.i = c.i + 1;
+            if (l < 'A' || l > 'X') { ret err[format.Error].err{format.Error.malformed{}}; }
+            v = 24 * (ch - 'o')::u32 + letter_state(l);
+            if (v > 255) { ret err[format.Error].err{format.Error.range{}}; }
+        }
+        or                                                    { ret err[format.Error].err{format.Error.malformed{}}; }
+        if (x + n > w || y >= h)                              { ret err[format.Error].err{format.Error.malformed{}}; }
+        if (!format.emit(e, ox + x, oy + y, n::usize, v::u8)) { ret err[format.Error].err{format.Error.sink{}}; }
+        x = x + n;
+    }
+    ret err[format.Error].ok{};
+}
+
+fun read_all(a: *allo.Allocator, p: *u8, n: usize, e: *format.Emit, com: *Vector[u8]) err[format.Error] {
+    var c: Cur;
+    c.p = p;
+    c.n = n;
+    c.i = 0;
+    var ox: i64 = 0;
+    var oy: i64 = 0;
+    for (true) {
+        skip_blank(?c);
+        if (at_end(?c))      { ret err[format.Error].err{format.Error.truncated{}}; }
+        if (c.p[c.i] != '#') { brk; }
+        val r: err[format.Error] = read_hash(a, ?c, com, e.info, ?ox, ?oy);
+        if (sel r.err) {
+            e.info.at = c.i;
+            ret r;
+        }
+    }
+    var w:  i64               = 0;
+    var h:  i64               = 0;
+    val hd: err[format.Error] = read_header(a, ?c, e.info, ?w, ?h);
+    if (sel hd.err) {
+        e.info.at = c.i;
+        ret hd;
+    }
+    if (w > 0 && h > 0) { format.cover(e.info, ox, oy, ox + w, oy + h); }
+    val body: err[format.Error] = read_body(?c, e, ox, oy, w, h);
+    if (sel body.err) { ret body; }
+    val m: err[allo.Error] = format.set_text(a, ?e.info.comments, com.data, com.len);
+    if (sel m.err) { ret err[format.Error].err{format.Error.alloc{m.err}}; }
+    ret err[format.Error].ok{};
+}
+
+# decode an RLE file
+fun decode(a: *allo.Allocator, p: *u8, n: usize, e: *format.Emit) err[format.Error] {
+    var com: Vector[u8]        = vector.init[u8](a);
+    val r:   err[format.Error] = read_all(a, p, n, e, ?com);
+    vector.dnit[u8](?com);
+    ret r;
+}
+
+# how likely the bytes are RLE: the first line that is not a '#' line must be an
+# "x = " header
+fun sniff(p: *u8, n: usize) u32 {
+    var c: Cur;
+    c.p = p;
+    c.n = n;
+    c.i = 0;
+    for (true) {
+        skip_blank(?c);
+        if (at_end(?c))      { ret 0; }
+        if (c.p[c.i] != '#') { brk; }
+        c.i = line_end(?c);
+    }
+    if ((peek(?c) | 0x20) != 'x') { ret 0; }
+    c.i = c.i + 1;
+    skip_spaces(?c);
+    if (peek(?c) != '=') { ret 0; }
+    ret 100;
+}
+
+# the writer's output and its position in the current line
+# ---
+# out: the file so far
+# col: bytes in the current line
+rec Out {
+    out: *Vector[u8];
+    col: usize;
+}
+
+fun put(w: *Out, b: u8) err[format.Error] {
+    val r: res[usize, allo.Error] = vector.push[u8](w.out, b);
+    if (sel r.err) { ret err[format.Error].err{format.Error.alloc{r.err}}; }
+    ret err[format.Error].ok{};
+}
+
+fun put_n(w: *Out, p: *u8, n: usize) err[format.Error] {
+    var i: usize = 0;
+    for (i < n) {
+        val r: err[format.Error] = put(w, p[i]);
+        if (sel r.err) { ret r; }
+        i = i + 1;
+    }
+    ret err[format.Error].ok{};
+}
+
+fun put_str(w: *Out, s: str) err[format.Error] {
+    ret put_n(w, s, string.str_len(s));
+}
+
+# write a header or comment line of a number and a label
+fun put_num(w: *Out, v: i64) err[format.Error] {
+    var b: [24]u8;
+    ret put_n(w, ?b[0], text.buf_i64(?b[0], 0, v));
+}
+
+# write a counted tag, starting a new line first when it would pass the wrap column
+# ---
+# count: repeat count, 1 writes none
+# tag:   the tag's bytes
+# n:     how many
+fun token(w: *Out, count: i64, tag: *u8, n: usize) err[format.Error] {
+    var b:   [40]u8;
+    var len: usize = 0;
+    if (count > 1) { len = text.buf_i64(?b[0], 0, count); }
+    var i: usize = 0;
+    for (i < n) {
+        b[len] = tag[i];
+        len    = len + 1;
+        i      = i + 1;
+    }
+    if (w.col + len > WRAP) {
+        val nl: err[format.Error] = put(w, '\n');
+        if (sel nl.err) { ret nl; }
+        w.col = 0;
+    }
+    w.col = w.col + len;
+    ret put_n(w, ?b[0], len);
+}
+
+# the tag bytes of state v, returning how many
+fun tag_of(v: u8, multi: bool, b: *u8) usize {
+    if (!multi) {
+        b[0] = 'o';
+        ret 1;
+    }
+    val k: u8    = (v - 1) / 24;
+    var n: usize = 0;
+    if (k > 0) {
+        b[0] = 'o' + k;
+        n    = 1;
+    }
+    b[n] = 'A' + (v - 1) % 24;
+    ret n + 1;
+}
+
+# the header and '#' lines
+fun write_head(w: *Out, src: *format.Source, info: *format.Info) err[format.Error] {
+    val name: str = format.text_of(?info.name);
+    if (name[0] != 0) {
+        var n: usize = 0;
+        for (name[n] != 0 && name[n] != '\n') { n = n + 1; }
+        val a: err[format.Error] = put_str(w, "#N ");
+        if (sel a.err) { ret a; }
+        val b: err[format.Error] = put_n(w, name, n);
+        if (sel b.err) { ret b; }
+        val c: err[format.Error] = put(w, '\n');
+        if (sel c.err) { ret c; }
+    }
+    val com: str   = format.text_of(?info.comments);
+    var i:   usize = 0;
+    for (com[i] != 0) {
+        val a: err[format.Error] = put_str(w, "#C ");
+        if (sel a.err) { ret a; }
+        for (com[i] != 0 && com[i] != '\n') {
+            val b: err[format.Error] = put(w, com[i]);
+            if (sel b.err) { ret b; }
+            i = i + 1;
+        }
+        if (com[i] == '\n') { i = i + 1; }
+        val c: err[format.Error] = put(w, '\n');
+        if (sel c.err) { ret c; }
+    }
+    if (src.x0 != 0 || src.y0 != 0) {
+        val a: err[format.Error] = put_str(w, "#R ");
+        if (sel a.err) { ret a; }
+        val b: err[format.Error] = put_num(w, src.x0);
+        if (sel b.err) { ret b; }
+        val c: err[format.Error] = put(w, ' ');
+        if (sel c.err) { ret c; }
+        val d: err[format.Error] = put_num(w, src.y0);
+        if (sel d.err) { ret d; }
+        val f: err[format.Error] = put(w, '\n');
+        if (sel f.err) { ret f; }
+    }
+    var rule: str = format.text_of(?info.rule);
+    if (rule[0] == 0) { rule = LIFE; }
+    val x: err[format.Error] = put_str(w, "x = ");
+    if (sel x.err) { ret x; }
+    val xw: err[format.Error] = put_num(w, src.x1 - src.x0);
+    if (sel xw.err) { ret xw; }
+    val y: err[format.Error] = put_str(w, ", y = ");
+    if (sel y.err) { ret y; }
+    val yh: err[format.Error] = put_num(w, src.y1 - src.y0);
+    if (sel yh.err) { ret yh; }
+    val r: err[format.Error] = put_str(w, ", rule = ");
+    if (sel r.err) { ret r; }
+    val rs: err[format.Error] = put_str(w, rule);
+    if (sel rs.err) { ret rs; }
+    ret put(w, '\n');
+}
+
+# write the source's runs as a body
+fun write_body(w: *Out, src: *format.Source) err[format.Error] {
+    val multi: bool = src.states > 2;
+    var curx:  i64  = src.x0;
+    var cury:  i64  = src.y0;
+    var r:     format.Run;
+    src.rewind(src.ctx);
+    for (src.next(src.ctx, ?r)) {
+        if (r.n == 0 || r.v == 0 || r.y < cury || r.y >= src.y1 || r.x < src.x0 || r.x + r.n::i64 > src.x1) {
+            ret err[format.Error].err{format.Error.range{}};
+        }
+        if (r.y > cury) {
+            val a: err[format.Error] = token(w, r.y - cury, "$", 1);
+            if (sel a.err) { ret a; }
+            cury = r.y;
+            curx = src.x0;
+        }
+        if (r.x < curx) { ret err[format.Error].err{format.Error.range{}}; }
+        if (r.x > curx) {
+            var dead: u8 = 'b';
+            if (multi) { dead = '.'; }
+            val g: err[format.Error] = token(w, r.x - curx, ?dead, 1);
+            if (sel g.err) { ret g; }
+        }
+        var tag: [2]u8;
+        val len: usize             = tag_of(r.v, multi, ?tag[0]);
+        val t:   err[format.Error] = token(w, r.n::i64, ?tag[0], len);
+        if (sel t.err) { ret t; }
+        curx = r.x + r.n::i64;
+    }
+    val bang: err[format.Error] = put(w, '!');
+    if (sel bang.err) { ret bang; }
+    ret put(w, '\n');
+}
+
+# encode a source as an RLE file
+fun encode(a: *allo.Allocator, src: *format.Source, info: *format.Info, out: *Vector[u8]) err[format.Error] {
+    val cw: i64 = src.x1 - src.x0;
+    val ch: i64 = src.y1 - src.y0;
+    if (cw < 0 || ch < 0 || cw > format.LIMIT || ch > format.LIMIT) { ret err[format.Error].err{format.Error.range{}}; }
+    if (src.x0 < 0 - format.LIMIT || src.x0 > format.LIMIT || src.y0 < 0 - format.LIMIT || src.y0 > format.LIMIT) {
+        ret err[format.Error].err{format.Error.range{}};
+    }
+    var w: Out;
+    w.out = out;
+    w.col = 0;
+    val h: err[format.Error] = write_head(?w, src, info);
+    if (sel h.err) { ret h; }
+    ret write_body(?w, src);
+}
+
+# the RLE format's registry record
+pub fun make() format.Format {
+    var f: format.Format;
+    f.id     = "rle";
+    f.exts   = "rle";
+    f.sniff  = sniff;
+    f.decode = decode;
+    f.encode = encode;
+    ret f;
+}
