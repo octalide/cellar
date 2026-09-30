@@ -25,6 +25,8 @@ negative weights allowed, plus birth and survive sets over the saturated
 weighted neighbor sum, so it generalizes Larger-than-Life (Golly's
 `R5,C0,M1,S34..58,B34..45,NM` for Bosco's rule, or HROT's
 `R2,C0,S2-3,B3,NC`) while still expressing the classic Life family exactly.
+Golly's weighted neighbourhoods read and write as well, `NW` then a hex weight
+for each cell row by row (`R1,C0,S2-3,B3,NW111101111` is Life).
 Built-in kernels: Conway's Life (`B3/S23`), HighLife (`B36/S23`), Seeds
 (`B2/S`) and Day & Night (`B3678/S34678`).
 
