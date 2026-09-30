@@ -33,6 +33,13 @@ states (`345/2/4` for Star Wars), reads too. The trails colour mode shows each
 state in its own colour. Built-in: Brian's Brain (`B2/S/C3`) and Star Wars
 (`B2/S345/C4`).
 
+Any rule runs on a bounded grid named after it as Golly writes one:
+`B3/S23:T100,100` is a 100 by 100 torus, `:P` a plane with dead edges, `:K`
+a Klein bottle whose starred size (`:K100*,80`) is the edge joined with a
+twist, and `:C` a cross-surface. A lone size gives a square, and a 0 leaves a
+plane or torus unbounded along that axis. Cells written off the grid are
+dropped.
+
 ## Controls
 
 | input                    | action                                                           |

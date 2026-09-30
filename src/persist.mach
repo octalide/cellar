@@ -34,6 +34,7 @@ use cellar.rules.weighted;
 use cellar.sim;
 use cellar.space;
 use cellar.text;
+use cellar.topology;
 use allo: std.allocator;
 use std.allocator.page;
 use alloc_testing: std.allocator.testing;
@@ -266,7 +267,7 @@ fun write_header(buf: *u8, s: *sim.Sim, v: *View) usize {
     off      = off + 1;
     buf[off] = '\n';
     off      = off + 1;
-    var rb: [1101]u8;
+    var rb: [rule.FORMAT_MAX + 1]u8;
     off = text.buf_str(buf, off, "family ");
     off = text.buf_str(buf, off, rule.family_id(rule.family_of(?s.rule)));
     off = text.buf_str(buf, off, "\nrule ");
@@ -433,9 +434,9 @@ fun world_version(b: *Vector[u8]) u8 {
 rec Head {
     family:     [32]u8;
     ruled:      bool;
-    rule:       [1101]u8;
+    rule:       [rule.FORMAT_MAX + 1]u8;
     shaped:     bool;
-    shape:      [1101]u8;
+    shape:      [rule.FORMAT_MAX + 1]u8;
     states:     u32;
     generation: u64;
     view:       View;
@@ -569,7 +570,7 @@ fun read_header(b: *Vector[u8], p: usize, out: *usize, h: *Head) err[Error] {
         var end: usize = e;
         for (end < b.len && b.data[end] != '\n') { end = end + 1; }
         for (end > e && (b.data[end - 1] == ' ' || b.data[end - 1] == '\t' || b.data[end - 1] == '\r')) { end = end - 1; }
-        var value: [1101]u8;
+        var value: [rule.FORMAT_MAX + 1]u8;
         var len:   usize = end - e;
         # a value too long for any field this version reads is read as none at all
         if (len > VALUE_MAX) { len = 0; }
@@ -1040,7 +1041,7 @@ test load_world__round_trips_a_wide_weighted_kernel {
     weighted.set_weight(?k, -2, 0, -4);
     weighted.set_weight(?k, 1, 2, 3);
     k.birth = weighted.set_bit(k.birth, 11);
-    sim.set_rule(?s, rule.Rule.weighted{k});
+    sim.set_rule(?s, rule.of(rule.Kind.weighted{k}));
     block(?s, 0, 0);
     var v: View = View{pan_x: 0.0, pan_y: 0.0, zoom: 1.0, mode: render.MODE_SOLID};
 
@@ -1097,6 +1098,37 @@ test load_world__round_trips_a_generations_world_and_its_dying_cells {
         }
         y = y + 1;
     }
+    sim.dnit(?s);
+    sim.dnit(?t);
+    ret 0;
+}
+
+test load_world__round_trips_a_bounded_grid_in_its_rule {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    val k: res[rule.Rule, str] = rule.parse("B3/S23:K100*,90");
+    if (sel k.err)               { ret 1; }
+    if (!sim.set_rule(?s, k.ok)) { ret 1; }
+    block(?s, 0, 0);
+    # a block across the grid's east edge, half of it dropped
+    block(?s, 49, 0);
+    var v: View = View{pan_x: 0.0, pan_y: 0.0, zoom: 1.0, mode: render.MODE_SOLID};
+
+    val path:  str        = "out/test/test_bounded.cellar";
+    val saved: err[Error] = save_world(?a, ?s, ?v, path);
+    if (sel saved.err) { ret 2; }
+    var t:     sim.Sim;
+    val made2: err[allo.Error] = sim.init(?t, ?a);
+    if (sel made2.err) { ret 3; }
+    val loaded: res[Loaded, Error] = load_world(?a, ?t, ?v, path);
+    fs.remove_file(path);
+    if (sel loaded.err)                                                           { ret 4; }
+    if (loaded.ok.foreign || !rule.same(?t.rule, ?s.rule))                        { ret 5; }
+    if (!topology.bounded(?t.rule.grid))                                          { ret 6; }
+    if (sim.population(?t) != 6 || !sim.alive(?t, 49, 1) || sim.alive(?t, 50, 1)) { ret 7; }
     sim.dnit(?s);
     sim.dnit(?t);
     ret 0;
@@ -1334,23 +1366,23 @@ test load_world__reads_cellar_2_and_every_cellar_3_header {
     if (v.pan_y != 7.25 || v.pan_x != 1.5 || v.mode != render.MODE_AGE) { ret 6; }
 
     # a rule cellar cannot run loads the world with the rule as it was
-    val odd: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v3_odd.cellar", "cellar 3\nrule B3/S23:T20,30\ngeneration 3\n\n");
+    val odd: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v3_odd.cellar", "cellar 3\nrule B3/S23:S20\ngeneration 3\n\n");
     if (sel odd.err)                                                      { ret 7; }
     if (!odd.ok.foreign || !rule.same(?s.rule, ?hl) || s.generation != 3) { ret 7; }
 
     # a whole kernel is preferred to the notation beside it, and one this
     # version cannot run is foreign even beside a rule it can
     val both: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v3_both.cellar", "cellar 3\nrule B3/S23\nkernel 1 64 12 1 1 1 1 0 1 1 1 1\n\n");
-    if (sel both.err)                            { ret 12; }
-    if (both.ok.foreign || !sel s.rule.weighted) { ret 12; }
-    if (sel s.rule.weighted) {
-        if (s.rule.weighted.birth != 64 || s.rule.weighted.survive != 12) { ret 12; }
+    if (sel both.err)                                 { ret 12; }
+    if (both.ok.foreign || !sel s.rule.kind.weighted) { ret 12; }
+    if (sel s.rule.kind.weighted) {
+        if (s.rule.kind.weighted.birth != 64 || s.rule.kind.weighted.survive != 12) { ret 12; }
     }
     val wide: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v3_wide.cellar", "cellar 3\nrule B3/S23\nkernel 9 8 12 1\n\n");
-    if (sel wide.err)                             { ret 13; }
-    if (!wide.ok.foreign || !sel s.rule.weighted) { ret 13; }
-    if (sel s.rule.weighted) {
-        if (s.rule.weighted.birth != 64) { ret 13; }
+    if (sel wide.err)                                  { ret 13; }
+    if (!wide.ok.foreign || !sel s.rule.kind.weighted) { ret 13; }
+    if (sel s.rule.kind.weighted) {
+        if (s.rule.kind.weighted.birth != 64) { ret 13; }
     }
 
     # a version from the future, a header that never ends, and a value that

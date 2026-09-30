@@ -25,6 +25,7 @@ use cellar.pattern;
 use cellar.persist;
 use cellar.region;
 use cellar.rule;
+use cellar.rules.weighted;
 use cellar.saves;
 use cellar.sim;
 use cellar.snapshot;
@@ -203,7 +204,7 @@ fun take(a: *app.App, s: *sim.Sim, d: *Deps, b: space.Box, cut: bool) {
         ret;
     }
     # the rule the cells were read under, set first so a refusal leaves the world alone
-    var text:  [1101]u8;
+    var text:  [rule.FORMAT_MAX + 1]u8;
     val named: err[allo.Error] = pattern.set_rule(?p, rule.format(?s.rule, ?text[0]));
     var ok:    bool            = sel named.ok;
     if (ok && cut) { ok = region.cut(s, b, ?p); }
@@ -348,6 +349,12 @@ fun back(a: *app.App, s: *sim.Sim, undo: bool) {
 
 # replace the rule, saying why when it could not be taken
 fun rule_to(a: *app.App, s: *sim.Sim, r: rule.Rule) {
+    var want: rule.Rule = r;
+    val why:  opt[str]  = rule.refusal(?want);
+    if (sel why.some) {
+        app.say_why(a, "the rule was not applied", why.some);
+        ret;
+    }
     val tree: bool = sim.on_tree(s);
     if (sim.set_rule(s, r)) { ret; }
     if (tree)               { app.say(a, "HashLife cannot run that rule, and the world is too large for the chunk pool"); }
@@ -879,6 +886,73 @@ test run__identifies_a_selection_off_the_frame_and_a_second_replaces_the_first {
     app.identify_poll(?ap);
     if (worker.running(?ap.identifier))                                          { ret 5; }
     if (!string.str_equals(ap.toast, "selection: a period 2 oscillator, xp2_7")) { ret 6; }
+    app.dnit(?ap);
+    sim.dnit(?s);
+    ret 0;
+}
+
+test run__refuses_a_kernel_widened_past_a_small_torus {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    var ap: app.App;
+    app.init(?ap);
+    val shown: err[format.Error] = app.attach(?ap, ?a);
+    if (sel shown.err) { ret 1; }
+    var d:     Deps;
+    val torus: res[rule.Rule, str] = rule.parse("B3/S23:T3,40");
+    if (sel torus.err) { ret 2; }
+    var small: rule.Rule = torus.ok;
+    app.submit(?ap, command.Command.rule{small});
+    run(?ap, ?s, ?d);
+    if (!rule.same(?s.rule, ?small)) { ret 3; }
+
+    # the kernel editor widens the kernel without parsing, to a radius the
+    # 3 wide torus cannot hold, and the rule stays as it was
+    var wide: rule.Rule = small;
+    if (sel wide.kind.weighted)  { weighted.set_radius(?wide.kind.weighted, 4); }
+    if (rule.radius(?wide) != 4) { ret 4; }
+    app.submit(?ap, command.Command.rule{wide});
+    run(?ap, ?s, ?d);
+    if (!rule.same(?s.rule, ?small))                                   { ret 5; }
+    if (!string.str_starts_with(ap.toast, "the rule was not applied")) { ret 6; }
+    if (sim.set_rule(?s, wide) || !rule.same(?s.rule, ?small))         { ret 7; }
+    app.dnit(?ap);
+    sim.dnit(?s);
+    ret 0;
+}
+
+test run__undo_takes_a_world_back_off_a_bounded_grid_with_the_cells_it_dropped {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    var ap: app.App;
+    app.init(?ap);
+    val shown: err[format.Error] = app.attach(?ap, ?a);
+    if (sel shown.err) { ret 1; }
+    var d:     Deps;
+    var life:  rule.Rule           = rule.preset_rule(0);
+    val torus: res[rule.Rule, str] = rule.parse("B3/S23:T100,100");
+    if (sel torus.err) { ret 2; }
+    var small: rule.Rule = torus.ok;
+
+    app.submit(?ap, command.Command.paint{command.Paint{x: 1, y: 1, v: 1}});
+    app.submit(?ap, command.Command.paint{command.Paint{x: 200, y: 200, v: 1}});
+    run(?ap, ?s, ?d);
+    # the torus drops the cell off it, and undo brings back the plane and the cell
+    app.submit(?ap, command.Command.rule{small});
+    run(?ap, ?s, ?d);
+    if (!rule.same(?s.rule, ?small) || sim.alive(?s, 200, 200) || !sim.alive(?s, 1, 1)) { ret 3; }
+    app.submit(?ap, command.Command.undo{});
+    run(?ap, ?s, ?d);
+    if (!rule.same(?s.rule, ?life) || !sim.alive(?s, 200, 200) || !sim.alive(?s, 1, 1)) { ret 4; }
+    app.submit(?ap, command.Command.redo{});
+    run(?ap, ?s, ?d);
+    if (!rule.same(?s.rule, ?small) || sim.alive(?s, 200, 200)) { ret 5; }
     app.dnit(?ap);
     sim.dnit(?s);
     ret 0;
