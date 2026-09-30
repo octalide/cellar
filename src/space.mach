@@ -51,8 +51,11 @@ pub val MASK_ALL: u32 = 0x1ef;
 pub val NONE: u32 = layout.NONE;
 # added to chunk coordinates in the page table
 pub val BIAS: i64 = 1073741824;
-# the most slots the pool may grow to, which the stages' arrays are sized for
-pub val MAX_SLOTS: usize = layout.MAX_SLOTS::usize;
+# the ceiling of a pool held on the host alone. front and back cells come to
+# 32 KiB a slot, so this is a gigabyte of cells, the most host memory the
+# world may take. a mirror on a device sets its own, lower where the device
+# needs it
+pub val HOST_SLOTS: usize = 32768;
 # the oldest age a cell records
 pub val AGE_MAX: u32 = layout.AGE_MAX;
 # heat a dead cell loses per generation, giving fading trails
@@ -69,41 +72,57 @@ pub val DIRTY_CELLS: u8 = 2;
 # a slot was allocated empty, which a mirror clears on its side
 pub val DIRTY_ZERO: u8 = 4;
 
+# a copy of the pool kept elsewhere, a device's, which must make room before
+# the pool grows
+# ---
+# ctx:     the mirror's own state, passed back to reserve
+# reserve: make room for a pool of the given slots; false refuses the growth
+pub rec Mirror {
+    ctx:     *u8;
+    reserve: fun(*u8, usize) bool;
+}
+
 # the pool
 # ---
-# a:       allocator backing every array
-# cap:     slots every array holds
-# hi:      slots in use lie below this
-# live:    slots in use
-# table:   the page table, cap * ENTRY words
-# cells:   the front cells, cap * CELLS
-# back:    the back cells, cap * CELLS, or nil when the GPU steps
-# census:  per slot live count, warm, incarnation, mask and extent, from the
-#          last step
-# dirty:   per slot DIRTY_ENTRY and DIRTY_CELLS, for a mirror to upload
-# frees:   free slots below hi
-# nfree:   how many frees holds
-# hash:    slot per bucket, NONE when empty, linear probing
-# hcap:    buckets, a power of two at least twice cap
-# serial:  the last incarnation handed out
-# stepped: whether back is kept
+# a:         allocator backing every array
+# cap:       slots every array holds
+# max_slots: the most slots the pool may grow to
+# mirrored:  mirror holds a copy that must make room before a growth
+# mirror:    that copy
+# hi:        slots in use lie below this
+# live:      slots in use
+# table:     the page table, cap * ENTRY words
+# cells:     the front cells, cap * CELLS
+# back:      the back cells, cap * CELLS, or nil when the GPU steps
+# census:    per slot live count, warm, incarnation, mask and extent, from the
+#            last step
+# dirty:     per slot DIRTY_ENTRY and DIRTY_CELLS, for a mirror to upload
+# frees:     free slots below hi
+# nfree:     how many frees holds
+# hash:      slot per bucket, NONE when empty, linear probing
+# hcap:      buckets, the power of two buckets gives for cap
+# serial:    the last incarnation handed out
+# stepped:   whether back is kept
 pub rec Space {
-    a:       *allo.Allocator;
-    cap:     usize;
-    hi:      usize;
-    live:    usize;
-    table:   *u32;
-    cells:   *u32;
-    back:    *u32;
-    census:  *u32;
-    before:  *u32;
-    dirty:   *u8;
-    frees:   *u32;
-    nfree:   usize;
-    hash:    *u32;
-    hcap:    usize;
-    serial:  u32;
-    stepped: bool;
+    a:         *allo.Allocator;
+    cap:       usize;
+    max_slots: usize;
+    mirrored:  bool;
+    mirror:    Mirror;
+    hi:        usize;
+    live:      usize;
+    table:     *u32;
+    cells:     *u32;
+    back:      *u32;
+    census:    *u32;
+    before:    *u32;
+    dirty:     *u8;
+    frees:     *u32;
+    nfree:     usize;
+    hash:      *u32;
+    hcap:      usize;
+    serial:    u32;
+    stepped:   bool;
 }
 
 # whether a cell is alive
@@ -184,6 +203,14 @@ fun hash_remove(sp: *Space, s: usize) {
     sp.hash[hole] = NONE;
 }
 
+# hash buckets for cap slots: a power of two, so a probe wraps with a mask, and
+# at least four a slot
+fun buckets(cap: usize) usize {
+    var n: usize = 1;
+    for (n < cap * 4) { n = n * 2; }
+    ret n;
+}
+
 fun zwords(a: *allo.Allocator, n: usize) *u32 {
     val r: res[*u32, allo.Error] = allo.zallocate[u32](a, n);
     if (sel r.err) { ret nil; }
@@ -199,7 +226,8 @@ fun alloc_arrays(sp: *Space, cap: usize) err[allo.Error] {
     val census: *u32                 = zwords(a, cap * CENSUS);
     val before: *u32                 = zwords(a, cap * CENSUS);
     val frees:  *u32                 = zwords(a, cap);
-    val hash:   *u32                 = zwords(a, cap * 4);
+    val hcap:   usize                = buckets(cap);
+    val hash:   *u32                 = zwords(a, hcap);
     var dirty:  *u8                  = nil;
     val rd:     res[*u8, allo.Error] = allo.zallocate[u8](a, cap);
     if (sel rd.ok) { dirty = rd.ok; }
@@ -211,7 +239,7 @@ fun alloc_arrays(sp: *Space, cap: usize) err[allo.Error] {
         if (census != nil) { allo.deallocate[u32](a, census, cap * CENSUS); }
         if (before != nil) { allo.deallocate[u32](a, before, cap * CENSUS); }
         if (frees != nil)  { allo.deallocate[u32](a, frees, cap); }
-        if (hash != nil)   { allo.deallocate[u32](a, hash, cap * 4); }
+        if (hash != nil)   { allo.deallocate[u32](a, hash, hcap); }
         if (dirty != nil)  { allo.deallocate[u8](a, dirty, cap); }
         ret err[allo.Error].err{allo.Error.exhausted{}};
     }
@@ -234,7 +262,7 @@ fun alloc_arrays(sp: *Space, cap: usize) err[allo.Error] {
     sp.frees  = frees;
     sp.hash   = hash;
     sp.cap    = cap;
-    sp.hcap   = cap * 4;
+    sp.hcap   = hcap;
     mem.fill[u32](sp.hash, NONE, sp.hcap);
     var s: usize = 0;
     for (s < sp.hi) {
@@ -263,14 +291,28 @@ fun free_arrays(sp: *Space) {
 # stepped: keep back cells, for the CPU to step into
 # ret:     ok, or the allocator's refusal
 pub fun init(sp: *Space, a: *allo.Allocator, stepped: bool) err[allo.Error] {
-    sp.a       = a;
-    sp.cap     = 0;
-    sp.hi      = 0;
-    sp.live    = 0;
-    sp.nfree   = 0;
-    sp.serial  = 0;
-    sp.stepped = stepped;
+    sp.a         = a;
+    sp.cap       = 0;
+    sp.max_slots = HOST_SLOTS;
+    sp.mirrored  = false;
+    sp.hi        = 0;
+    sp.live      = 0;
+    sp.nfree     = 0;
+    sp.serial    = 0;
+    sp.stepped   = stepped;
     ret alloc_arrays(sp, FIRST_CAP);
+}
+
+# hand the pool a mirror that must make room before it grows, and the ceiling
+# the mirror holds it to
+# ---
+# sp:        the pool, holding no more than max_slots
+# m:         the mirror, already holding the pool's capacity
+# max_slots: the most slots the mirror can hold
+pub fun set_mirror(sp: *Space, m: Mirror, max_slots: usize) {
+    sp.mirror   = m;
+    sp.mirrored = true;
+    if (max_slots < sp.max_slots) { sp.max_slots = max_slots; }
 }
 
 # release every array
@@ -325,7 +367,8 @@ pub fun reset(sp: *Space) {
 # sp:  the pool
 # cx:  chunk column
 # cy:  chunk row
-# ret: the slot, or NONE when the pool is full or the allocator refused
+# ret: the slot, or NONE when the pool is at its ceiling, or the allocator or
+#      the mirror refused to grow it
 pub fun alloc(sp: *Space, cx: i64, cy: i64) u32 {
     val have: u32 = find(sp, cx, cy);
     if (have != NONE) { ret have; }
@@ -335,9 +378,12 @@ pub fun alloc(sp: *Space, cx: i64, cy: i64) u32 {
         s        = sp.frees[sp.nfree]::usize;
     }
     or {
+        if (sp.hi >= sp.max_slots) { ret NONE; }
         if (sp.hi == sp.cap) {
-            if (sp.cap >= MAX_SLOTS) { ret NONE; }
-            val grown: err[allo.Error] = alloc_arrays(sp, sp.cap * 2);
+            var cap: usize = sp.cap * 2;
+            if (cap > sp.max_slots)                                    { cap = sp.max_slots; }
+            if (sp.mirrored && !sp.mirror.reserve(sp.mirror.ctx, cap)) { ret NONE; }
+            val grown: err[allo.Error] = alloc_arrays(sp, cap);
             if (sel grown.err) { ret NONE; }
         }
         s     = sp.hi;
