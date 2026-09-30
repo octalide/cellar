@@ -3,6 +3,13 @@
 # the one place a command's effect happens. the frame calls run once, before it
 # collects or records anything, so the world a save reads is the world the
 # command was issued against.
+#
+# it also keeps the start reset returns to. play starting from paused, by a
+# toggle or a step, takes a snapshot when none is held. an edit while paused
+# drops it, so the edited world is the start from then on and the next play
+# takes it. an edit while running is part of the run and leaves it alone, but
+# clear, randomize and load begin a new world, so they drop it paused and
+# retake it from the new world running.
 
 use cellar.app;
 use cellar.command;
@@ -10,6 +17,7 @@ use cellar.paths;
 use cellar.pattern;
 use cellar.persist;
 use cellar.sim;
+use cellar.snapshot;
 use cellar.text;
 use cellar.world;
 use allo: std.allocator;
@@ -61,19 +69,33 @@ fun save_world(a: *app.App, s: *sim.Sim, d: *Deps, path: str) {
 }
 
 # load the world and the view it was saved with, saying when its rule could not be taken
-fun load_world(a: *app.App, s: *sim.Sim, d: *Deps, path: str) {
+# ---
+# ret: whether the world was replaced
+fun load_world(a: *app.App, s: *sim.Sim, d: *Deps, path: str) bool {
     var v:    persist.View                       = view_of(a);
     val done: res[persist.Loaded, persist.Error] = persist.load_world(d.a, s, ?v, path);
     if (sel done.err) {
         app.say(a, persist.error_message(done.err));
-        ret;
+        ret false;
     }
     take_view(a, ?v);
     if (done.ok.foreign) {
         app.say(a, "world loaded, but its rule is not one cellar can run; the current rule is kept");
-        ret;
+        ret true;
     }
     app.say(a, "world loaded");
+    ret true;
+}
+
+# snapshot the world as the start, saying when it could not be kept
+fun take_start(a: *app.App, s: *sim.Sim) {
+    if (!sim.take(s, ?a.start)) { app.say(a, "the starting world could not be kept, so reset has nothing to return to"); }
+}
+
+# return to the start, or stay put when the world as it stands is the start. a
+# start the pool can no longer hold marks the world full, which the frame reports
+fun reset(a: *app.App, s: *sim.Sim) {
+    if (a.start.held) { sim.restore(s, ?a.start); }
 }
 
 # the file a command reads or writes, or false when no directory is known
@@ -88,6 +110,11 @@ fun file(d: *Deps, name: str, out: *u8, a: *app.App) bool {
 
 # apply one command
 fun apply(c: *command.Command, a: *app.App, s: *sim.Sim, d: *Deps) {
+    val paused: bool = !world.running(s);
+    if ((sel c.toggle || sel c.step) && paused && !world.full(s) && !a.start.held) { take_start(a, s); }
+    val edited: bool = sel c.paint || sel c.line || sel c.stamp || sel c.rule;
+    var fresh:  bool = sel c.clear || sel c.randomize;
+
     if (sel c.toggle)    { world.toggle(s); }
     if (sel c.step)      { world.step(s); }
     if (sel c.clear)     { world.clear(s); }
@@ -96,10 +123,11 @@ fun apply(c: *command.Command, a: *app.App, s: *sim.Sim, d: *Deps) {
     if (sel c.line)      { world.line(s, c.line.x0, c.line.y0, c.line.x1, c.line.y1, c.line.v); }
     if (sel c.stamp)     { world.stamp(s, ?c.stamp.p, c.stamp.x, c.stamp.y); }
     if (sel c.rule)      { s.kernel = c.rule; }
+    if (sel c.reset)     { reset(a, s); }
 
     var path: [1088]u8;
     if (sel c.save_world && file(d, paths.WORLD, ?path[0], a)) { save_world(a, s, d, ?path[0]); }
-    if (sel c.load_world && file(d, paths.WORLD, ?path[0], a)) { load_world(a, s, d, ?path[0]); }
+    if (sel c.load_world && file(d, paths.WORLD, ?path[0], a)) { fresh = load_world(a, s, d, ?path[0]); }
     if (sel c.save_pattern && file(d, paths.CUSTOM, ?path[0], a)) {
         report(a, "custom pattern saved", persist.save_pattern(d.a, ?a.custom, ?path[0]));
     }
@@ -107,6 +135,9 @@ fun apply(c: *command.Command, a: *app.App, s: *sim.Sim, d: *Deps) {
         report(a, "custom pattern loaded", persist.load_pattern(d.a, ?a.custom, ?path[0]));
         a.pattern_sel = pattern.BUILTIN_COUNT;
     }
+
+    if (fresh && !paused)            { take_start(a, s); }
+    or (fresh || (edited && paused)) { snapshot.drop(?a.start); }
 }
 
 # apply every waiting command in order and empty the queue
@@ -189,6 +220,58 @@ test run__applies_every_command_however_many_a_frame_holds {
     run(?ap, ?s, ?d);
     if (sim.population(?s) != 299)                     { ret 3; }
     if (sim.alive(?s, 7, 0) || !sim.alive(?s, 299, 0)) { ret 4; }
+
+    app.dnit(?ap);
+    sim.dnit(?s);
+    ret 0;
+}
+
+test run__reset_returns_to_where_play_started_and_a_paused_edit_moves_it {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    var ap: app.App;
+    app.init(?ap);
+    val shown: err[allo.Error] = app.attach(?ap, ?a);
+    if (sel shown.err) { ret 1; }
+    var d: Deps;
+
+    # a horizontal blinker, played for three generations and reset
+    app.submit(?ap, command.Command.line{command.Line{x0: -1, y0: 0, x1: 1, y1: 0, v: 1}});
+    app.submit(?ap, command.Command.toggle{});
+    run(?ap, ?s, ?d);
+    world.step(?s);
+    world.step(?s);
+    world.step(?s);
+    app.submit(?ap, command.Command.reset{});
+    run(?ap, ?s, ?d);
+    if (world.running(?s) || world.generation(?s) != 0) { ret 2; }
+    if (!sim.alive(?s, -1, 0) || sim.alive(?s, 0, -1))  { ret 3; }
+
+    # a step plays from the start, and an edit while paused makes the edited
+    # world the start, which a reset then keeps
+    app.submit(?ap, command.Command.step{});
+    app.submit(?ap, command.Command.paint{command.Paint{x: 10, y: 10, v: 1}});
+    app.submit(?ap, command.Command.reset{});
+    run(?ap, ?s, ?d);
+    if (world.generation(?s) != 1)                                               { ret 4; }
+    if (!sim.alive(?s, 0, -1) || sim.alive(?s, -1, 0) || !sim.alive(?s, 10, 10)) { ret 5; }
+
+    # played on, with an edit while running, and reset to the edited world
+    app.submit(?ap, command.Command.toggle{});
+    run(?ap, ?s, ?d);
+    world.step(?s);
+    app.submit(?ap, command.Command.paint{command.Paint{x: 20, y: 20, v: 1}});
+    app.submit(?ap, command.Command.toggle{});
+    run(?ap, ?s, ?d);
+    world.step(?s);
+    app.submit(?ap, command.Command.reset{});
+    run(?ap, ?s, ?d);
+    if (world.generation(?s) != 1)                                                { ret 6; }
+    if (!sim.alive(?s, 0, -1) || !sim.alive(?s, 10, 10) || sim.alive(?s, 20, 20)) { ret 7; }
+    if (sim.population(?s) != 4)                                                  { ret 8; }
 
     app.dnit(?ap);
     sim.dnit(?s);
