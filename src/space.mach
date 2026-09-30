@@ -17,10 +17,13 @@
 # generation. a hash over chunk coordinates finds a chunk's slot.
 #
 # settle keeps the pool the shape stepping needs: every chunk with a live cell
-# has all eight neighbours, and a chunk that is empty, cold and has no live
-# neighbour is freed. it works from a census, per slot the live count, whether
-# anything is warm and the incarnation the count was taken of, which the CPU
-# writes as it steps and the GPU writes once a frame.
+# has the neighbours its census mask asks for, and a chunk that is empty, cold
+# and asked for by no live neighbour is freed. the mask has a bit per neighbour,
+# set where a live cell lies near that side, so a sparse world keeps only the
+# chunks it can spread into. it works from a census, per slot the live count,
+# whether anything is warm, the incarnation the count was taken of and the mask,
+# which the CPU writes as it steps, asking for every neighbour, and the GPU
+# writes once a frame.
 
 use allo: std.allocator;
 use std.allocator.page;
@@ -38,8 +41,10 @@ pub val SIDE: i64 = 64;
 pub val CELLS: usize = 4096;
 # page-table words per slot
 pub val ENTRY: usize = 12;
-# census words per slot: live count, warm, incarnation, pad
+# census words per slot: live count, warm, incarnation, neighbour mask
 pub val CENSUS: usize = 4;
+# a mask asking for all eight neighbours, its bits laid out as the entry's words
+pub val MASK_ALL: u32 = 0x1ef;
 # a neighbour that does not exist
 pub val NONE: u32 = 0xffffffff;
 # added to chunk coordinates in the page table
@@ -385,20 +390,28 @@ pub fun release(sp: *Space, s: usize) {
     sp.live            = sp.live - 1;
 }
 
-# give a chunk all eight neighbours
+# give a chunk the neighbours a mask asks for
 # ---
-# ret: false when the pool could not hold them
-pub fun surround(sp: *Space, s: usize) bool {
+# mask: a bit per entry word, the chunk's own ignored
+# ret:  false when the pool could not hold them
+pub fun surround_by(sp: *Space, s: usize, mask: u32) bool {
     val cx: i64   = slot_x(sp, s);
     val cy: i64   = slot_y(sp, s);
     var k:  usize = 0;
     for (k < 9) {
-        if (k != 4 && sp.table[s * ENTRY + k] == NONE) {
+        if (k != 4 && ((mask >> k::u32) & 1) != 0 && sp.table[s * ENTRY + k] == NONE) {
             if (alloc(sp, cx + (k % 3)::i64 - 1, cy + (k / 3)::i64 - 1) == NONE) { ret false; }
         }
         k = k + 1;
     }
     ret true;
+}
+
+# give a chunk all eight neighbours
+# ---
+# ret: false when the pool could not hold them
+pub fun surround(sp: *Space, s: usize) bool {
+    ret surround_by(sp, s, MASK_ALL);
 }
 
 # whether a census entry describes the chunk the slot holds now
@@ -409,7 +422,7 @@ fun current(sp: *Space, census: *u32, n: usize, s: usize) bool {
 
 # reshape the pool around what a census found
 #
-# every chunk the census saw holding a live cell gets its eight neighbours.
+# every chunk the census saw holding a live cell gets the neighbours its mask asks for.
 # then, when frees is set, every chunk the census saw empty and cold whose
 # neighbours it saw empty is freed; a neighbour allocated since the census was
 # taken did not exist then, so it counts as empty. the census is copied into the
@@ -429,7 +442,7 @@ pub fun settle(sp: *Space, census: *u32, n: usize, frees: bool) bool {
     for (s < n && s < sp.hi) {
         if (own) { c = sp.census; }
         if (current(sp, c, n, s) && c[s * CENSUS] != 0) {
-            if (!surround(sp, s)) { ok = false; }
+            if (!surround_by(sp, s, c[s * CENSUS + 3])) { ok = false; }
         }
         s = s + 1;
     }
@@ -442,8 +455,11 @@ pub fun settle(sp: *Space, census: *u32, n: usize, frees: bool) bool {
                 var k:    usize = 0;
                 for (k < 9 && !busy) {
                     val nb: u32 = sp.table[s * ENTRY + k];
+                    # the neighbour asks for this chunk when its mask has the bit
+                    # for the side this chunk lies on from it
                     if (k != 4 && nb != NONE && current(sp, c, n, nb::usize)
-                        && c[nb::usize * CENSUS] != 0) { busy = true; }
+                        && c[nb::usize * CENSUS] != 0
+                        && ((c[nb::usize * CENSUS + 3] >> (8 - k)::u32) & 1) != 0) { busy = true; }
                     k = k + 1;
                 }
                 if (!busy) { release(sp, s); }
@@ -485,6 +501,8 @@ pub fun recount(sp: *Space, s: usize) {
     sp.census[s * CENSUS]     = live;
     sp.census[s * CENSUS + 1] = warm;
     sp.census[s * CENSUS + 2] = incarnation(sp, s);
+    sp.census[s * CENSUS + 3] = 0;
+    if (live != 0) { sp.census[s * CENSUS + 3] = MASK_ALL; }
 }
 
 test alloc__links_neighbours_both_ways_and_release_unlinks {
@@ -533,6 +551,30 @@ test alloc__grows_the_pool_and_keeps_every_chunk_findable {
         if ((i % 2 == 0) != (s == NONE)) { ret 4; }
         i = i + 1;
     }
+    dnit(?sp);
+    ret 0;
+}
+
+test settle__gives_a_live_chunk_only_the_neighbours_its_mask_asks_for {
+    var a: allo.Allocator;
+    page.make(?a);
+    var sp:   Space;
+    val made: err[allo.Error] = init(?sp, ?a, false);
+    if (sel made.err) { ret 1; }
+    val s: usize = alloc(?sp, 0, 0)::usize;
+    # live, warm, the chunk's incarnation, and a mask asking west and north-west
+    sp.census[s * CENSUS]     = 1;
+    sp.census[s * CENSUS + 1] = 1;
+    sp.census[s * CENSUS + 2] = incarnation(?sp, s);
+    sp.census[s * CENSUS + 3] = 0x9;
+    if (!settle(?sp, sp.census, sp.hi, true))                  { ret 2; }
+    if (sp.live != 3)                                          { ret 3; }
+    if (find(?sp, -1, 0) == NONE || find(?sp, -1, -1) == NONE) { ret 4; }
+    # the asked-for chunks stay while the live chunk asks, and go once it does not
+    sp.census[s * CENSUS + 3] = 0;
+    sp.census[s * CENSUS]     = 0;
+    sp.census[s * CENSUS + 1] = 0;
+    if (!settle(?sp, sp.census, sp.hi, true)) { ret 5; }
     dnit(?sp);
     ret 0;
 }
