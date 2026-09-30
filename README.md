@@ -55,8 +55,8 @@ corner, and the side panel groups every control by task:
   and birth and survive toggles over the reachable sums
 - **view**: colour mode (a solid colour from a set of swatches, fading trails,
   or colour by age), grid lines, and the interface size from 100 to 200 percent
-- **files**: saving and loading the world and the custom pattern, and
-  screenshots
+- **files**: named saves of the world and the custom pattern, a list of every
+  world and pattern in the data directory to load from, and screenshots
 
 Settings and the rule are kept between runs. They, saved worlds and patterns,
 and screenshots live in the platform's user data directory:
@@ -64,6 +64,13 @@ and screenshots live in the platform's user data directory:
 `~/Library/Application Support/cellar` on macOS and `%APPDATA%\cellar` on
 windows. The first run brings over anything an older version left in
 `arrangements/` in the working directory.
+
+`cellar <file>` opens a file at startup: a `.cellar` world loads as the world,
+and a pattern in any format cellar reads (RLE, plaintext `.cells`, Life 1.05
+and 1.06) is stamped onto an empty world centred on the origin and framed, taking its
+rule when cellar can run it. A file that cannot be read leaves the world as it
+was and says why. Options may come before or after the file, and `--` ends
+them, so `cellar -- -x.rle` opens a file whose name starts with a dash.
 
 `cellar --capture shot.png` draws a second of frames, saves the last one and
 exits, leaving the saved settings alone.

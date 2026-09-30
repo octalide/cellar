@@ -1,0 +1,260 @@
+# the command line, read into what the run should do
+#
+# options may come in any order, before or after the file. `--` ends the
+# options, so a file whose name starts with a dash can still be named. an
+# unknown option, an option missing its value, a bad value, an option given
+# twice or a second file is refused, and the binary says why and exits rather
+# than starting.
+#
+#   cellar [--version] [--capture <file.png>] [--bench <gpu|cpu> <dense|sparse> [seconds]] [--] [file]
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+# the usage line printed with a refusal
+pub val USAGE: str = "usage: cellar [--version] [--capture <file.png>] [--bench <gpu|cpu> <dense|sparse> [seconds]] [--] [file]";
+
+# no measurement: a normal session
+pub val BENCH_NONE: u8 = 0;
+# a 512 by 512 random soup
+pub val BENCH_DENSE: u8 = 1;
+# 400 small soups a thousand cells apart, a world twenty thousand cells across
+pub val BENCH_SPARSE: u8 = 2;
+
+# seconds a measurement runs when none are given
+pub val BENCH_SECS: f64 = 10.0;
+
+# what the command line asks for
+# ---
+# version:    print the version and exit
+# capture:    save a screenshot here after a second and exit, or nil
+# bench:      the measurement to run, BENCH_NONE for a normal session
+# bench_cpu:  the measurement steps on the CPU
+# bench_secs: seconds the measurement runs for
+# open:       a world or pattern file to open, or nil
+pub rec Args {
+    version:    bool;
+    capture:    str;
+    bench:      u8;
+    bench_cpu:  bool;
+    bench_secs: f64;
+    open:       str;
+}
+
+# why a command line was refused, each naming the argument at fault
+# ---
+# unknown: an option cellar does not have
+# missing: an option at the end without the value it takes
+# value:   an option's value is not one it accepts
+# twice:   an option given more than once
+# extra:   a second file
+pub tag Error: u8 {
+    unknown: str;
+    missing: str;
+    value:   str;
+    twice:   str;
+    extra:   str;
+}
+
+# the refusal as a line of text into buf
+# ---
+# e:   the refusal
+# buf: at least 64 bytes more than the argument it names
+# ret: buf
+pub fun error_message(e: Error, buf: *u8) str {
+    var what: str = "";
+    var arg:  str = "";
+    if (sel e.unknown) {
+        what = "unknown option ";
+        arg  = e.unknown;
+    }
+    if (sel e.missing) {
+        what = "a value is missing after ";
+        arg  = e.missing;
+    }
+    if (sel e.value) {
+        what = "not a value that option takes: ";
+        arg  = e.value;
+    }
+    if (sel e.twice) {
+        what = "given more than once: ";
+        arg  = e.twice;
+    }
+    if (sel e.extra) {
+        what = "only one file can be opened, not also ";
+        arg  = e.extra;
+    }
+    var o: usize = 0;
+    var i: usize = 0;
+    for (what[i] != 0) {
+        buf[o] = what[i];
+        o      = o + 1;
+        i      = i + 1;
+    }
+    i = 0;
+    for (arg[i] != 0 && i < 1024) {
+        buf[o] = arg[i];
+        o      = o + 1;
+        i      = i + 1;
+    }
+    buf[o] = 0;
+    ret buf;
+}
+
+# whether an argument is an option rather than a file
+fun is_option(s: str) bool {
+    ret s[0] == '-' && s[1] != 0;
+}
+
+# whether an argument is a whole number of seconds
+fun is_seconds(s: str) bool {
+    if (s[0] == 0) { ret false; }
+    var i: usize = 0;
+    for (s[i] != 0) {
+        if (s[i] < '0' || s[i] > '9') { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# a whole number of seconds from its digits, at least one
+fun seconds(s: str) f64 {
+    var v: f64   = 0.0;
+    var i: usize = 0;
+    for (s[i] >= '0' && s[i] <= '9') {
+        v = v * 10.0 + (s[i] - '0')::f64;
+        i = i + 1;
+    }
+    if (v < 1.0) { ret 1.0; }
+    ret v;
+}
+
+# read a command line
+# ---
+# argc: arguments, the program's name first
+# argv: the arguments
+# ret:  what they ask for, or why they were refused
+pub fun parse(argc: i64, argv: *str) res[Args, Error] {
+    var r: Args;
+    r.version    = false;
+    r.capture    = nil;
+    r.bench      = BENCH_NONE;
+    r.bench_cpu  = false;
+    r.bench_secs = BENCH_SECS;
+    r.open       = nil;
+    var flags: bool = true;
+    var i:     i64  = 1;
+    for (i < argc) {
+        val s: str = argv[i];
+        i = i + 1;
+        if (!flags || !is_option(s)) {
+            if (r.open != nil) { ret res[Args, Error].err{Error.extra{s}}; }
+            r.open = s;
+            cnt;
+        }
+        if (str_equals(s, "--")) {
+            flags = false;
+            cnt;
+        }
+        if (str_equals(s, "--version")) {
+            r.version = true;
+            cnt;
+        }
+        if (str_equals(s, "--capture")) {
+            if (r.capture != nil) { ret res[Args, Error].err{Error.twice{s}}; }
+            if (i >= argc)        { ret res[Args, Error].err{Error.missing{s}}; }
+            r.capture = argv[i];
+            i         = i + 1;
+            cnt;
+        }
+        if (str_equals(s, "--bench")) {
+            if (r.bench != BENCH_NONE) { ret res[Args, Error].err{Error.twice{s}}; }
+            if (i + 1 >= argc)         { ret res[Args, Error].err{Error.missing{s}}; }
+            val engine: str = argv[i];
+            val world:  str = argv[i + 1];
+            if (str_equals(engine, "cpu"))   { r.bench_cpu = true; }
+            or (!str_equals(engine, "gpu"))  { ret res[Args, Error].err{Error.value{engine}}; }
+            if (str_equals(world, "dense"))  { r.bench = BENCH_DENSE; }
+            or (str_equals(world, "sparse")) { r.bench = BENCH_SPARSE; }
+            or                               { ret res[Args, Error].err{Error.value{world}}; }
+            i = i + 2;
+            if (i < argc && is_seconds(argv[i])) {
+                r.bench_secs = seconds(argv[i]);
+                i            = i + 1;
+            }
+            cnt;
+        }
+        ret res[Args, Error].err{Error.unknown{s}};
+    }
+    ret res[Args, Error].ok{r};
+}
+
+# parse a line of arguments, the program's name left off
+#[testing]
+fun line(va: ...) res[Args, Error] {
+    var v: [8]str;
+    v[0] = "cellar";
+    var n: i64 = 1;
+    $each s in va {
+        v[n] = s;
+        n    = n + 1;
+    }
+    ret parse(n, ?v[0]);
+}
+
+test parse__takes_options_in_any_order_around_the_file {
+    val a: res[Args, Error] = line("gun.rle", "--capture", "shot.png");
+    if (!sel a.ok)                                                                  { ret 1; }
+    if (!str_equals(a.ok.open, "gun.rle") || !str_equals(a.ok.capture, "shot.png")) { ret 2; }
+    val b: res[Args, Error] = line("--capture", "shot.png", "gun.rle");
+    if (!sel b.ok)                                                                  { ret 3; }
+    if (!str_equals(b.ok.open, "gun.rle") || !str_equals(b.ok.capture, "shot.png")) { ret 4; }
+    val c: res[Args, Error] = line("--bench", "cpu", "sparse", "--version");
+    if (!sel c.ok)                                                                                       { ret 5; }
+    if (c.ok.bench != BENCH_SPARSE || !c.ok.bench_cpu || !c.ok.version || c.ok.bench_secs != BENCH_SECS) { ret 6; }
+    # the seconds are taken only when they are a number, so a file may follow
+    val d: res[Args, Error] = line("--bench", "gpu", "dense", "3", "soup.cellar");
+    if (!sel d.ok)                                                                         { ret 7; }
+    if (d.ok.bench_secs != 3.0 || d.ok.bench_cpu || !str_equals(d.ok.open, "soup.cellar")) { ret 8; }
+    val e: res[Args, Error] = line();
+    if (!sel e.ok)                                                           { ret 9; }
+    if (e.ok.open != nil || e.ok.capture != nil || e.ok.bench != BENCH_NONE) { ret 10; }
+    ret 0;
+}
+
+test parse__refuses_unknown_options_missing_values_and_a_second_file {
+    val a: res[Args, Error] = line("gun.rle", "--capure", "shot.png");
+    if (!(sel a.err && sel a.err.unknown)) { ret 1; }
+    val b: res[Args, Error] = line("gun.rle", "--capture");
+    if (!(sel b.err && sel b.err.missing)) { ret 2; }
+    val c: res[Args, Error] = line("--bench", "cpu");
+    if (!(sel c.err && sel c.err.missing)) { ret 3; }
+    val d: res[Args, Error] = line("--bench", "tpu", "dense");
+    if (!(sel d.err && sel d.err.value)) { ret 4; }
+    val e: res[Args, Error] = line("a.rle", "b.rle");
+    if (!(sel e.err && sel e.err.extra)) { ret 5; }
+    val f: res[Args, Error] = line("--capture", "a.png", "--capture", "b.png");
+    if (!(sel f.err && sel f.err.twice)) { ret 6; }
+    val g: res[Args, Error] = line("-x");
+    if (!(sel g.err && sel g.err.unknown)) { ret 7; }
+    var buf: [128]u8;
+    if (sel a.err && !str_equals(error_message(a.err, ?buf[0]), "unknown option --capure")) { ret 8; }
+    ret 0;
+}
+
+test parse__takes_everything_after_a_double_dash_as_the_file {
+    val a: res[Args, Error] = line("--capture", "shot.png", "--", "-x");
+    if (!sel a.ok)                                                             { ret 1; }
+    if (!str_equals(a.ok.open, "-x") || !str_equals(a.ok.capture, "shot.png")) { ret 2; }
+    val b: res[Args, Error] = line("--", "--version");
+    if (!sel b.ok)                                           { ret 3; }
+    if (b.ok.version || !str_equals(b.ok.open, "--version")) { ret 4; }
+    val c: res[Args, Error] = line("--", "a.rle", "b.rle");
+    if (!(sel c.err && sel c.err.extra)) { ret 5; }
+    ret 0;
+}
