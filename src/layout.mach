@@ -2,6 +2,13 @@
 #
 # values are u32 because the stages have no wider word, and the host casts
 # where it indexes. the records are the buffers' shapes as the stages see them.
+#
+# a cell is one word whose meaning belongs to the rule family running it (see
+# cellar.rule). the one thing every family holds to is that zero is the
+# quiescent background, what a chunk that does not exist reads as and what a
+# chunk just made holds. everything else the shared stages and the host need to
+# know about a word, what counts as live, what keeps a chunk and what the draw
+# shows, they read from the family's Sense.
 
 # side of a chunk in cells
 pub val SIDE: u32 = 64;
@@ -12,26 +19,47 @@ pub val ENTRY: u32 = 12;
 # the most slots any pool may hold: the stages' arrays are declared this long,
 # and a pool's own ceiling, the device's or the host's, lies at or below it
 pub val MAX_SLOTS: u32 = 32768;
-# words of the meta buffer ahead of the page table: the rule and its weights
-pub val HEAD: u32 = 96;
-# padded words in the rule's weight window
-pub val WEIGHTS: u32 = 88;
-# added to each weight so the stage reads it as unsigned; the padding holds zero
-pub val WEIGHT_BIAS: u32 = 1024;
+# words of the meta buffer ahead of the page table: the shared words, then the
+# rule family's window
+pub val HEAD: u32 = 128;
+# shared words at the head of the meta buffer: the census id, the slots in
+# use, the step serial and the sense
+pub val SHARED: u32 = 16;
+# words of the head a rule family packs its rule into
+pub val RULE: u32 = 112;
+# the word of the step serial in the meta buffer
+pub val SERIAL_AT: u32 = 2;
 # a neighbour that does not exist
 pub val NONE: u32 = 0xffffffff;
 
-# a cell is age << 8 | heat, alive while its age is nonzero
-pub val HEAT_MASK: u32 = 255;
-pub val AGE_SHIFT: u32 = 8;
-# the least value of a live cell
-pub val LIVE: u32 = 256;
-# the oldest age a cell records
-pub val AGE_MAX: u32 = 0xffffff;
-# heat a dead cell loses per generation, giving fading trails
-pub val DECAY: u32 = 12;
-# a live cell painted or seeded fresh: age 1, full heat
-pub val BORN: u32 = 511;
+# how the shared stages and the host read a rule family's cell word
+# ---
+# live_mask:  bits of the word the census tests
+# live_lo:    least masked value of a live cell, one the census counts and
+#             that can change a neighbour
+# live_hi:    greatest masked value of a live cell
+# warm_mask:  bits that keep a chunk from being freed while any is set
+# heat_shift: where the heat display channel starts
+# heat_mask:  its bits once shifted, zero when the family shows no heat
+# age_shift:  where the age display channel starts
+# age_mask:   its bits once shifted, zero when the family shows no age
+pub rec Sense {
+    live_mask:  u32;
+    live_lo:    u32;
+    live_hi:    u32;
+    warm_mask:  u32;
+    heat_shift: u32;
+    heat_mask:  u32;
+    age_shift:  u32;
+    age_mask:   u32;
+}
+
+# 1 when a word is live under a sense's live fields, else 0
+pub fun live(c: u32, mask: u32, lo: u32, hi: u32) u32 {
+    val m: u32 = c & mask;
+    if (m >= lo && m <= hi) { ret 1; }
+    ret 0;
+}
 
 # where a chunk's extent word keeps its live cells' first row, last column and
 # last row, six bits each above the first column
@@ -50,19 +78,24 @@ pub rec Cells {
     v: [MAX_SLOTS * CELLS]u32;
 }
 
-# the rule, then one page-table entry per slot: the slots of the 3 by 3 block
-# of chunks around it, its chunk coordinates biased by 2^30, and its
-# incarnation, zero while the slot is free
+# the shared words, the rule family's window, then one page-table entry per
+# slot: the slots of the 3 by 3 block of chunks around it, its chunk
+# coordinates biased by 2^30, and its incarnation, zero while the slot is free.
+# the words from live_mask to age_mask are a Sense, in order
 pub rec Meta {
-    radius:     u32;
-    birth_lo:   u32;
-    birth_hi:   u32;
-    survive_lo: u32;
-    survive_hi: u32;
     census:     u32;
     hi:         u32;
     serial:     u32;
-    weights:    [WEIGHTS]u32;
+    live_mask:  u32;
+    live_lo:    u32;
+    live_hi:    u32;
+    warm_mask:  u32;
+    heat_shift: u32;
+    heat_mask:  u32;
+    age_shift:  u32;
+    age_mask:   u32;
+    spare:      [5]u32;
+    rule:       [RULE]u32;
     table:      [MAX_SLOTS * ENTRY]u32;
 }
 
