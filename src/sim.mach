@@ -61,6 +61,8 @@ use cellar.cpu;
 use cellar.gpu;
 use cellar.hashlife;
 use cellar.history;
+use cellar.layout;
+use cellar.render;
 use cellar.rule;
 use ruletable: cellar.rules.table;
 use cellar.rules.table.load;
@@ -707,27 +709,40 @@ fun floor64(v: f64) i64 {
     ret t;
 }
 
-# a drawn cell's word for a square of pop live cells of level shift: the rule's
-# live word at a cell a square, else the share alive in 255ths, never 0
-fun summary(s: *Sim, shift: u32, pop: u64) u32 {
-    if (shift == 0) { ret rule.word(?s.rule, 1); }
+# a drawn cell's word for a square of level shift above a cell, as the pool's
+# coverage summarises its cells: the share of them the rule counts live in
+# 255ths, never 0 when one is, and above it the most heat any carries, which
+# is how a square of dying cells alone shows
+# ---
+# pop:  cells in the square the rule counts live
+# heat: the most heat any of them carries
+fun summary(shift: u32, pop: u64, heat: u32) u32 {
     var v: f64 = pop::f64 * 255.0 / (pow2(shift) * pow2(shift));
-    if (v < 1.0)   { v = 1.0; }
-    if (v > 255.0) { v = 255.0; }
-    ret v::u32;
+    if (pop != 0 && v < 1.0) { v = 1.0; }
+    if (v > 255.0)           { v = 255.0; }
+    ret v::u32 | (heat << layout.SUMMARY_HEAT);
 }
 
-# write a square of the tree into the pool, as the drawn cell at (qx, qy)
-fun show_square(ctx: *u8, qx: i64, qy: i64, pop: u64) {
+# write a square of the tree into the pool, as the drawn cell at (qx, qy): at a
+# cell a square the rule's word for its state, else its summary, added to one
+# already written there
+fun show_square(ctx: *u8, qx: i64, qy: i64, n: u32) {
     val s:  *Sim         = ctx::*Sim;
     val sp: *space.Space = ?s.space;
     val sl: u32          = space.alloc(sp, space.chunk_of(qx), space.chunk_of(qy));
     if (sl == space.NONE) { ret; }
-    val i: usize = sl::usize * space.CELLS + space.local_of(qy) * 64 + space.local_of(qx);
-    var v: u32   = sp.cells[i] + summary(s, s.seen.shift, pop);
-    if (s.seen.shift == 0) { v = summary(s, 0, pop); }
-    or (v > 255)           { v = 255; }
-    sp.cells[i]         = v;
+    val i: usize          = sl::usize * space.CELLS + space.local_of(qy) * 64 + space.local_of(qx);
+    val t: *hashlife.Tree = ?s.tree;
+    if (s.seen.shift == 0) { sp.cells[i] = rule.word(?s.rule, n); }
+    or {
+        val was:  u32 = sp.cells[i];
+        val new:  u32 = summary(s.seen.shift, hashlife.live(t, n), hashlife.heat(t, n));
+        var live: u32 = (was & layout.SUMMARY_LIVE) + (new & layout.SUMMARY_LIVE);
+        var heat: u32 = was >> layout.SUMMARY_HEAT;
+        if (live > layout.SUMMARY_LIVE)          { live = layout.SUMMARY_LIVE; }
+        if ((new >> layout.SUMMARY_HEAT) > heat) { heat = new >> layout.SUMMARY_HEAT; }
+        sp.cells[i] = live | (heat << layout.SUMMARY_HEAT);
+    }
     sp.dirty[sl::usize] = sp.dirty[sl::usize] | space.DIRTY_CELLS;
 }
 
@@ -735,8 +750,11 @@ fun show_square(ctx: *u8, qx: i64, qy: i64, pop: u64) {
 #
 # at a pixel per cell or more a drawn cell is a cell. below, it is the square
 # of the tree 2^shift cells on a side, the shallowest that is at least a pixel,
-# drawn by its population as coverage, so a world of any size costs what the
-# window does. the look is moved into the drawn cells' units, and draws solid.
+# drawn by its summary as the pool's coverage is: its live cells as coverage
+# and its hottest cell for the heat, so a square of dying cells shows as their
+# trail, and a world of any size costs what the window does. the look is moved
+# into the drawn cells' units and keeps its colour mode, but for age, which
+# the tree does not keep and is drawn solid.
 fun show_tree(s: *Sim, look: *gpu.Look) {
     var shift: u32 = 0;
     var ppc:   f32 = look.ppc;
@@ -757,8 +775,8 @@ fun show_tree(s: *Sim, look: *gpu.Look) {
     look.frac_y  = (dy - (by * 64)::f64)::f32;
     look.ppc     = ppc;
     look.shift   = shift;
-    look.mode    = 0;
-    if (shift != 0) { look.gutter = 0; }
+    if (look.mode == render.MODE_AGE::u32) { look.mode = render.MODE_SOLID::u32; }
+    if (shift != 0)                        { look.gutter = 0; }
 
     # the drawn cells in view, a chunk beyond each side
     val hw:  f64 = (look.half_w / ppc)::f64 + 64.0;
@@ -2954,13 +2972,13 @@ test reset__run_reset_run_reproduces_the_generations_on_both_engines {
     ret 0;
 }
 
-# a pool world held against a tree world, cell by cell
+# a world held against another, cell by cell
 # ---
-# tree:  the world on the tree
+# other: the world its chunks are held against
 # wrong: a cell differed
 #[testing]
 rec Against {
-    tree:  *Sim;
+    other: *Sim;
     wrong: bool;
 }
 
@@ -2971,7 +2989,7 @@ fun against_chunk(ctx: *u8, cx: i64, cy: i64, cells: *u8) {
     for (i < space.CELLS && !g.wrong) {
         val x: i64 = cx * space.SIDE + (i % 64)::i64;
         val y: i64 = cy * space.SIDE + (i / 64)::i64;
-        if (hashlife.get(?g.tree.tree, x, y) != cells[i]::u32) {
+        if (rule.state(?g.other.rule, cell(g.other, x, y)) != cells[i]::u32) {
             print.eprintlnf("cells differ at ({}, {})", x, y);
             g.wrong = true;
         }
@@ -2979,18 +2997,21 @@ fun against_chunk(ctx: *u8, cx: i64, cy: i64, cells: *u8) {
     }
 }
 
-# whether a pool world and a tree world hold the same cells: every live chunk
-# of the pool is the tree's, and the populations agree, so the tree holds
-# nothing else
+# whether a pool world and a tree world hold the same cells: every chunk of
+# either that holds a state but 0, a dying one included, is the other's, and
+# the populations and bounds agree
 #[testing]
 pub fun same_as_tree(p: *Sim, t: *Sim) bool {
     if (population(p) != population(t)) {
         print.eprintlnf("populations differ: {} and {}", population(p)::u64, population(t)::u64);
         ret false;
     }
-    var g: Against = Against{tree: t, wrong: false};
+    var g: Against = Against{other: t, wrong: false};
     chunks(p, against_chunk, (?g)::*u8);
     if (g.wrong) { ret false; }
+    var back: Against = Against{other: p, wrong: false};
+    chunks(t, against_chunk, (?back)::*u8);
+    if (back.wrong) { ret false; }
     val pb: opt[space.Box] = bounds(p);
     val tb: opt[space.Box] = bounds(t);
     var a:  space.Box      = space.Box{x0: 0, y0: 0, x1: 0, y1: 0};
@@ -3403,17 +3424,18 @@ test hashlife__a_zoomed_out_view_summarises_squares_of_the_tree {
     paint(?t, -40000, 8, 1);
     var look: gpu.Look = far_look();
     show_tree(?t, ?look);
-    # a drawn cell stands for 8 by 8 cells, at 1.6 pixels, drawn solid without a grid
+    # a drawn cell stands for 8 by 8 cells, at 1.6 pixels, without a grid, and
+    # the age the look asked for, which the tree does not keep, is drawn solid
     if (look.shift != 3 || look.ppc != 1.6 || look.mode != 0 || look.gutter != 0) { ret 3; }
     if (look.base_cx != space.BIAS::u32 || look.frac_x != 0.0)                    { ret 4; }
     # the block is 4 of the 64 cells of the square at the origin, and the far
     # cell out of view
     val sp: *space.Space = ?t.space;
     val sl: u32          = space.find(sp, 0, 0);
-    if (sl == space.NONE || sp.live != 1)                  { ret 5; }
-    if (sp.cells[sl::usize * space.CELLS] != 255 * 4 / 64) { ret 6; }
-    if (sp.cells[sl::usize * space.CELLS + 1] != 0)        { ret 7; }
-    if ((sp.dirty[sl::usize] & space.DIRTY_CELLS) == 0)    { ret 8; }
+    if (sl == space.NONE || sp.live != 1)                                                   { ret 5; }
+    if (sp.cells[sl::usize * space.CELLS] != (255 * 4 / 64 | (255 << layout.SUMMARY_HEAT))) { ret 6; }
+    if (sp.cells[sl::usize * space.CELLS + 1] != 0)                                         { ret 7; }
+    if ((sp.dirty[sl::usize] & space.DIRTY_CELLS) == 0)                                     { ret 8; }
     # an unchanged view is not rebuilt, and a step's is
     sp.dirty[sl::usize] = 0;
     look                = far_look();
