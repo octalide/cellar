@@ -29,9 +29,16 @@ Built-in kernels: Conway's Life (`B3/S23`), HighLife (`B36/S23`), Seeds
 | `S`                    | single step                             |
 | `R`                    | randomize                               |
 | `C`                    | clear                                   |
-| `D`, `E`, `T`          | draw, erase or stamp tool               |
+| `Backspace`            | reset to where play started             |
+| `D`, `E`, `T`, `V`     | draw, erase, stamp or select tool       |
 | `Z`, `X`               | rotate the stamp, flip the stamp        |
-| left mouse             | use the tool                            |
+| left mouse             | use the tool; drag to select            |
+| `Ctrl+C`, `Ctrl+X`     | copy or cut the selection to the stamp  |
+| `Delete`               | clear the selection                     |
+| `Shift+Delete`         | clear outside the selection             |
+| `Ctrl+R`               | fill the selection at random            |
+| `I`                    | invert the selection                    |
+| `B`                    | shrink the selection to its live cells  |
 | right or middle mouse  | drag to pan                             |
 | scroll                 | zoom toward the cursor                  |
 | arrow keys             | pan                                     |
@@ -42,7 +49,7 @@ Built-in kernels: Conway's Life (`B3/S23`), HighLife (`B36/S23`), Seeds
 | `H`, `F1`              | key reference                           |
 | `F11`                  | toggle borderless fullscreen            |
 | `F12`                  | screenshot                              |
-| `Esc`                  | close the key reference, or quit        |
+| `Esc`                  | close the reference, deselect, or quit  |
 
 A readout of the generation, population, rule and speed sits in the top-left
 corner, and the side panel groups every control by task:
@@ -52,7 +59,9 @@ corner, and the side panel groups every control by task:
 - **draw**: the tool, a library of about three hundred classic patterns
   (still lifes, oscillators, spaceships, guns, puffers, methuselahs and growth)
   to browse by category or search by name, a custom pattern drawn in place, and
-  a preview of the selected one. The library's sources are listed in
+  a preview of the selected one, and with the select tool the operations on the
+  selection. copying or cutting a selection makes it the custom pattern and arms
+  the stamp. The library's sources are listed in
   [res/patterns](res/patterns/README.md)
 - **rule**: presets, the rule in B/S notation, radius, a clickable weight grid,
   and birth and survive toggles over the reachable sums
