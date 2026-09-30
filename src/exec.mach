@@ -25,6 +25,7 @@ use cellar.pattern;
 use cellar.persist;
 use cellar.region;
 use cellar.rule;
+use cellar.rules.weighted;
 use cellar.saves;
 use cellar.sim;
 use cellar.snapshot;
@@ -124,6 +125,17 @@ fun load_world(a: *app.App, s: *sim.Sim, d: *Deps, path: str) Change {
 # snapshot the world as the start, saying when it could not be kept
 fun take_start(a: *app.App, s: *sim.Sim) {
     if (!sim.take(s, ?a.start)) { app.say(a, "the starting world could not be kept, so reset has nothing to return to"); }
+}
+
+# apply a rule, flashing why and leaving the rule as it was when it cannot
+# run as it stands, such as a kernel edited wider than a small grid
+fun set_rule(a: *app.App, s: *sim.Sim, r: *rule.Rule) {
+    val why: opt[str] = rule.refusal(r);
+    if (sel why.some) {
+        app.say_why(a, "the rule was not applied", why.some);
+        ret;
+    }
+    sim.set_rule(s, @r);
 }
 
 # return to the start, or stay put when the world as it stands is the start. a
@@ -374,7 +386,7 @@ fun apply(c: *command.Command, a: *app.App, s: *sim.Sim, d: *Deps) {
     if (sel c.paint)      { world.paint(s, c.paint.x, c.paint.y, c.paint.v); }
     if (sel c.line)       { world.line(s, c.line.x0, c.line.y0, c.line.x1, c.line.y1, c.line.v); }
     if (sel c.stamp)      { world.stamp(s, ?c.stamp.p, c.stamp.x, c.stamp.y); }
-    if (sel c.rule)       { sim.set_rule(s, c.rule); }
+    if (sel c.rule)       { set_rule(a, s, ?c.rule); }
     if (sel c.area)       { area(?c.area, a, s, d); }
     if (sel c.reset)      { reset(a, s); }
     if (sel c.save_world) { save_world(a, s, d, command.path(?c.save_world)); }
@@ -854,6 +866,39 @@ test run__identifies_a_selection_off_the_frame_and_a_second_replaces_the_first {
     app.identify_poll(?ap);
     if (worker.running(?ap.identifier))                                          { ret 5; }
     if (!string.str_equals(ap.toast, "selection: a period 2 oscillator, xp2_7")) { ret 6; }
+    app.dnit(?ap);
+    sim.dnit(?s);
+    ret 0;
+}
+
+test run__refuses_a_kernel_widened_past_a_small_torus {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    var ap: app.App;
+    app.init(?ap);
+    val shown: err[format.Error] = app.attach(?ap, ?a);
+    if (sel shown.err) { ret 1; }
+    var d:     Deps;
+    val torus: res[rule.Rule, str] = rule.parse("B3/S23:T3,40");
+    if (sel torus.err) { ret 2; }
+    var small: rule.Rule = torus.ok;
+    app.submit(?ap, command.Command.rule{small});
+    run(?ap, ?s, ?d);
+    if (!rule.same(?s.rule, ?small)) { ret 3; }
+
+    # the kernel editor widens the kernel without parsing, to a radius the
+    # 3 wide torus cannot hold, and the rule stays as it was
+    var wide: rule.Rule = small;
+    if (sel wide.kind.weighted)  { weighted.set_radius(?wide.kind.weighted, 4); }
+    if (rule.radius(?wide) != 4) { ret 4; }
+    app.submit(?ap, command.Command.rule{wide});
+    run(?ap, ?s, ?d);
+    if (!rule.same(?s.rule, ?small))                                   { ret 5; }
+    if (!string.str_starts_with(ap.toast, "the rule was not applied")) { ret 6; }
+    if (sim.set_rule(?s, wide) || !rule.same(?s.rule, ?small))         { ret 7; }
     app.dnit(?ap);
     sim.dnit(?s);
     ret 0;
