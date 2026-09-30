@@ -10,10 +10,15 @@
 # takes it. an edit while running is part of the run and leaves it alone, but
 # clear, randomize, and a load or open of a world begin a new world, so they
 # drop it paused and retake it from the new world running.
+#
+# and it keeps the journal undo and redo walk (cellar.journal, which says what
+# is recorded and how running and redo behave): each recorded command runs
+# inside a step, and undo and redo leave the world paused as the start.
 
 use cellar.app;
 use cellar.command;
 use cellar.format;
+use cellar.journal;
 use cellar.pattern;
 use cellar.persist;
 use cellar.region;
@@ -122,13 +127,27 @@ fun reset(a: *app.App, s: *sim.Sim) {
     if (a.start.held) { sim.restore(s, ?a.start); }
 }
 
+# put a new custom pattern in place, the journal keeping the one it replaces
+fun replace_custom(a: *app.App, p: pattern.Pattern) {
+    journal.keep_custom(?a.log, a.custom);
+    a.custom = p;
+}
+
 # load a file into the custom pattern and select it
 fun load_pattern(a: *app.App, d: *Deps, path: str) {
-    val done: err[persist.Error] = persist.load_pattern(d.a, ?a.custom, path);
+    var p:    pattern.Pattern;
+    val made: err[allo.Error] = pattern.init(?p, a.alloc, 0, 0, pattern.name(?a.custom));
+    if (sel made.err) {
+        app.say(a, "out of memory");
+        ret;
+    }
+    val done: err[persist.Error] = persist.load_pattern(d.a, ?p, path);
     if (sel done.err) {
+        pattern.dnit(?p);
         app.say_why(a, base(path), persist.error_message(done.err));
         ret;
     }
+    replace_custom(a, p);
     a.pattern_sel = app.CUSTOM;
     app.say_why(a, base(path), "loaded as the custom pattern");
 }
@@ -175,8 +194,7 @@ fun take(a: *app.App, s: *sim.Sim, b: space.Box, cut: bool) {
         app.say(a, "the selection could not be copied");
         ret;
     }
-    pattern.dnit(?a.custom);
-    a.custom      = p;
+    replace_custom(a, p);
     a.pattern_sel = app.CUSTOM;
     a.orient      = 0;
     a.tool        = app.TOOL_STAMP;
@@ -214,9 +232,48 @@ fun area(c: *command.Area, a: *app.App, s: *sim.Sim) {
     if (!ok)                                { app.say(a, "the selection could not be changed"); }
 }
 
+# no journal step
+val UNRECORDED: u8 = 255;
+
+# the kind of journal step a command runs in, or UNRECORDED
+fun recorded(c: *command.Command) u8 {
+    if (sel c.toggle || sel c.step) { ret journal.KIND_RUN; }
+    if (sel c.paint || sel c.line)  { ret journal.KIND_STROKE; }
+    if (sel c.area) {
+        if (c.area.op == command.AREA_SHRINK) { ret UNRECORDED; }
+        ret journal.KIND_EDIT;
+    }
+    if (sel c.clear || sel c.randomize || sel c.stamp || sel c.rule || sel c.reset) { ret journal.KIND_EDIT; }
+    if (sel c.load_world || sel c.load_pattern || sel c.open)                       { ret journal.KIND_EDIT; }
+    ret UNRECORDED;
+}
+
+# undo or redo, leaving the world paused as it now stands, which becomes the start
+fun back(a: *app.App, s: *sim.Sim, undo: bool) {
+    var went: journal.Went = journal.Went.none{};
+    if (undo) { went = journal.undo(?a.log, ?a.custom); }
+    or        { went = journal.redo(?a.log, ?a.custom); }
+    if (sel went.none) {
+        if (undo) { app.say(a, "nothing to undo"); }
+        or        { app.say(a, "nothing to redo"); }
+        ret;
+    }
+    if (sel went.lost)           { app.say(a, "the world could not be put back, so the history was cleared"); }
+    or (journal.dropped(?a.log)) { app.say(a, "the history outgrew its limit and was cleared"); }
+    snapshot.drop(?a.start);
+}
+
 # apply one command
 fun apply(c: *command.Command, a: *app.App, s: *sim.Sim, d: *Deps) {
+    if (sel c.undo || sel c.redo) {
+        back(a, s, sel c.undo);
+        ret;
+    }
     val paused: bool = !world.running(s);
+    # while running, everything recorded joins the run
+    val kind: u8 = recorded(c);
+    if (kind != UNRECORDED && !paused)                                             { journal.begin(?a.log, journal.KIND_RUN, true); }
+    or (kind != UNRECORDED)                                                        { journal.begin(?a.log, kind, kind == journal.KIND_RUN || sel c.line); }
     if ((sel c.toggle || sel c.step) && paused && !world.full(s) && !a.start.held) { take_start(a, s); }
     var change: Change = Change.none{};
     if (sel c.paint || sel c.line || sel c.stamp || sel c.rule) { change = Change.edit{}; }
@@ -247,6 +304,9 @@ fun apply(c: *command.Command, a: *app.App, s: *sim.Sim, d: *Deps) {
 
     if (sel change.fresh && !paused)                     { take_start(a, s); }
     or (sel change.fresh || (sel change.edit && paused)) { snapshot.drop(?a.start); }
+
+    if (kind != UNRECORDED)      { journal.end(?a.log); }
+    if (journal.dropped(?a.log)) { app.say(a, "that change is too large to undo, so the history was cleared"); }
 }
 
 # apply every waiting command in order and empty the queue
@@ -255,6 +315,7 @@ fun apply(c: *command.Command, a: *app.App, s: *sim.Sim, d: *Deps) {
 # s: the simulation, locked by the caller and not yet recorded into
 # d: what the commands need
 pub fun run(a: *app.App, s: *sim.Sim, d: *Deps) {
+    journal.bind(?a.log, s);
     var i: usize = 0;
     for (i < a.queue.items.len) {
         apply(?a.queue.items.data[i], a, s, d);
@@ -482,6 +543,58 @@ test run__reset_returns_to_where_play_started_and_a_paused_edit_moves_it {
     if (world.generation(?s) != 1)                                                { ret 6; }
     if (!sim.alive(?s, 0, -1) || !sim.alive(?s, 10, 10) || sim.alive(?s, 20, 20)) { ret 7; }
     if (sim.population(?s) != 4)                                                  { ret 8; }
+
+    app.dnit(?ap);
+    sim.dnit(?s);
+    ret 0;
+}
+
+test run__undo_and_redo_walk_the_changes_across_a_rule_change_and_a_new_change_clears_redo {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    var ap: app.App;
+    app.init(?ap);
+    val shown: err[format.Error] = app.attach(?ap, ?a);
+    if (sel shown.err) { ret 1; }
+    var d:    Deps;
+    var life: rule.Rule = rule.preset_rule(0);
+    var high: rule.Rule = rule.preset_rule(1);
+
+    # a stroke, a rule change and a second stroke are three steps
+    app.submit(?ap, command.Command.paint{command.Paint{x: 1, y: 1, v: 1}});
+    app.submit(?ap, command.Command.line{command.Line{x0: 1, y0: 1, x1: 4, y1: 1, v: 1}});
+    app.submit(?ap, command.Command.rule{high});
+    app.submit(?ap, command.Command.paint{command.Paint{x: 200, y: 200, v: 1}});
+    app.submit(?ap, command.Command.undo{});
+    run(?ap, ?s, ?d);
+    if (sim.alive(?s, 200, 200) || !sim.alive(?s, 4, 1) || !rule.same(?s.rule, ?high)) { ret 2; }
+    app.submit(?ap, command.Command.undo{});
+    run(?ap, ?s, ?d);
+    if (!rule.same(?s.rule, ?life) || sim.population(?s) != 4) { ret 3; }
+    app.submit(?ap, command.Command.undo{});
+    app.submit(?ap, command.Command.undo{});
+    run(?ap, ?s, ?d);
+    if (sim.population(?s) != 0 || !string.str_equals(ap.toast, "nothing to undo")) { ret 4; }
+
+    app.submit(?ap, command.Command.redo{});
+    app.submit(?ap, command.Command.redo{});
+    run(?ap, ?s, ?d);
+    if (!rule.same(?s.rule, ?high) || sim.population(?s) != 4) { ret 5; }
+    app.submit(?ap, command.Command.redo{});
+    run(?ap, ?s, ?d);
+    if (!sim.alive(?s, 200, 200) || journal.redoable(?ap.log) != 0) { ret 6; }
+
+    # undo back over the rule change, and a new change drops what could be redone
+    app.submit(?ap, command.Command.undo{});
+    app.submit(?ap, command.Command.undo{});
+    app.submit(?ap, command.Command.paint{command.Paint{x: -50, y: 9, v: 1}});
+    app.submit(?ap, command.Command.redo{});
+    run(?ap, ?s, ?d);
+    if (!rule.same(?s.rule, ?life) || !sim.alive(?s, -50, 9) || sim.alive(?s, 200, 200)) { ret 7; }
+    if (!string.str_equals(ap.toast, "nothing to redo"))                                 { ret 8; }
 
     app.dnit(?ap);
     sim.dnit(?s);
