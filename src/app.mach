@@ -5,9 +5,12 @@
 
 use cellar.command;
 use cellar.format;
+use cellar.identify;
+use cellar.identify.worker;
 use cellar.library;
 use cellar.pattern;
 use cellar.render;
+use cellar.rule;
 use cellar.ruletext;
 use cellar.saves;
 use cellar.snapshot;
@@ -118,6 +121,8 @@ pub val ZOOM_MAX: f32 = 16.0;
 # start:       the world reset returns to, once attach has run
 # clip:        text the frame is to put on the clipboard, once attach has run
 # clip_ready:  clip holds text not yet put on the clipboard
+# identifier:  classifies a selection off the frame
+# id_limits:   the limits a selection is classified under
 pub rec App {
     speed:       f32;
     mode:        usize;
@@ -172,7 +177,12 @@ pub rec App {
     start:       snapshot.Snapshot;
     clip:        Vector[u8];
     clip_ready:  bool;
+    identifier:  worker.Worker;
+    id_limits:   identify.Limits;
 }
+
+# the message shown while a selection is being identified
+pub val IDENTIFYING: str = "identifying...";
 
 # the randomize area's side length (cells) for a bounds-table index
 # ---
@@ -316,6 +326,7 @@ pub fun dnit(a: *App) {
     saves.dnit(?a.saves);
     snapshot.dnit(?a.start);
     vector.dnit[u8](?a.clip);
+    worker.cancel(?a.identifier);
 }
 
 # choose a library pattern to stamp and browse its category, or the custom pattern
@@ -498,6 +509,41 @@ pub fun init(a: *App) {
     a.selected = false;
     a.dragging = false;
     a.alloc    = nil;
+    worker.init(?a.identifier);
+    a.id_limits = identify.limits();
+}
+
+# classify a pattern off the frame under a rule, replacing a classification
+# still running, and say so while it runs
+# ---
+# a: application state
+# r: the rule
+# p: the pattern, which the worker copies, so the caller keeps it
+pub fun identify_start(a: *App, r: rule.Rule, p: *pattern.Pattern) {
+    if (!worker.start(?a.identifier, r, p, a.id_limits)) {
+        say(a, "the selection could not be identified: out of memory or threads");
+        ret;
+    }
+    say(a, IDENTIFYING);
+}
+
+# flash a finished classification, keeping the running message up until then;
+# the frame calls this once a frame
+pub fun identify_poll(a: *App) {
+    val c: worker.Collected = worker.collect(?a.identifier);
+    if (sel c.idle) {
+        if (worker.running(?a.identifier) && a.toast == IDENTIFYING) { a.toast_t = TOAST_TICKS; }
+        ret;
+    }
+    if (sel c.failed) {
+        say(a, "out of memory");
+        ret;
+    }
+    if (sel c.ready) {
+        var r:    identify.Result = c.ready;
+        var line: [641]u8;
+        say_why(a, "selection", identify.describe(?r, ?line[0]));
+    }
 }
 
 test zoom_min__keeps_a_pixel_within_a_chunks_neighbours {

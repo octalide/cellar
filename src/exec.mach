@@ -15,6 +15,7 @@ use cellar.app;
 use cellar.command;
 use cellar.format;
 use cellar.formats;
+use cellar.identify.worker;
 use cellar.pattern;
 use cellar.persist;
 use cellar.region;
@@ -27,7 +28,8 @@ use cellar.world;
 use allo: std.allocator;
 use std.allocator.page;
 use std.collections.vector;
-use fs:    std.filesystem;
+use fs: std.filesystem;
+use std.sync.atomic;
 use stext: std.text.string;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -264,6 +266,22 @@ fun shrink(a: *app.App, s: *sim.Sim, b: space.Box) {
     a.area     = got.some;
 }
 
+# start classifying the selection's pattern under the world's rule, off the frame
+fun identify_area(a: *app.App, s: *sim.Sim, b: space.Box) {
+    var p:    pattern.Pattern;
+    val made: err[allo.Error] = pattern.init(?p, a.alloc, 0, 0, "selection");
+    if (sel made.err) {
+        app.say(a, "out of memory");
+        ret;
+    }
+    fin { pattern.dnit(?p); }
+    if (!region.copy(s, b, ?p)) {
+        app.say(a, "the selection could not be read");
+        ret;
+    }
+    app.identify_start(a, s.rule, ?p);
+}
+
 # apply an operation on a rectangle
 fun area(c: *command.Area, a: *app.App, s: *sim.Sim, d: *Deps) {
     val b:  space.Box = c.box;
@@ -275,6 +293,7 @@ fun area(c: *command.Area, a: *app.App, s: *sim.Sim, d: *Deps) {
     if (c.op == command.AREA_FILL)          { ok = region.fill(s, b, sim.DEFAULT_DENSITY); }
     if (c.op == command.AREA_INVERT)        { ok = region.invert(s, b); }
     if (c.op == command.AREA_SHRINK)        { shrink(a, s, b); }
+    if (c.op == command.AREA_IDENTIFY)      { identify_area(a, s, b); }
     if (!ok)                                { app.say(a, "the selection could not be changed"); }
 }
 
@@ -285,9 +304,10 @@ fun apply(c: *command.Command, a: *app.App, s: *sim.Sim, d: *Deps) {
     var change: Change = Change.none{};
     if (sel c.paint || sel c.line || sel c.stamp || sel c.rule) { change = Change.edit{}; }
     if (sel c.clear || sel c.randomize)                         { change = Change.fresh{}; }
-    # copy and shrink only read the world
+    # copy, shrink and identify only read the world
     if (sel c.area) {
-        if (c.area.op != command.AREA_COPY && c.area.op != command.AREA_SHRINK) { change = Change.edit{}; }
+        val op: u8 = c.area.op;
+        if (op != command.AREA_COPY && op != command.AREA_SHRINK && op != command.AREA_IDENTIFY) { change = Change.edit{}; }
     }
 
     if (sel c.toggle)     { world.toggle(s); }
@@ -626,6 +646,51 @@ test run__reset_returns_to_where_play_started_and_a_paused_edit_moves_it {
     if (!sim.alive(?s, 0, -1) || !sim.alive(?s, 10, 10) || sim.alive(?s, 20, 20)) { ret 7; }
     if (sim.population(?s) != 4)                                                  { ret 8; }
 
+    app.dnit(?ap);
+    sim.dnit(?s);
+    ret 0;
+}
+
+test run__identifies_a_selection_off_the_frame_and_a_second_replaces_the_first {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    var ap: app.App;
+    app.init(?ap);
+    val shown: err[format.Error] = app.attach(?ap, ?a);
+    if (sel shown.err) { ret 1; }
+    var d: Deps = Deps{a: ?a};
+
+    # an R-pentomino, under limits so wide it runs for a long while, and a blinker
+    world.paint(?s, 1, 0, 1);
+    world.paint(?s, 2, 0, 1);
+    world.paint(?s, 0, 1, 1);
+    world.paint(?s, 1, 1, 1);
+    world.paint(?s, 1, 2, 1);
+    world.paint(?s, 40, 40, 1);
+    world.paint(?s, 41, 40, 1);
+    world.paint(?s, 42, 40, 1);
+    ap.id_limits.gens = 100000;
+    ap.id_limits.side = 2048;
+    app.select(?ap, 0, 0, 2, 2);
+    app.area(?ap, command.AREA_IDENTIFY);
+    run(?ap, ?s, ?d);
+    # run returned with the classification still going, and only read the world
+    if (!worker.running(?ap.identifier) || atomic.load(?ap.identifier.done) != 0) { ret 2; }
+    if (ap.toast != app.IDENTIFYING || sim.population(?s) != 8)                   { ret 3; }
+    app.identify_poll(?ap);
+    if (ap.toast != app.IDENTIFYING) { ret 4; }
+
+    # a second Identify cancels the first and its result is the one flashed
+    app.select(?ap, 40, 40, 42, 40);
+    app.area(?ap, command.AREA_IDENTIFY);
+    run(?ap, ?s, ?d);
+    worker.wait(?ap.identifier);
+    app.identify_poll(?ap);
+    if (worker.running(?ap.identifier))                                          { ret 5; }
+    if (!string.str_equals(ap.toast, "selection: a period 2 oscillator, xp2_7")) { ret 6; }
     app.dnit(?ap);
     sim.dnit(?s);
     ret 0;
