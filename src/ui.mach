@@ -1,73 +1,411 @@
-# cellar.ui: control-event globals posted by GLFW callbacks, plus small text
-# helpers shared by the control windows.
+# a small immediate-mode interface drawn straight into a boom overlay pass
 #
-# the keyboard and scroll callbacks are plain functions, so they communicate with
-# the frame loop through module-level globals it drains each frame.
+# rectangles, triangles and text go into the pass in call order, and the pass
+# keeps that order, so whatever is drawn later is on top and nothing needs a
+# layer of its own. widgets are placed down a column cursor and report their
+# interaction as they are drawn. a press is owned by the widget it began on
+# until the button comes up, so a drag that leaves a slider keeps moving it.
+# every size is multiplied by the interface scale.
 
+use gfx: boom.graphics;
+use gm:  boom.math;
+use cellar.theme;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
 use std.types.size.usize;
 use std.types.string.str;
 
-# control events, set by callbacks and drained once per frame.
-# g_quit:       request to close the window
-pub var g_quit:       u8 = 0;
-# g_toggle:     request to play/pause
-pub var g_toggle:     u8 = 0;
-# g_step:       request a single step
-pub var g_step:       u8 = 0;
-# g_clear:      request to clear the grid
-pub var g_clear:      u8 = 0;
-# g_random:     request to randomize the grid
-pub var g_random:     u8 = 0;
-# g_tab:        request to toggle UI visibility
-pub var g_tab:        u8 = 0;
-# g_fullscreen: request to toggle borderless fullscreen
-pub var g_fullscreen: u8 = 0;
-# g_mode:       request to cycle the color mode
-pub var g_mode:       u8 = 0;
-# g_scroll:     accumulated vertical scroll, consumed as a zoom delta
-pub var g_scroll:     f32 = 0.0;
+# unscaled row height, gap between rows and panel padding
+pub val ROW: f32 = 28.0;
+pub val GAP: f32 = 6.0;
+pub val PAD: f32 = 14.0;
 
-# buf_str: copy a NUL-terminated string into buf at off; ret the new offset.
+# the interface for one frame and what carries between frames
 # ---
-# buf: destination buffer
-# off: write offset
-# s:   NUL-terminated source string
-# ret: offset just past the copied bytes
-pub fun buf_str(buf: *u8, off: usize, s: str) usize {
-    var i: usize = 0;
-    var o: usize = off;
-    for (s[i] != 0) {
-        buf[o] = s[i];
-        o = o + 1;
-        i = i + 1;
-    }
-    ret o;
+# pass:     the overlay pass being drawn into
+# body:     the text face for labels
+# small:    the text face for headings and readouts
+# srgb:     the swapchain encodes sRGB, so colours are written as linear light
+# s:        interface scale
+# mx:       cursor x in framebuffer pixels
+# my:       cursor y in framebuffer pixels
+# down:     the left button is held
+# pressed:  the left button went down this frame
+# released: the left button came up this frame
+# active:   the widget a held press belongs to, 0 for none
+# next:     the id the next widget takes
+# over:     the cursor is over something the interface drew this frame
+# x:        the column's left edge
+# y:        the column's cursor, the top of the next row
+# w:        the column's width
+pub rec Ui {
+    pass:     *gfx.Pass;
+    body:     *gfx.Font;
+    small:    *gfx.Font;
+    srgb:     bool;
+    s:        f32;
+    mx:       f32;
+    my:       f32;
+    down:     bool;
+    pressed:  bool;
+    released: bool;
+    active:   u32;
+    next:     u32;
+    over:     bool;
+    x:        f32;
+    y:        f32;
+    w:        f32;
 }
 
-# buf_u64: write a decimal integer into buf at off; ret the new offset.
+# what a widget's rectangle is doing this frame
 # ---
-# buf: destination buffer
-# off: write offset
-# v:   value to format
-# ret: offset just past the digits
-pub fun buf_u64(buf: *u8, off: usize, v: u64) usize {
-    if (v == 0) {
-        buf[off] = '0';
-        ret off + 1;
+# hot:     the cursor is over it and no other widget holds the press
+# held:    a press that began on it is still down
+# clicked: a press that began on it was released over it
+pub rec Hit {
+    hot:     bool;
+    held:    bool;
+    clicked: bool;
+}
+
+# one vertex in boom's immediate-mode format
+rec Vertex {
+    x: f32;
+    y: f32;
+    u: f32;
+    v: f32;
+    r: f32;
+    g: f32;
+    b: f32;
+    a: f32;
+}
+
+# start a frame
+# ---
+# u:    the interface
+# pass: the overlay pass everything is drawn into
+# mx:   cursor x in framebuffer pixels
+# my:   cursor y in framebuffer pixels
+# down: the left button is held
+pub fun begin(u: *Ui, pass: *gfx.Pass, mx: f32, my: f32, down: bool) {
+    u.pass     = pass;
+    u.mx       = mx;
+    u.my       = my;
+    u.pressed  = down && !u.down;
+    u.released = !down && u.down;
+    u.down     = down;
+    u.next     = 1;
+    u.over     = false;
+}
+
+# finish a frame, letting go of a press once the button is up
+pub fun end(u: *Ui) {
+    if (!u.down) { u.active = 0; }
+}
+
+# a scaled length
+pub fun px(u: *Ui, v: f32) f32 {
+    ret v * u.s;
+}
+
+# a hex colour at an opacity, in the swapchain's encoding
+pub fun col(u: *Ui, hex: u32, alpha: f32) gm.Vec4 {
+    ret gm.vec4(channel(u, theme.red(hex)), channel(u, theme.green(hex)), channel(u, theme.blue(hex)), alpha);
+}
+
+# fill a rectangle given by its corners
+pub fun rect(u: *Ui, x0: f32, y0: f32, x1: f32, y1: f32, hex: u32, alpha: f32) {
+    if (x1 <= x0 || y1 <= y0) { ret; }
+    gfx.pass_draw_sprite(u.pass, opt[*gfx.Texture].none{}, gfx.rect(x0, y0, x1 - x0, y1 - y0), col(u, hex, alpha));
+}
+
+# outline a rectangle with a border t pixels thick, inside its corners
+pub fun frame(u: *Ui, x0: f32, y0: f32, x1: f32, y1: f32, t: f32, hex: u32, alpha: f32) {
+    rect(u, x0, y0, x1, y0 + t, hex, alpha);
+    rect(u, x0, y1 - t, x1, y1, hex, alpha);
+    rect(u, x0, y0 + t, x0 + t, y1 - t, hex, alpha);
+    rect(u, x1 - t, y0 + t, x1, y1 - t, hex, alpha);
+}
+
+# a channel of a hex colour in the swapchain's encoding
+fun channel(u: *Ui, byte: u8) f32 {
+    val c: f32 = byte::f32 / 255.0;
+    if (u.srgb) { ret theme.linear(c); }
+    ret c;
+}
+
+# fill a triangle, whichever way its corners wind
+pub fun tri(u: *Ui, ax: f32, ay: f32, bx: f32, by: f32, cx: f32, cy: f32, hex: u32, alpha: f32) {
+    val r: f32 = channel(u, theme.red(hex));
+    val g: f32 = channel(u, theme.green(hex));
+    val b: f32 = channel(u, theme.blue(hex));
+    var v: [6]Vertex;
+    v[0] = Vertex{x: ax, y: ay, u: 0.0, v: 0.0, r: r, g: g, b: b, a: alpha};
+    v[1] = Vertex{x: bx, y: by, u: 0.0, v: 0.0, r: r, g: g, b: b, a: alpha};
+    v[2] = Vertex{x: cx, y: cy, u: 0.0, v: 0.0, r: r, g: g, b: b, a: alpha};
+    v[3] = v[0];
+    v[4] = v[2];
+    v[5] = v[1];
+    gfx.pass_draw_triangles(u.pass, (?v[0])::ptr, 6, opt[*gfx.Texture].none{});
+}
+
+# the height of a line of text in a face
+pub fun line(f: *gfx.Font) f32 {
+    ret gfx.face_line_height(gfx.font_face(f));
+}
+
+# the width a string takes in a face
+pub fun measure(f: *gfx.Font, s: str) f32 {
+    ret gfx.text_measure(f, s);
+}
+
+# draw a string with its line box's top-left at (x, y); ret the pen after it
+pub fun text(u: *Ui, f: *gfx.Font, s: str, x: f32, y: f32, hex: u32, alpha: f32) f32 {
+    ret gfx.text_draw(u.pass, f, s, x, y, col(u, hex, alpha));
+}
+
+# draw a string vertically centred in a band from y0 to y1
+pub fun text_mid(u: *Ui, f: *gfx.Font, s: str, x: f32, y0: f32, y1: f32, hex: u32, alpha: f32) f32 {
+    ret text(u, f, s, x, y0 + (y1 - y0 - line(f)) / 2.0, hex, alpha);
+}
+
+# draw a string centred in a rectangle
+pub fun text_centre(u: *Ui, f: *gfx.Font, s: str, x0: f32, y0: f32, x1: f32, y1: f32, hex: u32, alpha: f32) {
+    text_mid(u, f, s, x0 + (x1 - x0 - measure(f, s)) / 2.0, y0, y1, hex, alpha);
+}
+
+# whether the cursor is inside a rectangle
+pub fun inside(u: *Ui, x0: f32, y0: f32, x1: f32, y1: f32) bool {
+    ret u.mx >= x0 && u.mx < x1 && u.my >= y0 && u.my < y1;
+}
+
+# claim a rectangle for the interface, so the world under it is left alone
+pub fun block(u: *Ui, x0: f32, y0: f32, x1: f32, y1: f32) {
+    if (inside(u, x0, y0, x1, y1)) { u.over = true; }
+}
+
+# take the id for the next widget
+pub fun id(u: *Ui) u32 {
+    val n: u32 = u.next;
+    u.next = u.next + 1;
+    ret n;
+}
+
+# interact with a rectangle as widget n
+pub fun hit(u: *Ui, n: u32, x0: f32, y0: f32, x1: f32, y1: f32) Hit {
+    var h:    Hit;
+    val over: bool = inside(u, x0, y0, x1, y1);
+    h.hot = over && (u.active == 0 || u.active == n);
+    if (h.hot && u.pressed) { u.active = n; }
+    h.held    = u.active == n && u.down;
+    h.clicked = u.active == n && u.released && over;
+    ret h;
+}
+
+# interact with a rectangle as the next widget
+pub fun region(u: *Ui, x0: f32, y0: f32, x1: f32, y1: f32) Hit {
+    ret hit(u, id(u), x0, y0, x1, y1);
+}
+
+# the fill a control takes for its state
+pub fun fill(h: Hit, on: bool) u32 {
+    if (on)     { ret theme.ACCENT; }
+    if (h.held) { ret theme.CONTROL_ON; }
+    if (h.hot)  { ret theme.CONTROL_HOT; }
+    ret theme.CONTROL;
+}
+
+# the ink for text on a control
+pub fun ink(on: bool) u32 {
+    if (on) { ret theme.ACCENT_INK; }
+    ret theme.TEXT;
+}
+
+# a labelled button in a rectangle; on draws it selected
+pub fun button_at(u: *Ui, label: str, x0: f32, y0: f32, x1: f32, y1: f32, on: bool) bool {
+    val h: Hit = region(u, x0, y0, x1, y1);
+    rect(u, x0, y0, x1, y1, fill(h, on), 1.0);
+    text_centre(u, u.body, label, x0, y0, x1, y1, ink(on), 1.0);
+    ret h.clicked;
+}
+
+# start a column of rows at (x, y), w wide
+pub fun column(u: *Ui, x: f32, y: f32, w: f32) {
+    u.x = x;
+    u.y = y;
+    u.w = w;
+}
+
+# leave vertical space in the column
+pub fun space(u: *Ui, v: f32) {
+    u.y = u.y + px(u, v);
+}
+
+# the left edge of cell i of n equal cells across the column
+pub fun cell_x0(u: *Ui, i: usize, n: usize) f32 {
+    val g: f32 = px(u, GAP);
+    val w: f32 = (u.w - g * (n - 1)::f32) / n::f32;
+    ret u.x + i::f32 * (w + g);
+}
+
+# the right edge of cell i of n equal cells across the column
+pub fun cell_x1(u: *Ui, i: usize, n: usize) f32 {
+    val g: f32 = px(u, GAP);
+    val w: f32 = (u.w - g * (n - 1)::f32) / n::f32;
+    ret u.x + i::f32 * (w + g) + w;
+}
+
+# move the cursor past a row of height h and the gap below it
+pub fun advance(u: *Ui, h: f32) {
+    u.y = u.y + h + px(u, GAP);
+}
+
+# a row of n buttons; ret the index clicked, or n for none
+pub fun buttons(u: *Ui, labels: *str, n: usize) usize {
+    val h:   f32   = px(u, ROW);
+    var got: usize = n;
+    var i:   usize = 0;
+    for (i < n) {
+        if (button_at(u, labels[i], cell_x0(u, i, n), u.y, cell_x1(u, i, n), u.y + h, false)) { got = i; }
+        i = i + 1;
     }
-    var tmp: [20]u8;
-    var n: usize = 0;
-    var x: u64 = v;
-    for (x > 0) {
-        tmp[n] = ('0' + (x % 10)::u8);
-        x = x / 10;
-        n = n + 1;
+    advance(u, h);
+    ret got;
+}
+
+# one full-width button
+pub fun button(u: *Ui, label: str, on: bool) bool {
+    val h:  f32  = px(u, ROW);
+    val hi: bool = button_at(u, label, u.x, u.y, u.x + u.w, u.y + h, on);
+    advance(u, h);
+    ret hi;
+}
+
+# a row choosing one of n options; ret true when the choice changed
+pub fun segmented(u: *Ui, labels: *str, n: usize, choice: *usize) bool {
+    val h:       f32   = px(u, ROW);
+    var changed: bool  = false;
+    var i:       usize = 0;
+    for (i < n) {
+        if (button_at(u, labels[i], cell_x0(u, i, n), u.y, cell_x1(u, i, n), u.y + h, @choice == i)) {
+            if (@choice != i) { changed = true; }
+            @choice = i;
+        }
+        i = i + 1;
     }
-    var o: usize = off;
-    for (n > 0) {
-        n = n - 1;
-        buf[o] = tmp[n];
-        o = o + 1;
+    advance(u, h);
+    ret changed;
+}
+
+# a labelled on/off switch; ret true when flipped
+pub fun toggle(u: *Ui, label: str, v: *u8) bool {
+    val h:  f32 = px(u, ROW);
+    val y0: f32 = u.y;
+    val y1: f32 = u.y + h;
+    val hh: Hit = region(u, u.x, y0, u.x + u.w, y1);
+    if (hh.hot) { rect(u, u.x - px(u, 6.0), y0, u.x + u.w + px(u, 6.0), y1, theme.CONTROL, 0.5); }
+    text_mid(u, u.body, label, u.x, y0, y1, theme.TEXT, 1.0);
+
+    val sw:    f32 = px(u, 34.0);
+    val sh:    f32 = px(u, 18.0);
+    val sx:    f32 = u.x + u.w - sw;
+    val sy:    f32 = y0 + (h - sh) / 2.0;
+    var track: u32 = theme.CONTROL_ON;
+    if (@v != 0) { track = theme.ACCENT; }
+    rect(u, sx, sy, sx + sw, sy + sh, track, 1.0);
+    val k:  f32 = sh - px(u, 6.0);
+    var kx: f32 = sx + px(u, 3.0);
+    if (@v != 0) { kx = sx + sw - px(u, 3.0) - k; }
+    var knob: u32 = theme.TEXT_DIM;
+    if (@v != 0) { knob = theme.ACCENT_INK; }
+    rect(u, kx, sy + px(u, 3.0), kx + k, sy + px(u, 3.0) + k, knob, 1.0);
+
+    advance(u, h);
+    if (hh.clicked) {
+        @v = 1 - @v;
+        ret true;
     }
-    ret o;
+    ret false;
+}
+
+# a dragged value between lo and hi, its label left and its reading right
+pub fun slider(u: *Ui, label: str, reading: str, v: *f32, lo: f32, hi: f32) bool {
+    val h:       f32  = px(u, ROW);
+    val x0:      f32  = u.x;
+    val x1:      f32  = u.x + u.w;
+    val y0:      f32  = u.y;
+    val y1:      f32  = u.y + h;
+    val hh:      Hit  = region(u, x0, y0, x1, y1);
+    var changed: bool = false;
+    if (hh.held) {
+        var t: f32 = (u.mx - x0) / (x1 - x0);
+        if (t < 0.0) { t = 0.0; }
+        if (t > 1.0) { t = 1.0; }
+        val nv: f32 = lo + t * (hi - lo);
+        if (nv != @v) { changed = true; }
+        @v = nv;
+    }
+    var f: f32 = (@v - lo) / (hi - lo);
+    if (f < 0.0) { f = 0.0; }
+    if (f > 1.0) { f = 1.0; }
+    rect(u, x0, y0, x1, y1, fill(hh, false), 1.0);
+    rect(u, x0, y0, x0 + (x1 - x0) * f, y1, theme.ACCENT, 0.28);
+    rect(u, x0 + (x1 - x0) * f - px(u, 2.0), y0, x0 + (x1 - x0) * f, y1, theme.ACCENT, 1.0);
+    text_mid(u, u.body, label, x0 + px(u, 10.0), y0, y1, theme.TEXT, 1.0);
+    text_mid(u, u.body, reading, x1 - px(u, 10.0) - measure(u.body, reading), y0, y1, theme.TEXT_DIM, 1.0);
+    advance(u, h);
+    ret changed;
+}
+
+# a line of small dim text
+pub fun note(u: *Ui, s: str) {
+    text(u, u.small, s, u.x, u.y, theme.TEXT_DIM, 1.0);
+    u.y = u.y + line(u.small) + px(u, 2.0);
+}
+
+# a small caret pointing right, or down when open
+pub fun caret(u: *Ui, x: f32, y: f32, open: bool, hex: u32) {
+    val k: f32 = px(u, 4.0);
+    if (open) { tri(u, x - k, y - k / 2.0, x + k, y - k / 2.0, x, y + k, hex, 1.0); }
+    or        { tri(u, x - k / 2.0, y - k, x - k / 2.0, y + k, x + k, y, hex, 1.0); }
+}
+
+# a collapsible section heading across the column; ret whether it is open
+pub fun heading(u: *Ui, title: str, open: *u8) bool {
+    val h:  f32 = px(u, 30.0);
+    val y0: f32 = u.y;
+    val y1: f32 = u.y + h;
+    val hh: Hit = region(u, u.x - px(u, PAD), y0, u.x + u.w + px(u, PAD), y1);
+    if (hh.clicked) { @open = 1 - @open; }
+    var ink: u32 = theme.TEXT_DIM;
+    if (hh.hot) { ink = theme.TEXT; }
+    caret(u, u.x + px(u, 4.0), y0 + h / 2.0, @open != 0, ink);
+    text_mid(u, u.small, title, u.x + px(u, 16.0), y0, y1, ink, 1.0);
+    u.y = y1 + px(u, 4.0);
+    ret @open != 0;
+}
+
+test hit__a_press_belongs_to_its_widget_until_release {
+    var u: Ui;
+    u.mx      = 5.0;
+    u.my      = 5.0;
+    u.pressed = true;
+    u.down    = true;
+    val a: Hit = hit(?u, 1, 0.0, 0.0, 10.0, 10.0);
+    if (!a.held || u.active != 1) { ret 1; }
+    # dragged off the widget, it keeps the press and another cannot take it
+    u.mx      = 50.0;
+    u.pressed = false;
+    val b: Hit = hit(?u, 2, 40.0, 0.0, 60.0, 10.0);
+    if (b.hot || b.held) { ret 2; }
+    val c: Hit = hit(?u, 1, 0.0, 0.0, 10.0, 10.0);
+    if (!c.held) { ret 3; }
+    # released away from it, it is not clicked
+    u.down     = false;
+    u.released = true;
+    val d: Hit = hit(?u, 1, 0.0, 0.0, 10.0, 10.0);
+    if (d.clicked) { ret 4; }
+    ret 0;
 }

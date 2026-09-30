@@ -1,0 +1,180 @@
+# one generation of every allocated chunk in the pool
+#
+# an invocation is a run of 8 cells in a row, and 8 workgroups of 64 cover a
+# chunk; workgroup y names the chunk's slot. the neighbourhood is read straight from
+# the source pool through the chunk's page-table entry, which names the slot of
+# each of its eight neighbours, so a chunk that does not exist reads as dead.
+# a cell is age << 8 | heat, alive while its age is nonzero.
+#
+# each step stamps, per slot, the step's serial into an alive and a warm word
+# when the chunk's result holds a live or a warm cell; every invocation that
+# finds one writes the same value, so no atomics are needed. the next step
+# reads the stamps of the source: a chunk with no live cell in its 3 by 3 block
+# only cools, and one that is also cold, and was cold the step before, already
+# holds zeros in both pools and is skipped.
+
+rec Cells {
+    v: [134217728]u32;
+}
+
+# the rule, then one page-table entry per slot: the slots of the 3 by 3 block
+# of chunks around it, its chunk coordinates biased by 2^30, and its
+# incarnation, zero while the slot is free
+rec Meta {
+    radius:     u32;
+    birth_lo:   u32;
+    birth_hi:   u32;
+    survive_lo: u32;
+    survive_hi: u32;
+    census:     u32;
+    hi:         u32;
+    serial:     u32;
+    weights:    [88]u32;
+    table:      [393216]u32;
+}
+
+# per slot: the serial of the last step that left a live cell, and a warm one
+rec Flags {
+    v: [65536]u32;
+}
+
+#[storage(1, 0, "readonly")]
+var src:   Cells;
+#[storage(1, 1)]
+var dst:   Cells;
+#[storage(1, 2, "readonly")]
+var meta:  Meta;
+#[storage(1, 3)]
+var flags: Flags;
+
+#[builtin("global_invocation")]
+var gid: u32x3;
+
+fun cool(v: u32) u32 {
+    val heat: u32 = v & 255;
+    if (heat > 12) { ret heat - 12; }
+    ret 0;
+}
+
+#[stage("compute")]
+#[workgroup(64, 1, 1)]
+fun comp_main() {
+    val slot: u32 = gid[1];
+    val ly:   i32 = (gid[0] / 8)::i32;
+    val x0:   u32 = (gid[0] % 8) * 8;
+    val base: u32 = slot * 12;
+    val row:  u32 = slot * 4096 + (ly * 64)::u32;
+    if (meta.table[base + 11] == 0) { ret; }
+
+    # the serial that produced the source. a stamp this step already wrote
+    # may have replaced it, so a stamp of either serial counts as set then; a
+    # chunk that is live or warm at the source carries one of the two
+    val last: u32 = meta.serial - 1;
+    val now:  u32 = meta.serial;
+    # a rule that births from nothing (B0) touches every cell regardless
+    var busy: u32 = meta.birth_lo & 1;
+    var k:    u32 = 0;
+    for (k < 9) {
+        val n: u32 = meta.table[base + k];
+        if (n != 0xffffffff) {
+            val f: u32 = flags.v[n * 2];
+            if (f == last || f == now) { busy = 1; }
+        }
+        k = k + 1;
+    }
+    var x: u32 = x0;
+    if (busy == 0) {
+        val warm: u32 = flags.v[slot * 2 + 1];
+        if (warm != last && warm != now) {
+            # cold at the source; if it was cold a step earlier too, the
+            # destination already holds zeros
+            if (warm != last - 1) { ret; }
+            for (x < x0 + 8) {
+                dst.v[row + x] = 0;
+                x              = x + 1;
+            }
+            ret;
+        }
+        var any: u32 = 0;
+        for (x < x0 + 8) {
+            val c: u32 = cool(src.v[row + x]);
+            dst.v[row + x] = c;
+            any            = any | c;
+            x              = x + 1;
+        }
+        if (any != 0) { flags.v[slot * 2 + 1] = now; }
+        ret;
+    }
+
+    val r:     i32 = meta.radius::i32;
+    val width: i32 = 2 * r + 1;
+    var live:  u32 = 0;
+    var warm:  u32 = 0;
+    for (x < x0 + 8) {
+        val lx:  i32 = x::i32;
+        var sum: i32 = 0;
+        var dy:  i32 = 0 - r;
+        for (dy <= r) {
+            var y:  i32 = ly + dy;
+            var cy: u32 = 1;
+            if (y < 0) {
+                y  = y + 64;
+                cy = 0;
+            }
+            or (y >= 64) {
+                y  = y - 64;
+                cy = 2;
+            }
+            var dx: i32 = 0 - r;
+            for (dx <= r) {
+                val w: i32 = meta.weights[((dy + r) * width + dx + r)::u32]::i32 - 1024;
+                if (w != 0) {
+                    var xx: i32 = lx + dx;
+                    var cx: u32 = 1;
+                    if (xx < 0) {
+                        xx = xx + 64;
+                        cx = 0;
+                    }
+                    or (xx >= 64) {
+                        xx = xx - 64;
+                        cx = 2;
+                    }
+                    val n: u32 = meta.table[base + cy * 3 + cx];
+                    if (n != 0xffffffff) {
+                        if (src.v[n * 4096 + (y * 64 + xx)::u32] >= 256) { sum = sum + w; }
+                    }
+                }
+                dx = dx + 1;
+            }
+            dy = dy + 1;
+        }
+
+        var s: u32 = 0;
+        if (sum > 63) { s = 63; }
+        or (sum > 0)  { s = sum::u32; }
+        val cur: u32 = src.v[row + x];
+        var lo:  u32 = meta.birth_lo;
+        var hi:  u32 = meta.birth_hi;
+        if (cur >= 256) {
+            lo = meta.survive_lo;
+            hi = meta.survive_hi;
+        }
+        var bit: u32 = 0;
+        if (s < 32) { bit = (lo >> s) & 1; }
+        or          { bit = (hi >> (s - 32)) & 1; }
+
+        var next: u32 = 0;
+        if (bit != 0) {
+            var age: u32 = (cur >> 8) + 1;
+            if (age > 0xffffff) { age = 0xffffff; }
+            next = (age << 8) | 255;
+            live = 1;
+        }
+        or { next = cool(cur); }
+        warm           = warm | (next & 255);
+        dst.v[row + x] = next;
+        x              = x + 1;
+    }
+    if (live != 0) { flags.v[slot * 2] = now; }
+    if (warm != 0) { flags.v[slot * 2 + 1] = now; }
+}

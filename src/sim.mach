@@ -1,267 +1,557 @@
-# cellar.sim: the simulation — a grid, the active kernel, and the controls that
-# advance, edit, and reset it.
+# the simulation: an unbounded world, the active kernel, and the controls that
+# advance, edit, and reset it
 #
-# stepping convolves the kernel footprint over the front buffer (toroidal wrap),
-# applies next_state into the back buffer, updates the per-cell age and heat
-# fields, then swaps. painting, randomize, and clear edit the front buffer
-# directly and keep the aux fields consistent.
+# the world is a sparse pool of chunks (cellar.space). the CPU steps it across
+# a team of threads (cellar.cpu) until a GPU is attached that can step it
+# (cellar.gpu); from then on a step is asked of the GPU and recorded with the
+# next frame, and the host's cells are a staging copy. painting, stamping,
+# randomize, load and clear edit the host's pool either way, and the GPU picks
+# the edits up as the frame begins. outside the pool every cell is dead, so a
+# rule that births from nothing (B0) only acts inside the chunks that exist.
 
-use std.types.size.usize;
-use std.types.string.str;
-use std.types.option.Option;
+use gfx: boom.graphics;
+use boom.window;
+use cellar.cpu;
+use cellar.gpu;
+use cellar.kernel;
+use cellar.space;
+use cellar.team;
 use allo: std.allocator;
-use page: std.allocator.page;
-use rand: std.rand;
-use grid:   cellar.grid;
-use kernel: cellar.kernel;
+use std.allocator.page;
+use std.print;
+use std.rand;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
 
-# DEFAULT_W: default grid width in cells.
-pub val DEFAULT_W: usize = 120;
-# DEFAULT_H: default grid height in cells.
-pub val DEFAULT_H: usize = 120;
-# DEFAULT_DENSITY: live-cell probability used by randomize when none is given.
+# live-cell probability randomize uses when none is given
 pub val DEFAULT_DENSITY: f32 = 0.30;
-# DECAY: heat lost per step by a dead cell, giving fading trails.
-pub val DECAY: u8 = 12;
+# generations a GPU may be owed before further steps are dropped
+val MAX_PENDING: usize = 4096;
 
-# Sim: cellular-automaton simulation state.
+# cellular-automaton simulation state
 # ---
-# grid:       the double-buffered cell grid with aux fields
+# space:      the pool of chunks
 # kernel:     the active weighted outer-totalistic kernel
-# rng:        PRNG used by randomize
-# generation: number of completed steps since the last clear/randomize
+# rng:        generator randomize draws from
+# team:       the threads the CPU steps across
+# gpu:        the GPU side once attached, else nil
+# pending:    generations asked of the GPU and not yet recorded
+# full:       the world outgrew the pool, and stepping stopped rather than go wrong
+# generation: completed steps since the last clear or randomize
 # running:    1 while auto-stepping, else 0
 # preset:     index of the active kernel preset
 pub rec Sim {
-    grid:       grid.Grid;
+    space:      space.Space;
     kernel:     kernel.Kernel;
     rng:        rand.Rng;
+    team:       team.Team;
+    gpu:        *gpu.Gpu;
+    pending:    usize;
+    full:       bool;
     generation: u64;
     running:    u8;
     preset:     usize;
 }
 
-# init: allocate the grid and seed the simulation with the default kernel.
+# an empty world stepped by the CPU, with the default kernel
 # ---
-# s: simulation to initialize
-# a: allocator backing the grid
-# w: grid width in cells
-# h: grid height in cells
-# ret: none on success, some(message) on allocation failure
-pub fun init(s: *Sim, a: *allo.Allocator, w: usize, h: usize) Option[str] {
-    val e: Option[str] = grid.init(?s.grid, a, w, h);
-    if (e.has_value) { ret e; }
+# s:   simulation to initialize; it must not move once started
+# a:   allocator backing the pool
+# ret: ok, or the allocator's refusal
+pub fun init(s: *Sim, a: *allo.Allocator) err[allo.Error] {
+    val e: err[allo.Error] = space.init(?s.space, a, true);
+    if (sel e.err) { ret e; }
+    team.start(?s.team);
     s.kernel     = kernel.preset(0);
     s.preset     = 0;
     s.rng        = rand.init();
+    s.gpu        = nil;
+    s.pending    = 0;
+    s.full       = false;
     s.generation = 0;
     s.running    = 0;
     ret e;
 }
 
-# dnit: release the simulation's grid.
-# ---
-# s:   simulation to deinitialize
-# ret: 0 on success, or the first negative errno from deallocation
-pub fun dnit(s: *Sim) i64 {
-    ret grid.dnit(?s.grid);
+# stop the team and release the pool
+pub fun dnit(s: *Sim) {
+    team.stop(?s.team);
+    space.dnit(?s.space);
 }
 
-# update_aux: refresh the age and heat of (x, y) for its next state.
+# whether the GPU steps the world
+pub fun on_gpu(s: *Sim) bool {
+    ret s.gpu != nil && s.gpu.stepping;
+}
+
+# hand the world to a GPU side, which steps it when it can and draws it either way
 # ---
-# g:  grid carrying the aux fields
-# x:  column
-# y:  row
-# ns: the cell's next state (0 or 1)
-fun update_aux(g: *grid.Grid, x: usize, y: usize, ns: u8) {
-    if (ns != 0) {
-        grid.set_age(g, x, y, grid.age_at(g, x, y) + 1);
-        grid.set_heat(g, x, y, 255);
-    } or {
-        grid.set_age(g, x, y, 0);
-        var nh: i32 = grid.heat_at(g, x, y)::i32 - DECAY::i32;
-        if (nh < 0) { nh = 0; }
-        grid.set_heat(g, x, y, nh::u8);
+# s: simulation
+# g: the GPU side, initialized with at least the pool's capacity
+pub fun attach(s: *Sim, g: *gpu.Gpu) {
+    s.gpu = g;
+    var t: usize = 0;
+    for (t < s.space.hi) {
+        s.space.dirty[t] = space.DIRTY_ENTRY | space.DIRTY_CELLS;
+        t                = t + 1;
     }
+    gpu.note_bulk(g);
+    # the GPU's pool is the world from now on, so the host needs no back cells
+    if (g.stepping) { space.set_stepped(?s.space, false); }
 }
 
-# step: advance one generation — convolve the kernel into the back buffer, update
-# the aux fields, then swap.
+# advance one generation, or ask the GPU for one
 # ---
 # s: simulation
 pub fun step(s: *Sim) {
-    val g: *grid.Grid    = ?s.grid;
-    val k: *kernel.Kernel = ?s.kernel;
-    val r:     i64 = k.radius::i64;
-    val width: i64 = (2 * k.radius + 1)::i64;
-    val w:     i64 = g.w::i64;
-    val h:     i64 = g.h::i64;
-    var y: usize = 0;
-    for (y < g.h) {
-        var x: usize = 0;
-        for (x < g.w) {
-            var sum: i32 = 0;
-            var dy: i64 = 0 - r;
-            for (dy <= r) {
-                var ny: i64 = (y::i64 + dy) % h;
-                if (ny < 0) { ny = ny + h; }
-                var dx: i64 = 0 - r;
-                for (dx <= r) {
-                    val wt: i32 = k.weights[((dy + r) * width + (dx + r))::usize];
-                    if (wt != 0) {
-                        var nx: i64 = (x::i64 + dx) % w;
-                        if (nx < 0) { nx = nx + w; }
-                        val al: u8 = g.cells[(ny * w + nx)::usize];
-                        sum = sum + wt * al::i32;
-                    }
-                    dx = dx + 1;
-                }
-                dy = dy + 1;
-            }
-            val alive: u8 = grid.get(g, x, y);
-            val ns:    u8 = kernel.next_state(k, alive, sum);
-            grid.set_back(g, x, y, ns);
-            update_aux(g, x, y, ns);
-            x = x + 1;
-        }
-        y = y + 1;
+    if (on_gpu(s)) {
+        if (s.pending < MAX_PENDING) { s.pending = s.pending + 1; }
+        ret;
     }
-    grid.swap(g);
+    if (s.full)                                  { ret; }
+    if (!cpu.step(?s.space, ?s.kernel, ?s.team)) { overflow(s); }
     s.generation = s.generation + 1;
 }
 
-# clear: empty the grid and reset the generation counter.
+# stop for good once a chunk the world needs could not be made: a pattern
+# reaching past the pool would be stepped as if it met dead space
+fun overflow(s: *Sim) {
+    if (!s.full) { print.eprintln("the world outgrew its pool of chunks; stepping stopped"); }
+    s.full    = true;
+    s.running = 0;
+    s.pending = 0;
+}
+
+# settle the pool from the GPU's newest census, once a frame before anything
+# is recorded
+# ---
+# s: simulation
+pub fun collect(s: *Sim) {
+    if (s.gpu == nil)                  { ret; }
+    if (!gpu.collect(s.gpu, ?s.space)) { overflow(s); }
+}
+
+# record the frame's generations on the GPU
+#
+# call where gpu.frame may be called. uncapped asks for as many as the budget
+# allows; otherwise the generations owed are recorded.
+# ---
+# s:        simulation with a GPU attached
+# uncapped: step as far as the budget allows
+# look:     the camera and colours for the draw
+# ret:      ok, or why the frame could not be recorded
+pub fun record(s: *Sim, uncapped: bool, look: *gpu.Look) err[gfx.Error] {
+    var want: usize = s.pending;
+    val fast: bool  = uncapped && s.running != 0 && on_gpu(s);
+    if (fast)       { want = gpu.stride(s.gpu); }
+    if (!on_gpu(s)) { want = 0; }
+    val done: res[usize, gfx.Error] = gpu.frame(s.gpu, ?s.space, ?s.kernel, want, look);
+    if (sel done.err) { ret err[gfx.Error].err{done.err}; }
+    s.generation = s.generation + done.ok::u64;
+    if (fast)                 { gpu.tune(s.gpu, want, done.ok); }
+    or                        { gpu.rest(s.gpu); }
+    if (done.ok >= s.pending) { s.pending = 0; }
+    or                        { s.pending = s.pending - done.ok; }
+    ret err[gfx.Error].ok{};
+}
+
+# bring the GPU's cells into the host's, before reading them there
+# ---
+# s:   simulation
+# ret: ok, or why the read failed
+pub fun sync(s: *Sim) err[gfx.Error] {
+    if (!on_gpu(s)) { ret err[gfx.Error].ok{}; }
+    ret gpu.pull(s.gpu, ?s.space);
+}
+
+# empty the world and reset the generation counter
 # ---
 # s: simulation
 pub fun clear(s: *Sim) {
-    grid.clear(?s.grid);
+    space.reset(?s.space);
     s.generation = 0;
+    s.pending    = 0;
+    s.full       = false;
+    if (s.gpu != nil) { gpu.note_bulk(s.gpu); }
 }
 
-# resize: reallocate the grid to a new size, clearing it and resetting the count.
+# empty the world ahead of seeding it with fill_cell
+pub fun fill_begin(s: *Sim) {
+    clear(s);
+}
+
+# seed a live cell, between fill_begin and fill_end
 # ---
-# s: simulation
-# w: new width in cells
-# h: new height in cells
-# ret: none on success, some(message) on allocation failure
-pub fun resize(s: *Sim, w: usize, h: usize) Option[str] {
-    val e: Option[str] = grid.resize(?s.grid, w, h);
-    if (e.has_value) { ret e; }
-    s.generation = 0;
-    ret e;
+# s:   simulation
+# x:   column
+# y:   row
+# ret: false when the pool is full
+pub fun fill_cell(s: *Sim, x: i64, y: i64) bool {
+    val sl: u32 = space.alloc(?s.space, space.chunk_of(x), space.chunk_of(y));
+    if (sl == space.NONE) { ret false; }
+    val i: usize = sl::usize * space.CELLS + space.local_of(y) * 64 + space.local_of(x);
+    s.space.cells[i]         = space.BORN;
+    s.space.dirty[sl::usize] = s.space.dirty[sl::usize] | space.DIRTY_CELLS;
+    ret true;
 }
 
-# randomize: fill the grid with live cells at the given density, reset the count.
+# count what fill_cell seeded and surround every live chunk
+# ---
+# s:   simulation
+# ret: false when the pool could not hold a needed chunk
+pub fun fill_end(s: *Sim) bool {
+    val sp: *space.Space = ?s.space;
+    var sl: usize        = 0;
+    for (sl < sp.hi) {
+        if (space.used(sp, sl)) { space.recount(sp, sl); }
+        sl = sl + 1;
+    }
+    val ok: bool = space.settle(sp, sp.census, sp.hi, false);
+    if (s.gpu != nil) { gpu.note_bulk(s.gpu); }
+    if (!ok)          { overflow(s); }
+    ret ok;
+}
+
+# fill a square centred on the origin with live cells at the given density,
+# replacing the world and resetting the count
 # ---
 # s:       simulation
 # density: live-cell probability in [0, 1]
-pub fun randomize(s: *Sim, density: f32) {
-    val g: *grid.Grid = ?s.grid;
+# side:    the square's side in cells
+pub fun randomize(s: *Sim, density: f32, side: usize) {
     var thresh: i64 = (density * 1000.0)::i64;
     if (thresh < 0)    { thresh = 0; }
     if (thresh > 1000) { thresh = 1000; }
-    var y: usize = 0;
-    for (y < g.h) {
-        var x: usize = 0;
-        for (x < g.w) {
-            var v: u8 = 0;
-            if (rand.range(?s.rng, 0, 1000) < thresh) { v = 1; }
-            grid.set(g, x, y, v);
-            if (v != 0) {
-                grid.set_age(g, x, y, 1);
-                grid.set_heat(g, x, y, 255);
-            } or {
-                grid.set_age(g, x, y, 0);
-                grid.set_heat(g, x, y, 0);
-            }
+    val half: i64 = (side / 2)::i64;
+    fill_begin(s);
+    var y: i64 = 0 - half;
+    for (y < half) {
+        var x: i64 = 0 - half;
+        for (x < half) {
+            if (rand.range(?s.rng, 0, 1000) < thresh) { fill_cell(s, x, y); }
             x = x + 1;
         }
         y = y + 1;
     }
-    s.generation = 0;
+    fill_end(s);
 }
 
-# paint: set the cell at (x, y) to v, keeping its aux fields consistent.
+# set the cell at (x, y) to v, fresh: a live cell starts at age 1 and full
+# heat, a dead one cold
 # ---
 # s: simulation
 # x: column
 # y: row
-# v: value to write (0 or 1)
-pub fun paint(s: *Sim, x: usize, y: usize, v: u8) {
-    if (x >= s.grid.w) { ret; }
-    if (y >= s.grid.h) { ret; }
-    val g: *grid.Grid = ?s.grid;
-    grid.set(g, x, y, v);
-    if (v != 0) {
-        grid.set_age(g, x, y, 1);
-        grid.set_heat(g, x, y, 255);
-    } or {
-        grid.set_age(g, x, y, 0);
-        grid.set_heat(g, x, y, 0);
+# v: value to write, 0 or 1
+pub fun paint(s: *Sim, x: i64, y: i64, v: u8) {
+    val sp: *space.Space = ?s.space;
+    val cx: i64          = space.chunk_of(x);
+    val cy: i64          = space.chunk_of(y);
+    var sl: u32          = space.find(sp, cx, cy);
+    if (sl == space.NONE) {
+        if (v == 0) { ret; }
+        sl = space.alloc(sp, cx, cy);
+        if (sl == space.NONE) { ret; }
     }
+    val slot: usize = sl::usize;
+    val i:    usize = space.local_of(y) * 64 + space.local_of(x);
+    var c:    u32   = 0;
+    if (v != 0) { c = space.BORN; }
+    sp.cells[slot * space.CELLS + i] = c;
+    if (v != 0) { space.surround(sp, slot); }
+    if (on_gpu(s)) {
+        gpu.note_write(s.gpu, sp, slot, i);
+        gpu.note_edit(s.gpu);
+        ret;
+    }
+    space.recount(sp, slot);
 }
 
-# toggle_running: flip between running and paused.
+# the cell at (x, y) as age << 8 | heat, from the host's cells
+#
+# on the GPU this is the staging copy, current only after sync.
+# ---
+# s:   simulation
+# x:   column
+# y:   row
+# ret: the cell, 0 where no chunk exists
+pub fun cell(s: *Sim, x: i64, y: i64) u32 {
+    val sl: u32 = space.find(?s.space, space.chunk_of(x), space.chunk_of(y));
+    if (sl == space.NONE) { ret 0; }
+    ret s.space.cells[sl::usize * space.CELLS + space.local_of(y) * 64 + space.local_of(x)];
+}
+
+# whether the cell at (x, y) is alive, from the host's cells
+pub fun alive(s: *Sim, x: i64, y: i64) bool {
+    ret cell(s, x, y) >= 256;
+}
+
+# live cells in the world, as of the last step or census
+pub fun population(s: *Sim) usize {
+    ret space.population(?s.space);
+}
+
+# flip between running and paused
 # ---
 # s: simulation
 pub fun toggle_running(s: *Sim) {
     s.running = 1 - s.running;
 }
 
-test "sim: a blinker oscillates with period two" {
+test step__blinker_oscillates_with_period_two {
     var a: allo.Allocator;
     page.make(?a);
+    var s:    Sim;
+    val made: err[allo.Error] = init(?s, ?a);
+    if (sel made.err) { ret 1; }
 
-    var s: Sim;
-    if (init(?s, ?a, 5, 5).has_value) { ret 1; }
-
-    # a horizontal three-cell row at the center
-    paint(?s, 1, 2, 1);
-    paint(?s, 2, 2, 1);
-    paint(?s, 3, 2, 1);
-
-    step(?s);
-    # now vertical
-    if (grid.get(?s.grid, 2, 1) != 1) { ret 1; }
-    if (grid.get(?s.grid, 2, 2) != 1) { ret 1; }
-    if (grid.get(?s.grid, 2, 3) != 1) { ret 1; }
-    if (grid.get(?s.grid, 1, 2) != 0) { ret 1; }
+    # a horizontal three-cell row straddling the origin's chunk corner
+    paint(?s, -1, 0, 1);
+    paint(?s, 0, 0, 1);
+    paint(?s, 1, 0, 1);
 
     step(?s);
-    # back to horizontal
-    if (grid.get(?s.grid, 1, 2) != 1) { ret 1; }
-    if (grid.get(?s.grid, 3, 2) != 1) { ret 1; }
+    if (!alive(?s, 0, -1) || !alive(?s, 0, 0) || !alive(?s, 0, 1)) { ret 2; }
+    if (alive(?s, -1, 0))                                          { ret 3; }
 
+    step(?s);
+    if (!alive(?s, -1, 0) || !alive(?s, 1, 0)) { ret 4; }
+    if (population(?s) != 3)                   { ret 5; }
     dnit(?s);
     ret 0;
 }
 
-test "sim: age accumulates while alive and heat decays after death" {
+test step__age_accumulates_and_heat_decays {
     var a: allo.Allocator;
     page.make(?a);
-
-    var s: Sim;
-    if (init(?s, ?a, 5, 5).has_value) { ret 1; }
+    var s:    Sim;
+    val made: err[allo.Error] = init(?s, ?a);
+    if (sel made.err) { ret 1; }
 
     # a block is still life under Life, so its cells stay alive every step
     paint(?s, 1, 1, 1);
     paint(?s, 2, 1, 1);
     paint(?s, 1, 2, 1);
     paint(?s, 2, 2, 1);
-
     step(?s);
     step(?s);
-    if (grid.age_at(?s.grid, 1, 1) != 3) { ret 1; }
-    if (grid.heat_at(?s.grid, 1, 1) != 255) { ret 1; }
+    if ((cell(?s, 1, 1) >> 8) != 3)    { ret 2; }
+    if ((cell(?s, 1, 1) & 255) != 255) { ret 3; }
 
-    # an isolated cell dies; its heat must decay rather than vanish
-    paint(?s, 4, 4, 1);
-    if (grid.heat_at(?s.grid, 4, 4) != 255) { ret 1; }
+    # an isolated cell dies, and its heat decays rather than vanishing
+    paint(?s, 40, 40, 1);
     step(?s);
-    if (grid.get(?s.grid, 4, 4) != 0) { ret 1; }
-    if (grid.age_at(?s.grid, 4, 4) != 0) { ret 1; }
-    if (grid.heat_at(?s.grid, 4, 4) != 255 - DECAY) { ret 1; }
-
+    if (cell(?s, 40, 40) != 255 - space.DECAY) { ret 4; }
     dnit(?s);
+    ret 0;
+}
+
+test randomize__fills_a_centred_square_and_clear_empties_the_pool {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    Sim;
+    val made: err[allo.Error] = init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    randomize(?s, 0.5, 128);
+    val n: usize = population(?s);
+    # half of 128 x 128 cells, give or take
+    if (n < 7000 || n > 9400)                                      { ret 2; }
+    if (alive(?s, 64, 0) || alive(?s, 0, 64) || alive(?s, -65, 0)) { ret 3; }
+    # 2 x 2 chunks seeded, and the ring of 12 around them
+    if (s.space.live != 16) { ret 4; }
+    clear(?s);
+    if (population(?s) != 0 || s.space.live != 0 || s.generation != 0) { ret 5; }
+    dnit(?s);
+    ret 0;
+}
+
+# run frames until the GPU has recorded every generation owed
+#[testing]
+fun settle_frames(r: *gfx.Renderer, s: *Sim, want: u64) bool {
+    var frames: usize = 0;
+    var look:   gpu.Look;
+    look.ppc    = 1.0;
+    look.half_w = 32.0;
+    look.half_h = 32.0;
+    look.win_w  = 64.0;
+    for (s.generation < want && frames < 1000) {
+        window.window_poll();
+        val br: res[bool, gfx.Error] = gfx.renderer_begin_frame(r);
+        if (sel br.err) { ret false; }
+        if (br.ok) {
+            collect(s);
+            val rec: err[gfx.Error] = record(s, false, ?look);
+            if (sel rec.err) { ret false; }
+            val ended: err[gfx.Error] = gfx.renderer_end_frame(r);
+            if (sel ended.err) { ret false; }
+        }
+        frames = frames + 1;
+    }
+    ret s.generation == want;
+}
+
+# whether every cell either world holds is the same in the other
+#[testing]
+fun same_world(a: *Sim, b: *Sim) bool {
+    var pass: usize = 0;
+    for (pass < 2) {
+        var x: *Sim = a;
+        var y: *Sim = b;
+        if (pass == 1) {
+            x = b;
+            y = a;
+        }
+        var sl: usize = 0;
+        for (sl < x.space.hi) {
+            if (space.used(?x.space, sl)) {
+                val ox: i64   = space.slot_x(?x.space, sl) * space.SIDE;
+                val oy: i64   = space.slot_y(?x.space, sl) * space.SIDE;
+                var i:  usize = 0;
+                for (i < space.CELLS) {
+                    val cx: i64 = ox + (i % 64)::i64;
+                    val cy: i64 = oy + (i / 64)::i64;
+                    if (cell(x, cx, cy) != cell(y, cx, cy)) {
+                        print.eprintlnf("cells differ at ({}, {}): {} and {}", cx, cy, cell(x, cx, cy), cell(y, cx, cy));
+                        ret false;
+                    }
+                    i = i + 1;
+                }
+            }
+            sl = sl + 1;
+        }
+        pass = pass + 1;
+    }
+    ret true;
+}
+
+# seed the same soups and far-flung glider into a world
+#[testing]
+fun seed_world(s: *Sim) {
+    s.rng = rand.seed(1, 2, 3, 4);
+    fill_begin(s);
+    var y: i64 = -70;
+    for (y < 70) {
+        var x: i64 = -70;
+        for (x < 70) {
+            if (rand.range(?s.rng, 0, 1000) < 350) { fill_cell(s, x, y); }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    fill_cell(s, 5001, -3000);
+    fill_cell(s, 5002, -2999);
+    fill_cell(s, 5000, -2998);
+    fill_cell(s, 5001, -2998);
+    fill_cell(s, 5002, -2998);
+    fill_end(s);
+}
+
+# a radius-2 rule with uneven weights, to exercise the wide footprint
+#[testing]
+fun wide_rule() kernel.Kernel {
+    var k: kernel.Kernel = kernel.life();
+    kernel.set_radius(?k, 2);
+    var dy: i64 = -2;
+    for (dy <= 2) {
+        var dx: i64 = -2;
+        for (dx <= 2) {
+            var w: i32 = 1;
+            if (dx == 0 && dy == 0)                         { w = 0; }
+            or (dx >= -1 && dx <= 1 && dy >= -1 && dy <= 1) { w = 2; }
+            kernel.set_weight(?k, dx, dy, w);
+            dx = dx + 1;
+        }
+        dy = dy + 1;
+    }
+    k.birth   = kernel.set_bit(kernel.set_bit(kernel.set_bit(0, 7), 8), 9);
+    k.survive = kernel.set_bit(kernel.set_bit(kernel.set_bit(kernel.set_bit(0, 6), 7), 8), 10);
+    ret k;
+}
+
+test frame__steps_on_the_gpu_exactly_as_the_cpu_does {
+    val opened: res[window.Window, window.WindowError] = window.window_open(64, 64, "cellar gpu test");
+    if (sel opened.err) {
+        print.eprintln("skipped: no window can be opened here");
+        ret 0;
+    }
+    var w:  window.Window  = opened.ok;
+    var r:  gfx.Renderer;
+    val up: err[gfx.Error] = gfx.renderer_init(?r, ?w);
+    if (sel up.err) {
+        print.eprintlnf("skipped: no renderer: {}", gfx.error_message(up.err));
+        ret 0;
+    }
+    var a: allo.Allocator;
+    page.make(?a);
+
+    var cpu_world: Sim;
+    var gpu_world: Sim;
+    val m1:        err[allo.Error] = init(?cpu_world, ?a);
+    if (sel m1.err) { ret 1; }
+    val m2: err[allo.Error] = init(?gpu_world, ?a);
+    if (sel m2.err) { ret 2; }
+    seed_world(?cpu_world);
+    seed_world(?gpu_world);
+
+    var heat: [1024]f32;
+    var age:  [1024]f32;
+    var g:    gpu.Gpu;
+    val made: err[gfx.Error] = gpu.init(?g, ?a, ?r, gpu_world.space.cap, ?heat[0], ?age[0]);
+    if (sel made.err) { ret 3; }
+    if (!g.stepping) {
+        print.eprintln("skipped: the compute stages were refused");
+        ret 0;
+    }
+    attach(?gpu_world, ?g);
+
+    # blocks painted far apart grow the pool past what the GPU was built for
+    var b: i64 = 0;
+    for (b < 20) {
+        var c: usize = 0;
+        for (c < 4) {
+            val x: i64 = b * 1000 + (c % 2)::i64;
+            val y: i64 = 7000 + (c / 2)::i64;
+            paint(?cpu_world, x, y, 1);
+            paint(?gpu_world, x, y, 1);
+            c = c + 1;
+        }
+        b = b + 1;
+    }
+
+    # life for 60 generations, then a wide weighted rule for 30 more
+    var phase: usize = 0;
+    var gens:  u64   = 0;
+    for (phase < 2) {
+        var n: u64 = 60;
+        if (phase == 1) {
+            n                = 30;
+            cpu_world.kernel = wide_rule();
+            gpu_world.kernel = wide_rule();
+        }
+        var i: u64 = 0;
+        for (i < n) {
+            step(?cpu_world);
+            step(?gpu_world);
+            i = i + 1;
+        }
+        gens = gens + n;
+        if (!settle_frames(?r, ?gpu_world, gens)) { ret 4; }
+        gfx.renderer_wait_idle(?r);
+        val synced: err[gfx.Error] = sync(?gpu_world);
+        if (sel synced.err)                      { ret 5; }
+        if (!same_world(?cpu_world, ?gpu_world)) { ret 6 + phase::i32; }
+        phase = phase + 1;
+    }
+    if (population(?cpu_world) == 0) { ret 8; }
+
+    gpu.dnit(?g);
+    dnit(?cpu_world);
+    dnit(?gpu_world);
+    gfx.renderer_dnit(?r);
+    window.window_close(?w);
     ret 0;
 }

@@ -1,0 +1,150 @@
+# the uncapped stepping thread
+#
+# while the simulation runs uncapped, a worker thread steps it back to back,
+# as fast as the machine allows, decoupled from the frame rate. the world is
+# guarded by one lock. a step runs whole under it, so the UI thread, holding
+# the lock while it reads or edits the world, always sees a completed
+# generation. the worker hands the lock over between steps whenever the UI
+# thread asks for it, so a long run never starves input or drawing, and it
+# sleeps on a condition while there is nothing to step.
+
+use cellar.sim;
+use allo: std.allocator;
+use std.allocator.page;
+use std.sync.atomic;
+use std.sync.condition;
+use std.sync.mutex;
+use std.sync.thread;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.size.usize;
+
+# the lock, the worker and what it is asked to do
+# ---
+# lock:    guards the simulation and the fields below
+# wake:    signalled when the worker has something to do or should quit
+# worker:  the stepping thread
+# sim:     the simulation it steps
+# active:  1 while the worker should step, written under lock
+# quit:    1 once the worker should exit, written under lock
+# waiting: how many callers of enter are waiting for the lock
+# started: the worker was spawned and has not been joined
+pub rec Runner {
+    lock:    mutex.Mutex;
+    wake:    condition.Condition;
+    worker:  thread.Thread;
+    sim:     *sim.Sim;
+    active:  i64;
+    quit:    i64;
+    waiting: i64;
+    started: bool;
+}
+
+fun work(arg: *u8) {
+    val r: *Runner = arg::*Runner;
+    mutex.lock(?r.lock);
+    for (r.quit == 0) {
+        if (r.active == 0) {
+            condition.wait(?r.wake, ?r.lock);
+            cnt;
+        }
+        sim.step(r.sim);
+        if (atomic.load(?r.waiting) != 0) {
+            # hand over: the mutex is unfair, so re-locking at once could
+            # keep winning it from the UI thread indefinitely
+            mutex.unlock(?r.lock);
+            for (atomic.load(?r.waiting) != 0) { atomic.spin_hint(); }
+            mutex.lock(?r.lock);
+        }
+    }
+    mutex.unlock(?r.lock);
+}
+
+# start the worker, idle until leave asks it to step
+# ---
+# r:   runner to start
+# s:   the simulation it guards and steps
+# ret: ok, or why the thread could not be spawned
+pub fun start(r: *Runner, s: *sim.Sim) err[thread.ThreadError] {
+    r.lock    = mutex.make();
+    r.wake    = condition.make();
+    r.sim     = s;
+    r.active  = 0;
+    r.quit    = 0;
+    r.waiting = 0;
+    r.started = false;
+    val spawned: thread.Operation = thread.spawn_with(work, r::*u8, ?r.worker);
+    if (sel spawned.err) { ret err[thread.ThreadError].err{spawned.err}; }
+    r.started = true;
+    ret err[thread.ThreadError].ok{};
+}
+
+# take the lock before reading or changing the simulation
+# ---
+# r: the runner
+pub fun enter(r: *Runner) {
+    atomic.fetch_add(?r.waiting, 1);
+    mutex.lock(?r.lock);
+    atomic.fetch_sub(?r.waiting, 1);
+}
+
+# release the lock, telling the worker whether to keep stepping
+# ---
+# r:    the runner
+# step: true while the simulation runs uncapped
+pub fun leave(r: *Runner, step: bool) {
+    r.active = 0;
+    if (step) {
+        r.active = 1;
+        condition.signal(?r.wake);
+    }
+    mutex.unlock(?r.lock);
+}
+
+# stop the worker and wait for it to exit
+# ---
+# r: the runner
+pub fun stop(r: *Runner) {
+    if (!r.started) { ret; }
+    mutex.lock(?r.lock);
+    r.quit = 1;
+    condition.signal(?r.wake);
+    mutex.unlock(?r.lock);
+    thread.join(?r.worker);
+    r.started = false;
+}
+
+test runner__steps_while_asked_and_stops {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var s:     sim.Sim;
+    val world: err[allo.Error] = sim.init(?s, ?a);
+    if (sel world.err) { ret 2; }
+
+    var r:       Runner;
+    val started: err[thread.ThreadError] = start(?r, ?s);
+    if (sel started.err) { ret 3; }
+    enter(?r);
+    leave(?r, true);
+
+    # every look at the world is a completed generation taken under the lock
+    var seen:  u64   = 0;
+    var tries: usize = 0;
+    for (seen < 8 && tries < 100000000) {
+        enter(?r);
+        seen = s.generation;
+        leave(?r, true);
+        tries = tries + 1;
+    }
+    if (seen < 8) { ret 4; }
+
+    enter(?r);
+    leave(?r, false);
+    stop(?r);
+    if (r.started) { ret 5; }
+    sim.dnit(?s);
+    ret 0;
+}

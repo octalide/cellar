@@ -1,0 +1,580 @@
+# the unbounded world as a pool of 64 by 64 chunks with a page table
+#
+# only chunks that hold something, or border a chunk with a live cell, exist.
+# each lives in a slot of the pool, and the slot's page-table entry names the
+# slots of the 3 by 3 block of chunks around it, so a step reads a chunk's
+# neighbourhood without a lookup. the entry's layout is the one the GPU's
+# stages read, so the table uploads as it stands:
+#
+#   words 0..9  the neighbour slots, row-major with the chunk itself at 4,
+#               NONE where that chunk does not exist
+#   words 9, 10 the chunk's coordinates biased by BIAS, so they stay positive
+#   word 11     the slot's incarnation, zero while it is free
+#
+# a cell is age << 8 | heat: alive while its age is nonzero, 255 heat while
+# alive and fading by DECAY a generation once dead. the front cells are the
+# world; the back cells, kept only when the CPU steps, take the next
+# generation. a hash over chunk coordinates finds a chunk's slot.
+#
+# settle keeps the pool the shape stepping needs: every chunk with a live cell
+# has the neighbours its census mask asks for, and a chunk that is empty, cold
+# and asked for by no live neighbour is freed. the mask has a bit per neighbour,
+# set where a live cell lies near that side, so a sparse world keeps only the
+# chunks it can spread into. it works from a census, per slot the live count,
+# whether anything is warm, the incarnation the count was taken of and the mask,
+# which the CPU writes as it steps, asking for every neighbour, and the GPU
+# writes once a frame.
+
+use allo: std.allocator;
+use std.allocator.page;
+use mem: std.memory;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+
+# side of a chunk in cells
+pub val SIDE: i64 = 64;
+# cells in a chunk
+pub val CELLS: usize = 4096;
+# page-table words per slot
+pub val ENTRY: usize = 12;
+# census words per slot: live count, warm, incarnation, neighbour mask
+pub val CENSUS: usize = 4;
+# a mask asking for all eight neighbours, its bits laid out as the entry's words
+pub val MASK_ALL: u32 = 0x1ef;
+# a neighbour that does not exist
+pub val NONE: u32 = 0xffffffff;
+# added to chunk coordinates in the page table
+pub val BIAS: i64 = 1073741824;
+# the most slots the pool may grow to, which the stages' arrays are sized for
+pub val MAX_SLOTS: usize = 32768;
+# the oldest age a cell records
+pub val AGE_MAX: u32 = 0xffffff;
+# heat a dead cell loses per generation, giving fading trails
+pub val DECAY: u32 = 12;
+# a live cell painted or seeded fresh: age 1, full heat
+pub val BORN: u32 = 511;
+# the slots a new pool holds
+val FIRST_CAP: usize = 64;
+
+# a slot's page-table entry changed
+pub val DIRTY_ENTRY: u8 = 1;
+# a slot's cells changed wholesale, and the host's are the ones to keep
+pub val DIRTY_CELLS: u8 = 2;
+# a slot was allocated empty, which a mirror clears on its side
+pub val DIRTY_ZERO: u8 = 4;
+
+# the pool
+# ---
+# a:       allocator backing every array
+# cap:     slots every array holds
+# hi:      slots in use lie below this
+# live:    slots in use
+# table:   the page table, cap * ENTRY words
+# cells:   the front cells, cap * CELLS
+# back:    the back cells, cap * CELLS, or nil when the GPU steps
+# census:  per slot live count, warm, incarnation and a pad, from the last step
+# dirty:   per slot DIRTY_ENTRY and DIRTY_CELLS, for a mirror to upload
+# frees:   free slots below hi
+# nfree:   how many frees holds
+# hash:    slot per bucket, NONE when empty, linear probing
+# hcap:    buckets, a power of two at least twice cap
+# serial:  the last incarnation handed out
+# stepped: whether back is kept
+pub rec Space {
+    a:       *allo.Allocator;
+    cap:     usize;
+    hi:      usize;
+    live:    usize;
+    table:   *u32;
+    cells:   *u32;
+    back:    *u32;
+    census:  *u32;
+    before:  *u32;
+    dirty:   *u8;
+    frees:   *u32;
+    nfree:   usize;
+    hash:    *u32;
+    hcap:    usize;
+    serial:  u32;
+    stepped: bool;
+}
+
+# whether a cell is alive
+pub fun alive(c: u32) bool {
+    ret c >= 256;
+}
+
+# the chunk coordinate holding a cell coordinate
+pub fun chunk_of(v: i64) i64 {
+    ret v >> 6;
+}
+
+# a cell coordinate's offset inside its chunk
+pub fun local_of(v: i64) usize {
+    ret (v & 63)::usize;
+}
+
+fun bucket(sp: *Space, cx: i64, cy: i64) usize {
+    val h: u64 = (cx::u64 * 0x9e3779b97f4a7c15) ^ (cy::u64 * 0xc2b2ae3d27d4eb4f);
+    ret ((h ^ (h >> 29))::usize) & (sp.hcap - 1);
+}
+
+# the chunk x coordinate of a slot in use
+pub fun slot_x(sp: *Space, s: usize) i64 {
+    ret sp.table[s * ENTRY + 9]::i64 - BIAS;
+}
+
+# the chunk y coordinate of a slot in use
+pub fun slot_y(sp: *Space, s: usize) i64 {
+    ret sp.table[s * ENTRY + 10]::i64 - BIAS;
+}
+
+# whether a slot holds a chunk
+pub fun used(sp: *Space, s: usize) bool {
+    ret sp.table[s * ENTRY + 11] != 0;
+}
+
+# a slot's incarnation, zero while free
+pub fun incarnation(sp: *Space, s: usize) u32 {
+    ret sp.table[s * ENTRY + 11];
+}
+
+# the slot of the chunk at (cx, cy), or NONE
+pub fun find(sp: *Space, cx: i64, cy: i64) u32 {
+    var b: usize = bucket(sp, cx, cy);
+    for (sp.hash[b] != NONE) {
+        val s: usize = sp.hash[b]::usize;
+        if (slot_x(sp, s) == cx && slot_y(sp, s) == cy) { ret s::u32; }
+        b = (b + 1) & (sp.hcap - 1);
+    }
+    ret NONE;
+}
+
+fun hash_put(sp: *Space, s: usize) {
+    var b: usize = bucket(sp, slot_x(sp, s), slot_y(sp, s));
+    for (sp.hash[b] != NONE) { b = (b + 1) & (sp.hcap - 1); }
+    sp.hash[b] = s::u32;
+}
+
+# remove a slot from the hash, shifting later entries of its run back so a
+# probe never stops at a hole
+fun hash_remove(sp: *Space, s: usize) {
+    val m: usize = sp.hcap - 1;
+    var b: usize = bucket(sp, slot_x(sp, s), slot_y(sp, s));
+    for (sp.hash[b] != s::u32) { b = (b + 1) & m; }
+    var hole: usize = b;
+    var j:    usize = (b + 1) & m;
+    for (sp.hash[j] != NONE) {
+        val t:    usize = sp.hash[j]::usize;
+        val home: usize = bucket(sp, slot_x(sp, t), slot_y(sp, t));
+        # t may fill the hole unless its home lies cyclically in (hole, j]
+        if (((j - home) & m) >= ((j - hole) & m)) {
+            sp.hash[hole] = t::u32;
+            hole          = j;
+        }
+        j = (j + 1) & m;
+    }
+    sp.hash[hole] = NONE;
+}
+
+fun zwords(a: *allo.Allocator, n: usize) *u32 {
+    val r: res[*u32, allo.Error] = allo.zallocate[u32](a, n);
+    if (sel r.err) { ret nil; }
+    ret r.ok;
+}
+
+fun alloc_arrays(sp: *Space, cap: usize) err[allo.Error] {
+    val a:     *allo.Allocator = sp.a;
+    val table: *u32            = zwords(a, cap * ENTRY);
+    val cells: *u32            = zwords(a, cap * CELLS);
+    var back:  *u32            = nil;
+    if (sp.stepped) { back = zwords(a, cap * CELLS); }
+    val census: *u32                 = zwords(a, cap * CENSUS);
+    val before: *u32                 = zwords(a, cap * CENSUS);
+    val frees:  *u32                 = zwords(a, cap);
+    val hash:   *u32                 = zwords(a, cap * 4);
+    var dirty:  *u8                  = nil;
+    val rd:     res[*u8, allo.Error] = allo.zallocate[u8](a, cap);
+    if (sel rd.ok) { dirty = rd.ok; }
+    if (table == nil || cells == nil || (sp.stepped && back == nil) || census == nil
+        || before == nil || frees == nil || hash == nil || dirty == nil) {
+        if (table != nil)  { allo.deallocate[u32](a, table, cap * ENTRY); }
+        if (cells != nil)  { allo.deallocate[u32](a, cells, cap * CELLS); }
+        if (back != nil)   { allo.deallocate[u32](a, back, cap * CELLS); }
+        if (census != nil) { allo.deallocate[u32](a, census, cap * CENSUS); }
+        if (before != nil) { allo.deallocate[u32](a, before, cap * CENSUS); }
+        if (frees != nil)  { allo.deallocate[u32](a, frees, cap); }
+        if (hash != nil)   { allo.deallocate[u32](a, hash, cap * 4); }
+        if (dirty != nil)  { allo.deallocate[u8](a, dirty, cap); }
+        ret err[allo.Error].err{allo.Error.exhausted{}};
+    }
+    # carry the old pool over, then rebuild the hash at its new size
+    if (sp.cap != 0) {
+        mem.copy[u32](table, sp.table, sp.hi * ENTRY);
+        mem.copy[u32](cells, sp.cells, sp.hi * CELLS);
+        if (back != nil) { mem.copy[u32](back, sp.back, sp.hi * CELLS); }
+        mem.copy[u32](census, sp.census, sp.hi * CENSUS);
+        mem.copy[u8](dirty, sp.dirty, sp.hi);
+        mem.copy[u32](frees, sp.frees, sp.nfree);
+        free_arrays(sp);
+    }
+    sp.table  = table;
+    sp.cells  = cells;
+    sp.back   = back;
+    sp.census = census;
+    sp.before = before;
+    sp.dirty  = dirty;
+    sp.frees  = frees;
+    sp.hash   = hash;
+    sp.cap    = cap;
+    sp.hcap   = cap * 4;
+    mem.fill[u32](sp.hash, NONE, sp.hcap);
+    var s: usize = 0;
+    for (s < sp.hi) {
+        if (used(sp, s)) { hash_put(sp, s); }
+        s = s + 1;
+    }
+    ret err[allo.Error].ok{};
+}
+
+fun free_arrays(sp: *Space) {
+    val a: *allo.Allocator = sp.a;
+    allo.deallocate[u32](a, sp.table, sp.cap * ENTRY);
+    allo.deallocate[u32](a, sp.cells, sp.cap * CELLS);
+    if (sp.back != nil) { allo.deallocate[u32](a, sp.back, sp.cap * CELLS); }
+    allo.deallocate[u32](a, sp.census, sp.cap * CENSUS);
+    allo.deallocate[u32](a, sp.before, sp.cap * CENSUS);
+    allo.deallocate[u8](a, sp.dirty, sp.cap);
+    allo.deallocate[u32](a, sp.frees, sp.cap);
+    allo.deallocate[u32](a, sp.hash, sp.hcap);
+}
+
+# an empty pool
+# ---
+# sp:      pool to initialize
+# a:       allocator backing it
+# stepped: keep back cells, for the CPU to step into
+# ret:     ok, or the allocator's refusal
+pub fun init(sp: *Space, a: *allo.Allocator, stepped: bool) err[allo.Error] {
+    sp.a       = a;
+    sp.cap     = 0;
+    sp.hi      = 0;
+    sp.live    = 0;
+    sp.nfree   = 0;
+    sp.serial  = 0;
+    sp.stepped = stepped;
+    ret alloc_arrays(sp, FIRST_CAP);
+}
+
+# release every array
+pub fun dnit(sp: *Space) {
+    if (sp.cap == 0) { ret; }
+    free_arrays(sp);
+    sp.cap  = 0;
+    sp.hi   = 0;
+    sp.live = 0;
+}
+
+# drop or take up the back cells, for a change of who steps
+# ---
+# sp:      the pool
+# stepped: keep back cells
+# ret:     ok, or the allocator's refusal, which leaves the pool as it was
+pub fun set_stepped(sp: *Space, stepped: bool) err[allo.Error] {
+    if (stepped == sp.stepped) { ret err[allo.Error].ok{}; }
+    if (!stepped) {
+        allo.deallocate[u32](sp.a, sp.back, sp.cap * CELLS);
+        sp.back    = nil;
+        sp.stepped = false;
+        ret err[allo.Error].ok{};
+    }
+    val rb: res[*u32, allo.Error] = allo.zallocate[u32](sp.a, sp.cap * CELLS);
+    if (sel rb.err) { ret err[allo.Error].err{rb.err}; }
+    sp.back    = rb.ok;
+    sp.stepped = true;
+    ret err[allo.Error].ok{};
+}
+
+# free every slot, keeping the capacity
+pub fun reset(sp: *Space) {
+    mem.zero[u32](sp.table, sp.hi * ENTRY);
+    mem.zero[u32](sp.census, sp.hi * CENSUS);
+    mem.fill[u32](sp.hash, NONE, sp.hcap);
+    var s: usize = 0;
+    for (s < sp.hi) {
+        sp.dirty[s] = DIRTY_ENTRY;
+        s           = s + 1;
+    }
+    sp.live  = 0;
+    sp.nfree = 0;
+    sp.hi    = 0;
+}
+
+# the slot of the chunk at (cx, cy), allocating it empty when it does not exist
+#
+# a new chunk is linked into its neighbours' entries, and its own entry and
+# cells and each changed neighbour entry are marked dirty.
+# ---
+# sp:  the pool
+# cx:  chunk column
+# cy:  chunk row
+# ret: the slot, or NONE when the pool is full or the allocator refused
+pub fun alloc(sp: *Space, cx: i64, cy: i64) u32 {
+    val have: u32 = find(sp, cx, cy);
+    if (have != NONE) { ret have; }
+    var s: usize = 0;
+    if (sp.nfree != 0) {
+        sp.nfree = sp.nfree - 1;
+        s        = sp.frees[sp.nfree]::usize;
+    }
+    or {
+        if (sp.hi == sp.cap) {
+            if (sp.cap >= MAX_SLOTS) { ret NONE; }
+            val grown: err[allo.Error] = alloc_arrays(sp, sp.cap * 2);
+            if (sel grown.err) { ret NONE; }
+        }
+        s     = sp.hi;
+        sp.hi = sp.hi + 1;
+    }
+    sp.serial = sp.serial + 1;
+    if (sp.serial == 0) { sp.serial = 1; }
+    val e: *u32 = ?sp.table[s * ENTRY];
+    e[9]  = (cx + BIAS)::u32;
+    e[10] = (cy + BIAS)::u32;
+    e[11] = sp.serial;
+    mem.zero[u32](?sp.cells[s * CELLS], CELLS);
+    mem.zero[u32](?sp.census[s * CENSUS], CENSUS);
+    hash_put(sp, s);
+    sp.live     = sp.live + 1;
+    sp.dirty[s] = DIRTY_ENTRY | DIRTY_ZERO;
+
+    var k: usize = 0;
+    for (k < 9) {
+        val dx: i64 = (k % 3)::i64 - 1;
+        val dy: i64 = (k / 3)::i64 - 1;
+        var n:  u32 = s::u32;
+        if (k != 4) { n = find(sp, cx + dx, cy + dy); }
+        e[k] = n;
+        if (n != NONE && k != 4) {
+            sp.table[n::usize * ENTRY + 8 - k] = s::u32;
+            sp.dirty[n::usize]                 = sp.dirty[n::usize] | DIRTY_ENTRY;
+        }
+        k = k + 1;
+    }
+    ret s::u32;
+}
+
+# free a slot, unlinking it from its neighbours
+pub fun release(sp: *Space, s: usize) {
+    if (!used(sp, s)) { ret; }
+    hash_remove(sp, s);
+    val e: *u32  = ?sp.table[s * ENTRY];
+    var k: usize = 0;
+    for (k < 9) {
+        val n: u32 = e[k];
+        if (n != NONE && k != 4) {
+            sp.table[n::usize * ENTRY + 8 - k] = NONE;
+            sp.dirty[n::usize]                 = sp.dirty[n::usize] | DIRTY_ENTRY;
+        }
+        k = k + 1;
+    }
+    mem.zero[u32](e, ENTRY);
+    mem.zero[u32](?sp.census[s * CENSUS], CENSUS);
+    sp.dirty[s]        = DIRTY_ENTRY;
+    sp.frees[sp.nfree] = s::u32;
+    sp.nfree           = sp.nfree + 1;
+    sp.live            = sp.live - 1;
+}
+
+# give a chunk the neighbours a mask asks for
+# ---
+# mask: a bit per entry word, the chunk's own ignored
+# ret:  false when the pool could not hold them
+pub fun surround_by(sp: *Space, s: usize, mask: u32) bool {
+    val cx: i64   = slot_x(sp, s);
+    val cy: i64   = slot_y(sp, s);
+    var k:  usize = 0;
+    for (k < 9) {
+        if (k != 4 && ((mask >> k::u32) & 1) != 0 && sp.table[s * ENTRY + k] == NONE) {
+            if (alloc(sp, cx + (k % 3)::i64 - 1, cy + (k / 3)::i64 - 1) == NONE) { ret false; }
+        }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# give a chunk all eight neighbours
+# ---
+# ret: false when the pool could not hold them
+pub fun surround(sp: *Space, s: usize) bool {
+    ret surround_by(sp, s, MASK_ALL);
+}
+
+# whether a census entry describes the chunk the slot holds now
+fun current(sp: *Space, census: *u32, n: usize, s: usize) bool {
+    if (s >= n || !used(sp, s)) { ret false; }
+    ret census[s * CENSUS + 2] == incarnation(sp, s);
+}
+
+# reshape the pool around what a census found
+#
+# every chunk the census saw holding a live cell gets the neighbours its mask asks for.
+# then, when frees is set, every chunk the census saw empty and cold whose
+# neighbours it saw empty is freed; a neighbour allocated since the census was
+# taken did not exist then, so it counts as empty. the census is copied into the
+# pool's own for the slots it describes.
+# ---
+# sp:     the pool
+# census: CENSUS words per slot
+# n:      slots the census covers
+# frees:  whether empty chunks may be freed
+# ret:    false when the pool could not hold a needed chunk
+pub fun settle(sp: *Space, census: *u32, n: usize, frees: bool) bool {
+    # the pool's own census moves when surrounding a chunk grows the pool
+    val own: bool  = census == sp.census;
+    var c:   *u32  = census;
+    var ok:  bool  = true;
+    var s:   usize = 0;
+    for (s < n && s < sp.hi) {
+        if (own) { c = sp.census; }
+        if (current(sp, c, n, s) && c[s * CENSUS] != 0) {
+            if (!surround_by(sp, s, c[s * CENSUS + 3])) { ok = false; }
+        }
+        s = s + 1;
+    }
+    if (own) { c = sp.census; }
+    if (frees) {
+        s = 0;
+        for (s < n && s < sp.hi) {
+            if (current(sp, c, n, s) && c[s * CENSUS] == 0 && c[s * CENSUS + 1] == 0) {
+                var busy: bool  = false;
+                var k:    usize = 0;
+                for (k < 9 && !busy) {
+                    val nb: u32 = sp.table[s * ENTRY + k];
+                    # the neighbour asks for this chunk when its mask has the bit
+                    # for the side this chunk lies on from it
+                    if (k != 4 && nb != NONE && current(sp, c, n, nb::usize)
+                        && c[nb::usize * CENSUS] != 0
+                        && ((c[nb::usize * CENSUS + 3] >> (8 - k)::u32) & 1) != 0) { busy = true; }
+                    k = k + 1;
+                }
+                if (!busy) { release(sp, s); }
+            }
+            s = s + 1;
+        }
+    }
+    if (own) { ret ok; }
+    s = 0;
+    for (s < n && s < sp.hi) {
+        if (current(sp, c, n, s)) { mem.copy[u32](?sp.census[s * CENSUS], ?c[s * CENSUS], CENSUS); }
+        s = s + 1;
+    }
+    ret ok;
+}
+
+# the live cells the census counted
+pub fun population(sp: *Space) usize {
+    var n: usize = 0;
+    var s: usize = 0;
+    for (s < sp.hi) {
+        n = n + sp.census[s * CENSUS]::usize;
+        s = s + 1;
+    }
+    ret n;
+}
+
+# count a slot's live and warm cells into its census from its front cells
+pub fun recount(sp: *Space, s: usize) {
+    var live: u32   = 0;
+    var warm: u32   = 0;
+    val c:    *u32  = ?sp.cells[s * CELLS];
+    var i:    usize = 0;
+    for (i < CELLS) {
+        if (c[i] >= 256)       { live = live + 1; }
+        if ((c[i] & 255) != 0) { warm = 1; }
+        i = i + 1;
+    }
+    sp.census[s * CENSUS]     = live;
+    sp.census[s * CENSUS + 1] = warm;
+    sp.census[s * CENSUS + 2] = incarnation(sp, s);
+    sp.census[s * CENSUS + 3] = 0;
+    if (live != 0) { sp.census[s * CENSUS + 3] = MASK_ALL; }
+}
+
+test alloc__links_neighbours_both_ways_and_release_unlinks {
+    var a: allo.Allocator;
+    page.make(?a);
+    var sp:   Space;
+    val made: err[allo.Error] = init(?sp, ?a, true);
+    if (sel made.err) { ret 1; }
+
+    val s: u32 = alloc(?sp, -1, 0);
+    val t: u32 = alloc(?sp, 0, 0);
+    # t is east of s: s names t at 5, t names s at 3
+    if (sp.table[s::usize * ENTRY + 5] != t)                       { ret 2; }
+    if (sp.table[t::usize * ENTRY + 3] != s)                       { ret 3; }
+    if (find(?sp, -1, 0) != s || find(?sp, 0, 0) != t)             { ret 4; }
+    if (slot_x(?sp, s::usize) != -1 || slot_y(?sp, s::usize) != 0) { ret 5; }
+
+    release(?sp, s::usize);
+    if (sp.table[t::usize * ENTRY + 3] != NONE)           { ret 6; }
+    if (find(?sp, -1, 0) != NONE || find(?sp, 0, 0) != t) { ret 7; }
+    dnit(?sp);
+    ret 0;
+}
+
+test alloc__grows_the_pool_and_keeps_every_chunk_findable {
+    var a: allo.Allocator;
+    page.make(?a);
+    var sp:   Space;
+    val made: err[allo.Error] = init(?sp, ?a, false);
+    if (sel made.err) { ret 1; }
+    var i: i64 = 0;
+    for (i < 300) {
+        if (alloc(?sp, i % 20 - 10, i / 20 - 7) == NONE) { ret 2; }
+        i = i + 1;
+    }
+    if (sp.live != 300 || sp.cap < 300) { ret 3; }
+    # free every other chunk, then every survivor must still be found
+    i = 0;
+    for (i < 300) {
+        if (i % 2 == 0) { release(?sp, find(?sp, i % 20 - 10, i / 20 - 7)::usize); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < 300) {
+        val s: u32 = find(?sp, i % 20 - 10, i / 20 - 7);
+        if ((i % 2 == 0) != (s == NONE)) { ret 4; }
+        i = i + 1;
+    }
+    dnit(?sp);
+    ret 0;
+}
+
+test settle__gives_a_live_chunk_only_the_neighbours_its_mask_asks_for {
+    var a: allo.Allocator;
+    page.make(?a);
+    var sp:   Space;
+    val made: err[allo.Error] = init(?sp, ?a, false);
+    if (sel made.err) { ret 1; }
+    val s: usize = alloc(?sp, 0, 0)::usize;
+    # live, warm, the chunk's incarnation, and a mask asking west and north-west
+    sp.census[s * CENSUS]     = 1;
+    sp.census[s * CENSUS + 1] = 1;
+    sp.census[s * CENSUS + 2] = incarnation(?sp, s);
+    sp.census[s * CENSUS + 3] = 0x9;
+    if (!settle(?sp, sp.census, sp.hi, true))                  { ret 2; }
+    if (sp.live != 3)                                          { ret 3; }
+    if (find(?sp, -1, 0) == NONE || find(?sp, -1, -1) == NONE) { ret 4; }
+    # the asked-for chunks stay while the live chunk asks, and go once it does not
+    sp.census[s * CENSUS + 3] = 0;
+    sp.census[s * CENSUS]     = 0;
+    sp.census[s * CENSUS + 1] = 0;
+    if (!settle(?sp, sp.census, sp.hi, true)) { ret 5; }
+    dnit(?sp);
+    ret 0;
+}

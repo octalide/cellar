@@ -1,209 +1,200 @@
-# cellar.render: the world view — a camera that maps grid cells to screen pixels,
-# the grid-to-quad painter, and the inverse cursor-to-cell mapping the editor uses.
+# the world view: a camera over the unbounded plane, and the colours cells
+# are drawn in
 #
-# all geometry is emitted through blit as screen-space quads, so the cell grid and
-# the control panel share one vertex stream, one shader, and one texture. cells
-# default to solid fills; a color mode picks how each cell is tinted (flat live
-# color, a fading heat trail, or an age-driven sin palette).
+# the camera is a world point at the centre of the window and a zoom in pixels
+# per cell, so panning and zooming never meet an edge, and it answers the
+# inverse, the cell under a cursor, for the editor. cells are drawn by the GPU
+# straight from the pool (cellar.gpu); this builds what that draw reads: the
+# camera as the chunk the centre lies in plus an offset, so it stays exact far
+# from the origin, and the palettes of the colour modes, converted once into
+# the space the window stores.
 
+use gfx: boom.graphics;
+use cellar.gpu;
+use cellar.space;
+use cellar.theme;
+use std.types.bool.bool;
 use std.types.size.usize;
-use bd: blit.draw;
-use bc: blit.context;
-use sim:  cellar.sim;
-use grid: cellar.grid;
 
-# MARGIN: minimum gap in pixels between the fitted grid and the window edge.
-val MARGIN: f32 = 16.0;
+# pixels per cell at zoom 1
+pub val BASE_PPC: f32 = 7.0;
 
-# PI/TAU: constants for the sin approximation driving the age palette.
-val PI:  f32 = 3.14159265;
-val TAU: f32 = 6.28318531;
-
-# MODE_SOLID: live cells in a flat color, dead cells unpainted.
+# live cells in a flat color, dead cells unpainted
 pub val MODE_SOLID: u8 = 0;
-# MODE_HEAT: every cell with nonzero heat tinted through a fire palette, so trails fade.
+# every cell with nonzero heat tinted through the trail palette, so trails fade
 pub val MODE_HEAT: u8 = 1;
-# MODE_AGE_SIN: live cells colored by a sin-wave palette over age.
-pub val MODE_AGE_SIN: u8 = 2;
+# live cells coloured by the age palette
+pub val MODE_AGE: u8 = 2;
 
-# Camera: places the grid as a square of `cell`-pixel cells with its top-left
-# corner at (ox, oy) in screen space.
+# the view for one frame
 # ---
-# cell: side length of one cell in pixels
-# ox:   screen x of the grid's left edge
-# oy:   screen y of the grid's top edge
+# x:   world column at the window's centre, in cells
+# y:   world row at the window's centre, in cells
+# ppc: pixels per cell
+# sw:  window width in pixels
+# sh:  window height in pixels
 pub rec Camera {
-    cell: f32;
-    ox:   f32;
-    oy:   f32;
+    x:   f64;
+    y:   f64;
+    ppc: f32;
+    sw:  f32;
+    sh:  f32;
 }
 
-# fabs: absolute value of an f32.
+# the camera the user's zoom and pan give
 # ---
-# v:   value
-# ret: |v|
-fun fabs(v: f32) f32 {
-    if (v < 0.0) { ret 0.0 - v; }
-    ret v;
-}
-
-# clamp01: clamp an f32 into [0, 1].
-# ---
-# v:   value
-# ret: v clamped to [0, 1]
-fun clamp01(v: f32) f32 {
-    if (v < 0.0) { ret 0.0; }
-    if (v > 1.0) { ret 1.0; }
-    ret v;
-}
-
-# sin_approx: low-precision sine via the classic parabolic approximation.
-# defined for non-negative radians; the age palette only ever feeds it x >= 0.
-# ---
-# x:   angle in radians, x >= 0
-# ret: an approximation of sin(x) in [-1, 1]
-fun sin_approx(x: f32) f32 {
-    # range-reduce into [0, TAU) without a loop, then shift to [-PI, PI)
-    val k: f32 = (x / TAU)::i64::f32;
-    var t: f32 = x - k * TAU;
-    if (t > PI) { t = t - TAU; }
-    # y = (4/PI) t - (4/PI^2) t|t|
-    ret 1.27323954 * t - 0.405284735 * t * fabs(t);
-}
-
-# heat_color: map a heat value to a black-red-orange-yellow-white fire ramp.
-# ---
-# heat: trail value in [1, 255]
-# ret:  the fill color
-fun heat_color(heat: u8) bd.Color {
-    val t: f32 = heat::f32 / 255.0;
-    val r: f32 = clamp01(t * 3.0);
-    val g: f32 = clamp01(t * 3.0 - 1.0);
-    val b: f32 = clamp01(t * 3.0 - 2.0);
-    ret bd.rgba(r, g, b, 1.0);
-}
-
-# age_color: map a cell age to a smoothly cycling sin-wave palette.
-# ---
-# age: generations the cell has been continuously alive
-# ret: the fill color
-fun age_color(age: u32) bd.Color {
-    val p: f32 = age::f32 * 0.15;
-    val r: f32 = 0.5 + 0.5 * sin_approx(p);
-    val g: f32 = 0.5 + 0.5 * sin_approx(p + 2.094395);
-    val b: f32 = 0.5 + 0.5 * sin_approx(p + 4.188790);
-    ret bd.rgba(r, g, b, 1.0);
-}
-
-# fit: a camera that scales the grid to fill the window (minus a margin),
-# centers it, then applies the user's zoom and pan.
-# ---
-# g:     the grid being viewed
+# zoom:  zoom multiplier, BASE_PPC pixels per cell at 1
+# pan_x: world column at the window's centre
+# pan_y: world row at the window's centre
 # sw:    window width in pixels
 # sh:    window height in pixels
-# zoom:  user zoom multiplier (1.0 = fit)
-# pan_x: horizontal pan offset in pixels
-# pan_y: vertical pan offset in pixels
 # ret:   the camera for this frame
-pub fun fit(g: *grid.Grid, sw: f32, sh: f32, zoom: f32, pan_x: f32, pan_y: f32) Camera {
-    val gw: f32 = g.w::f32;
-    val gh: f32 = g.h::f32;
-
-    var avail_w: f32 = sw - MARGIN * 2.0;
-    var avail_h: f32 = sh - MARGIN * 2.0;
-    if (avail_w < 1.0) { avail_w = 1.0; }
-    if (avail_h < 1.0) { avail_h = 1.0; }
-
-    var base: f32 = avail_w / gw;
-    if (avail_h / gh < base) { base = avail_h / gh; }
-
-    var cell: f32 = base * zoom;
-    if (cell < 1.0) { cell = 1.0; }
-
+pub fun camera(zoom: f32, pan_x: f32, pan_y: f32, sw: f32, sh: f32) Camera {
     var cam: Camera;
-    cam.cell = cell;
-    cam.ox = (sw - gw * cell) / 2.0 + pan_x;
-    cam.oy = (sh - gh * cell) / 2.0 + pan_y;
+    cam.x   = pan_x::f64;
+    cam.y   = pan_y::f64;
+    cam.ppc = BASE_PPC * zoom;
+    cam.sw  = sw;
+    cam.sh  = sh;
     ret cam;
 }
 
-# cell_at: the grid cell under screen pixel (px, py). writes (cx, cy) and returns
-# 1 when the pixel lands on a cell, else returns 0 and leaves the outputs alone.
+# the part of the window the world shows through, in pixels, from the top-left
 # ---
-# cam: the current camera
-# g:   the grid being viewed
-# px:  screen x in pixels
-# py:  screen y in pixels
-# cx:  out — column of the hit cell
-# cy:  out — row of the hit cell
-# ret: 1 if (px, py) is over a cell, else 0
-pub fun cell_at(cam: Camera, g: *grid.Grid, px: f32, py: f32, cx: *usize, cy: *usize) u8 {
-    if (cam.cell <= 0.0) { ret 0; }
-    val fx: f32 = (px - cam.ox) / cam.cell;
-    val fy: f32 = (py - cam.oy) / cam.cell;
-    if (fx < 0.0) { ret 0; }
-    if (fy < 0.0) { ret 0; }
-    val ix: usize = fx::usize;
-    val iy: usize = fy::usize;
-    if (ix >= g.w) { ret 0; }
-    if (iy >= g.h) { ret 0; }
-    @cx = ix;
-    @cy = iy;
-    ret 1;
+# w: width
+# h: height
+pub rec Port {
+    w: f32;
+    h: f32;
 }
 
-# draw_grid: paint the dead-field backdrop and the cells for this frame.
+# the world point under screen pixel (px, py), unrounded
 # ---
-# ctx:    blit context accumulating the frame's geometry
-# s:      simulation whose grid is drawn
-# cam:    the camera mapping cells to pixels
-# mode:   color mode (MODE_SOLID, MODE_HEAT, or MODE_AGE_SIN)
-# gutter: 1 to leave a 1px gap between cells, 0 for solid fills
-# sr:     solid-mode live-cell red in [0, 1]
-# sg:     solid-mode live-cell green in [0, 1]
-# sb:     solid-mode live-cell blue in [0, 1]
-pub fun draw_grid(ctx: *bc.Context, s: *sim.Sim, cam: Camera, mode: u8, gutter: u8, sr: f32, sg: f32, sb: f32) {
-    val g:  *grid.Grid = ?s.grid;
-    val gw: f32 = g.w::f32;
-    val gh: f32 = g.h::f32;
+# cam: the current camera
+# px:  screen x in pixels
+# py:  screen y in pixels
+# wx:  receives the column
+# wy:  receives the row
+pub fun world_at(cam: Camera, px: f32, py: f32, wx: *f64, wy: *f64) {
+    @wx = cam.x + ((px - cam.sw / 2.0) / cam.ppc)::f64;
+    @wy = cam.y + ((py - cam.sh / 2.0) / cam.ppc)::f64;
+}
 
-    val bg: bd.Color = bd.rgba(0.08, 0.09, 0.11, 1.0);
-    bc.quad(ctx, cam.ox, cam.oy, cam.ox + gw * cam.cell, cam.oy + gh * cam.cell, bg);
+# screen x of world column x
+pub fun screen_x(cam: Camera, x: f64) f32 {
+    ret cam.sw / 2.0 + ((x - cam.x) * cam.ppc::f64)::f32;
+}
 
-    var gap: f32 = 0.0;
-    if (gutter != 0) { gap = 1.0; }
+# screen y of world row y
+pub fun screen_y(cam: Camera, y: f64) f32 {
+    ret cam.sh / 2.0 + ((y - cam.y) * cam.ppc::f64)::f32;
+}
 
-    val live: bd.Color = bd.rgba(sr, sg, sb, 1.0);
-    var y: usize = 0;
-    for (y < g.h) {
-        var x: usize = 0;
-        for (x < g.w) {
-            val alive: u8 = grid.get(g, x, y);
-            var paint: u8 = 0;
-            var col: bd.Color;
-            if (mode == MODE_HEAT) {
-                val hv: u8 = grid.heat_at(g, x, y);
-                if (hv != 0) {
-                    paint = 1;
-                    col   = heat_color(hv);
-                }
-            } or {
-                if (alive != 0) {
-                    paint = 1;
-                    if (mode == MODE_AGE_SIN) {
-                        col = age_color(grid.age_at(g, x, y));
-                    } or {
-                        col = live;
-                    }
-                }
-            }
-            if (paint != 0) {
-                val x0: f32 = cam.ox + x::f32 * cam.cell;
-                val y0: f32 = cam.oy + y::f32 * cam.cell;
-                bc.quad(ctx, x0, y0, x0 + cam.cell - gap, y0 + cam.cell - gap, col);
-            }
-            x = x + 1;
-        }
-        y = y + 1;
+fun floor64(v: f64) i64 {
+    val t: i64 = v::i64;
+    if (t::f64 > v) { ret t - 1; }
+    ret t;
+}
+
+# the world cell under screen pixel (px, py)
+# ---
+# cam: the current camera
+# px:  screen x in pixels
+# py:  screen y in pixels
+# cx:  receives the column
+# cy:  receives the row
+pub fun cell_at(cam: Camera, px: f32, py: f32, cx: *i64, cy: *i64) {
+    @cx = floor64(cam.x + ((px - cam.sw / 2.0) / cam.ppc)::f64);
+    @cy = floor64(cam.y + ((py - cam.sh / 2.0) / cam.ppc)::f64);
+}
+
+fun put(out: *f32, r: f32, g: f32, b: f32, srgb: bool) {
+    out[0] = r;
+    out[1] = g;
+    out[2] = b;
+    out[3] = 1.0;
+    if (srgb) {
+        out[0] = theme.linear(r);
+        out[1] = theme.linear(g);
+        out[2] = theme.linear(b);
     }
+}
+
+# a hex colour's channel in [0, 1]
+fun unit(byte: u8) f32 {
+    ret byte::f32 / 255.0;
+}
+
+# the backdrop, in the space the window stores
+# ---
+# out:  four floats
+# srgb: whether the window encodes sRGB, so colours must arrive linear
+pub fun backdrop(out: *f32, srgb: bool) {
+    put(out, unit(theme.red(theme.BG)), unit(theme.green(theme.BG)), unit(theme.blue(theme.BG)), srgb);
+}
+
+# the trail and age palettes, gpu.SHADES entries of four floats each
+#
+# trails run from the backdrop through an ember ramp to white hot over heat
+# [0, 255]; age runs from a newborn glow through teal and indigo to violet
+# over the first 255 generations (cellar.theme).
+# ---
+# heat: receives the trail palette
+# age:  receives the age palette
+# srgb: whether the window encodes sRGB
+pub fun palettes(heat: *f32, age: *f32, srgb: bool) {
+    var r: theme.Ramps;
+    theme.ramps(?r);
+    var i: usize = 0;
+    for (i < gpu.SHADES) {
+        put(?heat[i * 4], unit(r.trail[i * 3]), unit(r.trail[i * 3 + 1]), unit(r.trail[i * 3 + 2]), srgb);
+        put(?age[i * 4], unit(r.age[i * 3]), unit(r.age[i * 3 + 1]), unit(r.age[i * 3 + 2]), srgb);
+        i = i + 1;
+    }
+}
+
+# what the draw reads this frame
+# ---
+# cam:    the camera
+# win_w:  the window width in pixels, of which the camera sees the left cam.sw
+# mode:   colour mode, a MODE_*
+# gutter: 1 to show grid lines
+# solid:  solid-mode live-cell colour, sRGB hex
+# srgb:   whether the window encodes sRGB
+# ret:    the look
+pub fun look(cam: Camera, win_w: f32, mode: u8, gutter: u8, solid: u32, srgb: bool) gpu.Look {
+    var l:  gpu.Look;
+    val bx: i64 = floor64(cam.x / 64.0);
+    val by: i64 = floor64(cam.y / 64.0);
+    l.base_cx = (bx + space.BIAS)::u32;
+    l.base_cy = (by + space.BIAS)::u32;
+    l.mode    = mode::u32;
+    l.gutter  = gutter::u32;
+    l.frac_x  = (cam.x - (bx * 64)::f64)::f32;
+    l.frac_y  = (cam.y - (by * 64)::f64)::f32;
+    l.ppc     = cam.ppc;
+    l.half_w  = cam.sw / 2.0;
+    l.half_h  = cam.sh / 2.0;
+    l.win_w   = win_w;
+    l.pad1    = 0;
+    l.pad2    = 0;
+    put(?l.solid[0], unit(theme.red(solid)), unit(theme.green(solid)), unit(theme.blue(solid)), srgb);
+    backdrop(?l.back[0], srgb);
+    ret l;
+}
+
+test cell_at__maps_pixels_to_signed_cells_either_side_of_the_origin {
+    var cam: Camera;
+    cam.x   = 0.0;
+    cam.y   = 0.0;
+    cam.ppc = 10.0;
+    cam.sw  = 100.0;
+    cam.sh  = 100.0;
+    var cx: i64 = 0;
+    var cy: i64 = 0;
+    cell_at(cam, 51.0, 49.0, ?cx, ?cy);
+    if (cx != 0 || cy != -1) { ret 1; }
+    cell_at(cam, 5.0, 95.0, ?cx, ?cy);
+    if (cx != -5 || cy != 4) { ret 2; }
+    ret 0;
 }
