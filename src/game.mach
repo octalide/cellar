@@ -120,6 +120,8 @@ val SMALL_PX: f32 = 14.0;
 # bench_r:     the radius the measured rule reads, Life's weights widened to it
 # bench_gps:   generations a second the measurement is capped at, 0 uncapped
 # engine:      the args.ENGINE_* the command line named
+# saved_tree:  HashLife was wanted by the settings, not the command line, so a
+#              world it cannot take stays on the pool
 # want_tree:   the world is to move onto HashLife with the first frame, and
 #              the run stops if it cannot
 # started:     when the measurement began
@@ -151,6 +153,7 @@ pub rec Game {
     bench_r:     usize;
     bench_gps:   usize;
     engine:      u8;
+    saved_tree:  bool;
     want_tree:   bool;
     started:     Instant;
     frames:      u64;
@@ -246,21 +249,49 @@ pub fun on_init(ctx: *Context) {
         ret;
     }
     g.gpu_ok = true;
-    if (g.bench_cpu || g.engine == args.ENGINE_CPU) { gpu.forgo_compute(?g.gpu); }
+    # a command-line engine decides this run, else the settings' choice does
+    val engine: u8 = pick_engine(?g.app, ?g.sim, g.engine);
+    g.saved_tree = g.engine == args.ENGINE_ANY && engine == args.ENGINE_HASHLIFE;
+    if (g.bench_cpu || engine == args.ENGINE_CPU) { gpu.forgo_compute(?g.gpu); }
     sim.attach(?g.sim, ?g.gpu);
-    if (!g.gpu.stepping && g.engine == args.ENGINE_GPU) {
+    if (!g.gpu.stepping && engine == args.ENGINE_GPU) {
         give_up(ctx, "cellar: --engine gpu: the GPU here cannot step the world");
         ret;
     }
-    if (!g.gpu.stepping && g.engine != args.ENGINE_CPU) { print.eprintln("the GPU cannot step the world; stepping on the CPU"); }
+    if (!g.gpu.stepping && engine != args.ENGINE_CPU) { print.eprintln("the GPU cannot step the world; stepping on the CPU"); }
 
     # the world is seeded once the GPU has set how far the pool may grow
     g.want_tree = false;
     if (g.bench != args.BENCH_NONE) { bench_world(g); }
-    or                              { g.want_tree = start_world(?g.app, ?g.sim, g.open, g.capture != nil, g.engine); }
+    or                              { g.want_tree = start_world(?g.app, ?g.sim, g.open, g.capture != nil, engine); }
 
     val spawned: err[thread.ThreadError] = runner.start(?g.runner, ?g.sim);
     if (sel spawned.err) { give_up(ctx, "could not start the simulation thread"); }
+}
+
+# the engine a session runs on: the command line's when it names one, else the
+# one the settings chose, which is not changed by the command line's
+#
+# a saved HashLife that cannot run the loaded rule gives way to the chunk
+# engine, with a message. a saved GPU is the default, which steps on the GPU
+# where it can, and so is ENGINE_ANY rather than ENGINE_GPU, which a machine
+# without one refuses.
+# ---
+# a:   application state, with the settings loaded
+# s:   the simulation, with the rule loaded
+# cli: the args.ENGINE_* the command line named
+# ret: the args.ENGINE_* to run on
+pub fun pick_engine(a: *app.App, s: *sim.Sim, cli: u8) u8 {
+    if (cli != args.ENGINE_ANY) { ret cli; }
+    if (a.engine_tree) {
+        if (world.hashlife_runs(s)) { ret args.ENGINE_HASHLIFE; }
+        var rb: [rule.DISPLAY_MAX + 1]u8;
+        app.say_why(a, "HashLife cannot run the saved rule", world.rule_string(s, ?rb[0]));
+        app.say_also(a, "using the chunk engine");
+        ret args.ENGINE_ANY;
+    }
+    if (a.engine_cpu) { ret args.ENGINE_CPU; }
+    ret args.ENGINE_ANY;
 }
 
 # stop the run that asked for HashLife on the command line when it could not
@@ -684,7 +715,10 @@ pub fun on_draw(ctx: *Context) {
     exec.run(a, ?g.sim, ?deps);
     if (g.want_tree) {
         g.want_tree = false;
-        if (!world.hashlife(?g.sim)) {
+        if (!world.hashlife(?g.sim) && g.saved_tree) {
+            app.say(a, "HashLife could not take the world; using the chunk engine");
+        }
+        or (!world.hashlife(?g.sim)) {
             runner.leave(?g.runner, false);
             refuse_tree(ctx, g);
             ret;
@@ -727,7 +761,9 @@ pub fun on_draw(ctx: *Context) {
     var pass: gfx.Pass = gfx.pass_begin(?g.renderer, ?desc);
     gpu.draw(?g.gpu, ?pass);
 
-    ui.begin(u, ?pass, ctx.input.mouse_x::f32, ctx.input.mouse_y::f32, inp.button_down(?ctx.input, inp.BUTTON_LEFT));
+    # a capture has no user, so any pointer over its window is not one
+    val pointer: bool = ctx.input.pointer_in && g.capture == nil;
+    ui.begin(u, ?pass, pointer, ctx.input.mouse_x::f32, ctx.input.mouse_y::f32, inp.button_down(?ctx.input, inp.BUTTON_LEFT));
     grid_edge(g, cam);
     outline(g, cam);
     hud.selection(u, a, cam);
@@ -967,5 +1003,40 @@ test start_world__a_file_opens_onto_an_empty_world_running_on_either_engine {
         e = e + args.ENGINE_HASHLIFE;
     }
     fs.remove_file("out/test/start_world/row.rle");
+    ret 0;
+}
+
+test pick_engine__the_command_line_overrides_the_saved_engine_and_a_rule_hashlife_cannot_run_falls_back {
+    var al: allo.Allocator;
+    page.make(?al);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?al);
+    if (sel made.err) { ret 1; }
+    var a: app.App;
+    app.init(?a);
+
+    # nothing saved runs the default, cpu the CPU, and a named engine wins
+    if (pick_engine(?a, ?s, args.ENGINE_ANY) != args.ENGINE_ANY) { ret 2; }
+    a.engine_cpu = true;
+    if (pick_engine(?a, ?s, args.ENGINE_ANY) != args.ENGINE_CPU) { ret 3; }
+    a.engine_tree = true;
+    if (pick_engine(?a, ?s, args.ENGINE_GPU) != args.ENGINE_GPU)      { ret 4; }
+    if (pick_engine(?a, ?s, args.ENGINE_ANY) != args.ENGINE_HASHLIFE) { ret 5; }
+    if (a.toast_t != 0)                                               { ret 6; }
+    # the command line's choice is not the saved one
+    if (!a.engine_tree || !a.engine_cpu) { ret 7; }
+
+    # a rule HashLife cannot run runs on the pool, saying so
+    val b0: res[rule.Rule, str] = rule.parse("B0/S");
+    if (sel b0.err) { ret 11; }
+    sim.set_rule(?s, b0.ok);
+    if (world.hashlife_runs(?s))                                                   { ret 8; }
+    if (pick_engine(?a, ?s, args.ENGINE_ANY) != args.ENGINE_ANY || a.toast_t == 0) { ret 9; }
+    # a named engine is left to the run, which stops when it cannot
+    a.toast_t = 0;
+    if (pick_engine(?a, ?s, args.ENGINE_HASHLIFE) != args.ENGINE_HASHLIFE || a.toast_t != 0) { ret 10; }
+
+    app.dnit(?a);
+    sim.dnit(?s);
     ret 0;
 }
