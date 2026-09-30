@@ -9,6 +9,7 @@ use cellar.command;
 use cellar.kernel;
 use cellar.pattern;
 use cellar.persist;
+use cellar.region;
 use cellar.saves;
 use cellar.sim;
 use cellar.space;
@@ -16,6 +17,8 @@ use cellar.world;
 use allo: std.allocator;
 use std.allocator.page;
 use fs: std.filesystem;
+use std.types.bool.bool;
+use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
 use std.types.option.opt;
@@ -115,6 +118,65 @@ fun open(a: *app.App, s: *sim.Sim, d: *Deps, path: str) {
     app.say_why(a, base(path), "opened");
 }
 
+# read the selection into a new custom pattern, cutting it with cut, and make
+# that the stamp, laid down as it was read
+fun take(a: *app.App, s: *sim.Sim, b: space.Box, cut: bool) {
+    var p:    pattern.Pattern;
+    val made: err[allo.Error] = pattern.init(?p, a.alloc, 0, 0, "selection");
+    if (sel made.err) {
+        app.say(a, "out of memory");
+        ret;
+    }
+    # the rule the cells were read under, set first so a refusal leaves the world alone
+    var rule:  [200]u8;
+    val named: err[allo.Error] = pattern.set_rule(?p, kernel.notation(?s.kernel, ?rule[0]));
+    var ok:    bool            = sel named.ok;
+    if (ok && cut) { ok = region.cut(s, b, ?p); }
+    or (ok)        { ok = region.copy(s, b, ?p); }
+    if (!ok) {
+        pattern.dnit(?p);
+        app.say(a, "the selection could not be copied");
+        ret;
+    }
+    pattern.dnit(?a.custom);
+    a.custom      = p;
+    a.pattern_sel = pattern.BUILTIN_COUNT;
+    a.orient      = 0;
+    a.tool        = app.TOOL_STAMP;
+    if (cut) { app.say(a, "selection cut to the stamp"); }
+    or       { app.say(a, "selection copied to the stamp"); }
+}
+
+# shrink the selection to the box its live cells span, dropping it when none is alive
+fun shrink(a: *app.App, s: *sim.Sim, b: space.Box) {
+    var got: opt[space.Box] = opt[space.Box].none{};
+    if (!region.bounds(s, b, ?got)) {
+        app.say(a, "the selection could not be read");
+        ret;
+    }
+    if (sel got.none) {
+        app.deselect(a);
+        app.say(a, "nothing is alive in the selection");
+        ret;
+    }
+    a.selected = true;
+    a.area     = got.some;
+}
+
+# apply an operation on a rectangle
+fun area(c: *command.Area, a: *app.App, s: *sim.Sim) {
+    val b:  space.Box = c.box;
+    var ok: bool      = true;
+    if (c.op == command.AREA_COPY)          { take(a, s, b, false); }
+    if (c.op == command.AREA_CUT)           { take(a, s, b, true); }
+    if (c.op == command.AREA_CLEAR)         { ok = region.clear(s, b); }
+    if (c.op == command.AREA_CLEAR_OUTSIDE) { ok = region.clear_outside(s, b); }
+    if (c.op == command.AREA_FILL)          { ok = region.fill(s, b, sim.DEFAULT_DENSITY); }
+    if (c.op == command.AREA_INVERT)        { ok = region.invert(s, b); }
+    if (c.op == command.AREA_SHRINK)        { shrink(a, s, b); }
+    if (!ok)                                { app.say(a, "the selection could not be changed"); }
+}
+
 # apply one command
 fun apply(c: *command.Command, a: *app.App, s: *sim.Sim, d: *Deps) {
     if (sel c.toggle)     { world.toggle(s); }
@@ -125,6 +187,7 @@ fun apply(c: *command.Command, a: *app.App, s: *sim.Sim, d: *Deps) {
     if (sel c.line)       { world.line(s, c.line.x0, c.line.y0, c.line.x1, c.line.y1, c.line.v); }
     if (sel c.stamp)      { world.stamp(s, ?c.stamp.p, c.stamp.x, c.stamp.y); }
     if (sel c.rule)       { s.kernel = c.rule; }
+    if (sel c.area)       { area(?c.area, a, s); }
     if (sel c.save_world) { save_world(a, s, d, command.path(?c.save_world)); }
     if (sel c.load_world) { load_world(a, s, d, command.path(?c.load_world)); }
     if (sel c.save_pattern) {
@@ -223,6 +286,18 @@ test run__applies_in_order_and_a_save_sees_the_edits_before_it {
     val last:  *saves.Entry = ?ap.saves.items.data[2];
     if (!string.str_equals(first.name, "empty.cellar") || first.kind != saves.KIND_WORLD)                  { ret 12; }
     if (!string.str_equals(last.name, "soup.cellar") || ap.saves.items.data[1].kind != saves.KIND_PATTERN) { ret 13; }
+
+    # a selection copied becomes the stamp, and shrinks to the cells it holds
+    app.submit(?ap, command.Command.load_world{file(?ap, "out/test/exec/soup.cellar")});
+    app.select(?ap, 15, 11, 0, 0);
+    app.area(?ap, command.AREA_COPY);
+    app.select(?ap, -5, -5, 49, 49);
+    app.area(?ap, command.AREA_SHRINK);
+    run(?ap, ?s, ?d);
+    if (ap.pattern_sel != pattern.BUILTIN_COUNT || ap.tool != app.TOOL_STAMP)                       { ret 14; }
+    if (ap.custom.w != 16 || ap.custom.h != 12 || pattern.get(?ap.custom, 1, 2) != 1)               { ret 15; }
+    if (pattern.get(?ap.custom, 14, 10) != 1 || pattern.get(?ap.custom, 0, 0) != 0)                 { ret 16; }
+    if (!ap.selected || ap.area.x0 != 1 || ap.area.y0 != 2 || ap.area.x1 != 15 || ap.area.y1 != 11) { ret 17; }
 
     fs.remove_file("out/test/exec/soup.cellar");
     fs.remove_file("out/test/exec/empty.cellar");
