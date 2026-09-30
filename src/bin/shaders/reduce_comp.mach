@@ -1,0 +1,103 @@
+# every chunk's coverage pyramid (cellar.layout.Mip), from the frame's last
+# generation, for the draw below a pixel per cell
+#
+# workgroup y names the slot and an invocation is an 8 by 8 block of its cells,
+# whose level 1, 2 and 3 texels it writes from the cells alone, so no invocation
+# reads another's work. a chunk whose warm stamp is not the current serial holds
+# only zeros, and so does its pyramid once cleared: an invocation that finds its
+# block's level 3 texel set there, left by a chunk that has since cooled or by
+# the slot's last owner, clears its block's texels.
+
+use cellar.layout;
+use cellar.layout.Cells;
+use cellar.layout.Flags;
+use cellar.layout.Meta;
+use cellar.layout.Mip;
+
+#[storage(1, 0, "readonly")]
+var cells: Cells;
+#[storage(1, 1, "readonly")]
+var meta:  Meta;
+#[storage(1, 2, "readonly")]
+var flags: Flags;
+#[storage(1, 3)]
+var mip:   Mip;
+
+#[builtin("global_invocation")]
+var gid: u32x3;
+
+#[stage("compute")]
+#[workgroup(64, 1, 1)]
+fun comp_main() {
+    val slot: u32 = gid[1];
+    val bx:   u32 = gid[0] & 7;
+    val by:   u32 = gid[0] >> 3;
+    if (meta.table[slot * layout.ENTRY + (layout.ENTRY - 1)] == 0) { ret; }
+    val base: u32 = slot * layout.MIP;
+    val s1:   u32 = layout.mip_side(1);
+    val s2:   u32 = layout.mip_side(2);
+    val s3:   u32 = layout.mip_side(3);
+    val at1:  u32 = base + layout.mip_at(1);
+    val at2:  u32 = base + layout.mip_at(2);
+    val at3:  u32 = base + layout.mip_at(3) + by * s3 + bx;
+
+    if (flags.v[slot * 2 + 1] != meta.serial) {
+        if (mip.v[at3] == 0) { ret; }
+        var z: u32 = 0;
+        for (z < 16) {
+            val i: u32 = at1 + (by * 4 + (z >> 2)) * s1 + bx * 4 + (z & 3);
+            mip.v[i] = 0;
+            z        = z + 1;
+        }
+        z = 0;
+        for (z < 4) {
+            val i: u32 = at2 + (by * 2 + (z >> 1)) * s2 + bx * 2 + (z & 1);
+            mip.v[i] = 0;
+            z        = z + 1;
+        }
+        mip.v[at3] = 0;
+        ret;
+    }
+
+    val row:   u32 = slot * layout.CELLS;
+    var live3: u32 = 0;
+    var heat3: u32 = 0;
+    var ages3: u32 = 0;
+    var j:     u32 = 0;
+    for (j < 4) {
+        val qx:    u32 = bx * 2 + (j & 1);
+        val qy:    u32 = by * 2 + (j >> 1);
+        var live2: u32 = 0;
+        var heat2: u32 = 0;
+        var ages2: u32 = 0;
+        var k:     u32 = 0;
+        for (k < 4) {
+            val px:    u32 = qx * 2 + (k & 1);
+            val py:    u32 = qy * 2 + (k >> 1);
+            var live1: u32 = 0;
+            var heat1: u32 = 0;
+            var ages1: u32 = 0;
+            var m:     u32 = 0;
+            for (m < 4) {
+                val c: u32 = cells.v[row + (py * 2 + (m >> 1)) * layout.SIDE + px * 2 + (m & 1)];
+                if (c >= layout.LIVE) {
+                    live1 = live1 + 1;
+                    ages1 = ages1 + layout.texel_age(c);
+                }
+                if ((c & layout.HEAT_MASK) > heat1) { heat1 = c & layout.HEAT_MASK; }
+                m = m + 1;
+            }
+            mip.v[at1 + py * s1 + px] = layout.texel(live1, heat1, ages1);
+            live2                     = live2 + live1;
+            ages2                     = ages2 + ages1;
+            if (heat1 > heat2) { heat2 = heat1; }
+            k = k + 1;
+        }
+        mip.v[at2 + qy * s2 + qx] = layout.texel(live2, heat2, ages2);
+        live3                     = live3 + live2;
+        ages3                     = ages3 + ages2;
+        if (heat2 > heat3) { heat3 = heat2; }
+        j = j + 1;
+    }
+    mip.v[at3] = layout.texel(live3, heat3, ages3);
+}
