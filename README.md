@@ -25,6 +25,8 @@ negative weights allowed, plus birth and survive sets over the saturated
 weighted neighbor sum, so it generalizes Larger-than-Life (Golly's
 `R5,C0,M1,S34..58,B34..45,NM` for Bosco's rule, or HROT's
 `R2,C0,S2-3,B3,NC`) while still expressing the classic Life family exactly.
+Golly's weighted neighbourhoods read and write as well, `NW` then a hex weight
+for each cell row by row (`R1,C0,S2-3,B3,NW111101111` is Life).
 Built-in kernels: Conway's Life (`B3/S23`), HighLife (`B36/S23`), Seeds
 (`B2/S`) and Day & Night (`B3678/S34678`).
 
@@ -108,7 +110,11 @@ Settings and the rule are kept between runs. They, saved worlds and patterns,
 and screenshots live in the platform's user data directory:
 `$XDG_DATA_HOME/cellar` (or `~/.local/share/cellar`) on linux,
 `~/Library/Application Support/cellar` on macOS and `%APPDATA%\cellar` on
-windows. The first run brings over anything an older version left in
+windows. The engine chosen in the run section and HashLife's step exponent are
+kept too. `--engine` overrides the saved engine for that run and leaves the
+saved choice alone until the panel changes it, and a saved HashLife that cannot
+run the loaded rule starts on the chunk engine with a message. The first run
+brings over anything an older version left in
 `arrangements/` in the working directory.
 
 `cellar <file>` opens a file at startup: a `.cellar` world loads as the world,
@@ -116,7 +122,9 @@ and a pattern in any format cellar reads (RLE, plaintext `.cells`, Life 1.05
 and 1.06, Golly's Macrocell `.mc`) is stamped onto an empty world centred on the
 origin and framed, taking its rule when cellar can run it. A file that cannot be
 read, or a pattern too large for the world to hold, leaves the world as it was
-and says why. Options may come before or after the file, and `--` ends
+and says why. With `--engine hashlife` a Macrocell file is built straight into
+HashLife's tree from its nodes, so a pattern far past the chunk pool opens in
+the time its file takes to read, and undo takes it back. Options may come before or after the file, and `--` ends
 them, so `cellar -- -x.rle` opens a file whose name starts with a dash.
 
 A file dropped on the window opens the same way, a pattern stamped onto the

@@ -20,12 +20,30 @@
 # MAX_LEVEL as long as its live cells lie within format.LIMIT of the origin and
 # number at most format.LIMIT.
 #
+# a sink that offers its quadtree (format.TreeSink) is built into instead, never
+# listing a cell. the sink's squares are aligned to their size on its own grid,
+# as HashLife's are to the origin, a row below Golly's and shifted as the sink
+# places the pattern. so each square of the sink is made from the 2 by 2 of the
+# file's squares of its level that it overlaps, and its quarters from the 4 by
+# 4 of their children, as the writer does the other way, and a square is made
+# once for each such window. the squares laid are the fewest of one level that
+# cover the live cells, so the cost follows the file's distinct nodes, not the
+# cells they hold or the root's side.
+#
 # the writer reads its source twice: once for the extent of the live cells,
 # which picks the smallest root holding them, and once band by band from the
 # top, turning each band of rows into leaves and pairing finished bands level
 # by level into their parents, so it holds a band of runs and the nodes
 # written, never the pattern. equal squares are one node, however often they
 # appear. a source of more than two states writes the multi-state form.
+#
+# a source that offers its quadtree is written from the tree instead, never
+# reading a run. the file's squares need not line up with the tree's: HashLife
+# centres its root on the origin, a row above Golly's. so each square of the
+# file is read from the 2 by 2 of the tree's squares of its level that it
+# overlaps, and its quarters from the 4 by 4 of their children, and a square is
+# worked out once for each such window. the cost follows the tree's distinct
+# nodes, not the cells they hold.
 
 use cellar.format;
 use cellar.text;
@@ -405,6 +423,24 @@ fun read_all(a: *allo.Allocator, p: *u8, n: usize, e: *format.Emit, nodes: *Vect
     if (e.sink == nil) {
         format.gather(e.info, ox + rn.x0, oy + rn.y0, ox + rn.x1, oy + rn.y1, rn.pop, rn.top::u8);
         ret err[format.Error].ok{};
+    }
+    if (e.tree != nil) {
+        var o: Onto;
+        o.nodes = nodes.data;
+        o.root  = root;
+        o.level = rn.level;
+        o.ox    = ox;
+        o.oy    = oy;
+        o.t     = e.tree;
+        o.memo  = map.init[Win, u32](a);
+        var k: usize = 0;
+        for (k < 64) {
+            o.empty[k] = format.NO_NODE;
+            k          = k + 1;
+        }
+        val r: err[format.Error] = build_into(?o, rn);
+        map.dnit[Win, u32](?o.memo);
+        ret r;
     }
     if (!walk(nodes.data, root, ox, oy, e)) { ret err[format.Error].err{format.Error.sink{}}; }
     ret err[format.Error].ok{};
@@ -807,10 +843,11 @@ fun write_node(out: *Vector[u8], k: *Key) err[format.Error] {
 # ret: ok, or range when a run is out of order or place
 fun measure(src: *format.Source, box: *i64, any: *bool) err[format.Error] {
     var r:   format.Run;
-    var cy:  i64  = src.y0;
-    var cx:  i64  = src.x0;
-    var got: bool = false;
-    src.rewind(src.ctx);
+    var cy:  i64               = src.y0;
+    var cx:  i64               = src.x0;
+    var got: bool              = false;
+    val rw:  err[format.Error] = src.rewind(src.ctx);
+    if (sel rw.err) { ret rw; }
     for (src.next(src.ctx, ?r)) {
         if (r.n == 0 || r.v == 0 || r.y < cy || r.y >= src.y1 || r.x < src.x0 || r.n::i64 > src.x1 - r.x) {
             ret err[format.Error].err{format.Error.range{}};
@@ -831,8 +868,9 @@ fun measure(src: *format.Source, box: *i64, any: *bool) err[format.Error] {
 
 # build the tree from the source's second reading and write it
 fun build(t: *Tree, src: *format.Source, out: *Vector[u8]) err[format.Error] {
-    var r: format.Run;
-    src.rewind(src.ctx);
+    var r:  format.Run;
+    val rw: err[format.Error] = src.rewind(src.ctx);
+    if (sel rw.err) { ret rw; }
     for (src.next(src.ctx, ?r)) {
         val a: err[format.Error] = add_run(t, ?r);
         if (sel a.err) { ret a; }
@@ -857,6 +895,11 @@ fun build(t: *Tree, src: *format.Source, out: *Vector[u8]) err[format.Error] {
         }
         k = k + 1;
     }
+    ret write_nodes(t, out);
+}
+
+# write every node made, children before their parents
+fun write_nodes(t: *Tree, out: *Vector[u8]) err[format.Error] {
     var i: usize = 0;
     for (i < t.nodes.len) {
         val k: *Key              = ?t.nodes.data[i];
@@ -881,21 +924,13 @@ fun tree_dnit(t: *Tree) {
     }
 }
 
-# encode a source as a Macrocell file
-fun encode(a: *allo.Allocator, src: *format.Source, info: *format.Info, out: *Vector[u8]) err[format.Error] {
-    if (src.x0 < 0 - format.LIMIT || src.y0 < 0 - format.LIMIT || src.x1 > format.LIMIT || src.y1 > format.LIMIT || src.states > 256) {
-        ret err[format.Error].err{format.Error.range{}};
-    }
-    var box: [4]i64;
-    var any: bool              = false;
-    val m:   err[format.Error] = measure(src, ?box[0], ?any);
-    if (sel m.err) { ret m; }
-    val h: err[format.Error] = write_head(out, info);
-    if (sel h.err || !any) { ret h; }
-
-    var t: Tree;
+# a tree for the smallest root holding the live box, up to TOP_LEVEL
+# ---
+# multi: the source has more than two states
+# box:   x0, y0, x1, y1 of the live cells
+fun tree_init(t: *Tree, a: *allo.Allocator, multi: bool, box: *i64) {
     t.a     = a;
-    t.multi = src.states > 2;
+    t.multi = multi;
     t.base  = 3;
     if (t.multi) { t.base = 1; }
     t.top = t.base;
@@ -911,6 +946,536 @@ fun encode(a: *allo.Allocator, src: *format.Source, info: *format.Info, out: *Ve
     t.pcs   = vector.init[Piece](a);
     t.row   = 0;
     t.fresh = true;
+    var k: usize = 0;
+    for (k < 64) {
+        t.bands[k].on = false;
+        k             = k + 1;
+    }
+}
+
+# a square of the source's tree that is not there, outside its root
+val NONE: u32 = 0xffffffff;
+
+# a square of the file over the source's tree
+#
+# it lies across the 2 by 2 of the tree's squares of its level that it
+# overlaps, starting (dx, dy) into the north-west one. a square it misses, as
+# the east ones when dx is 0, is NONE, so equal windows are one key.
+# ---
+# level: the squares' level
+# nw:    the north-west square of the tree, or NONE outside its root
+# ne:    the north-east
+# sw:    the south-west
+# se:    the south-east
+# dx:    the file square's first column from nw's corner, below 2^level
+# dy:    its first row
+rec Win {
+    level: u32;
+    nw:    u32;
+    ne:    u32;
+    sw:    u32;
+    se:    u32;
+    dx:    i64;
+    dy:    i64;
+}
+
+# the writer's reading of a source's tree
+# ---
+# q:    the tree
+# memo: the node number of each window worked out, 0 for an empty square
+rec Over {
+    q:    *format.Quadtree;
+    memo: Map[Win, u32];
+}
+
+fun q_live(o: *Over, n: u32) bool {
+    if (n == NONE) { ret false; }
+    ret o.q.live(o.q.ctx, n);
+}
+
+fun q_kid(o: *Over, n: u32, k: usize) u32 {
+    if (n == NONE) { ret NONE; }
+    ret o.q.kid(o.q.ctx, n, k);
+}
+
+# the state of the cell at (x, y) of a node of level l, from its corner
+fun q_cell(o: *Over, n: u32, l: u32, x: i64, y: i64) u32 {
+    var id: u32 = n;
+    var k:  u32 = l;
+    for (k > 0) {
+        if (!q_live(o, id)) { ret 0; }
+        k = k - 1;
+        val q: usize = (((y >> k::i64) & 1) * 2 + ((x >> k::i64) & 1))::usize;
+        id = q_kid(o, id, q);
+    }
+    if (id == NONE) { ret 0; }
+    ret id;
+}
+
+# the state of the cell at (x, y), anywhere
+fun q_at(o: *Over, x: i64, y: i64) u32 {
+    val side: i64 = pow2(o.q.level);
+    val rx:   i64 = x - o.q.x0;
+    val ry:   i64 = y - o.q.y0;
+    if (rx < 0 || ry < 0 || rx >= side || ry >= side) { ret 0; }
+    ret q_cell(o, o.q.root, o.q.level, rx, ry);
+}
+
+# the state of the cell at (x, y) of a window, from the file square's corner
+fun win_cell(o: *Over, w: *Win, x: i64, y: i64) u32 {
+    val wx: i64    = w.dx + x;
+    val wy: i64    = w.dy + y;
+    val l:  i64    = w.level::i64;
+    var sq: [4]u32 = [4]u32{w.nw, w.ne, w.sw, w.se};
+    val m:  i64    = pow2(w.level) - 1;
+    ret q_cell(o, sq[((wy >> l) * 2 + (wx >> l))::usize], w.level, wx & m, wy & m);
+}
+
+# the tree's square of level l at (gx, gy) in squares of its size from the
+# root's corner, or NONE outside the root
+fun q_square(o: *Over, l: u32, gx: i64, gy: i64) u32 {
+    val span: i64 = pow2(o.q.level - l);
+    if (gx < 0 || gy < 0 || gx >= span || gy >= span) { ret NONE; }
+    var n: u32 = o.q.root;
+    var b: u32 = o.q.level - l;
+    for (b > 0 && q_live(o, n)) {
+        b = b - 1;
+        n = q_kid(o, n, (((gy >> b::i64) & 1) * 2 + ((gx >> b::i64) & 1))::usize);
+    }
+    ret n;
+}
+
+# the key of a leaf whose cells cell reads, from the file square's corner:
+# through the window w, or when w is nil straight from the root at (px, py)
+fun leaf_key(t: *Tree, o: *Over, w: *Win, px: i64, py: i64) Key {
+    var k: Key = Key{level: t.base, nw: 0, ne: 0, sw: 0, se: 0};
+    val n: i64 = pow2(t.base);
+    var y: i64 = 0;
+    for (y < n) {
+        var x: i64 = 0;
+        for (x < n) {
+            var v: u32 = 0;
+            if (w != nil) { v = win_cell(o, w, x, y); }
+            or            { v = q_at(o, px + x, py + y); }
+            if (t.multi) {
+                val q: i64 = y * 2 + x;
+                if (q == 0) { k.nw = v; }
+                if (q == 1) { k.ne = v; }
+                if (q == 2) { k.sw = v; }
+                if (q == 3) { k.se = v; }
+            }
+            or (v != 0) {
+                if (y < 4) { k.nw = k.nw | (1::u32 << (y * 8 + x)::u32); }
+                or         { k.ne = k.ne | (1::u32 << ((y - 4) * 8 + x)::u32); }
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    ret k;
+}
+
+# the number of a key's node, 0 when it is the empty square
+fun intern_live(t: *Tree, k: Key, out: *u32) err[format.Error] {
+    if ((k.nw | k.ne | k.sw | k.se) == 0) {
+        @out = 0;
+        ret err[format.Error].ok{};
+    }
+    ret intern(t, k, out);
+}
+
+# the node of the file square a window covers, 0 when it is empty
+# ---
+# w:   the window, trimmed of the squares it misses here
+# out: receives its number
+fun over_node(t: *Tree, o: *Over, w: *Win, out: *u32) err[format.Error] {
+    if (w.dx == 0) {
+        w.ne = NONE;
+        w.se = NONE;
+    }
+    if (w.dy == 0) {
+        w.sw = NONE;
+        w.se = NONE;
+    }
+    if (!q_live(o, w.nw) && !q_live(o, w.ne) && !q_live(o, w.sw) && !q_live(o, w.se)) {
+        @out = 0;
+        ret err[format.Error].ok{};
+    }
+    val have: opt[*u32] = map.get[Win, u32](?o.memo, w);
+    if (sel have.some) {
+        @out = @have.some;
+        ret err[format.Error].ok{};
+    }
+    var k: Key = Key{level: w.level, nw: 0, ne: 0, sw: 0, se: 0};
+    if (w.level == t.base) { k = leaf_key(t, o, w, 0, 0); }
+    or {
+        # the 4 by 4 of the squares' children, and each quarter's window over them
+        var sq: [4]u32 = [4]u32{w.nw, w.ne, w.sw, w.se};
+        var g:  [16]u32;
+        var i:  usize  = 0;
+        for (i < 16) {
+            val gx: usize = i % 4;
+            val gy: usize = i / 4;
+            g[i] = q_kid(o, sq[(gy / 2) * 2 + gx / 2], (gy % 2) * 2 + gx % 2);
+            i    = i + 1;
+        }
+        val l:  u32   = w.level - 1;
+        val h:  i64   = pow2(l);
+        var id: [4]u32;
+        var c:  usize = 0;
+        for (c < 4) {
+            val px: i64               = w.dx + (c % 2)::i64 * h;
+            val py: i64               = w.dy + (c / 2)::i64 * h;
+            val gx: usize             = (px >> l::i64)::usize;
+            val gy: usize             = (py >> l::i64)::usize;
+            var cw: Win               = Win{level: l, nw: g[gy * 4 + gx], ne: g[gy * 4 + gx + 1], sw: g[(gy + 1) * 4 + gx], se: g[(gy + 1) * 4 + gx + 1], dx: px - gx::i64 * h, dy: py - gy::i64 * h};
+            val r:  err[format.Error] = over_node(t, o, ?cw, ?id[c]);
+            if (sel r.err) { ret r; }
+            c = c + 1;
+        }
+        k = Key{level: w.level, nw: id[0], ne: id[1], sw: id[2], se: id[3]};
+    }
+    val r: err[format.Error] = intern_live(t, k, out);
+    if (sel r.err) { ret r; }
+    val put: res[bool, allo.Error] = map.insert[Win, u32](?o.memo, @w, @out);
+    if (sel put.err) { ret alloc_err(put.err); }
+    ret err[format.Error].ok{};
+}
+
+# the node of the file square of level l at (px, py), 0 when it is empty
+fun over_top(t: *Tree, o: *Over, l: u32, px: i64, py: i64, out: *u32) err[format.Error] {
+    if (l <= o.q.level) {
+        val side: i64 = pow2(l);
+        val gx:   i64 = (px - o.q.x0) >> l::i64;
+        val gy:   i64 = (py - o.q.y0) >> l::i64;
+        var w:    Win = Win{level: l, nw: q_square(o, l, gx, gy), ne: q_square(o, l, gx + 1, gy), sw: q_square(o, l, gx, gy + 1), se: q_square(o, l, gx + 1, gy + 1), dx: px - o.q.x0 - gx * side, dy: py - o.q.y0 - gy * side};
+        ret over_node(t, o, ?w, out);
+    }
+    # a root smaller than a leaf is read cell by cell
+    if (l == t.base) { ret intern_live(t, leaf_key(t, o, nil, px, py), out); }
+    val h:  i64   = pow2(l - 1);
+    var id: [4]u32;
+    var c:  usize = 0;
+    for (c < 4) {
+        val r: err[format.Error] = over_top(t, o, l - 1, px + (c % 2)::i64 * h, py + (c / 2)::i64 * h, ?id[c]);
+        if (sel r.err) { ret r; }
+        c = c + 1;
+    }
+    ret intern_live(t, Key{level: l, nw: id[0], ne: id[1], sw: id[2], se: id[3]}, out);
+}
+
+# one edge of the live cells under a node, as cellar.hashlife finds its own:
+# the leftmost column, or with rows the top row, or with far the column or row
+# just past the last. best is the edge so far and any whether there is one
+fun q_edge(o: *Over, n: u32, l: u32, ox: i64, oy: i64, rows: bool, far: bool, best: i64, any: *bool) i64 {
+    if (!q_live(o, n)) { ret best; }
+    val side: i64 = pow2(l);
+    var at:   i64 = ox;
+    if (rows)                             { at = oy; }
+    if (@any && !far && at >= best)       { ret best; }
+    if (@any && far && at + side <= best) { ret best; }
+    if (l == 0) {
+        @any = true;
+        if (far) { ret at + 1; }
+        ret at;
+    }
+    val s: i64 = side / 2;
+    # the nearer half's two quarters, then the farther half's
+    var qs: [4]usize = [4]usize{0, 2, 1, 3};
+    if (rows) { qs = [4]usize{0, 1, 2, 3}; }
+    if (far)  { qs = [4]usize{qs[2], qs[3], qs[0], qs[1]}; }
+    val had: bool  = @any;
+    var got: i64   = best;
+    var i:   usize = 0;
+    for (i < 4) {
+        if (i == 2 && ((!had && @any) || got != best)) { ret got; }
+        val q: usize = qs[i];
+        var x: i64   = ox;
+        var y: i64   = oy;
+        if (q == 1 || q == 3) { x = ox + s; }
+        if (q >= 2)           { y = oy + s; }
+        got = q_edge(o, q_kid(o, n, q), l - 1, x, y, rows, far, got, any);
+        i   = i + 1;
+    }
+    ret got;
+}
+
+# the file's tree being built into a sink's
+# ---
+# nodes: the file's nodes, node 0 the empty one
+# root:  the root's number
+# level: the root's level
+# ox:    the root's leftmost column
+# oy:    its top row
+# t:     the sink's tree
+# memo:  the sink's node of each window made, keyed by the file's squares
+# empty: the sink's empty node of each level, format.NO_NODE until made
+rec Onto {
+    nodes: *Node;
+    root:  u32;
+    level: u32;
+    ox:    i64;
+    oy:    i64;
+    t:     *format.TreeSink;
+    memo:  Map[Win, u32];
+    empty: [64]u32;
+}
+
+fun f_live(o: *Onto, n: u32) bool {
+    if (n == NONE) { ret false; }
+    ret o.nodes[n::usize].pop != 0;
+}
+
+# child q of a file node above level 3, or NONE for NONE
+fun f_kid(o: *Onto, n: u32, q: usize) u32 {
+    if (n == NONE) { ret NONE; }
+    val nd: *Node = ?o.nodes[n::usize];
+    if (q == 0) { ret nd.nw; }
+    if (q == 1) { ret nd.ne; }
+    if (q == 2) { ret nd.sw; }
+    ret nd.se;
+}
+
+# the state of the cell at (x, y) of a file node of level l, from its corner
+fun f_cell(o: *Onto, n: u32, l: u32, x: i64, y: i64) u32 {
+    var id: u32 = n;
+    var k:  u32 = l;
+    for (k > 0) {
+        if (!f_live(o, id)) { ret 0; }
+        val nd: *Node = ?o.nodes[id::usize];
+        if (nd.uni != MIXED) { ret nd.uni; }
+        if (nd.leaf) {
+            val bit: i64 = (y & 7) * 8 + (x & 7);
+            if (bit < 32) { ret (nd.lo >> bit::u32) & 1; }
+            ret (nd.hi >> (bit - 32)::u32) & 1;
+        }
+        k = k - 1;
+        val q: usize = (((y >> k::i64) & 1) * 2 + ((x >> k::i64) & 1))::usize;
+        # a level 1 node's children are states
+        if (k == 0) { ret f_kid(o, id, q); }
+        id = f_kid(o, id, q);
+    }
+    ret 0;
+}
+
+# the state of the cell at (x, y) of the file, anywhere
+fun f_at(o: *Onto, x: i64, y: i64) u32 {
+    val side: i64 = pow2(o.level);
+    val rx:   i64 = x - o.ox;
+    val ry:   i64 = y - o.oy;
+    if (rx < 0 || ry < 0 || rx >= side || ry >= side) { ret 0; }
+    ret f_cell(o, o.root, o.level, rx, ry);
+}
+
+# the state of the cell at (x, y) of a window, from the sink square's corner
+fun f_win_cell(o: *Onto, w: *Win, x: i64, y: i64) u32 {
+    val wx: i64    = w.dx + x;
+    val wy: i64    = w.dy + y;
+    val l:  i64    = w.level::i64;
+    var sq: [4]u32 = [4]u32{w.nw, w.ne, w.sw, w.se};
+    val m:  i64    = pow2(w.level) - 1;
+    ret f_cell(o, sq[((wy >> l) * 2 + (wx >> l))::usize], w.level, wx & m, wy & m);
+}
+
+# the file's square of level l above 3 at (gx, gy) in squares of its size from
+# the root's corner, 0 when empty, or NONE outside the root
+fun f_square(o: *Onto, l: u32, gx: i64, gy: i64) u32 {
+    val span: i64 = pow2(o.level - l);
+    if (gx < 0 || gy < 0 || gx >= span || gy >= span) { ret NONE; }
+    var n: u32 = o.root;
+    var b: u32 = o.level - l;
+    for (b > 0) {
+        if (!f_live(o, n)) { ret 0; }
+        b = b - 1;
+        n = f_kid(o, n, (((gy >> b::i64) & 1) * 2 + ((gx >> b::i64) & 1))::usize);
+    }
+    ret n;
+}
+
+# the sink's node of four, or NO_NODE when one of them is
+fun d_join(o: *Onto, nw: u32, ne: u32, sw: u32, se: u32) u32 {
+    if (nw == format.NO_NODE || ne == format.NO_NODE || sw == format.NO_NODE || se == format.NO_NODE) { ret format.NO_NODE; }
+    ret o.t.join(o.t.ctx, nw, ne, sw, se);
+}
+
+# the sink's empty node of a level
+fun d_empty(o: *Onto, l: u32) u32 {
+    if (l == 0)                              { ret 0; }
+    if (o.empty[l::usize] != format.NO_NODE) { ret o.empty[l::usize]; }
+    val e: u32 = d_empty(o, l - 1);
+    o.empty[l::usize] = d_join(o, e, e, e, e);
+    ret o.empty[l::usize];
+}
+
+# the sink's node of level l of the cells from (x, y) of a square: read through
+# the window w, or when w is nil straight from the root at (x, y)
+fun d_cells(o: *Onto, w: *Win, l: u32, x: i64, y: i64) u32 {
+    if (l == 0) {
+        if (w != nil) { ret f_win_cell(o, w, x, y); }
+        ret f_at(o, x, y);
+    }
+    val h: i64 = pow2(l - 1);
+    ret d_join(o, d_cells(o, w, l - 1, x, y), d_cells(o, w, l - 1, x + h, y), d_cells(o, w, l - 1, x, y + h), d_cells(o, w, l - 1, x + h, y + h));
+}
+
+# the sink's node of the square a window covers
+# ---
+# w:   the window over the file's squares, trimmed of those it misses here
+# out: receives the node
+fun onto_node(o: *Onto, w: *Win, out: *u32) err[format.Error] {
+    if (w.dx == 0) {
+        w.ne = NONE;
+        w.se = NONE;
+    }
+    if (w.dy == 0) {
+        w.sw = NONE;
+        w.se = NONE;
+    }
+    if (!f_live(o, w.nw) && !f_live(o, w.ne) && !f_live(o, w.sw) && !f_live(o, w.se)) {
+        @out = d_empty(o, w.level);
+        if (@out == format.NO_NODE) { ret err[format.Error].err{format.Error.sink{}}; }
+        ret err[format.Error].ok{};
+    }
+    val have: opt[*u32] = map.get[Win, u32](?o.memo, w);
+    if (sel have.some) {
+        @out = @have.some;
+        ret err[format.Error].ok{};
+    }
+    var n: u32 = format.NO_NODE;
+    if (w.level <= 3) { n = d_cells(o, w, w.level, 0, 0); }
+    or {
+        # the 4 by 4 of the squares' children, and each quarter's window over them
+        var sq: [4]u32 = [4]u32{w.nw, w.ne, w.sw, w.se};
+        var g:  [16]u32;
+        var i:  usize  = 0;
+        for (i < 16) {
+            val gx: usize = i % 4;
+            val gy: usize = i / 4;
+            g[i] = f_kid(o, sq[(gy / 2) * 2 + gx / 2], (gy % 2) * 2 + gx % 2);
+            i    = i + 1;
+        }
+        val l:  u32   = w.level - 1;
+        val h:  i64   = pow2(l);
+        var id: [4]u32;
+        var c:  usize = 0;
+        for (c < 4) {
+            val px: i64               = w.dx + (c % 2)::i64 * h;
+            val py: i64               = w.dy + (c / 2)::i64 * h;
+            val gx: usize             = (px >> l::i64)::usize;
+            val gy: usize             = (py >> l::i64)::usize;
+            var cw: Win               = Win{level: l, nw: g[gy * 4 + gx], ne: g[gy * 4 + gx + 1], sw: g[(gy + 1) * 4 + gx], se: g[(gy + 1) * 4 + gx + 1], dx: px - gx::i64 * h, dy: py - gy::i64 * h};
+            val r:  err[format.Error] = onto_node(o, ?cw, ?id[c]);
+            if (sel r.err) { ret r; }
+            c = c + 1;
+        }
+        n = d_join(o, id[0], id[1], id[2], id[3]);
+    }
+    if (n == format.NO_NODE) { ret err[format.Error].err{format.Error.sink{}}; }
+    val put: res[bool, allo.Error] = map.insert[Win, u32](?o.memo, @w, n);
+    if (sel put.err) { ret alloc_err(put.err); }
+    @out = n;
+    ret err[format.Error].ok{};
+}
+
+# a divided by b, rounded down, b above 0
+fun floor_div(a: i64, b: i64) i64 {
+    var q: i64 = a / b;
+    if (q * b > a) { q = q - 1; }
+    ret q;
+}
+
+# build the file's live cells into the sink's tree, as the fewest squares of
+# one level on the sink's grid that cover them
+# ---
+# rn:  the root, holding a live cell
+# ret: ok, or sink when the sink could not make or lay a square
+fun build_into(o: *Onto, rn: *Node) err[format.Error] {
+    val bx0: i64 = o.ox + rn.x0;
+    val by0: i64 = o.oy + rn.y0;
+    val bx1: i64 = o.ox + rn.x1;
+    val by1: i64 = o.oy + rn.y1;
+    var m:   u32 = 0;
+    for (pow2(m) < bx1 - bx0 || pow2(m) < by1 - by0) { m = m + 1; }
+    val side: i64 = pow2(m);
+    # the squares the box meets, at most 2 by 2 since it is no wider than one
+    val ax0: i64 = floor_div(bx0 - o.t.x0, side);
+    val ay0: i64 = floor_div(by0 - o.t.y0, side);
+    val ax1: i64 = floor_div(bx1 - 1 - o.t.x0, side);
+    val ay1: i64 = floor_div(by1 - 1 - o.t.y0, side);
+    var j:   i64 = ay0;
+    for (j <= ay1) {
+        var i: i64 = ax0;
+        for (i <= ax1) {
+            val px: i64 = o.t.x0 + i * side;
+            val py: i64 = o.t.y0 + j * side;
+            var n:  u32 = format.NO_NODE;
+            # a square no larger than a leaf is read cell by cell
+            if (m <= 3) { n = d_cells(o, nil, m, px, py); }
+            or {
+                val fx: i64               = px - o.ox;
+                val fy: i64               = py - o.oy;
+                val gx: i64               = floor_div(fx, side);
+                val gy: i64               = floor_div(fy, side);
+                var w:  Win               = Win{level: m, nw: f_square(o, m, gx, gy), ne: f_square(o, m, gx + 1, gy), sw: f_square(o, m, gx, gy + 1), se: f_square(o, m, gx + 1, gy + 1), dx: fx - gx * side, dy: fy - gy * side};
+                val r:  err[format.Error] = onto_node(o, ?w, ?n);
+                if (sel r.err) { ret r; }
+            }
+            if (n == format.NO_NODE || !o.t.put(o.t.ctx, n, m, px, py)) { ret err[format.Error].err{format.Error.sink{}}; }
+            i = i + 1;
+        }
+        j = j + 1;
+    }
+    ret err[format.Error].ok{};
+}
+
+# encode a source's quadtree as a Macrocell file
+fun encode_tree(a: *allo.Allocator, src: *format.Source, info: *format.Info, out: *Vector[u8]) err[format.Error] {
+    var o: Over;
+    o.q = src.tree;
+    if (o.q.level == 0 || o.q.level > MAX_LEVEL || src.states > 256) { ret err[format.Error].err{format.Error.range{}}; }
+    var box: [4]i64;
+    val any: bool = q_live(?o, o.q.root);
+    if (any) {
+        var i: usize = 0;
+        for (i < 4) {
+            var got: bool = false;
+            box[i] = q_edge(?o, o.q.root, o.q.level, o.q.x0, o.q.y0, i % 2 == 1, i >= 2, 0, ?got);
+            i      = i + 1;
+        }
+        if (box[0] < 0 - format.LIMIT || box[1] < 0 - format.LIMIT || box[2] > format.LIMIT || box[3] > format.LIMIT) {
+            ret err[format.Error].err{format.Error.range{}};
+        }
+    }
+    val h: err[format.Error] = write_head(out, info);
+    if (sel h.err || !any) { ret h; }
+
+    var t: Tree;
+    tree_init(?t, a, src.states > 2, ?box[0]);
+    o.memo = map.init[Win, u32](a);
+    var root: u32               = 0;
+    val made: err[format.Error] = over_top(?t, ?o, t.top, t.ox, t.oy, ?root);
+    map.dnit[Win, u32](?o.memo);
+    var r: err[format.Error] = made;
+    if (!(sel made.err)) { r = write_nodes(?t, out); }
+    tree_dnit(?t);
+    ret r;
+}
+
+# encode a source as a Macrocell file, from its quadtree when it offers one
+fun encode(a: *allo.Allocator, src: *format.Source, info: *format.Info, out: *Vector[u8]) err[format.Error] {
+    if (src.tree != nil) { ret encode_tree(a, src, info, out); }
+    if (src.x0 < 0 - format.LIMIT || src.y0 < 0 - format.LIMIT || src.x1 > format.LIMIT || src.y1 > format.LIMIT || src.states > 256) {
+        ret err[format.Error].err{format.Error.range{}};
+    }
+    var box: [4]i64;
+    var any: bool              = false;
+    val m:   err[format.Error] = measure(src, ?box[0], ?any);
+    if (sel m.err) { ret m; }
+    val h: err[format.Error] = write_head(out, info);
+    if (sel h.err || !any) { ret h; }
+
+    var t: Tree;
+    tree_init(?t, a, src.states > 2, ?box[0]);
     val r: err[format.Error] = build(?t, src, out);
     tree_dnit(?t);
     ret r;
@@ -923,6 +1488,7 @@ pub fun make() format.Format {
     f.exts   = "mc";
     f.sniff  = sniff;
     f.decode = decode;
+    f.builds = true;
     f.encode = encode;
     ret f;
 }

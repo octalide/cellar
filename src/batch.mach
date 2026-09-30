@@ -6,7 +6,9 @@
 # straight to the generation, by the powers of two n is made of. a file is opened as the app opens it
 # (cellar.persist.open_bytes), so a world file replaces the world and a pattern
 # is stamped centred on the origin through the format registry and the world
-# sink, and a step is sim.step, the step the app takes. the stages are separate
+# sink, and a step is sim.step, the step the app takes. a run on HashLife moves
+# onto it before the file is opened, so a file built as nodes (Macrocell) goes
+# straight into the tree rather than through the pool. the stages are separate
 # calls on a Batch so a script can drive them in any order and read the world
 # between them, and run strings them together for `cellar run`.
 
@@ -22,6 +24,8 @@ use cellar.sim;
 use cellar.space;
 use allo: std.allocator;
 use std.allocator.page;
+use std.chrono.duration;
+use std.chrono.time;
 use std.collections.vector;
 use std.collections.vector.Vector;
 use fs: std.filesystem;
@@ -280,6 +284,12 @@ fun deliver(b: *Batch, j: *Job, out: *Vector[u8]) err[Error] {
 
 # the stages of a job on an open batch, stopping at the first that fails
 fun drive(b: *Batch, j: *Job, f: *format.Format, out: *Vector[u8]) err[Error] {
+    # the tree takes the file first, and the world stays there unless the
+    # file's rule is one HashLife cannot run, which the move after it judges
+    if (j.engine == args.ENGINE_HASHLIFE) {
+        val early: err[Error] = use_hashlife(b, true);
+        if (sel early.err) { ret early; }
+    }
     val rr: res[Vector[u8], fs.FsError] = fs.read_bytes(b.a, j.pattern);
     if (sel rr.err) { ret err[Error].err{Error.read{rr.err}}; }
     var data:   Vector[u8] = rr.ok;
@@ -596,6 +606,19 @@ test run__on_hashlife_writes_what_the_chunk_engine_does {
     if (pv.len == 0 || pv.len != tv.len || !mem.equal[u8](pv.data, tv.data, pv.len)) { ret 6; }
     vector.dnit[u8](?pv);
     vector.dnit[u8](?tv);
+    # Macrocell is written from the tree's nodes on HashLife and from runs on
+    # the pool, and both read back to the same cells
+    if (!same_as_rle(?a, "out/test/batch_engine/gun.rle", args.ENGINE_CPU, "out/test/batch_engine/pool.mc", "out/test/batch_engine/pool_mc.rle"))      { ret 10; }
+    if (!same_as_rle(?a, "out/test/batch_engine/gun.rle", args.ENGINE_HASHLIFE, "out/test/batch_engine/tree.mc", "out/test/batch_engine/tree_mc.rle")) { ret 11; }
+    val pm: res[Vector[u8], fs.FsError] = fs.read_bytes(?a, "out/test/batch_engine/pool_mc.rle");
+    val tm: res[Vector[u8], fs.FsError] = fs.read_bytes(?a, "out/test/batch_engine/tree_mc.rle");
+    if (sel pm.err) { ret 12; }
+    if (sel tm.err) { ret 12; }
+    var pmv: Vector[u8] = pm.ok;
+    var tmv: Vector[u8] = tm.ok;
+    if (pmv.len == 0 || pmv.len != tmv.len || !mem.equal[u8](pmv.data, tmv.data, pmv.len)) { ret 13; }
+    vector.dnit[u8](?pmv);
+    vector.dnit[u8](?tmv);
 
     # a rule HashLife cannot run is refused, naming the engine
     var wide: Job                = Job{pattern: "out/test/batch_engine/gun.rle", rule: weighted.sample(1), gens: 10, engine: args.ENGINE_HASHLIFE, out: "out/test/batch_engine/wide.rle"};
@@ -609,5 +632,102 @@ test run__on_hashlife_writes_what_the_chunk_engine_does {
     fs.remove_file("out/test/batch_engine/gun.rle");
     fs.remove_file("out/test/batch_engine/pool.rle");
     fs.remove_file("out/test/batch_engine/tree.rle");
+    fs.remove_file("out/test/batch_engine/pool.mc");
+    fs.remove_file("out/test/batch_engine/tree.mc");
+    fs.remove_file("out/test/batch_engine/pool_mc.rle");
+    fs.remove_file("out/test/batch_engine/tree_mc.rle");
+    ret 0;
+}
+
+# run a pattern 1000 generations on an engine to a Macrocell file, then that
+# file on the pool to RLE
+#[testing]
+fun same_as_rle(a: *allo.Allocator, from: str, engine: u8, mc: str, rle: str) bool {
+    var there: Job                = Job{pattern: from, rule: nil, gens: 1000, engine: engine, out: mc};
+    val r:     res[Report, Error] = run(a, ?there);
+    if (sel r.err) { ret false; }
+    var back: Job                = Job{pattern: mc, rule: nil, gens: 0, engine: args.ENGINE_CPU, out: rle};
+    val k:    res[Report, Error] = run(a, ?back);
+    if (sel k.err) { ret false; }
+    ret k.ok.population == r.ok.population;
+}
+
+test run__writes_the_gun_at_two_to_the_thirty_to_macrocell_and_reopens_it_from_its_nodes {
+    var a: allo.Allocator;
+    page.make(?a);
+    val dir: err[fs.FsError] = persist.make_parent(?a, "out/test/batch_far/gun.rle");
+    if (sel dir.err) { ret 1; }
+    val w: err[fs.FsError] = fs.write_bytes("out/test/batch_far/gun.rle", GUN, string.str_len(GUN), persist.FILE_MODE);
+    if (sel w.err) { ret 1; }
+    # about 36 million gliders, which a run of each took minutes to write, in
+    # the time of a few thousand nodes
+    val start: time.InstantClock = time.instant();
+    if (sel start.err) { ret 2; }
+    var far: Job                = Job{pattern: "out/test/batch_far/gun.rle", rule: nil, gens: 1073741824, engine: args.ENGINE_HASHLIFE, out: "out/test/batch_far/far.mc"};
+    val r:   res[Report, Error] = run(?a, ?far);
+    if (sel r.err) { ret 3; }
+    val took: time.Elapsed = time.elapsed(start.ok);
+    if (sel took.err)                  { ret 4; }
+    if (took.ok > 2 * duration.SECOND) { ret 5; }
+    val at: Report = r.ok;
+    if (at.generation != 1073741824) { ret 6; }
+
+    # the file holds the world's cells in a few thousand nodes
+    val fb: res[Vector[u8], fs.FsError] = fs.read_bytes(?a, "out/test/batch_far/far.mc");
+    if (sel fb.err) { ret 7; }
+    var data: Vector[u8] = fb.ok;
+    if (data.len > 65536) { ret 8; }
+    var f: format.Format;
+    if (!formats.by_id("macrocell", ?f)) { ret 9; }
+    var info: format.Info;
+    format.info_init(?info, ?a);
+    val v: err[format.Error] = formats.validate(?a, ?f, data.data, data.len, ?info);
+    if (sel v.err)                  { ret 10; }
+    if (info.live != at.population) { ret 11; }
+
+    # and reopens onto HashLife from its nodes rather than its cells, in the
+    # time a few thousand nodes take too
+    val again: time.InstantClock = time.instant();
+    if (sel again.err) { ret 12; }
+    var back: Job                = Job{pattern: "out/test/batch_far/far.mc", rule: nil, gens: 0, engine: args.ENGINE_HASHLIFE, out: "out/test/batch_far/back.mc"};
+    val k:    res[Report, Error] = run(?a, ?back);
+    if (sel k.err) { ret 13; }
+    val took_back: time.Elapsed = time.elapsed(again.ok);
+    if (sel took_back.err)                  { ret 14; }
+    if (took_back.ok > 5 * duration.SECOND) { ret 15; }
+    if (k.ok.population != at.population)   { ret 16; }
+
+    # the open centred the pattern, and moved back by as much it is the file it came from
+    val bb: res[Vector[u8], fs.FsError] = fs.read_bytes(?a, "out/test/batch_far/back.mc");
+    if (sel bb.err) { ret 17; }
+    var moved: Vector[u8] = bb.ok;
+    var got:   format.Info;
+    format.info_init(?got, ?a);
+    val vb: err[format.Error] = formats.validate(?a, ?f, moved.data, moved.len, ?got);
+    if (sel vb.err || got.live != info.live || got.x1 - got.x0 != info.x1 - info.x0 || got.y1 - got.y0 != info.y1 - info.y0) { ret 18; }
+    var b:      Batch;
+    val opened: err[Error] = open(?b, ?a);
+    if (sel opened.err) { ret 19; }
+    val tree: err[Error] = use_hashlife(?b, true);
+    if (sel tree.err) { ret 20; }
+    var ws:   adapt.WorldSink;
+    var told: format.Info;
+    format.info_init(?told, ?a);
+    val l: err[format.Error] = formats.load(?a, ?f, moved.data, moved.len, adapt.world_sink(?ws, world(?b), info.x0 - got.x0, info.y0 - got.y0), ?told);
+    if (sel l.err) { ret 21; }
+    var same: Vector[u8] = vector.init[u8](?a);
+    val e:    err[Error] = encode(?b, ?f, ?same);
+    if (sel e.err)                                                              { ret 22; }
+    if (same.len != data.len || !mem.equal[u8](same.data, data.data, data.len)) { ret 23; }
+    close(?b);
+    vector.dnit[u8](?same);
+    vector.dnit[u8](?moved);
+    format.info_dnit(?told);
+    format.info_dnit(?got);
+    format.info_dnit(?info);
+    vector.dnit[u8](?data);
+    fs.remove_file("out/test/batch_far/gun.rle");
+    fs.remove_file("out/test/batch_far/far.mc");
+    fs.remove_file("out/test/batch_far/back.mc");
     ret 0;
 }

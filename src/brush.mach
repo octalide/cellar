@@ -1,0 +1,159 @@
+# the wide kernel editor's brush and view
+#
+# a wide footprint's weights are painted rather than clicked one by one: a
+# drag sets every cell it crosses, and its mirror images under the chosen
+# symmetry, to the brush's weight. a stroke is held back as a pending kernel
+# while the button is down and applied as one rule change when it comes up.
+# the grid zooms through a few cell sizes and scrolls around its centre.
+
+use kernel: cellar.rules.weighted;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+
+# symmetry: the cell alone
+pub val SYM_NONE: usize = 0;
+# its mirror images across both axes
+pub val SYM_FOUR: usize = 1;
+# those and their transposes, the square's every rotation and reflection
+pub val SYM_EIGHT: usize = 2;
+
+# zoom levels past fitting the footprint
+pub val ZOOMS: usize = 4;
+
+# the brush, the view and a stroke under way
+# ---
+# weight:  the weight painted
+# sym:     SYM_NONE, SYM_FOUR or SYM_EIGHT
+# zoom:    0 to fit the footprint, up to ZOOMS for larger cells
+# cx:      the column offset the view is centred on
+# cy:      the row offset the view is centred on
+# stroke:  a drag has painted, and pending holds what it came to
+# pending: the kernel the stroke has painted so far
+pub rec Brush {
+    weight:  i32;
+    sym:     usize;
+    zoom:    usize;
+    cx:      i64;
+    cy:      i64;
+    stroke:  bool;
+    pending: kernel.Kernel;
+}
+
+# a footprint offset
+pub rec Offset {
+    dx: i64;
+    dy: i64;
+}
+
+# a weight-1 brush with every symmetry, the footprint fitted
+pub fun init(b: *Brush) {
+    b.weight = 1;
+    b.sym    = SYM_EIGHT;
+    b.zoom   = 0;
+    b.cx     = 0;
+    b.cy     = 0;
+    b.stroke = false;
+}
+
+# the unscaled cell size of zoom level z, 1 to ZOOMS
+pub fun zoom_cell(z: usize) f32 {
+    if (z <= 1) { ret 12.0; }
+    if (z == 2) { ret 16.0; }
+    if (z == 3) { ret 22.0; }
+    ret 28.0;
+}
+
+# add an offset to a list unless it is there
+fun add(out: *Offset, n: usize, dx: i64, dy: i64) usize {
+    var i: usize = 0;
+    for (i < n) {
+        if (out[i].dx == dx && out[i].dy == dy) { ret n; }
+        i = i + 1;
+    }
+    out[n] = Offset{dx: dx, dy: dy};
+    ret n + 1;
+}
+
+# the distinct images of an offset under a symmetry, itself first
+# ---
+# dx:  column offset
+# dy:  row offset
+# sym: SYM_NONE, SYM_FOUR or SYM_EIGHT
+# out: at least 8 offsets
+# ret: how many were written
+pub fun images(dx: i64, dy: i64, sym: usize, out: *Offset) usize {
+    var n: usize = add(out, 0, dx, dy);
+    if (sym == SYM_NONE) { ret n; }
+    n = add(out, n, 0 - dx, dy);
+    n = add(out, n, dx, 0 - dy);
+    n = add(out, n, 0 - dx, 0 - dy);
+    if (sym == SYM_FOUR) { ret n; }
+    n = add(out, n, dy, dx);
+    n = add(out, n, 0 - dy, dx);
+    n = add(out, n, dy, 0 - dx);
+    n = add(out, n, 0 - dy, 0 - dx);
+    ret n;
+}
+
+# set an offset and its images to a weight
+# ---
+# k:   the kernel, the offset inside its footprint
+# dx:  column offset
+# dy:  row offset
+# w:   the weight
+# sym: SYM_NONE, SYM_FOUR or SYM_EIGHT
+# ret: whether any weight changed
+pub fun paint(k: *kernel.Kernel, dx: i64, dy: i64, w: i32, sym: usize) bool {
+    var at: [8]Offset;
+    val n:  usize = images(dx, dy, sym, ?at[0]);
+    var ch: bool  = false;
+    var i:  usize = 0;
+    for (i < n) {
+        if (kernel.weight_at(k, at[i].dx, at[i].dy) != w) {
+            kernel.set_weight(k, at[i].dx, at[i].dy, w);
+            ch = true;
+        }
+        i = i + 1;
+    }
+    ret ch;
+}
+
+# how many footprint cells hold a nonzero weight
+#[testing]
+fun painted(k: *kernel.Kernel) usize {
+    val r:  i64   = k.radius::i64;
+    var n:  usize = 0;
+    var dy: i64   = 0 - r;
+    for (dy <= r) {
+        var dx: i64 = 0 - r;
+        for (dx <= r) {
+            if (kernel.weight_at(k, dx, dy) != 0) { n = n + 1; }
+            dx = dx + 1;
+        }
+        dy = dy + 1;
+    }
+    ret n;
+}
+
+test paint__sets_every_image_under_the_symmetry {
+    var k: kernel.Kernel;
+    k.radius = 10;
+    if (painted(?k) != 0) { ret 1; }
+    # a general offset has 1, 4 and 8 images
+    if (!paint(?k, 7, 2, 3, SYM_NONE) || painted(?k) != 1)                    { ret 2; }
+    if (!paint(?k, 7, 2, 3, SYM_FOUR) || painted(?k) != 4)                    { ret 3; }
+    if (!paint(?k, 7, 2, 3, SYM_EIGHT) || painted(?k) != 8)                   { ret 4; }
+    if (kernel.weight_at(?k, -2, -7) != 3 || kernel.weight_at(?k, 2, 7) != 3) { ret 5; }
+    # painting what is there changes nothing
+    if (paint(?k, -7, 2, 3, SYM_EIGHT)) { ret 6; }
+    # a diagonal or axis offset has four images under 8-fold, an axis one two under 4-fold, the centre one
+    if (!paint(?k, 4, 4, -2, SYM_EIGHT) || painted(?k) != 12) { ret 7; }
+    if (!paint(?k, 0, 5, 1, SYM_EIGHT) || painted(?k) != 16)  { ret 8; }
+    if (!paint(?k, 0, 3, 1, SYM_FOUR) || painted(?k) != 18)   { ret 9; }
+    if (!paint(?k, 0, 0, 1, SYM_EIGHT) || painted(?k) != 19)  { ret 10; }
+    # erasing with weight 0 takes every image back out
+    if (!paint(?k, 2, -7, 0, SYM_EIGHT) || painted(?k) != 11) { ret 11; }
+    ret 0;
+}

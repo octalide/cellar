@@ -16,6 +16,7 @@ use cellar.formats.life;
 use cellar.formats.macrocell;
 use cellar.formats.plaintext;
 use cellar.formats.rle;
+use cellar.hashlife;
 use cellar.pattern;
 use cellar.sim;
 use cellar.space;
@@ -23,10 +24,13 @@ use allo: std.allocator;
 use std.allocator.page;
 use std.collections.vector;
 use std.collections.vector.Vector;
+use mem: std.memory;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
 use std.types.size.usize;
 use std.types.string;
 use std.types.string.str;
@@ -122,6 +126,7 @@ pub fun validate(a: *allo.Allocator, f: *format.Format, p: *u8, n: usize, info: 
     e.sink = nil;
     e.info = info;
     e.fits = false;
+    e.tree = nil;
     val r: err[format.Error] = f.decode(a, p, n, ?e);
     if (sel r.err) { ret r; }
     format.settle(info);
@@ -135,8 +140,10 @@ pub fun validate(a: *allo.Allocator, f: *format.Format, p: *u8, n: usize, info: 
 # offered every run, and only once it has taken them all is it opened and
 # given them. so malformed or truncated input, and a pattern the sink judges
 # too large, are refused having changed nothing. a sink that neither plans nor
-# fits can still refuse a valid pattern part way, for lack of room. a load the
-# sink planned is closed either way.
+# fits can still refuse a valid pattern part way, for lack of room. a format
+# that builds is handed the sink's tree when it offers one, which is opened in
+# place of the sink and built in place of the runs, with nothing to fit. a load
+# the sink planned is closed either way.
 # ---
 # a:    allocator for the decoder's scratch
 # f:    the format
@@ -149,26 +156,32 @@ pub fun load(a: *allo.Allocator, f: *format.Format, p: *u8, n: usize, sink: *for
     val ok: err[format.Error] = validate(a, f, p, n, info);
     if (sel ok.err)                                     { ret ok; }
     if (sink.plan != nil && !sink.plan(sink.ctx, info)) { ret err[format.Error].err{format.Error.sink{}}; }
+    var tree: *format.TreeSink = nil;
+    if (f.builds) { tree = sink.tree; }
     var r: err[format.Error] = err[format.Error].ok{};
-    if (sink.fit != nil) { r = pass(a, f, p, n, sink, true); }
-    val fits: bool = sel r.ok;
-    if (fits && !sink.open(sink.ctx, info)) { r = err[format.Error].err{format.Error.sink{}}; }
-    val opened: bool = sel r.ok;
-    if (opened) { r = pass(a, f, p, n, sink, false); }
+    if (sink.fit != nil && tree == nil) { r = pass(a, f, p, n, sink, true, nil); }
+    val fits:   bool = sel r.ok;
+    var opened: bool = false;
+    if (fits && tree == nil) { opened = sink.open(sink.ctx, info); }
+    or (fits)                { opened = tree.open(tree.ctx, info); }
+    if (fits && !opened)     { r = err[format.Error].err{format.Error.sink{}}; }
+    if (opened)              { r = pass(a, f, p, n, sink, false, tree); }
     val kept: bool = sink.close(sink.ctx);
     if (sel r.err) { ret r; }
     if (!kept)     { ret err[format.Error].err{format.Error.sink{}}; }
     ret err[format.Error].ok{};
 }
 
-# decode validated bytes into a sink's fit or run, gathering a scratch Info
-fun pass(a: *allo.Allocator, f: *format.Format, p: *u8, n: usize, sink: *format.Sink, fits: bool) err[format.Error] {
+# decode validated bytes into a sink's fit or run, or its tree when tree is
+# not nil, gathering a scratch Info
+fun pass(a: *allo.Allocator, f: *format.Format, p: *u8, n: usize, sink: *format.Sink, fits: bool, tree: *format.TreeSink) err[format.Error] {
     var again: format.Info;
     format.info_init(?again, a);
     var e: format.Emit;
     e.sink = sink;
     e.info = ?again;
     e.fits = fits;
+    e.tree = tree;
     val r: err[format.Error] = f.decode(a, p, n, ?e);
     format.info_dnit(?again);
     ret r;
@@ -196,6 +209,54 @@ fun same(p: *pattern.Pattern, q: *pattern.Pattern) bool {
         i = i + 1;
     }
     ret string.str_equals(pattern.rule(p), pattern.rule(q)) && string.str_equals(pattern.name(p), pattern.name(q)) && string.str_equals(pattern.comments(p), pattern.comments(q));
+}
+
+# write a pattern out in a format from a HashLife tree of its cells, not its
+# runs, read it back, and compare
+# ---
+# f:    the format
+# info: the text to write
+# ret:  whether it came back identical
+fun from_tree(a: *allo.Allocator, p: *pattern.Pattern, f: *format.Format, info: *format.Info) bool {
+    var t: hashlife.Tree;
+    hashlife.init(?t, a, hashlife.DEFAULT_MAX);
+    if (!hashlife.make(?t)) { ret false; }
+    var i: usize = 0;
+    for (i < p.w * p.h) {
+        if (p.cells[i] != 0) {
+            val x:  i64 = p.x + (i % p.w)::i64;
+            val y:  i64 = p.y + (i / p.w)::i64;
+            val cx: i64 = space.chunk_of(x);
+            val cy: i64 = space.chunk_of(y);
+            val c:  *u8 = hashlife.chunk(?t, cx, cy, true);
+            c[((y - cy * space.SIDE) * space.SIDE + x - cx * space.SIDE)::usize] = p.cells[i];
+            hashlife.wrote(?t, cx, cy);
+        }
+        i = i + 1;
+    }
+    var ok:   bool           = hashlife.flush(?t);
+    var src:  adapt.PatternSource;
+    var q:    format.Quadtree;
+    var out:  Vector[u8]     = vector.init[u8](a);
+    val from: *format.Source = adapt.pattern_source(?src, p);
+    from.tree = adapt.quadtree(?q, ?t);
+    val w: err[format.Error] = save(a, f, from, info, ?out);
+    if (sel w.err) { ok = false; }
+    var back: pattern.Pattern;
+    val m:    err[allo.Error] = pattern.init(?back, a, 0, 0, "");
+    if (sel m.err) { ok = false; }
+    var ps:  adapt.PatternSink;
+    var got: format.Info;
+    format.info_init(?got, a);
+    if (ok) {
+        val r: err[format.Error] = load(a, f, out.data, out.len, adapt.pattern_sink(?ps, ?back), ?got);
+        ok = sel r.ok && same(p, ?back);
+    }
+    if (!(sel m.err)) { pattern.dnit(?back); }
+    format.info_dnit(?got);
+    vector.dnit[u8](?out);
+    hashlife.dnit(?t);
+    ret ok;
 }
 
 # write a pattern out in a format, read it back, and compare
@@ -236,8 +297,9 @@ fun roundtrip(a: *allo.Allocator, p: *pattern.Pattern, id: str, wrap: usize) u32
     val r: err[format.Error] = load(a, ?f, out.data, out.len, adapt.pattern_sink(?ps, ?q), ?got);
     if (sel r.err) { ret 6; }
     var ok: u32 = 0;
-    if (!same(p, ?q))                      { ok = 7; }
-    or (got.notes != 0 && got.states <= 2) { ok = 8; }
+    if (!same(p, ?q))                                                      { ok = 7; }
+    or (got.notes != 0 && got.states <= 2)                                 { ok = 8; }
+    or (string.str_equals(id, "macrocell") && !from_tree(a, p, ?f, ?info)) { ok = 9; }
     pattern.dnit(?q);
     format.info_dnit(?got);
     format.info_dnit(?info);
@@ -436,6 +498,9 @@ test load__refuses_mangled_plaintext_life_and_macrocell_without_touching_the_wor
     if (fuzz(?a, ?s, "life", "#Life 1.06\n#R 23/3\n0 -1\n1 0\n-1 1\n0 1\n1 1\n1 1\n", junk::*u8, jn) != 0)          { ret 4; }
     val mc: str = "[M2] (golly 2.0)\n#R B3/S23\n#C two\n$$..*$...*$.***$\n1 0 3 2 0\n2 2 0 0 0\n3 0 3 0 0\n4 1 4 0 1\n5 0 0 5 0\n";
     if (fuzz(?a, ?s, "macrocell", mc, "0123459*.$#[M \n\0"::*u8, 16) != 0) { ret 5; }
+    # and built into the tree from its nodes
+    if (!sim.use_hashlife(?s, true))                                       { ret 6; }
+    if (fuzz(?a, ?s, "macrocell", mc, "0123459*.$#[M \n\0"::*u8, 16) != 0) { ret 7; }
     sim.dnit(?s);
     ret 0;
 }
@@ -682,6 +747,11 @@ test load__judges_a_giant_macrocell_by_its_nodes {
     var live: u64 = 0;
     if (world_takes(?a, ?s, "macrocell", text::*u8, string.str_len(text), ?live)) { ret 7; }
     if (sim.population(?s) != 0 || s.full || s.space.live != 0)                   { ret 8; }
+    # where the tree is built from the nodes, whatever the cells number
+    if (!sim.use_hashlife(?s, true))                                                             { ret 9; }
+    if (!world_takes(?a, ?s, "macrocell", text::*u8, string.str_len(text), ?live))               { ret 10; }
+    if (sim.population(?s)::u64 != format.LIMIT::u64 || s.full)                                  { ret 11; }
+    if (!sim.alive(?s, 0 - side / 2, 1 - side / 2) || sim.alive(?s, 0 - side / 2, 0 - side / 2)) { ret 12; }
     sim.dnit(?s);
     ret 0;
 }
@@ -699,9 +769,10 @@ rec RunSource {
     source: format.Source;
 }
 
-fun runs_rewind(ctx: *u8) {
+fun runs_rewind(ctx: *u8) err[format.Error] {
     val s: *RunSource = ctx::*RunSource;
     s.i = 0;
+    ret err[format.Error].ok{};
 }
 
 fun runs_next(ctx: *u8, r: *format.Run) bool {
@@ -725,6 +796,7 @@ fun write_runs(a: *allo.Allocator, runs: *format.Run, n: usize, out: *Vector[u8]
     rs.source.x1     = format.LIMIT;
     rs.source.y1     = format.LIMIT;
     rs.source.states = 2;
+    rs.source.tree   = nil;
     rs.source.rewind = runs_rewind;
     rs.source.next   = runs_next;
     var f: format.Format;
@@ -776,11 +848,157 @@ test load__takes_a_sparse_giant_and_refuses_what_the_world_cannot_hold {
     ret 0;
 }
 
+# load a Macrocell file shifted by (dx, dy) into a world on the tree, built
+# from its nodes or, with runs, cell by cell, and write the world back out
+# ---
+# runs: take the runs rather than the tree
+# out:  receives the world as Macrocell
+fun tree_load(a: *allo.Allocator, text: str, dx: i64, dy: i64, runs: bool, out: *Vector[u8]) bool {
+    var s: sim.Sim;
+    val m: err[allo.Error] = sim.init(?s, a);
+    if (sel m.err) { ret false; }
+    var f:    format.Format;
+    var ok:   bool = by_id("macrocell", ?f) && sim.use_hashlife(?s, true);
+    var ws:   adapt.WorldSink;
+    var info: format.Info;
+    format.info_init(?info, a);
+    val k: *format.Sink = adapt.world_sink(?ws, ?s, dx, dy);
+    if (runs) { k.tree = nil; }
+    if (ok) {
+        val r: err[format.Error] = load(a, ?f, text::*u8, string.str_len(text), k, ?info);
+        ok = sel r.ok && sim.population(?s)::u64 == info.live && !s.full;
+    }
+    format.info_dnit(?info);
+    var src: adapt.WorldSource;
+    var got: format.Info;
+    format.info_init(?got, a);
+    val w: res[*format.Source, format.Error] = adapt.world_source(?src, ?s, a);
+    if (sel w.err) { ok = false; }
+    if (sel w.ok) {
+        if (ok) {
+            val e: err[format.Error] = save(a, ?f, w.ok, ?got, out);
+            ok = sel e.ok;
+        }
+    }
+    adapt.world_source_dnit(?src);
+    format.info_dnit(?got);
+    sim.dnit(?s);
+    ret ok;
+}
+
+test load__a_macrocell_built_into_the_tree_holds_the_cells_its_runs_would {
+    var a: allo.Allocator;
+    page.make(?a);
+    # a sparse spread wide enough that the tree's squares straddle the file's
+    val far:  i64 = 1000;
+    var runs: [5]format.Run;
+    runs[0] = format.Run{x: -40, y: -70, n: 3, v: 1};
+    runs[1] = format.Run{x: -38, y: -69, n: 1, v: 1};
+    runs[2] = format.Run{x: 5, y: 0, n: 20, v: 1};
+    runs[3] = format.Run{x: far, y: 3, n: 1, v: 1};
+    runs[4] = format.Run{x: -far, y: far, n: 2, v: 1};
+    var sparse: Vector[u8] = vector.init[u8](?a);
+    if (!write_runs(?a, ?runs[0], 5, ?sparse)) { ret 1; }
+    val nul: res[usize, allo.Error] = vector.push[u8](?sparse, 0);
+    if (sel nul.err) { ret 1; }
+    var texts: [4]str;
+    texts[0] = "[M2] (golly 2.0)\n#R B3/S23\n#C two\n$$..*$...*$.***$\n1 0 3 2 0\n2 2 0 0 0\n3 0 3 0 0\n4 1 4 0 1\n5 0 0 5 0\n";
+    texts[1] = "[M2] (golly 3.0)\n1 0 2 3 0\n2 1 0 0 0\n";
+    texts[2] = "[M2]\n**$**$\n4 1 0 0 0\n5 2 0 0 2\n6 0 3 3 0\n";
+    texts[3] = sparse.data::str;
+    # shifts on and off the file's grid, a row, a column and odd ones
+    var dx: [6]i64 = [6]i64{0, 0, 1, -37, 5, 64};
+    var dy: [6]i64 = [6]i64{0, -1, 0, 91, 3, -64};
+    var t:  usize  = 0;
+    for (t < 4) {
+        var k: usize = 0;
+        for (k < 6) {
+            var built: Vector[u8] = vector.init[u8](?a);
+            var cells: Vector[u8] = vector.init[u8](?a);
+            if (!tree_load(?a, texts[t], dx[k], dy[k], false, ?built))                                         { ret 2; }
+            if (!tree_load(?a, texts[t], dx[k], dy[k], true, ?cells))                                          { ret 3; }
+            if (built.len == 0 || built.len != cells.len || !mem.equal[u8](built.data, cells.data, built.len)) { ret 4; }
+            vector.dnit[u8](?built);
+            vector.dnit[u8](?cells);
+            k = k + 1;
+        }
+        t = t + 1;
+    }
+    vector.dnit[u8](?sparse);
+    ret 0;
+}
+
 # the id of the format the bytes sniff as, or "" when none
 fun sniffs(text: str) str {
     var f: format.Format;
     if (!by_bytes(text::*u8, string.str_len(text), ?f)) { ret ""; }
     ret f.id;
+}
+
+# an allocator that refuses any request past max bytes, over another
+# ---
+# base: the allocator it hands the rest to
+# max:  the largest request it takes
+rec Capped {
+    base: *allo.Allocator;
+    max:  usize;
+}
+
+fun capped_allocate(ctx: ptr, size: usize, align: usize) opt[ptr] {
+    val c: *Capped = ctx::*Capped;
+    if (size > c.max) { ret opt[ptr].none{}; }
+    ret c.base.fn_allocate(c.base.ctx, size, align);
+}
+
+fun capped_reallocate(ctx: ptr, p: ptr, old: usize, size: usize, align: usize) opt[ptr] {
+    val c: *Capped = ctx::*Capped;
+    if (size > c.max) { ret opt[ptr].none{}; }
+    ret c.base.fn_reallocate(c.base.ctx, p, old, size, align);
+}
+
+fun capped_deallocate(ctx: ptr, p: ptr, size: usize, align: usize) i64 {
+    val c: *Capped = ctx::*Capped;
+    ret c.base.fn_deallocate(c.base.ctx, p, size, align);
+}
+
+# save the world as RLE, reading it through an allocator
+fun save_world(a: *allo.Allocator, s: *sim.Sim, reads: *allo.Allocator, out: *Vector[u8]) err[format.Error] {
+    var f: format.Format;
+    if (!by_id("rle", ?f)) { ret err[format.Error].err{format.Error.unsupported{}}; }
+    var info: format.Info;
+    format.info_init(?info, a);
+    var ws:  adapt.WorldSource;
+    var r:   err[format.Error]                 = err[format.Error].ok{};
+    val src: res[*format.Source, format.Error] = adapt.world_source(?ws, s, reads);
+    if (sel src.err) { r = err[format.Error].err{src.err}; }
+    if (sel src.ok)  { r = save(a, ?f, src.ok, ?info, out); }
+    adapt.world_source_dnit(?ws);
+    format.info_dnit(?info);
+    ret r;
+}
+
+test save__fails_rather_than_write_a_world_short_without_the_memory_to_read_it {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s: sim.Sim;
+    val m: err[allo.Error] = sim.init(?s, ?a);
+    if (sel m.err) { ret 1; }
+    # a line across 20 chunks, whose row of chunks takes 80 KiB to read
+    val text: str = "x = 1280, y = 1, rule = B3/S23\n1280o!\n";
+    var live: u64 = 0;
+    if (!world_takes(?a, ?s, "rle", text::*u8, string.str_len(text), ?live) || live != 1280) { ret 2; }
+    var out: Vector[u8]        = vector.init[u8](?a);
+    val all: err[format.Error] = save_world(?a, ?s, ?a, ?out);
+    if (sel all.err || out.len == 0) { ret 3; }
+    vector.clear[u8](?out);
+    var cap:   Capped            = Capped{base: ?a, max: 32768};
+    var few:   allo.Allocator    = allo.Allocator{ctx: (?cap)::ptr, fn_allocate: capped_allocate, fn_reallocate: capped_reallocate, fn_deallocate: capped_deallocate, retains: false};
+    val short: err[format.Error] = save_world(?a, ?s, ?few, ?out);
+    if (!(sel short.err))                        { ret 4; }
+    if (sel short.err && !(sel short.err.alloc)) { ret 5; }
+    vector.dnit[u8](?out);
+    sim.dnit(?s);
+    ret 0;
 }
 
 test registry__finds_formats_by_id_extension_and_content {

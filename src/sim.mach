@@ -6,12 +6,13 @@
 #
 #   step, collect, record, sync      advance the world and show it
 #   clear, fill_*, randomize         replace it
-#   read_*, edit_*, paint,           read and write cells by area
-#   clear_outside
+#   read_*, edit_*, paint,           read and write cells by area, or lay
+#   clear_outside, merge_*           the tree's own squares over it
 #   take, restore                    snapshot it and put a snapshot back
 #   cell, alive, population, bounds  ask after it
 #   chunks                           list its live chunks, for a save
-#   need_*, load_fits                judge a load before it is written
+#   quadtree                         the tree itself, for a save that is one
+#   need_*                           judge a load before it is written
 #
 # and caps says what else a member can do (Caps), which the interface and the
 # draw ask before offering it.
@@ -93,8 +94,8 @@ val MAX_PENDING: usize = 4096;
 # the most cells an edit's area may hold to be written cell by cell, where a
 # larger one is written chunk by chunk
 val SPARSE_CELLS: usize = 512;
-# the most live cells a load may bring into the tree, which writes them a
-# chunk at a time
+# the most live cells a load may bring into the tree as runs, which writes them
+# a chunk at a time. a load of the tree's own squares (merge_begin) has no cap
 pub val LOAD_CELLS: u64 = 67108864;
 # the most chunks a world file may bring into the tree
 val LOAD_CHUNKS: usize = 262144;
@@ -172,9 +173,9 @@ pub rec Seen {
 
 # what is shown the cells a change is about to write, so it can keep them
 #
-# wants is asked before an edit of a box writes anything, or before a clear or
-# a re-encoding rule change with whole set, and says whether the cells there
-# are wanted as they stand.
+# wants is asked before an edit of a box writes anything, or before a clear, a
+# re-encoding rule change or a merge into the tree with whole set, and says
+# whether the cells there are wanted as they stand.
 # when they are, the host's cells over the box, or everywhere with whole, are
 # brought level with the GPU's and keep is called before the change goes
 # ahead. current false tells keep they could not be read, and a clear goes
@@ -275,6 +276,13 @@ pub fun engine(s: *Sim) Engine {
 # whether the quadtree holds the world
 pub fun on_tree(s: *Sim) bool {
     ret sel s.engine.hashlife;
+}
+
+# the quadtree that holds the world, for a save to read its nodes, or nil when
+# the pool holds it. it must not change while the save reads it
+pub fun quadtree(s: *Sim) *hashlife.Tree {
+    if (!on_tree(s)) { ret nil; }
+    ret ?s.tree;
 }
 
 # what the member that holds the world can do
@@ -1432,6 +1440,62 @@ pub fun edit_chunk(s: *Sim, cx: i64, cy: i64, cells: *u32) bool {
     ret true;
 }
 
+# open an edit of the tree that lays squares of its own nodes over the cells
+# in [x0, x1) by [y0, y1), as a load of a file built as nodes does
+#
+# the watch is shown the world whole, whose image on the tree is its distinct
+# nodes, so an edit of any extent costs it what the tree does. squares are made
+# with merge_node and laid with edit_square, and edit_end closes it.
+# ---
+# s:   simulation
+# x0:  first column
+# y0:  first row
+# x1:  column after the last
+# y1:  row after the last
+# ret: false when the pool holds the world, an edit is already open, or the
+#      area passes the world's reach
+pub fun merge_begin(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64) bool {
+    if (!on_tree(s) || s.edit.open || !reaches(x0, y0, x1, y1)) { ret false; }
+    if (wanted(s, 0, 0, 0, 0, true))                            { kept(s, 0, 0, 0, 0, true, true); }
+    val e: *Edit = ?s.edit;
+    e.x0     = x0;
+    e.y0     = y0;
+    e.x1     = x1;
+    e.y1     = y1;
+    e.sparse = false;
+    e.lost   = false;
+    e.open   = true;
+    # the squares are made from the table's room, so what the world no longer reaches goes first
+    hashlife.tidy(?s.tree, hashlife.NONE);
+    ret true;
+}
+
+# the tree's node of four of one level, found or made, for an edit to lay
+# ---
+# s:   simulation, its world in the tree
+# ret: the node, or hashlife.NONE when a child is or the table is full
+pub fun merge_node(s: *Sim, nw: u32, ne: u32, sw: u32, se: u32) u32 {
+    ret hashlife.node(?s.tree, nw, ne, sw, se);
+}
+
+# lay a square of the tree's nodes over the world in the open edit, its live
+# cells replacing the world's and its dead ones leaving them
+# ---
+# s:   simulation, its world in the tree
+# n:   the square, made with merge_node
+# l:   its level
+# x:   its leftmost column, a multiple of 2^l
+# y:   its top row, a multiple of 2^l
+# ret: false when no edit is open on the tree, or the table could not hold it
+pub fun edit_square(s: *Sim, n: u32, l: u32, x: i64, y: i64) bool {
+    if (!s.edit.open || !on_tree(s)) { ret false; }
+    if (!hashlife.lay(?s.tree, n, l, x, y)) {
+        s.edit.lost = true;
+        ret false;
+    }
+    ret true;
+}
+
 # close the open edit: count the chunks it wrote, surround the live ones, and
 # hand the change to the GPU, all once, or graft the chunks it wrote into the tree
 #
@@ -1564,7 +1628,7 @@ rec ChunkAt {
 # wide every chunk two away, all exist once an edit ends, so those of them the
 # pool lacks are what the edit adds, and a pattern needing more than the pool
 # has room for can be refused before any of it is written. on the tree there
-# is no pool, and nothing is measured.
+# is no pool, and the live cells are counted instead, up to LOAD_CELLS.
 # ---
 # s:     simulation measured against
 # pool:  the world is in the pool, so the measure counts
@@ -1572,10 +1636,12 @@ rec ChunkAt {
 # room:  slots the pool may still take
 # last:  the chunk the last run ended in, whose block is already counted
 # any:   whether last holds one
+# cells: the live cells counted on the tree
 # spent: the measure ran out of room or memory
 pub rec Need {
     s:     *Sim;
     pool:  bool;
+    cells: u64;
     add:   Set[ChunkAt];
     room:  usize;
     last:  ChunkAt;
@@ -1592,6 +1658,7 @@ pub fun need_init(n: *Need, s: *Sim) {
     n.pool  = caps(s).pool;
     n.add   = set.init[ChunkAt](s.space.a);
     n.room  = 0;
+    n.cells = 0;
     n.any   = false;
     n.spent = false;
     if (s.space.max_slots > s.space.live) { n.room = s.space.max_slots - s.space.live; }
@@ -1605,10 +1672,14 @@ pub fun need_dnit(n: *Need) {
 # count n live cells from (x, y) rightward into a measure
 # ---
 # ret: false once the edit needs more chunks than the pool has room for, or
-#      the measure could not grow
+#      more cells than the tree takes as runs, or the measure could not grow
 pub fun need_run(n: *Need, x: i64, y: i64, count: usize) bool {
     if (n.spent) { ret false; }
-    if (!n.pool) { ret true; }
+    if (!n.pool) {
+        n.cells = n.cells + count::u64;
+        n.spent = n.cells > LOAD_CELLS;
+        ret !n.spent;
+    }
     # a cell off the grid is dropped, and needs nothing
     var x0: i64 = x;
     var x1: i64 = x + count::i64;
@@ -1648,14 +1719,6 @@ pub fun need_run(n: *Need, x: i64, y: i64, count: usize) bool {
         }
         cx = cx + 1;
     }
-    ret true;
-}
-
-# whether a load of this many live cells is one the world takes at all, before
-# the chunks it needs are measured: the pool measures them, and the tree takes
-# up to LOAD_CELLS
-pub fun load_fits(s: *Sim, live: u64) bool {
-    if (on_tree(s)) { ret live <= LOAD_CELLS; }
     ret true;
 }
 
@@ -3161,9 +3224,10 @@ test b0__rules_match_an_unbounded_plane_on_both_engines {
 }
 
 test plane__life_highlife_and_larger_than_life_match_an_unbounded_plane_on_both_engines {
-    var rules: [3]str = [3]str{"B3/S23", "B36/S23", "R2,C0,M1,S8..13,B9..12,NM"};
+    # the last a lopsided Golly weighted neighbourhood, negative weights among it
+    var rules: [4]str = [4]str{"B3/S23", "B36/S23", "R2,C0,M1,S8..13,B9..12,NM", "R2,C0,S3-7,B4-6,NW101000211011090012110010A"};
     var i:     usize  = 0;
-    for (i < 3) {
+    for (i < 4) {
         val got: i32 = matches_plane(rules[i]);
         if (got != 0) {
             print.eprintlnf("{}: check {} failed", rules[i], got);
@@ -3450,6 +3514,99 @@ test step__bounded_grids_match_a_reference_stepper {
     ret 0;
 }
 
+# one generation of a bounded grid's reference array under a generations rule
+#[testing]
+fun bounded_generations_reference(g: *topology.Grid, birth: u32, survive: u32, n: u8, cur: *u8, out: *u8) {
+    var y: i64 = 0;
+    for (y < g.h) {
+        var x: i64 = 0;
+        for (x < g.w) {
+            var count: u32 = 0;
+            var dy:    i64 = -1;
+            for (dy <= 1) {
+                var dx: i64 = -1;
+                for (dx <= 1) {
+                    val at: i64 = reference_at(g, x + dx, y + dy);
+                    if ((dx != 0 || dy != 0) && at >= 0 && cur[at::usize] == 1) { count = count + 1; }
+                    dx = dx + 1;
+                }
+                dy = dy + 1;
+            }
+            val i: usize = (y * g.w + x)::usize;
+            val c: u8    = cur[i];
+            var v: u8    = 0;
+            if (c == 0) {
+                if (((birth >> count) & 1) != 0) { v = 1; }
+            }
+            or (c == 1 && ((survive >> count) & 1) != 0) { v = 1; }
+            or (c + 1 < n)                               { v = c + 1; }
+            out[i] = v;
+            x      = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+test step__generations_on_bounded_grids_match_a_reference_stepper {
+    var a: allo.Allocator;
+    page.make(?a);
+    val strings: [4]str = [4]str{"B2/S/C3:T100,90", "345/2/4:T100,90", "B2/S/C3:K70*,60", "345/2/4:C45,53"};
+    val survive: [4]u32 = [4]u32{0, 0x38, 0, 0x38};
+    val states:  [4]u8  = [4]u8{3, 4, 3, 4};
+    var cur:     [10000]u8;
+    var nxt:     [10000]u8;
+    var k:       usize  = 0;
+    for (k < 4) {
+        val r: res[rule.Rule, str] = rule.parse(strings[k]);
+        if (sel r.err) { ret 1; }
+        var ru:   rule.Rule       = r.ok;
+        var g:    topology.Grid   = ru.grid;
+        var s:    Sim;
+        val made: err[allo.Error] = init(?s, ?a);
+        if (sel made.err)      { ret 2; }
+        if (!set_rule(?s, ru)) { ret 3; }
+        s.rng = rand.seed(3, 1, 4, 1 + k::u64);
+        mem.zero[u8](?cur[0], 10000);
+        fill_begin(?s);
+        var y: i64 = 0;
+        for (y < g.h) {
+            var x: i64 = 0;
+            for (x < g.w) {
+                if (rand.range(?s.rng, 0, 1000) < 350) {
+                    fill_cell(?s, topology.left(?g) + x, topology.top(?g) + y, 1);
+                    cur[(y * g.w + x)::usize] = 1;
+                }
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        fill_end(?s);
+        var gen: usize = 0;
+        for (gen < 30) {
+            step(?s);
+            bounded_generations_reference(?g, 4, survive[k], states[k], ?cur[0], ?nxt[0]);
+            mem.copy[u8](?cur[0], ?nxt[0], 10000);
+            y = 0;
+            for (y < g.h) {
+                var x: i64 = 0;
+                for (x < g.w) {
+                    val got: u32 = rule.state(?s.rule, cell(?s, topology.left(?g) + x, topology.top(?g) + y));
+                    if (got != cur[(y * g.w + x)::usize]::u32) {
+                        print.eprintlnf("{}: generation {} differs at ({}, {})", strings[k], gen + 1, x, y);
+                        ret 10 + k::i32;
+                    }
+                    x = x + 1;
+                }
+                y = y + 1;
+            }
+            gen = gen + 1;
+        }
+        dnit(?s);
+        k = k + 1;
+    }
+    ret 0;
+}
+
 # a glider heading south-east with its top-left cell at (x, y)
 #[testing]
 fun seed_glider_at(s: *Sim, x: i64, y: i64) {
@@ -3610,10 +3767,10 @@ test frame__bounded_grids_step_on_the_gpu_as_on_the_cpu {
     val n:    usize = string.str_len(rule.sample(0, 3));
     mem.raw_copy(?wide[0], rule.sample(0, 3), n);
     mem.raw_copy(?wide[n], ":T100,90", 9);
-    val strings: [7]str = [7]str{"B3/S23:T100,100", "B2/S/C3:K37,41*", "R2,C0,M0,S5..9,B7..8,NM:C66,65", "B3/S23:P70,50", "B0123/S123:T100,90",
+    val strings: [8]str = [8]str{"B3/S23:T100,100", "B2/S/C3:K37,41*", "345/2/4:T100,90", "R2,C0,M0,S5..9,B7..8,NM:C66,65", "B3/S23:P70,50", "B0123/S123:T100,90",
         "R5,C0,M1,S34..58,B34..45,NM:K70*,60", ?wide[0]};
     var k: usize = 0;
-    for (k < 7) {
+    for (k < 8) {
         var t:    Rig;
         val code: i32 = rig_open(?t, rule_named(strings[k]), seed_grid_soup);
         if (code != 0)                           { ret code; }
