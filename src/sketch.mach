@@ -1,0 +1,332 @@
+# large patterns drawn from a texture rather than a rectangle a cell
+#
+# a pattern with more cells than SMALL costs too much to draw a rectangle per
+# cell each frame, so it is uploaded once as an atlas of coverage levels and
+# drawn as one quad. level 0 holds a texel per cell, or per block of cells for a
+# pattern wider than LIMIT, and each level after it halves the one before, its
+# texels showing the share of their cells alive the way the world shows density
+# below a pixel per cell. a draw samples the finest level whose texels are at
+# least a pixel wide, so no cell falls between samples. the atlas is rebuilt
+# only when the cells or the orientation change, which the stamp a pattern
+# carries tells (pattern.Pattern.seen).
+
+use gfx: boom.graphics;
+use boom.graphics.renderer.pass_draw_sprite_filtered;
+use cellar.pattern;
+use cellar.ui;
+use allo: std.allocator;
+use std.allocator.page;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+# the most cells drawn as a rectangle each
+pub val SMALL: usize = 16384;
+# the longest side of level 0 in texels
+pub val LIMIT: usize = 2048;
+# the most levels an atlas holds, LIMIT halved down to one texel
+val LEVELS: usize = 12;
+
+# the density a live region shows at, as the world's draw shows it
+val FLOOR: f32 = 0.45;
+val KNEE:  f32 = 0.2;
+
+# one pattern's atlas and what it was built from
+# ---
+# tex:    the atlas, valid when made
+# made:   tex holds an upload
+# seen:   the pattern's stamp when it was built
+# orient: the orientation it was built in
+# w:      the pattern's width in that orientation, in cells
+# h:      its height
+# k:      cells a level 0 texel spans on a side
+# levels: levels the atlas holds
+# aw:     atlas width in texels
+# ah:     atlas height in texels
+# lx:     each level's left edge in the atlas
+# ly:     each level's top edge
+pub rec Sketch {
+    tex:    gfx.Texture;
+    made:   bool;
+    seen:   u64;
+    orient: u8;
+    w:      usize;
+    h:      usize;
+    k:      usize;
+    levels: usize;
+    aw:     usize;
+    ah:     usize;
+    lx:     [LEVELS]usize;
+    ly:     [LEVELS]usize;
+}
+
+# the sketches the interface keeps, and the stamps it gives patterns
+# ---
+# a:       allocator for the scratch a build needs
+# d:       the device the atlases live on
+# next:    the last stamp given
+# preview: the draw section's preview, as the pattern is drawn
+# ghost:   the stamp's ghost over the world, as it would be laid down
+pub rec Sketches {
+    a:       *allo.Allocator;
+    d:       *gfx.Device;
+    next:    u64;
+    preview: Sketch;
+    ghost:   Sketch;
+}
+
+# start with no atlas
+pub fun init(s: *Sketches, a: *allo.Allocator, d: *gfx.Device) {
+    s.a            = a;
+    s.d            = d;
+    s.next         = 0;
+    s.preview.made = false;
+    s.ghost.made   = false;
+}
+
+fun drop(s: *Sketches, k: *Sketch) {
+    if (!k.made) { ret; }
+    gfx.texture_delete(s.d, ?k.tex);
+    k.made = false;
+}
+
+# release every atlas, before the renderer goes
+pub fun dnit(s: *Sketches) {
+    drop(s, ?s.preview);
+    drop(s, ?s.ghost);
+}
+
+# the share of the live colour for cells this dense
+fun cover(d: f32) f32 {
+    ret FLOOR + (1.0 - FLOOR) * d * (1.0 + KNEE) / (d + KNEE);
+}
+
+fun ceil_div(a: usize, b: usize) usize {
+    ret (a + b - 1) / b;
+}
+
+# a level's side in texels, from the pattern's side in cells and a level 0 texel's span
+fun side(n: usize, k: usize, l: usize) usize {
+    ret ceil_div(n, k << l);
+}
+
+# lay out the levels of a w x h pattern in orientation o: level 0 on the left,
+# the rest down a column to its right, a texel apart so no sample reaches a neighbour
+fun layout(k: *Sketch, w: usize, h: usize) {
+    var big: usize = w;
+    if (h > big) { big = h; }
+    k.w      = w;
+    k.h      = h;
+    k.k      = ceil_div(big, LIMIT);
+    k.levels = 1;
+    for (k.levels < LEVELS && (side(w, k.k, k.levels - 1) > 1 || side(h, k.k, k.levels - 1) > 1)) {
+        k.levels = k.levels + 1;
+    }
+    val w0: usize = side(w, k.k, 0);
+    val h0: usize = side(h, k.k, 0);
+    k.lx[0] = 0;
+    k.ly[0] = 0;
+    k.aw    = w0;
+    k.ah    = h0;
+    var y: usize = 0;
+    var l: usize = 1;
+    for (l < k.levels) {
+        k.lx[l] = w0 + 1;
+        k.ly[l] = y;
+        y       = y + side(h, k.k, l) + 1;
+        if (k.lx[l] + side(w, k.k, l) > k.aw) { k.aw = k.lx[l] + side(w, k.k, l); }
+        if (y - 1 > k.ah)                     { k.ah = y - 1; }
+        l = l + 1;
+    }
+}
+
+# the live cells under each level 0 texel of p laid down in orientation o
+fun count(k: *Sketch, p: *pattern.Pattern, o: u8, out: *u32) {
+    val w0: usize = side(k.w, k.k, 0);
+    var y:  usize = 0;
+    for (y < k.h) {
+        val row: usize = (y / k.k) * w0;
+        var x:   usize = 0;
+        for (x < k.w) {
+            if (pattern.get_oriented(p, o, x, y) != 0) { out[row + x / k.k] = out[row + x / k.k] + 1; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+# the counts of level l from those of level l - 1, each texel summing the four under it
+fun halve(k: *Sketch, l: usize, src: *u32, dst: *u32) {
+    val sw: usize = side(k.w, k.k, l - 1);
+    val sh: usize = side(k.h, k.k, l - 1);
+    val dw: usize = side(k.w, k.k, l);
+    val dh: usize = side(k.h, k.k, l);
+    var y:  usize = 0;
+    for (y < dh) {
+        var x: usize = 0;
+        for (x < dw) {
+            var n:  u32  = src[y * 2 * sw + x * 2];
+            val x1: bool = x * 2 + 1 < sw;
+            val y1: bool = y * 2 + 1 < sh;
+            if (x1)       { n = n + src[y * 2 * sw + x * 2 + 1]; }
+            if (y1)       { n = n + src[(y * 2 + 1) * sw + x * 2]; }
+            if (x1 && y1) { n = n + src[(y * 2 + 1) * sw + x * 2 + 1]; }
+            dst[y * dw + x] = n;
+            x               = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+# write level l's counts into the atlas as white at the density they show
+fun paint(k: *Sketch, l: usize, counts: *u32, px: *u8) {
+    val span: usize = k.k << l;
+    val lw:   usize = side(k.w, k.k, l);
+    val lh:   usize = side(k.h, k.k, l);
+    var y:    usize = 0;
+    for (y < lh) {
+        # an edge texel spans only the cells the pattern has there
+        var ch: usize = k.h - y * span;
+        if (ch > span) { ch = span; }
+        var x: usize = 0;
+        for (x < lw) {
+            val n: u32 = counts[y * lw + x];
+            if (n != 0) {
+                var cw: usize = k.w - x * span;
+                if (cw > span) { cw = span; }
+                val at: usize = ((k.ly[l] + y) * k.aw + k.lx[l] + x) * 4;
+                px[at]     = 255;
+                px[at + 1] = 255;
+                px[at + 2] = 255;
+                px[at + 3] = (cover(n::f32 / (cw * ch)::f32) * 255.0 + 0.5)::u8;
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+# build k's atlas from p laid down in orientation o, replacing any it held
+fun build(s: *Sketches, k: *Sketch, p: *pattern.Pattern, o: u8) bool {
+    drop(s, k);
+    layout(k, pattern.width(p, o), pattern.height(p, o));
+    val n0:  usize                 = side(k.w, k.k, 0) * side(k.h, k.k, 0);
+    val cur: res[*u32, allo.Error] = allo.zallocate[u32](s.a, n0);
+    if (sel cur.err) { ret false; }
+    fin { allo.deallocate[u32](s.a, cur.ok, n0); }
+    val nxt: res[*u32, allo.Error] = allo.zallocate[u32](s.a, n0);
+    if (sel nxt.err) { ret false; }
+    fin { allo.deallocate[u32](s.a, nxt.ok, n0); }
+    val bytes: usize                = k.aw * k.ah * 4;
+    val px:    res[*u8, allo.Error] = allo.zallocate[u8](s.a, bytes);
+    if (sel px.err) { ret false; }
+    fin { allo.deallocate[u8](s.a, px.ok, bytes); }
+
+    count(k, p, o, cur.ok);
+    var a: *u32  = cur.ok;
+    var b: *u32  = nxt.ok;
+    var l: usize = 0;
+    for (l < k.levels) {
+        if (l > 0) {
+            halve(k, l, a, b);
+            val t: *u32 = a;
+            a = b;
+            b = t;
+        }
+        paint(k, l, a, px.ok);
+        l = l + 1;
+    }
+    val t: res[gfx.Texture, gfx.Error] = gfx.texture(s.d, px.ok, k.aw::i32, k.ah::i32, gfx.ColorSpace.linear{});
+    if (sel t.err) { ret false; }
+    k.tex    = t.ok;
+    k.made   = true;
+    k.seen   = p.seen;
+    k.orient = o;
+    ret true;
+}
+
+# whether a pattern of w x h cells is drawn from an atlas rather than a rectangle a cell
+pub fun large(w: usize, h: usize) bool {
+    ret w > 0 && h > SMALL / w;
+}
+
+# draw p laid down in orientation o from k's atlas, its top-left cell at (x0, y0)
+# and ppc pixels a cell, building the atlas first when p changed since
+# ---
+# u:     the interface
+# s:     the sketches
+# k:     the sketch this draw keeps, one per place a pattern is drawn
+# p:     the pattern
+# o:     orientation, below pattern.ORIENT_COUNT
+# x0:    screen x of the pattern's left edge
+# y0:    screen y of its top edge
+# ppc:   pixels a cell
+# hex:   the colour of a live cell
+# alpha: its opacity
+pub fun draw(u: *ui.Ui, s: *Sketches, k: *Sketch, p: *pattern.Pattern, o: u8, x0: f32, y0: f32, ppc: f32, hex: u32, alpha: f32) {
+    if (p.w == 0 || p.h == 0) { ret; }
+    if (p.seen == 0) {
+        s.next = s.next + 1;
+        p.seen = s.next;
+    }
+    if (!k.made || k.seen != p.seen || k.orient != o) {
+        if (!build(s, k, p, o)) { ret; }
+    }
+    # the finest level whose texels are a pixel or wider
+    var l: usize = 0;
+    for (l + 1 < k.levels && ppc * (k.k << l)::f32 < 1.0) { l = l + 1; }
+    val span: f32      = (k.k << l)::f32;
+    val src:  gfx.Rect = gfx.rect(k.lx[l]::f32 / k.aw::f32, k.ly[l]::f32 / k.ah::f32,
+        k.w::f32 / span / k.aw::f32, k.h::f32 / span / k.ah::f32);
+    val dest: gfx.Rect = gfx.rect(x0, y0, k.w::f32 * ppc, k.h::f32 * ppc);
+    pass_draw_sprite_filtered(u.pass, opt[*gfx.Texture].some{?k.tex}, dest, src, ui.col(u, hex, alpha), gfx.TextureFilter.nearest{});
+}
+
+test layout__stacks_the_halved_levels_beside_level_zero {
+    var k: Sketch;
+    layout(?k, 5, 3);
+    # 5x3, 3x2, 2x1, 1x1
+    if (k.k != 1 || k.levels != 4)                                    { ret 1; }
+    if (k.lx[1] != 6 || k.ly[1] != 0 || k.ly[2] != 3 || k.ly[3] != 5) { ret 2; }
+    if (k.aw != 9 || k.ah != 6)                                       { ret 3; }
+    layout(?k, LIMIT * 3, 10);
+    if (k.k != 3 || side(k.w, k.k, 0) != LIMIT || side(k.h, k.k, 0) != 4) { ret 4; }
+    ret 0;
+}
+
+test halve__sums_every_cell_once_across_uneven_edges {
+    var a: allo.Allocator;
+    page.make(?a);
+    var p: pattern.Pattern;
+    pattern.init(?p, ?a, 5, 3, "t");
+    fin { pattern.dnit(?p); }
+    var y: usize = 0;
+    for (y < 3) {
+        var x: usize = 0;
+        for (x < 5) {
+            pattern.set(?p, x, y, 1);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    var k: Sketch;
+    layout(?k, 5, 3);
+    var c0: [15]u32;
+    var c1: [15]u32;
+    count(?k, ?p, 0, ?c0[0]);
+    var l:   usize = 1;
+    var src: *u32  = ?c0[0];
+    var dst: *u32  = ?c1[0];
+    for (l < k.levels) {
+        halve(?k, l, src, dst);
+        val t: *u32 = src;
+        src = dst;
+        dst = t;
+        l   = l + 1;
+    }
+    if (src[0] != 15) { ret 1; }
+    ret 0;
+}
