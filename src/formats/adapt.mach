@@ -94,6 +94,7 @@ fun pattern_close(ctx: *u8) bool {
 pub fun pattern_sink(s: *PatternSink, p: *pattern.Pattern) *format.Sink {
     s.p          = p;
     s.sink.ctx   = s::*u8;
+    s.sink.tree  = nil;
     s.sink.plan  = pattern_plan;
     s.sink.fit   = nil;
     s.sink.open  = pattern_open;
@@ -109,8 +110,11 @@ pub fun pattern_sink(s: *PatternSink, p: *pattern.Pattern) *format.Sink {
 # the chunks the runs would add, so a pattern the pool cannot hold is refused
 # whole while one far larger than the pool in extent but sparse enough loads.
 # the quadtree has no pool, so a pattern of any extent loads straight into it,
-# up to sim.LOAD_CELLS live cells. only open begins the edit, and a rule the
-# sink was given to take is set there, once the pattern is known to fit and
+# its runs counted up to sim.LOAD_CELLS live cells as they fit. while it holds
+# the world the sink offers it as a tree too, so a format that builds lays its
+# squares straight into it (sim.merge_begin), of any size, and the watch keeps
+# the world whole rather than the box. only open begins the edit, and a rule
+# the sink was given to take is set there, once the pattern is known to fit and
 # before any cell is written, so the cells are written as that rule's states.
 # ---
 # s:       simulation to write onto
@@ -124,6 +128,7 @@ pub fun pattern_sink(s: *PatternSink, p: *pattern.Pattern) *format.Sink {
 # take:    rule holds a rule to set as the sink opens
 # rule:    the rule to take
 # refused: the simulation refused the rule, so the world kept its own
+# tree:    the tree the sink offers while the quadtree holds the world
 # sink:    the sink to hand to formats.load
 pub rec WorldSink {
     s:       *sim.Sim;
@@ -136,6 +141,7 @@ pub rec WorldSink {
     take:    bool;
     rule:    rule.Rule;
     refused: bool;
+    tree:    format.TreeSink;
     sink:    format.Sink;
 }
 
@@ -146,8 +152,10 @@ fun world_plan(ctx: *u8, info: *format.Info) bool {
         w.dx = pattern.corner(0, (info.x1 - info.x0)::usize) - info.x0;
         w.dy = pattern.corner(0, (info.y1 - info.y0)::usize) - info.y0;
     }
+    # the tree's grid is the world's, whose origin lies at (-dx, -dy) in the file
+    w.tree.x0 = 0 - w.dx;
+    w.tree.y0 = 0 - w.dy;
     if (!sim.reaches(info.x0 + w.dx, info.y0 + w.dy, info.x1 + w.dx, info.y1 + w.dy)) { ret false; }
-    if (!sim.load_fits(w.s, info.live))                                               { ret false; }
     sim.need_init(?w.need, w.s);
     w.planned = true;
     ret true;
@@ -158,12 +166,16 @@ fun world_fit(ctx: *u8, x: i64, y: i64, n: usize, v: u8) bool {
     ret sim.need_run(?w.need, x + w.dx, y + w.dy, n);
 }
 
+# set the rule the sink was given to take, once
+fun take_rule(w: *WorldSink) {
+    if (!w.take) { ret; }
+    w.take    = false;
+    w.refused = !sim.set_rule(w.s, w.rule);
+}
+
 fun world_open(ctx: *u8, info: *format.Info) bool {
     val w: *WorldSink = ctx::*WorldSink;
-    if (w.take) {
-        w.take    = false;
-        w.refused = !sim.set_rule(w.s, w.rule);
-    }
+    take_rule(w);
     if (!info.bounded) { ret true; }
     w.opened = sim.edit_begin(w.s, info.x0 + w.dx, info.y0 + w.dy, info.x1 + w.dx, info.y1 + w.dy);
     ret w.opened;
@@ -172,6 +184,26 @@ fun world_open(ctx: *u8, info: *format.Info) bool {
 fun world_run(ctx: *u8, x: i64, y: i64, n: usize, v: u8) bool {
     val w: *WorldSink = ctx::*WorldSink;
     ret sim.edit_run(w.s, x + w.dx, y + w.dy, n, v);
+}
+
+fun world_tree_open(ctx: *u8, info: *format.Info) bool {
+    val w: *WorldSink = ctx::*WorldSink;
+    take_rule(w);
+    if (!info.bounded) { ret true; }
+    w.opened = sim.merge_begin(w.s, info.x0 + w.dx, info.y0 + w.dy, info.x1 + w.dx, info.y1 + w.dy);
+    ret w.opened;
+}
+
+fun world_join(ctx: *u8, nw: u32, ne: u32, sw: u32, se: u32) u32 {
+    val w: *WorldSink = ctx::*WorldSink;
+    val n: u32        = sim.merge_node(w.s, nw, ne, sw, se);
+    if (n == hashlife.NONE) { ret format.NO_NODE; }
+    ret n;
+}
+
+fun world_put(ctx: *u8, n: u32, l: u32, x: i64, y: i64) bool {
+    val w: *WorldSink = ctx::*WorldSink;
+    ret sim.edit_square(w.s, n, l, x + w.dx, y + w.dy);
 }
 
 fun world_close(ctx: *u8) bool {
@@ -183,22 +215,30 @@ fun world_close(ctx: *u8) bool {
     ret sim.edit_end(w.s);
 }
 
-# point a WorldSink at a simulation
+# point a WorldSink at a simulation, offering the tree while it holds the world
 # ---
 # w:  sink record
 # s:  simulation
 # dx: columns to shift every cell by
 # dy: rows to shift every cell by
 pub fun world_sink(w: *WorldSink, s: *sim.Sim, dx: i64, dy: i64) *format.Sink {
-    w.s          = s;
-    w.dx         = dx;
-    w.dy         = dy;
-    w.centre     = false;
-    w.planned    = false;
-    w.opened     = false;
-    w.take       = false;
-    w.refused    = false;
-    w.sink.ctx   = w::*u8;
+    w.s         = s;
+    w.dx        = dx;
+    w.dy        = dy;
+    w.centre    = false;
+    w.planned   = false;
+    w.opened    = false;
+    w.take      = false;
+    w.refused   = false;
+    w.tree.ctx  = w::*u8;
+    w.tree.x0   = 0 - dx;
+    w.tree.y0   = 0 - dy;
+    w.tree.open = world_tree_open;
+    w.tree.join = world_join;
+    w.tree.put  = world_put;
+    w.sink.ctx  = w::*u8;
+    w.sink.tree = nil;
+    if (sim.on_tree(s)) { w.sink.tree = ?w.tree; }
     w.sink.plan  = world_plan;
     w.sink.fit   = world_fit;
     w.sink.open  = world_open;
@@ -217,10 +257,13 @@ pub fun centred_sink(w: *WorldSink, s: *sim.Sim) *format.Sink {
     ret k;
 }
 
-# have a WorldSink set a rule as it opens, before it writes a cell
+# have a WorldSink set a rule as it opens, before it writes a cell. a rule the
+# quadtree cannot run moves the world off it as it is set, so the sink then
+# offers no tree and the cells go in as runs
 pub fun sink_rule(w: *WorldSink, r: rule.Rule) {
     w.take = true;
     w.rule = r;
+    if (!rule.caps(?w.rule).hashlife) { w.sink.tree = nil; }
 }
 
 # a source that reads a heap pattern, its live cells in rows

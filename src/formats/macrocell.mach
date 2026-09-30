@@ -20,6 +20,16 @@
 # MAX_LEVEL as long as its live cells lie within format.LIMIT of the origin and
 # number at most format.LIMIT.
 #
+# a sink that offers its quadtree (format.TreeSink) is built into instead, never
+# listing a cell. the sink's squares are aligned to their size on its own grid,
+# as HashLife's are to the origin, a row below Golly's and shifted as the sink
+# places the pattern. so each square of the sink is made from the 2 by 2 of the
+# file's squares of its level that it overlaps, and its quarters from the 4 by
+# 4 of their children, as the writer does the other way, and a square is made
+# once for each such window. the squares laid are the fewest of one level that
+# cover the live cells, so the cost follows the file's distinct nodes, not the
+# cells they hold or the root's side.
+#
 # the writer reads its source twice: once for the extent of the live cells,
 # which picks the smallest root holding them, and once band by band from the
 # top, turning each band of rows into leaves and pairing finished bands level
@@ -413,6 +423,24 @@ fun read_all(a: *allo.Allocator, p: *u8, n: usize, e: *format.Emit, nodes: *Vect
     if (e.sink == nil) {
         format.gather(e.info, ox + rn.x0, oy + rn.y0, ox + rn.x1, oy + rn.y1, rn.pop, rn.top::u8);
         ret err[format.Error].ok{};
+    }
+    if (e.tree != nil) {
+        var o: Onto;
+        o.nodes = nodes.data;
+        o.root  = root;
+        o.level = rn.level;
+        o.ox    = ox;
+        o.oy    = oy;
+        o.t     = e.tree;
+        o.memo  = map.init[Win, u32](a);
+        var k: usize = 0;
+        for (k < 64) {
+            o.empty[k] = format.NO_NODE;
+            k          = k + 1;
+        }
+        val r: err[format.Error] = build_into(?o, rn);
+        map.dnit[Win, u32](?o.memo);
+        ret r;
     }
     if (!walk(nodes.data, root, ox, oy, e)) { ret err[format.Error].err{format.Error.sink{}}; }
     ret err[format.Error].ok{};
@@ -1172,6 +1200,234 @@ fun q_edge(o: *Over, n: u32, l: u32, ox: i64, oy: i64, rows: bool, far: bool, be
     ret got;
 }
 
+# the file's tree being built into a sink's
+# ---
+# nodes: the file's nodes, node 0 the empty one
+# root:  the root's number
+# level: the root's level
+# ox:    the root's leftmost column
+# oy:    its top row
+# t:     the sink's tree
+# memo:  the sink's node of each window made, keyed by the file's squares
+# empty: the sink's empty node of each level, format.NO_NODE until made
+rec Onto {
+    nodes: *Node;
+    root:  u32;
+    level: u32;
+    ox:    i64;
+    oy:    i64;
+    t:     *format.TreeSink;
+    memo:  Map[Win, u32];
+    empty: [64]u32;
+}
+
+fun f_live(o: *Onto, n: u32) bool {
+    if (n == NONE) { ret false; }
+    ret o.nodes[n::usize].pop != 0;
+}
+
+# child q of a file node above level 3, or NONE for NONE
+fun f_kid(o: *Onto, n: u32, q: usize) u32 {
+    if (n == NONE) { ret NONE; }
+    val nd: *Node = ?o.nodes[n::usize];
+    if (q == 0) { ret nd.nw; }
+    if (q == 1) { ret nd.ne; }
+    if (q == 2) { ret nd.sw; }
+    ret nd.se;
+}
+
+# the state of the cell at (x, y) of a file node of level l, from its corner
+fun f_cell(o: *Onto, n: u32, l: u32, x: i64, y: i64) u32 {
+    var id: u32 = n;
+    var k:  u32 = l;
+    for (k > 0) {
+        if (!f_live(o, id)) { ret 0; }
+        val nd: *Node = ?o.nodes[id::usize];
+        if (nd.uni != MIXED) { ret nd.uni; }
+        if (nd.leaf) {
+            val bit: i64 = (y & 7) * 8 + (x & 7);
+            if (bit < 32) { ret (nd.lo >> bit::u32) & 1; }
+            ret (nd.hi >> (bit - 32)::u32) & 1;
+        }
+        k = k - 1;
+        val q: usize = (((y >> k::i64) & 1) * 2 + ((x >> k::i64) & 1))::usize;
+        # a level 1 node's children are states
+        if (k == 0) { ret f_kid(o, id, q); }
+        id = f_kid(o, id, q);
+    }
+    ret 0;
+}
+
+# the state of the cell at (x, y) of the file, anywhere
+fun f_at(o: *Onto, x: i64, y: i64) u32 {
+    val side: i64 = pow2(o.level);
+    val rx:   i64 = x - o.ox;
+    val ry:   i64 = y - o.oy;
+    if (rx < 0 || ry < 0 || rx >= side || ry >= side) { ret 0; }
+    ret f_cell(o, o.root, o.level, rx, ry);
+}
+
+# the state of the cell at (x, y) of a window, from the sink square's corner
+fun f_win_cell(o: *Onto, w: *Win, x: i64, y: i64) u32 {
+    val wx: i64    = w.dx + x;
+    val wy: i64    = w.dy + y;
+    val l:  i64    = w.level::i64;
+    var sq: [4]u32 = [4]u32{w.nw, w.ne, w.sw, w.se};
+    val m:  i64    = pow2(w.level) - 1;
+    ret f_cell(o, sq[((wy >> l) * 2 + (wx >> l))::usize], w.level, wx & m, wy & m);
+}
+
+# the file's square of level l above 3 at (gx, gy) in squares of its size from
+# the root's corner, 0 when empty, or NONE outside the root
+fun f_square(o: *Onto, l: u32, gx: i64, gy: i64) u32 {
+    val span: i64 = pow2(o.level - l);
+    if (gx < 0 || gy < 0 || gx >= span || gy >= span) { ret NONE; }
+    var n: u32 = o.root;
+    var b: u32 = o.level - l;
+    for (b > 0) {
+        if (!f_live(o, n)) { ret 0; }
+        b = b - 1;
+        n = f_kid(o, n, (((gy >> b::i64) & 1) * 2 + ((gx >> b::i64) & 1))::usize);
+    }
+    ret n;
+}
+
+# the sink's node of four, or NO_NODE when one of them is
+fun d_join(o: *Onto, nw: u32, ne: u32, sw: u32, se: u32) u32 {
+    if (nw == format.NO_NODE || ne == format.NO_NODE || sw == format.NO_NODE || se == format.NO_NODE) { ret format.NO_NODE; }
+    ret o.t.join(o.t.ctx, nw, ne, sw, se);
+}
+
+# the sink's empty node of a level
+fun d_empty(o: *Onto, l: u32) u32 {
+    if (l == 0)                              { ret 0; }
+    if (o.empty[l::usize] != format.NO_NODE) { ret o.empty[l::usize]; }
+    val e: u32 = d_empty(o, l - 1);
+    o.empty[l::usize] = d_join(o, e, e, e, e);
+    ret o.empty[l::usize];
+}
+
+# the sink's node of level l of the cells from (x, y) of a square: read through
+# the window w, or when w is nil straight from the root at (x, y)
+fun d_cells(o: *Onto, w: *Win, l: u32, x: i64, y: i64) u32 {
+    if (l == 0) {
+        if (w != nil) { ret f_win_cell(o, w, x, y); }
+        ret f_at(o, x, y);
+    }
+    val h: i64 = pow2(l - 1);
+    ret d_join(o, d_cells(o, w, l - 1, x, y), d_cells(o, w, l - 1, x + h, y), d_cells(o, w, l - 1, x, y + h), d_cells(o, w, l - 1, x + h, y + h));
+}
+
+# the sink's node of the square a window covers
+# ---
+# w:   the window over the file's squares, trimmed of those it misses here
+# out: receives the node
+fun onto_node(o: *Onto, w: *Win, out: *u32) err[format.Error] {
+    if (w.dx == 0) {
+        w.ne = NONE;
+        w.se = NONE;
+    }
+    if (w.dy == 0) {
+        w.sw = NONE;
+        w.se = NONE;
+    }
+    if (!f_live(o, w.nw) && !f_live(o, w.ne) && !f_live(o, w.sw) && !f_live(o, w.se)) {
+        @out = d_empty(o, w.level);
+        if (@out == format.NO_NODE) { ret err[format.Error].err{format.Error.sink{}}; }
+        ret err[format.Error].ok{};
+    }
+    val have: opt[*u32] = map.get[Win, u32](?o.memo, w);
+    if (sel have.some) {
+        @out = @have.some;
+        ret err[format.Error].ok{};
+    }
+    var n: u32 = format.NO_NODE;
+    if (w.level <= 3) { n = d_cells(o, w, w.level, 0, 0); }
+    or {
+        # the 4 by 4 of the squares' children, and each quarter's window over them
+        var sq: [4]u32 = [4]u32{w.nw, w.ne, w.sw, w.se};
+        var g:  [16]u32;
+        var i:  usize  = 0;
+        for (i < 16) {
+            val gx: usize = i % 4;
+            val gy: usize = i / 4;
+            g[i] = f_kid(o, sq[(gy / 2) * 2 + gx / 2], (gy % 2) * 2 + gx % 2);
+            i    = i + 1;
+        }
+        val l:  u32   = w.level - 1;
+        val h:  i64   = pow2(l);
+        var id: [4]u32;
+        var c:  usize = 0;
+        for (c < 4) {
+            val px: i64               = w.dx + (c % 2)::i64 * h;
+            val py: i64               = w.dy + (c / 2)::i64 * h;
+            val gx: usize             = (px >> l::i64)::usize;
+            val gy: usize             = (py >> l::i64)::usize;
+            var cw: Win               = Win{level: l, nw: g[gy * 4 + gx], ne: g[gy * 4 + gx + 1], sw: g[(gy + 1) * 4 + gx], se: g[(gy + 1) * 4 + gx + 1], dx: px - gx::i64 * h, dy: py - gy::i64 * h};
+            val r:  err[format.Error] = onto_node(o, ?cw, ?id[c]);
+            if (sel r.err) { ret r; }
+            c = c + 1;
+        }
+        n = d_join(o, id[0], id[1], id[2], id[3]);
+    }
+    if (n == format.NO_NODE) { ret err[format.Error].err{format.Error.sink{}}; }
+    val put: res[bool, allo.Error] = map.insert[Win, u32](?o.memo, @w, n);
+    if (sel put.err) { ret alloc_err(put.err); }
+    @out = n;
+    ret err[format.Error].ok{};
+}
+
+# a divided by b, rounded down, b above 0
+fun floor_div(a: i64, b: i64) i64 {
+    var q: i64 = a / b;
+    if (q * b > a) { q = q - 1; }
+    ret q;
+}
+
+# build the file's live cells into the sink's tree, as the fewest squares of
+# one level on the sink's grid that cover them
+# ---
+# rn:  the root, holding a live cell
+# ret: ok, or sink when the sink could not make or lay a square
+fun build_into(o: *Onto, rn: *Node) err[format.Error] {
+    val bx0: i64 = o.ox + rn.x0;
+    val by0: i64 = o.oy + rn.y0;
+    val bx1: i64 = o.ox + rn.x1;
+    val by1: i64 = o.oy + rn.y1;
+    var m:   u32 = 0;
+    for (pow2(m) < bx1 - bx0 || pow2(m) < by1 - by0) { m = m + 1; }
+    val side: i64 = pow2(m);
+    # the squares the box meets, at most 2 by 2 since it is no wider than one
+    val ax0: i64 = floor_div(bx0 - o.t.x0, side);
+    val ay0: i64 = floor_div(by0 - o.t.y0, side);
+    val ax1: i64 = floor_div(bx1 - 1 - o.t.x0, side);
+    val ay1: i64 = floor_div(by1 - 1 - o.t.y0, side);
+    var j:   i64 = ay0;
+    for (j <= ay1) {
+        var i: i64 = ax0;
+        for (i <= ax1) {
+            val px: i64 = o.t.x0 + i * side;
+            val py: i64 = o.t.y0 + j * side;
+            var n:  u32 = format.NO_NODE;
+            # a square no larger than a leaf is read cell by cell
+            if (m <= 3) { n = d_cells(o, nil, m, px, py); }
+            or {
+                val fx: i64               = px - o.ox;
+                val fy: i64               = py - o.oy;
+                val gx: i64               = floor_div(fx, side);
+                val gy: i64               = floor_div(fy, side);
+                var w:  Win               = Win{level: m, nw: f_square(o, m, gx, gy), ne: f_square(o, m, gx + 1, gy), sw: f_square(o, m, gx, gy + 1), se: f_square(o, m, gx + 1, gy + 1), dx: fx - gx * side, dy: fy - gy * side};
+                val r:  err[format.Error] = onto_node(o, ?w, ?n);
+                if (sel r.err) { ret r; }
+            }
+            if (n == format.NO_NODE || !o.t.put(o.t.ctx, n, m, px, py)) { ret err[format.Error].err{format.Error.sink{}}; }
+            i = i + 1;
+        }
+        j = j + 1;
+    }
+    ret err[format.Error].ok{};
+}
+
 # encode a source's quadtree as a Macrocell file
 fun encode_tree(a: *allo.Allocator, src: *format.Source, info: *format.Info, out: *Vector[u8]) err[format.Error] {
     var o: Over;
@@ -1232,6 +1488,7 @@ pub fun make() format.Format {
     f.exts   = "mc";
     f.sniff  = sniff;
     f.decode = decode;
+    f.builds = true;
     f.encode = encode;
     ret f;
 }
