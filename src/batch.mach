@@ -1,19 +1,23 @@
-# headless runs: open a file into a world, step it on the CPU, write it out
+# headless runs: open a file into a world, step it on the CPU or on HashLife,
+# write it out
 #
 # a batch owns a simulation that is never handed a GPU, so nothing here opens
-# a window or reaches boom's renderer. a file is opened as the app opens it
+# a window or reaches boom's renderer. on HashLife a step of n generations goes
+# straight to the generation, by the powers of two n is made of. a file is opened as the app opens it
 # (cellar.persist.open_bytes), so a world file replaces the world and a pattern
 # is stamped centred on the origin through the format registry and the world
 # sink, and a step is sim.step, the step the app takes. the stages are separate
 # calls on a Batch so a script can drive them in any order and read the world
 # between them, and run strings them together for `cellar run`.
 
+use cellar.args;
 use cellar.format;
 use cellar.formats;
 use cellar.formats.adapt;
 use cellar.pattern;
 use cellar.persist;
 use cellar.rule;
+use cellar.rules.weighted;
 use cellar.sim;
 use cellar.space;
 use allo: std.allocator;
@@ -22,6 +26,7 @@ use std.collections.vector;
 use std.collections.vector.Vector;
 use fs: std.filesystem;
 use std.io.writer;
+use mem: std.memory;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -61,12 +66,15 @@ pub rec Report {
 # pattern: the world or pattern file to open
 # rule:    the rule to run under, or nil for the file's
 # gens:    generations to step
+# engine:  args.ENGINE_ANY or ENGINE_CPU for the pool, ENGINE_HASHLIFE for the
+#          quadtree
 # out:     the file to write, its format by its extension, or nil for
 #          DEFAULT_FORMAT on stdout
 pub rec Job {
     pattern: str;
     rule:    str;
     gens:    u64;
+    engine:  u8;
     out:     str;
 }
 
@@ -77,7 +85,9 @@ pub rec Job {
 # open:    the file was refused, see cellar.persist.Error
 # rule:    the rule text was refused, for the reason given
 # foreign: the file names a rule this cellar cannot run and none was given
-# full:    the world outgrew the pool, so stepping on would go wrong
+# full:    the world outgrew the pool or HashLife's node table, so stepping
+#          on would go wrong
+# engine:  the engine asked for cannot run the rule or take the world
 # format:  the world could not be written, see cellar.format.Error
 # write:   the output file could not be written
 # stdout:  standard output refused the result
@@ -88,6 +98,7 @@ pub tag Error: u8 {
     rule:  str;
     foreign;
     full;
+    engine;
     format: format.Error;
     write:  fs.FsError;
     stdout;
@@ -104,6 +115,7 @@ pub fun error_message(e: Error) str {
     if (sel e.rule)    { ret e.rule; }
     if (sel e.foreign) { ret "the file's rule is not one cellar can run; name one with --rule"; }
     if (sel e.full)    { ret "the world outgrew what cellar can hold"; }
+    if (sel e.engine)  { ret "HashLife cannot run the rule; it runs radius 1 rules without B0 on the unbounded plane"; }
     if (sel e.format)  { ret format.error_message(e.format); }
     if (sel e.write)   { ret "the output file could not be written"; }
     ret "standard output could not be written";
@@ -115,7 +127,8 @@ pub fun error_message(e: Error) str {
 # j:   the job that failed
 # ret: the argument to name beside error_message
 pub fun error_subject(e: Error, j: *Job) str {
-    if (sel e.rule) { ret j.rule; }
+    if (sel e.rule)   { ret j.rule; }
+    if (sel e.engine) { ret "--engine hashlife"; }
     if (sel e.format || sel e.write || sel e.stdout) {
         if (j.out == nil) { ret "stdout"; }
         ret j.out;
@@ -173,13 +186,34 @@ pub fun set_rule(b: *Batch, text: str) err[Error] {
     ret err[Error].ok{};
 }
 
+# move the world onto HashLife, or back into the pool
+# ---
+# b:    batch
+# tree: HashLife
+# ret:  ok, or engine when HashLife cannot run the rule or take the world
+pub fun use_hashlife(b: *Batch, tree: bool) err[Error] {
+    if (!sim.use_hashlife(?b.s, tree)) { ret err[Error].err{Error.engine{}}; }
+    ret err[Error].ok{};
+}
+
 # advance the world n generations
 # ---
 # b:   batch
 # n:   generations
-# ret: ok, or full once the world outgrew the pool, the generations stepped
-#      before it counted
+# ret: ok, or full once the world outgrew the pool or the node table, the
+#      generations stepped before it counted
 pub fun step(b: *Batch, n: u64) err[Error] {
+    if (sim.on_tree(?b.s)) {
+        # straight to the generation, in pieces jump takes
+        var left: u64 = n;
+        for (left > 0) {
+            var d: u64 = left;
+            if (d > (1::u64 << 48))                  { d = 1::u64 << 48; }
+            if (!sim.jump(?b.s, b.s.generation + d)) { ret err[Error].err{Error.full{}}; }
+            left = left - d;
+        }
+        ret err[Error].ok{};
+    }
     var i: u64 = 0;
     for (i < n) {
         sim.step(?b.s);
@@ -257,6 +291,10 @@ fun drive(b: *Batch, j: *Job, f: *format.Format, out: *Vector[u8]) err[Error] {
         if (sel ruled.err) { ret ruled; }
     }
     if (b.foreign) { ret err[Error].err{Error.foreign{}}; }
+    if (j.engine == args.ENGINE_HASHLIFE) {
+        val moved: err[Error] = use_hashlife(b, true);
+        if (sel moved.err) { ret moved; }
+    }
     val stepped: err[Error] = step(b, j.gens);
     if (sel stepped.err) { ret stepped; }
     val coded: err[Error] = encode(b, f, out);
@@ -530,5 +568,46 @@ test encode__writes_every_dying_cell_of_a_generations_world {
         k = k + 1;
     }
     close(?b);
+    ret 0;
+}
+
+test run__on_hashlife_writes_what_the_chunk_engine_does {
+    var a: allo.Allocator;
+    page.make(?a);
+    val dir: err[fs.FsError] = persist.make_parent(?a, "out/test/batch_engine/gun.rle");
+    if (sel dir.err) { ret 1; }
+    val w: err[fs.FsError] = fs.write_bytes("out/test/batch_engine/gun.rle", GUN, string.str_len(GUN), persist.FILE_MODE);
+    if (sel w.err) { ret 1; }
+    var pool: Job                = Job{pattern: "out/test/batch_engine/gun.rle", rule: nil, gens: 1000, engine: args.ENGINE_CPU, out: "out/test/batch_engine/pool.rle"};
+    var tree: Job                = Job{pattern: "out/test/batch_engine/gun.rle", rule: nil, gens: 1000, engine: args.ENGINE_HASHLIFE, out: "out/test/batch_engine/tree.rle"};
+    val p:    res[Report, Error] = run(?a, ?pool);
+    val t:    res[Report, Error] = run(?a, ?tree);
+    if (sel p.err) { ret 2; }
+    if (sel t.err) { ret 2; }
+    # 1000 is 10 past 33 glider periods: the gun and 33 gliders
+    if (p.ok.generation != 1000 || t.ok.generation != 1000) { ret 3; }
+    if (p.ok.population != t.ok.population)                 { ret 4; }
+    val pb: res[Vector[u8], fs.FsError] = fs.read_bytes(?a, "out/test/batch_engine/pool.rle");
+    val tb: res[Vector[u8], fs.FsError] = fs.read_bytes(?a, "out/test/batch_engine/tree.rle");
+    if (sel pb.err) { ret 5; }
+    if (sel tb.err) { ret 5; }
+    var pv: Vector[u8] = pb.ok;
+    var tv: Vector[u8] = tb.ok;
+    if (pv.len == 0 || pv.len != tv.len || !mem.equal[u8](pv.data, tv.data, pv.len)) { ret 6; }
+    vector.dnit[u8](?pv);
+    vector.dnit[u8](?tv);
+
+    # a rule HashLife cannot run is refused, naming the engine
+    var wide: Job                = Job{pattern: "out/test/batch_engine/gun.rle", rule: weighted.sample(1), gens: 10, engine: args.ENGINE_HASHLIFE, out: "out/test/batch_engine/wide.rle"};
+    val r:    res[Report, Error] = run(?a, ?wide);
+    if (!(sel r.err && sel r.err.engine))                                                  { ret 7; }
+    if (sel r.err && !string.str_equals(error_subject(r.err, ?wide), "--engine hashlife")) { ret 8; }
+    # and so is a bounded grid, which only the pool runs
+    var torus: Job                = Job{pattern: "out/test/batch_engine/gun.rle", rule: "B3/S23:T200,200", gens: 10, engine: args.ENGINE_HASHLIFE, out: "out/test/batch_engine/torus.rle"};
+    val tr:    res[Report, Error] = run(?a, ?torus);
+    if (!(sel tr.err && sel tr.err.engine)) { ret 9; }
+    fs.remove_file("out/test/batch_engine/gun.rle");
+    fs.remove_file("out/test/batch_engine/pool.rle");
+    fs.remove_file("out/test/batch_engine/tree.rle");
     ret 0;
 }
