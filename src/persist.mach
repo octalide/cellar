@@ -779,24 +779,31 @@ fun world_from(a: *allo.Allocator, s: *sim.Sim, v: *View, data: *Vector[u8]) res
 fun stamp_from(a: *allo.Allocator, s: *sim.Sim, data: *Vector[u8]) res[Opened, Error] {
     var f: format.Format;
     if (!formats.by_bytes(data.data, data.len, ?f)) { ret res[Opened, Error].err{Error.format{format.Error.malformed{}}}; }
-    var ws:   adapt.WorldSink;
-    var info: format.Info;
+    # the rule is read first and taken as the sink opens, so the cells are
+    # written as its states, a state past the world's rule's included
+    var ws:      adapt.WorldSink;
+    var info:    format.Info;
+    var foreign: bool = false;
     format.info_init(?info, a);
-    val r:       err[format.Error] = formats.load(a, ?f, data.data, data.len, adapt.centred_sink(?ws, s), ?info);
-    var foreign: bool              = false;
-    var box:     opt[space.Box]    = opt[space.Box].none{};
-    if (sel r.ok && info.bounded) {
-        box = opt[space.Box].some{space.Box{x0: info.x0 + ws.dx, y0: info.y0 + ws.dy, x1: info.x1 + ws.dx, y1: info.y1 + ws.dy}};
-    }
-    if (sel r.ok) {
+    val sink:  *format.Sink      = adapt.centred_sink(?ws, s);
+    val known: err[format.Error] = formats.validate(a, ?f, data.data, data.len, ?info);
+    if (sel known.ok) {
         val named: str = format.text_of(?info.rule);
         if (named[0] != 0) {
             val k: res[rule.Rule, str] = rule.parse(named);
-            # a rule the pool cannot take the world for is not taken either
-            if (sel k.ok) { foreign = !sim.set_rule(s, k.ok); }
+            if (sel k.ok) { adapt.sink_rule(?ws, k.ok); }
             or            { foreign = true; }
         }
     }
+    format.info_dnit(?info);
+    format.info_init(?info, a);
+    val r:   err[format.Error] = formats.load(a, ?f, data.data, data.len, sink, ?info);
+    var box: opt[space.Box]    = opt[space.Box].none{};
+    if (sel r.ok && info.bounded) {
+        box = opt[space.Box].some{space.Box{x0: info.x0 + ws.dx, y0: info.y0 + ws.dy, x1: info.x1 + ws.dx, y1: info.y1 + ws.dy}};
+    }
+    # a rule the pool cannot take the world for is not taken either
+    if (ws.refused) { foreign = true; }
     format.info_dnit(?info);
     if (sel r.err) { ret res[Opened, Error].err{from_format(r.err)}; }
     ret res[Opened, Error].ok{Opened{world: false, foreign: foreign, box: box, stray: false}};
@@ -1579,7 +1586,22 @@ test open_file__runs_a_rule_file_and_installs_it_where_its_name_is_looked_up {
     val stamped: res[Opened, Error] = open_file(?a, ?s, ?v, pat);
     if (sel stamped.err || !rule.same(?again.ok, ?s.rule)) { ret 13; }
     if (sel stamped.ok && stamped.ok.foreign)              { ret 13; }
-    if (sim.population(?s) != 2)                           { ret 14; }
+    # the pattern's cells are written as the states of its rule, which the
+    # world's rule before it lacked
+    var ones:   usize = 0;
+    var threes: usize = 0;
+    var y:      i64   = -2;
+    for (y <= 2) {
+        var x: i64 = -2;
+        for (x <= 2) {
+            val st: u32 = rule.state(?s.rule, sim.cell(?s, x, y));
+            if (st == 1) { ones = ones + 1; }
+            if (st == 3) { threes = threes + 1; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    if (sim.population(?s) != 2 || ones != 1 || threes != 1) { ret 14; }
     sim.dnit(?s);
     fs.remove_file(path);
     fs.remove_file(pat);
