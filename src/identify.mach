@@ -255,15 +255,53 @@ fun load(run: *Run, p: *pattern.Pattern, b: space.Box) bool {
     ret space.settle(sp, sp.census, sp.hi, false);
 }
 
+# the box every cell in a state other than 0 spans, which for a family with
+# dying states is more than the live cells the census bounds: a dying cell
+# still decides where a birth can happen
+# ---
+# run: the run
+# ret: the box, or none when every cell is in state 0
+fun extent(run: *Run) opt[space.Box] {
+    val sp:  *space.Space = ?run.sp;
+    var b:   space.Box    = space.Box{x0: 0, y0: 0, x1: 0, y1: 0};
+    var any: bool         = false;
+    var s:   usize        = 0;
+    for (s < sp.hi) {
+        val cn: *u32 = ?sp.census[s * space.CENSUS];
+        # a chunk with no live or warm cell holds only state 0
+        if (space.used(sp, s) && (cn[0] != 0 || cn[1] != 0)) {
+            val ox: i64   = space.slot_x(sp, s) * space.SIDE;
+            val oy: i64   = space.slot_y(sp, s) * space.SIDE;
+            val c:  *u32  = ?sp.cells[s * space.CELLS];
+            var i:  usize = 0;
+            for (i < space.CELLS) {
+                if (c[i] != 0 && rule.state(run.r, c[i]) != 0) {
+                    val x: i64 = ox + (i & 63)::i64;
+                    val y: i64 = oy + (i >> 6)::i64;
+                    if (!any || x < b.x0)     { b.x0 = x; }
+                    if (!any || y < b.y0)     { b.y0 = y; }
+                    if (!any || x + 1 > b.x1) { b.x1 = x + 1; }
+                    if (!any || y + 1 > b.y1) { b.y1 = y + 1; }
+                    any = true;
+                }
+                i = i + 1;
+            }
+        }
+        s = s + 1;
+    }
+    if (!any) { ret opt[space.Box].none{}; }
+    ret opt[space.Box].some{b};
+}
+
 # read the run's current form into its grid, hashing it
 # ---
-# run:  the run, whose pool holds a live cell
+# run:  the run, whose pool holds a cell in a state other than 0
 # side: the largest form the grid holds
 # f:    receives the form's place, size and hashes
 # ret:  false when the form is wider or taller than side
 fun read(run: *Run, side: usize, f: *Seen) bool {
     val sp: *space.Space   = ?run.sp;
-    val ob: opt[space.Box] = space.bounds(sp);
+    val ob: opt[space.Box] = extent(run);
     if (sel ob.none) { ret false; }
     val b: space.Box = ob.some;
     val w: usize     = (b.x1 - b.x0)::usize;
@@ -548,7 +586,7 @@ pub fun classify(a: *allo.Allocator, r: *rule.Rule, p: *pattern.Pattern, lim: Li
             out.at   = g;
             ret err[allo.Error].ok{};
         }
-        val alive: opt[space.Box] = space.bounds(?run.sp);
+        val alive: opt[space.Box] = extent(?run);
         if (sel alive.none) {
             out.fate = Fate.dies{};
             out.at   = g;
@@ -706,7 +744,8 @@ pub fun describe(r: *Result, buf: *u8) str {
     ret buf;
 }
 
-# a pattern from rows split by '/', O live and anything else dead
+# a pattern from rows split by '/', O live, D the first dying state and
+# anything else dead
 #[testing]
 pub fun rows(p: *pattern.Pattern, a: *allo.Allocator, s: str) bool {
     var w: usize = 0;
@@ -735,6 +774,7 @@ pub fun rows(p: *pattern.Pattern, a: *allo.Allocator, s: str) bool {
         }
         or {
             if (s[i] == 'O') { pattern.set(p, x, y, 1); }
+            if (s[i] == 'D') { pattern.set(p, x, y, 2); }
             x = x + 1;
         }
         i = i + 1;
@@ -825,5 +865,13 @@ test classify__gives_no_apgcode_under_a_rule_that_is_not_life_like {
     var k: weighted.Kernel = weighted.life();
     weighted.set_radius(?k, 2);
     if (expect(rule.Rule.weighted{k}, "OOO", Fate.oscillator{}, 2, 0, 0, "") != 0) { ret 1; }
+    ret 0;
+}
+
+test classify__finds_a_spaceship_under_a_generations_rule {
+    # Brian's Brain's c/1 ship: two live cells with the two dying cells they left behind
+    val bb: res[rule.Rule, str] = rule.parse("B2/S/C3");
+    if (sel bb.err)                                                 { ret 1; }
+    if (expect(bb.ok, "DO/DO", Fate.spaceship{}, 1, 1, 0, "") != 0) { ret 2; }
     ret 0;
 }
