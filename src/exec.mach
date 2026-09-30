@@ -243,8 +243,7 @@ fun paste(a: *app.App, s: *sim.Sim, d: *Deps, c: *command.Paste) Change {
         app.say_why(a, "paste", persist.error_message(got.err));
         ret Change.none{};
     }
-    pattern.dnit(?a.custom);
-    a.custom      = p;
+    replace_custom(a, p);
     a.pattern_sel = app.CUSTOM;
     a.orient      = 0;
     a.tool        = app.TOOL_STAMP;
@@ -307,8 +306,8 @@ fun recorded(c: *command.Command) u8 {
         if (c.area.op == command.AREA_SHRINK) { ret UNRECORDED; }
         ret journal.KIND_EDIT;
     }
-    if (sel c.clear || sel c.randomize || sel c.stamp || sel c.rule || sel c.reset) { ret journal.KIND_EDIT; }
-    if (sel c.load_world || sel c.load_pattern || sel c.open)                       { ret journal.KIND_EDIT; }
+    if (sel c.clear || sel c.randomize || sel c.stamp || sel c.rule || sel c.reset)        { ret journal.KIND_EDIT; }
+    if (sel c.load_world || sel c.load_pattern || sel c.open || sel c.paste || sel c.drop) { ret journal.KIND_EDIT; }
     ret UNRECORDED;
 }
 
@@ -742,6 +741,53 @@ test run__undo_and_redo_walk_the_changes_across_a_rule_change_and_a_new_change_c
     if (!rule.same(?s.rule, ?life) || !sim.alive(?s, -50, 9) || sim.alive(?s, 200, 200)) { ret 7; }
     if (!string.str_equals(ap.toast, "nothing to redo"))                                 { ret 8; }
 
+    app.dnit(?ap);
+    sim.dnit(?s);
+    ret 0;
+}
+
+test run__undo_takes_back_a_paste_with_its_rule_and_a_dropped_file {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    var ap: app.App;
+    app.init(?ap);
+    val shown: err[format.Error] = app.attach(?ap, ?a);
+    if (sel shown.err) { ret 1; }
+    var d:   Deps            = Deps{a: ?a};
+    val dir: err[fs.FsError] = persist.make_parent(?a, "out/test/undo-drop/x");
+    if (sel dir.err) { ret 1; }
+    val rle: str = "x = 3, y = 1, rule = B36/S23\n3o!\n";
+    fs.write_bytes("out/test/undo-drop/row.rle", rle, string.str_len(rle), persist.FILE_MODE);
+    var life: rule.Rule = rule.preset_rule(0);
+    var high: rule.Rule = rule.preset_rule(1);
+    world.paint(?s, 50, 50, 1);
+    val word: u32 = sim.cell(?s, 50, 50);
+
+    # a glider pasted taking HighLife is one step, and the dropped row another
+    app.paste(?ap, clipboard(?ap, "x = 3, y = 3, rule = B36/S23\nbo$2bo$3o!\n"), true);
+    run(?ap, ?s, ?d);
+    if (ap.custom.w != 3 || !rule.same(?s.rule, ?high)) { ret 2; }
+    var names: [1]str;
+    names[0] = "out/test/undo-drop/row.rle";
+    app.drop(?ap, ?names[0], 1);
+    run(?ap, ?s, ?d);
+    if (sim.population(?s) != 4) { ret 3; }
+
+    app.submit(?ap, command.Command.undo{});
+    run(?ap, ?s, ?d);
+    if (sim.population(?s) != 1 || sim.cell(?s, 50, 50) != word || ap.custom.w != 3) { ret 4; }
+    app.submit(?ap, command.Command.undo{});
+    run(?ap, ?s, ?d);
+    if (!rule.same(?s.rule, ?life) || ap.custom.w != 16 || !string.str_equals(pattern.name(?ap.custom), "custom")) { ret 5; }
+    app.submit(?ap, command.Command.redo{});
+    app.submit(?ap, command.Command.redo{});
+    run(?ap, ?s, ?d);
+    if (!rule.same(?s.rule, ?high) || ap.custom.w != 3 || sim.population(?s) != 4) { ret 6; }
+
+    fs.remove_file("out/test/undo-drop/row.rle");
     app.dnit(?ap);
     sim.dnit(?s);
     ret 0;
