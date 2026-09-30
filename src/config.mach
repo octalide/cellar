@@ -17,10 +17,20 @@
 # wrapped. versions 1 and 2, what 0.3.0 and 0.4.0 wrote, kept the index of one
 # of seven built-ins in the pattern slot, which is read through the names those
 # built-ins have in the library, and version 1 has no window positions.
-# version 3 added the selection line.
+# version 3 added the selection line, version 4 the rule line, and version 5 the
+# engine line.
+#
+# the engine line is "<engine> <exponent>" after the rule line: the engine
+# chosen, cpu, gpu or hashlife, and HashLife's step exponent. a file without it
+# keeps the defaults. the engine is what the panel chose, which a command-line
+# --engine overrides for that run only, so a run that names one saves the choice
+# the file held until the panel changes it. cpu and gpu both mean the chunk
+# pool, the GPU stepping it where it can unless cpu is saved. a saved hashlife
+# whose rule HashLife cannot run is run on the chunk pool, with a message.
 
 use cellar.app;
 use cellar.format;
+use cellar.hashlife;
 use cellar.library;
 use cellar.persist;
 use cellar.rule;
@@ -44,12 +54,19 @@ use std.types.size.usize;
 use std.types.string;
 use std.types.string.str;
 
-# settings-format version written; versions 1 to 3 are still read
-val VERSION: u64 = 4;
+# settings-format version written; versions 1 to 4 are still read
+val VERSION: u64 = 5;
 # the last version that kept the rule as a weighted kernel's integers
 val KERNEL_INTS: usize = 3;
 # the first version with the selection line
 val SEL_LINE: usize = 3;
+# the first version with the engine line
+val ENGINE_LINE: usize = 5;
+
+# the engine line's words for the engine chosen
+val ENGINE_CPU:      str = "cpu";
+val ENGINE_GPU:      str = "gpu";
+val ENGINE_HASHLIFE: str = "hashlife";
 
 # the second line's selection of the custom pattern
 val SEL_CUSTOM: str = "custom";
@@ -103,6 +120,13 @@ fun read_sel(ap: *app.App, b: *Vector[u8], pos: usize) {
     if (string.str_equals(l, SEL_CUSTOM)) { app.choose(ap, app.CUSTOM); }
     or (starts(l, SEL_LIBRARY))           { app.choose_named(ap, ?line[string.str_len(SEL_LIBRARY)]); }
     or                                    { app.choose_default(ap); }
+}
+
+# the engine line's word for the engine ap chose
+fun engine_word(ap: *app.App) str {
+    if (ap.engine_tree) { ret ENGINE_HASHLIFE; }
+    if (ap.engine_cpu)  { ret ENGINE_CPU; }
+    ret ENGINE_GPU;
 }
 
 # buffer size for the serialized settings, ample for the integers, the
@@ -215,6 +239,10 @@ pub fun save(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) err[persi
     var rb: [rule.FORMAT_MAX + 1]u8;
     o      = text.buf_str(buf, o + 1, rule.format(?s.rule, ?rb[0]));
     buf[o] = '\n';
+    o      = text.buf_str(buf, o + 1, engine_word(ap));
+    buf[o] = ' ';
+    o      = text.buf_u64(buf, o + 1, sim.exponent(s)::u64);
+    buf[o] = '\n';
     o      = o + 1;
 
     val wrote: err[fs.FsError] = fs.write_bytes(path, buf, o, persist.FILE_MODE);
@@ -291,6 +319,12 @@ pub fun load(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) err[persi
         var at: usize = nl + 1;
         for (at < full && data.data[at] != '\n') { at = at + 1; }
         if (at < full) { read_rule(?data, at + 1, s); }
+        if (version >= ENGINE_LINE) {
+            # the engine is the line after the rule
+            at = at + 1;
+            for (at < full && data.data[at] != '\n') { at = at + 1; }
+            if (at < full) { read_engine(?data, at + 1, ap, s); }
+        }
     }
     vector.dnit[u8](?data);
     ret err[persist.Error].ok{};
@@ -319,6 +353,35 @@ fun read_kernel(b: *Vector[u8], p: *usize) weighted.Kernel {
         i = i + 1;
     }
     ret k;
+}
+
+# read the engine line, "<engine> <exponent>", into ap and s's step exponent; a
+# word it does not know keeps the default engine
+# ---
+# b:  the file
+# at: where the line starts
+# ap: application state
+# s:  the simulation
+fun read_engine(b: *Vector[u8], at: usize, ap: *app.App, s: *sim.Sim) {
+    var word: [16]u8;
+    var n:    usize = 0;
+    var o:    usize = at;
+    for (o < b.len && b.data[o] != ' ' && b.data[o] != '\n' && b.data[o] != '\r') {
+        if (n < 15) { word[n] = b.data[o]; }
+        n = n + 1;
+        o = o + 1;
+    }
+    if (n > 15) { ret; }
+    word[n] = 0;
+    val w: str = ?word[0];
+    ap.engine_tree = false;
+    ap.engine_cpu  = false;
+    if (string.str_equals(w, ENGINE_HASHLIFE)) { ap.engine_tree = true; }
+    or (string.str_equals(w, ENGINE_CPU))      { ap.engine_cpu = true; }
+    var p: usize = o;
+    var k: usize = read_uint(b, ?p);
+    if (k > hashlife.MAX_EXPONENT::usize) { k = hashlife.MAX_EXPONENT::usize; }
+    sim.set_exponent(s, k::u32);
 }
 
 # read the rule line, "<family> <rule string>", into s when its family reads it
@@ -595,6 +658,24 @@ fun write_old(path: str, version: u64, birth: u64) bool {
     ret !(sel wrote.err);
 }
 
+# rewrite the version 5 settings file at path as a version 4 one, which ends
+# with the rule line
+fun as_v4(a: *allo.Allocator, path: str) bool {
+    val rr: res[Vector[u8], fs.FsError] = fs.read_bytes(a, path);
+    if (sel rr.err) { ret false; }
+    var data:  Vector[u8] = rr.ok;
+    var lines: usize      = 0;
+    var n:     usize      = 0;
+    for (n < data.len && lines < 3) {
+        if (data.data[n] == '\n') { lines = lines + 1; }
+        n = n + 1;
+    }
+    data.data[0] = '4';
+    val wrote: err[fs.FsError] = fs.write_bytes(path, data.data::*u8, n, persist.FILE_MODE);
+    vector.dnit[u8](?data);
+    ret lines == 3 && !(sel wrote.err);
+}
+
 test load__reads_every_version {
     var a: allo.Allocator;
     page.make(?a);
@@ -624,7 +705,24 @@ test load__reads_every_version {
     }
     if (ap.panel != 1) { ret 50; }
 
-    # version 4 keeps the pattern and the rule by name, through the family
+    # version 4 kept the pattern and the rule by name, through the family, and
+    # has no engine line: the engine and exponent keep what they were
+    sim.set_rule(?s, rule.preset_rule(3));
+    app.choose_named(?ap, "Pulsar");
+    if (!saves_ok(?a, ?ap, ?s, path)) { ret 55; }
+    if (!as_v4(?a, path))             { ret 56; }
+    sim.set_rule(?s, rule.preset_rule(0));
+    app.choose_default(?ap);
+    ap.engine_tree = true;
+    sim.set_exponent(?s, 6);
+    if (!loads_ok(?a, ?ap, ?s, path)) { ret 57; }
+    var life: rule.Rule = rule.preset_rule(3);
+    if (!rule.same(?s.rule, ?life) || ap.pattern_sel != library.find(l, "Pulsar")) { ret 58; }
+    if (!ap.engine_tree || sim.exponent(?s) != 6)                                  { ret 59; }
+    ap.engine_tree = false;
+    sim.set_exponent(?s, 0);
+
+    # version 5 keeps the pattern, the rule, the engine and the exponent
     app.choose_named(?ap, "Block");
     val block: usize = ap.pattern_sel;
     sim.set_rule(?s, rule.preset_rule(3));
@@ -634,6 +732,28 @@ test load__reads_every_version {
     if (!loads_ok(?a, ?ap, ?s, path)) { ret 61; }
     var dn: rule.Rule = rule.preset_rule(3);
     if (!rule.same(?s.rule, ?dn) || ap.pattern_sel != block) { ret 62; }
+
+    # each engine comes back, the exponent with it even off the tree, and a
+    # word it does not know keeps the default engine
+    var e: usize = 0;
+    for (e < 3) {
+        ap.engine_tree = e == 2;
+        ap.engine_cpu  = e == 0;
+        sim.set_exponent(?s, 5 + e::u32);
+        if (!saves_ok(?a, ?ap, ?s, path)) { ret 63; }
+        ap.engine_tree = e != 2;
+        ap.engine_cpu  = e != 0;
+        sim.set_exponent(?s, 0);
+        if (!loads_ok(?a, ?ap, ?s, path))                                                              { ret 64; }
+        if (ap.engine_tree != (e == 2) || ap.engine_cpu != (e == 0) || sim.exponent(?s) != 5 + e::u32) { ret 65; }
+        e = e + 1;
+    }
+    val odd:  str             = "5 10 0 0 0 0 0 0 0 255 255 255 1 1 1 1 1 1 0\nlibrary Pulsar\nlife B3/S23\nquantum 99\n";
+    val wodd: err[fs.FsError] = fs.write_bytes(path, odd::*u8, string.str_len(odd), persist.FILE_MODE);
+    if (sel wodd.err) { ret 66; }
+    ap.engine_tree = true;
+    if (!loads_ok(?a, ?ap, ?s, path) || ap.engine_tree || ap.engine_cpu) { ret 67; }
+    if (sim.exponent(?s) != hashlife.MAX_EXPONENT)                       { ret 68; }
 
     fs.remove_file(path);
     app.dnit(?ap);
