@@ -284,7 +284,8 @@ fun write_header(buf: *u8, s: *sim.Sim, v: *View) usize {
     ret text.buf_str(buf, off, "\n\n");
 }
 
-# serialize the world's live chunks, its rule, its generation and the view to path
+# serialize the world's chunks that hold a state, its rule, its generation and
+# the view to path
 #
 # on the GPU the cells are read back first, a stall.
 # ---
@@ -787,12 +788,23 @@ fun stamp_from(a: *allo.Allocator, s: *sim.Sim, data: *Vector[u8]) res[Opened, E
 pub fun open_file(a: *allo.Allocator, s: *sim.Sim, v: *View, path: str) res[Opened, Error] {
     val rr: res[Vector[u8], fs.FsError] = fs.read_bytes(a, path);
     if (sel rr.err) { ret res[Opened, Error].err{Error.fs{rr.err}}; }
-    var data: Vector[u8] = rr.ok;
-    var r:    res[Opened, Error];
-    if (world_version(?data) != 0) { r = opened_world(world_from(a, s, v, ?data)); }
-    or                             { r = stamp_from(a, s, ?data); }
+    var data: Vector[u8]         = rr.ok;
+    val r:    res[Opened, Error] = open_bytes(a, s, v, ?data);
     vector.dnit[u8](?data);
     ret r;
+}
+
+# open a file's bytes as open_file does, which is how every caller that opens
+# a file into the world reads it alike
+# ---
+# a:    allocator for the parse buffers
+# s:    simulation to load into
+# v:    the view, which a world file replaces
+# data: the file's bytes
+# ret:  what the file was and did, or why nothing was loaded
+pub fun open_bytes(a: *allo.Allocator, s: *sim.Sim, v: *View, data: *Vector[u8]) res[Opened, Error] {
+    if (world_version(data) != 0) { ret opened_world(world_from(a, s, v, data)); }
+    ret stamp_from(a, s, data);
 }
 
 # a world load's outcome as an open's
@@ -1016,6 +1028,44 @@ test load_world__round_trips_a_wide_weighted_kernel {
     if (loaded.ok.foreign || rule.radius(?t.rule) != 2) { ret 5; }
     if (!rule.same(?t.rule, ?s.rule))                   { ret 6; }
     if (sim.population(?t) != 4)                        { ret 7; }
+    sim.dnit(?s);
+    sim.dnit(?t);
+    ret 0;
+}
+
+test load_world__round_trips_a_generations_world_and_its_dying_cells {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    sim.set_rule(?s, rule.preset_rule(4));
+    block(?s, 0, 0);
+    # a lone cell starts dying, leaving its chunk with no live cell at all
+    sim.paint(?s, 1000, 1000, 1);
+    sim.step(?s);
+    var v: View = View{pan_x: 0.0, pan_y: 0.0, zoom: 1.0, mode: render.MODE_HEAT};
+
+    val path:  str        = "out/test/test_generations.cellar";
+    val saved: err[Error] = save_world(?a, ?s, ?v, path);
+    if (sel saved.err) { ret 2; }
+    var t:     sim.Sim;
+    val made2: err[allo.Error] = sim.init(?t, ?a);
+    if (sel made2.err) { ret 3; }
+    val loaded: res[Loaded, Error] = load_world(?a, ?t, ?v, path);
+    fs.remove_file(path);
+    if (sel loaded.err)                                     { ret 4; }
+    if (loaded.ok.foreign || !rule.same(?t.rule, ?s.rule))  { ret 5; }
+    if (rule.state(?t.rule, sim.cell(?t, 1000, 1000)) != 2) { ret 6; }
+    var y: i64 = -2;
+    for (y < 4) {
+        var x: i64 = -2;
+        for (x < 4) {
+            if (sim.cell(?t, x, y) != sim.cell(?s, x, y)) { ret 7; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
     sim.dnit(?s);
     sim.dnit(?t);
     ret 0;

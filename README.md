@@ -26,6 +26,13 @@ Larger-than-Life while still expressing the classic Life family exactly.
 Built-in kernels: Conway's Life (`B3/S23`), HighLife (`B36/S23`), Seeds
 (`B2/S`) and Day & Night (`B3678/S34678`).
 
+Generations rules add dying states: in `B2/S/C3` (Brian's Brain) a live cell
+that does not survive passes through the states up to `C`-1 before it is dead,
+and only live cells count as neighbours. Golly's older form, survive, birth and
+states (`345/2/4` for Star Wars), reads too. The trails colour mode shows each
+state in its own colour. Built-in: Brian's Brain (`B2/S/C3`) and Star Wars
+(`B2/S345/C4`).
+
 ## Controls
 
 | input                  | action                                  |
@@ -94,6 +101,13 @@ them, so `cellar -- -x.rle` opens a file whose name starts with a dash.
 
 `cellar --capture shot.png` draws a second of frames, saves the last one and
 exits, leaving the saved settings alone.
+
+`cellar run <file> --gens <n> [--rule <rule>] [--out <file>] [--quiet]` runs
+a world or pattern headless, with no window and no GPU. The file opens as it
+would at startup, runs under `--rule` or else its own rule for `n`
+generations on the CPU, and is written in the format `--out`'s extension names
+(`.rle`, `.cells`, `.mc`), or as RLE on stdout without one. The
+generation and population go to stderr unless `--quiet`.
 
 ## Install
 

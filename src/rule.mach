@@ -11,8 +11,8 @@
 #   display(r: *R, buf: *u8) str     a short form for the readout, at most
 #                                    DISPLAY_MAX bytes
 #   same_rule(a: *R, b: *R) bool     whether two rules step alike
-#   STATES: u32                      how many states a cell can be in
-#   word_of(state: u32) u32          the word a fresh cell of a state holds
+#   states(r: *R) u32                how many states a cell can be in
+#   word_of(r: *R, state: u32) u32   the word a fresh cell of a state holds
 #   state_of(c: u32) u32             the state a word holds
 #   sense() layout.Sense             how shared code reads the word
 #   radius(r: *R) usize              how far one generation reaches
@@ -31,18 +31,25 @@
 # no case for its rule panics, since every case is handled above it, and the
 # test that runs every function over every family's samples finds a missed line.
 #
-# changing a world's rule to one of another family re-encodes its cells: each
-# word becomes the new family's word for the state the old family reads in it,
-# word(new, state(old, c)), and a state the new family lacks becomes state 0,
-# the quiescent background, the one mapping safe between any two families. a
-# family that needs a smarter mapping can later offer adopt(state, from) u32
-# as the extension point. sim.set_rule must do this once a second family
-# exists; while there is one, the words already read alike. word zero is always
-# the quiescent background (see cellar.layout). a family whose rule does not
-# fit layout.RULE words, a rule table, needs a rule buffer of its own bound to
-# its stage, which boom's four storage bindings leave no room for yet.
+# the states and their words belong to the rule, not only its family: a
+# generations rule has as many states as its string names, and its words show
+# where each state lies among them.
+#
+# changing a world's rule to one whose words differ, one of another family or
+# of the same family with other states, re-encodes its cells: each word becomes
+# the new rule's word for the state the old rule reads in it, word(new,
+# state(old, c)), and a state the new rule lacks becomes state 0, the quiescent
+# background, the one mapping safe between any two rules. a family that needs
+# a smarter mapping can later offer adopt(state, from) u32 as the extension
+# point. sim.set_rule does this. word zero is always the quiescent background
+# (see cellar.layout).
+#
+# a family whose rule does not fit layout.RULE words, a rule table, needs a
+# rule buffer of its own bound to its stage, which boom's four storage bindings
+# leave no room for yet.
 
 use cellar.layout;
+use cellar.rules.generations;
 use cellar.rules.weighted;
 use cellar.space;
 use std.system.panic;
@@ -57,14 +64,16 @@ use std.types.string.str;
 
 # a rule of one family
 # ---
-# weighted: a weighted outer-totalistic kernel, the Life family and its
-#           radius, weight and range generalizations
+# weighted:    a weighted outer-totalistic kernel, the Life family and its
+#              radius, weight and range generalizations
+# generations: a Life-like rule whose cells die through dying states
 pub tag Rule: u8 {
-    weighted: weighted.Kernel;
+    weighted:    weighted.Kernel;
+    generations: generations.Rule;
 }
 
 # rule families this version runs
-pub val FAMILIES: usize = 1;
+pub val FAMILIES: usize = 2;
 
 # the longest rule string any family's format writes, less its NUL
 pub val FORMAT_MAX: usize = weighted.FORMAT_MAX;
@@ -84,6 +93,7 @@ pub rec Caps {
 
 # the id family i's rule strings are recorded under, in world and settings files
 pub fun family_id(i: usize) str {
+    if (i == 1) { ret "generations"; }
     ret "weighted";
 }
 
@@ -102,7 +112,8 @@ pub fun family_named(id: str) opt[usize] {
 
 # the family a rule belongs to
 pub fun family_of(r: *Rule) usize {
-    if (sel r.weighted) { ret 0; }
+    if (sel r.weighted)    { ret 0; }
+    if (sel r.generations) { ret 1; }
     unmatched();
     ret 0;
 }
@@ -118,16 +129,19 @@ fun unmatched() {
 # len: receives its length in bytes
 # ret: its first byte
 pub fun stage(i: usize, len: *usize) *u8 {
+    if (i == 1) { ret generations.stage(len); }
     ret weighted.stage(len);
 }
 
 # how many sample rule strings family i gives its tests
 pub fun sample_count(i: usize) usize {
+    if (i == 1) { ret generations.SAMPLE_COUNT; }
     ret weighted.SAMPLE_COUNT;
 }
 
 # family i's sample rule string n
 pub fun sample(i: usize, n: usize) str {
+    if (i == 1) { ret generations.sample(n); }
     ret weighted.sample(n);
 }
 
@@ -137,6 +151,11 @@ pub fun sample(i: usize, n: usize) str {
 # s:   NUL-terminated rule text
 # ret: the rule, or what is wrong with s
 pub fun parse_as(i: usize, s: str) res[Rule, str] {
+    if (i == 1) {
+        val g: res[generations.Rule, str] = generations.parse(s);
+        if (sel g.err) { ret res[Rule, str].err{g.err}; }
+        ret res[Rule, str].ok{Rule.generations{g.ok}};
+    }
     val k: res[weighted.Kernel, str] = weighted.parse(s);
     if (sel k.err) { ret res[Rule, str].err{k.err}; }
     ret res[Rule, str].ok{Rule.weighted{k.ok}};
@@ -164,7 +183,8 @@ pub fun parse(s: str) res[Rule, str] {
 # buf: at least FORMAT_MAX + 1 bytes
 # ret: buf
 pub fun format(r: *Rule, buf: *u8) str {
-    if (sel r.weighted) { ret weighted.format(?r.weighted, buf); }
+    if (sel r.weighted)    { ret weighted.format(?r.weighted, buf); }
+    if (sel r.generations) { ret generations.format(?r.generations, buf); }
     unmatched();
     ret buf;
 }
@@ -178,7 +198,8 @@ pub val DISPLAY_MAX: usize = 199;
 # buf: at least DISPLAY_MAX + 1 bytes
 # ret: buf
 pub fun display(r: *Rule, buf: *u8) str {
-    if (sel r.weighted) { ret weighted.display(?r.weighted, buf); }
+    if (sel r.weighted)    { ret weighted.display(?r.weighted, buf); }
+    if (sel r.generations) { ret generations.display(?r.generations, buf); }
     unmatched();
     ret buf;
 }
@@ -188,12 +209,16 @@ pub fun same(a: *Rule, b: *Rule) bool {
     if (sel a.weighted) {
         if (sel b.weighted) { ret weighted.same_rule(?a.weighted, ?b.weighted); }
     }
+    if (sel a.generations) {
+        if (sel b.generations) { ret generations.same_rule(?a.generations, ?b.generations); }
+    }
     ret false;
 }
 
 # how many states a cell of the rule can be in
 pub fun states(r: *Rule) u32 {
-    if (sel r.weighted) { ret weighted.STATES; }
+    if (sel r.weighted)    { ret weighted.states(?r.weighted); }
+    if (sel r.generations) { ret generations.states(?r.generations); }
     unmatched();
     ret 0;
 }
@@ -204,14 +229,16 @@ pub fun states(r: *Rule) u32 {
 # state: below states(r)
 # ret:   the word
 pub fun word(r: *Rule, state: u32) u32 {
-    if (sel r.weighted) { ret weighted.word_of(state); }
+    if (sel r.weighted)    { ret weighted.word_of(?r.weighted, state); }
+    if (sel r.generations) { ret generations.word_of(?r.generations, state); }
     unmatched();
     ret 0;
 }
 
 # the state a cell's word holds, its display channels aside
 pub fun state(r: *Rule, c: u32) u32 {
-    if (sel r.weighted) { ret weighted.state_of(c); }
+    if (sel r.weighted)    { ret weighted.state_of(c); }
+    if (sel r.generations) { ret generations.state_of(c); }
     unmatched();
     ret 0;
 }
@@ -219,24 +246,33 @@ pub fun state(r: *Rule, c: u32) u32 {
 # how shared code reads the rule's cell word: the census, the pool and the draw
 pub fun sense(r: *Rule) layout.Sense {
     var none: layout.Sense;
-    if (sel r.weighted) { ret weighted.sense(); }
+    if (sel r.weighted)    { ret weighted.sense(); }
+    if (sel r.generations) { ret generations.sense(); }
     unmatched();
     ret none;
 }
 
 # how far one generation reaches, in cells
 pub fun radius(r: *Rule) usize {
-    if (sel r.weighted) { ret weighted.radius(?r.weighted); }
+    if (sel r.weighted)    { ret weighted.radius(?r.weighted); }
+    if (sel r.generations) { ret generations.radius(?r.generations); }
     unmatched();
     ret 0;
 }
 
 # what the rule can do
 pub fun caps(r: *Rule) Caps {
-    var c: weighted.Caps;
-    if (sel r.weighted) { c = weighted.caps(?r.weighted); }
-    or                  { unmatched(); }
-    ret Caps{b0: c.b0, isotropic: c.isotropic, hashlife: c.hashlife, bounded: c.bounded};
+    if (sel r.weighted) {
+        val c: weighted.Caps = weighted.caps(?r.weighted);
+        ret Caps{b0: c.b0, isotropic: c.isotropic, hashlife: c.hashlife, bounded: c.bounded};
+    }
+    if (sel r.generations) {
+        val c: generations.Caps = generations.caps(?r.generations);
+        ret Caps{b0: c.b0, isotropic: c.isotropic, hashlife: c.hashlife, bounded: c.bounded};
+    }
+    unmatched();
+    var none: Caps;
+    ret none;
 }
 
 # step one chunk on the CPU
@@ -249,6 +285,10 @@ pub fun step_chunk(r: *Rule, b: *space.Block, t: *space.Tally) {
         weighted.step_chunk(?r.weighted, b, t);
         ret;
     }
+    if (sel r.generations) {
+        generations.step_chunk(?r.generations, b, t);
+        ret;
+    }
     unmatched();
 }
 
@@ -258,7 +298,8 @@ pub fun step_chunk(r: *Rule, b: *space.Block, t: *space.Tally) {
 # nb:  nine states below states(r), row-major with the cell at 4
 # ret: its next state
 pub fun next(r: *Rule, nb: *u32) u32 {
-    if (sel r.weighted) { ret weighted.next_of(?r.weighted, nb); }
+    if (sel r.weighted)    { ret weighted.next_of(?r.weighted, nb); }
+    if (sel r.generations) { ret generations.next_of(?r.generations, nb); }
     unmatched();
     ret 0;
 }
@@ -270,6 +311,10 @@ pub fun next(r: *Rule, nb: *u32) u32 {
 pub fun pack(r: *Rule, w: *u32) {
     if (sel r.weighted) {
         weighted.pack(?r.weighted, w);
+        ret;
+    }
+    if (sel r.generations) {
+        generations.pack(?r.generations, w);
         ret;
     }
     unmatched();
@@ -285,13 +330,15 @@ pub rec Preset {
 }
 
 # built-in rules
-pub val PRESET_COUNT: usize = 4;
+pub val PRESET_COUNT: usize = 6;
 
-val PRESETS: [4]Preset = [4]Preset{
+val PRESETS: [6]Preset = [6]Preset{
     Preset{label: "Life", rulestring: "B3/S23"},
     Preset{label: "HighLife", rulestring: "B36/S23"},
     Preset{label: "Seeds", rulestring: "B2/S"},
     Preset{label: "Day & Night", rulestring: "B3678/S34678"},
+    Preset{label: "Brian's Brain", rulestring: "B2/S/C3"},
+    Preset{label: "Star Wars", rulestring: "B2/S345/C4"},
 };
 
 # built-in rule i

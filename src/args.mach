@@ -6,18 +6,36 @@
 # twice or a second file is refused, and the binary says why and exits rather
 # than starting.
 #
-#   cellar [--version] [--capture <file.png>] [--bench <gpu|cpu> <dense|sparse> [seconds]] [--] [file]
+#   cellar [--version] [--capture <file.png>] [--bench <gpu|cpu> <dense|sparse> [seconds [radius [speed]]]] [--] [file]
+#   cellar run <pattern> --gens <n> [--rule <rule>] [--out <file>] [--quiet] [--]
+#
+# a first argument of exactly "run" names the batch command, whose options are
+# its own, and anything else is the session's command line. a file named run is
+# opened as ./run or after --.
 
+use cellar.rules.weighted;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_equals;
 
-# the usage line printed with a refusal
-pub val USAGE: str = "usage: cellar [--version] [--capture <file.png>] [--bench <gpu|cpu> <dense|sparse> [seconds]] [--] [file]";
+# the usage printed with a refusal of the session's command line, both forms
+pub val USAGE: str = "usage: cellar [--version] [--capture <file.png>] [--bench <gpu|cpu> <dense|sparse> [seconds [radius [speed]]]] [--] [file]\n       cellar run <pattern> --gens <n> [--rule <rule>] [--out <file>] [--quiet] [--]";
+
+# the usage printed with a refusal of a batch run, its form alone
+pub val RUN_USAGE: str = "usage: cellar run <pattern> --gens <n> [--rule <rule>] [--out <file>] [--quiet] [--]";
+
+# an interactive session
+pub val COMMAND_APP: u8 = 0;
+# a headless batch run, see cellar.batch
+pub val COMMAND_RUN: u8 = 1;
+
+# the most generations a batch run takes, so the count never overflows
+pub val GENS_MAX: u64 = 1000000000000000;
 
 # no measurement: a normal session
 pub val BENCH_NONE: u8 = 0;
@@ -29,20 +47,44 @@ pub val BENCH_SPARSE: u8 = 2;
 # seconds a measurement runs when none are given
 pub val BENCH_SECS: f64 = 10.0;
 
+# what a batch run asks for
+# ---
+# pattern: the world or pattern file to run
+# rule:    the rule to run it under, or nil for the file's
+# gens:    generations to step
+# out:     the file to write the result to, its format by its extension, or
+#          nil for RLE on stdout
+# quiet:   leave the generation and population off stderr
+pub rec Run {
+    pattern: str;
+    rule:    str;
+    gens:    u64;
+    out:     str;
+    quiet:   bool;
+}
+
 # what the command line asks for
 # ---
+# command:    COMMAND_APP, or COMMAND_RUN with run filled
+# run:        the batch run's arguments
 # version:    print the version and exit
 # capture:    save a screenshot here after a second and exit, or nil
 # bench:      the measurement to run, BENCH_NONE for a normal session
 # bench_cpu:  the measurement steps on the CPU
 # bench_secs: seconds the measurement runs for
+# bench_r:    the radius the measured rule reads, Life's weights widened to it
+# bench_gps:  generations a second the measurement is capped at, 0 uncapped
 # open:       a world or pattern file to open, or nil
 pub rec Args {
+    command:    u8;
+    run:        Run;
     version:    bool;
     capture:    str;
     bench:      u8;
     bench_cpu:  bool;
     bench_secs: f64;
+    bench_r:    usize;
+    bench_gps:  usize;
     open:       str;
 }
 
@@ -53,12 +95,14 @@ pub rec Args {
 # value:   an option's value is not one it accepts
 # twice:   an option given more than once
 # extra:   a second file
+# absent:  something the command needs was not given
 pub tag Error: u8 {
     unknown: str;
     missing: str;
     value:   str;
     twice:   str;
     extra:   str;
+    absent:  str;
 }
 
 # the refusal as a line of text into buf
@@ -88,6 +132,10 @@ pub fun error_message(e: Error, buf: *u8) str {
     if (sel e.extra) {
         what = "only one file can be opened, not also ";
         arg  = e.extra;
+    }
+    if (sel e.absent) {
+        what = "run needs ";
+        arg  = e.absent;
     }
     var o: usize = 0;
     var i: usize = 0;
@@ -122,6 +170,17 @@ fun is_seconds(s: str) bool {
     ret true;
 }
 
+# a whole number from its digits
+fun whole(s: str) usize {
+    var v: usize = 0;
+    var i: usize = 0;
+    for (s[i] >= '0' && s[i] <= '9') {
+        v = v * 10 + (s[i] - '0')::usize;
+        i = i + 1;
+    }
+    ret v;
+}
+
 # a whole number of seconds from its digits, at least one
 fun seconds(s: str) f64 {
     var v: f64   = 0.0;
@@ -134,6 +193,90 @@ fun seconds(s: str) f64 {
     ret v;
 }
 
+# a whole number of generations, or false when s is not one GENS_MAX holds
+fun gens(s: str, out: *u64) bool {
+    if (s[0] == 0) { ret false; }
+    var v: u64   = 0;
+    var i: usize = 0;
+    for (s[i] != 0) {
+        if (s[i] < '0' || s[i] > '9') { ret false; }
+        v = v * 10 + (s[i] - '0')::u64;
+        if (v > GENS_MAX) { ret false; }
+        i = i + 1;
+    }
+    @out = v;
+    ret true;
+}
+
+# the value after an option taking one, or why there is none
+fun value(argc: i64, argv: *str, i: *i64, taken: bool, name: str, out: *str) opt[Error] {
+    if (taken)      { ret opt[Error].some{Error.twice{name}}; }
+    if (@i >= argc) { ret opt[Error].some{Error.missing{name}}; }
+    @out = argv[@i];
+    @i   = @i + 1;
+    ret opt[Error].none{};
+}
+
+# read a batch run's arguments, those after "run"
+fun parse_run(argc: i64, argv: *str, r: *Args) opt[Error] {
+    val o: *Run = ?r.run;
+    r.command = COMMAND_RUN;
+    o.pattern = nil;
+    o.rule    = nil;
+    o.gens    = 0;
+    o.out     = nil;
+    o.quiet   = false;
+    var counted: bool = false;
+    var flags:   bool = true;
+    var i:       i64  = 2;
+    for (i < argc) {
+        val s: str = argv[i];
+        i = i + 1;
+        if (!flags || !is_option(s)) {
+            if (o.pattern != nil) { ret opt[Error].some{Error.extra{s}}; }
+            o.pattern = s;
+            cnt;
+        }
+        if (str_equals(s, "--")) {
+            flags = false;
+            cnt;
+        }
+        if (str_equals(s, "--quiet")) {
+            o.quiet = true;
+            cnt;
+        }
+        var e: opt[Error] = opt[Error].none{};
+        if (str_equals(s, "--rule")) { e = value(argc, argv, ?i, o.rule != nil, s, ?o.rule); }
+        or (str_equals(s, "--out"))  { e = value(argc, argv, ?i, o.out != nil, s, ?o.out); }
+        or (str_equals(s, "--gens")) {
+            var n: str = nil;
+            e = value(argc, argv, ?i, counted, s, ?n);
+            if (sel e.none && !gens(n, ?o.gens)) { e = opt[Error].some{Error.value{n}}; }
+            counted = true;
+        }
+        or              { e = opt[Error].some{Error.unknown{s}}; }
+        if (sel e.some) { ret e; }
+    }
+    if (o.pattern == nil) { ret opt[Error].some{Error.absent{"a pattern file"}}; }
+    if (!counted)         { ret opt[Error].some{Error.absent{"--gens"}}; }
+    ret opt[Error].none{};
+}
+
+# whether a command line names the batch run
+fun is_run(argc: i64, argv: *str) bool {
+    ret argc > 1 && str_equals(argv[1], "run");
+}
+
+# the usage to print beside a refusal of a command line: the batch run's form
+# when it names the run, both forms otherwise
+# ---
+# argc: arguments, the program's name first
+# argv: the arguments
+pub fun usage(argc: i64, argv: *str) str {
+    if (is_run(argc, argv)) { ret RUN_USAGE; }
+    ret USAGE;
+}
+
 # read a command line
 # ---
 # argc: arguments, the program's name first
@@ -141,12 +284,20 @@ fun seconds(s: str) f64 {
 # ret:  what they ask for, or why they were refused
 pub fun parse(argc: i64, argv: *str) res[Args, Error] {
     var r: Args;
+    r.command    = COMMAND_APP;
     r.version    = false;
     r.capture    = nil;
     r.bench      = BENCH_NONE;
     r.bench_cpu  = false;
     r.bench_secs = BENCH_SECS;
+    r.bench_r    = 1;
+    r.bench_gps  = 0;
     r.open       = nil;
+    if (is_run(argc, argv)) {
+        val bad: opt[Error] = parse_run(argc, argv, ?r);
+        if (sel bad.some) { ret res[Args, Error].err{bad.some}; }
+        ret res[Args, Error].ok{r};
+    }
     var flags: bool = true;
     var i:     i64  = 1;
     for (i < argc) {
@@ -186,6 +337,17 @@ pub fun parse(argc: i64, argv: *str) res[Args, Error] {
             if (i < argc && is_seconds(argv[i])) {
                 r.bench_secs = seconds(argv[i]);
                 i            = i + 1;
+                # a radius may follow the seconds
+                if (i < argc && is_seconds(argv[i])) {
+                    r.bench_r = seconds(argv[i])::usize;
+                    if (r.bench_r > weighted.MAX_RADIUS) { ret res[Args, Error].err{Error.value{argv[i]}}; }
+                    i = i + 1;
+                    # and a capped speed the radius
+                    if (i < argc && is_seconds(argv[i])) {
+                        r.bench_gps = whole(argv[i]);
+                        i           = i + 1;
+                    }
+                }
             }
             cnt;
         }
@@ -197,7 +359,7 @@ pub fun parse(argc: i64, argv: *str) res[Args, Error] {
 # parse a line of arguments, the program's name left off
 #[testing]
 fun line(va: ...) res[Args, Error] {
-    var v: [8]str;
+    var v: [12]str;
     v[0] = "cellar";
     var n: i64 = 1;
     $each s in va {
@@ -219,8 +381,14 @@ test parse__takes_options_in_any_order_around_the_file {
     if (c.ok.bench != BENCH_SPARSE || !c.ok.bench_cpu || !c.ok.version || c.ok.bench_secs != BENCH_SECS) { ret 6; }
     # the seconds are taken only when they are a number, so a file may follow
     val d: res[Args, Error] = line("--bench", "gpu", "dense", "3", "soup.cellar");
-    if (!sel d.ok)                                                                         { ret 7; }
-    if (d.ok.bench_secs != 3.0 || d.ok.bench_cpu || !str_equals(d.ok.open, "soup.cellar")) { ret 8; }
+    if (!sel d.ok)                                                                                              { ret 7; }
+    if (d.ok.bench_secs != 3.0 || d.ok.bench_cpu || d.ok.bench_r != 1 || !str_equals(d.ok.open, "soup.cellar")) { ret 8; }
+    val f: res[Args, Error] = line("--bench", "gpu", "dense", "3", "4");
+    if (!sel f.ok)                                                          { ret 11; }
+    if (f.ok.bench_secs != 3.0 || f.ok.bench_r != 4 || f.ok.bench_gps != 0) { ret 12; }
+    val h: res[Args, Error] = line("--bench", "gpu", "sparse", "3", "1", "60");
+    if (!sel h.ok)                                 { ret 13; }
+    if (h.ok.bench_r != 1 || h.ok.bench_gps != 60) { ret 14; }
     val e: res[Args, Error] = line();
     if (!sel e.ok)                                                           { ret 9; }
     if (e.ok.open != nil || e.ok.capture != nil || e.ok.bench != BENCH_NONE) { ret 10; }
@@ -242,6 +410,8 @@ test parse__refuses_unknown_options_missing_values_and_a_second_file {
     if (!(sel f.err && sel f.err.twice)) { ret 6; }
     val g: res[Args, Error] = line("-x");
     if (!(sel g.err && sel g.err.unknown)) { ret 7; }
+    val h: res[Args, Error] = line("--bench", "gpu", "dense", "3", "5");
+    if (!(sel h.err && sel h.err.value)) { ret 9; }
     var buf: [128]u8;
     if (sel a.err && !str_equals(error_message(a.err, ?buf[0]), "unknown option --capure")) { ret 8; }
     ret 0;
@@ -256,5 +426,60 @@ test parse__takes_everything_after_a_double_dash_as_the_file {
     if (b.ok.version || !str_equals(b.ok.open, "--version")) { ret 4; }
     val c: res[Args, Error] = line("--", "a.rle", "b.rle");
     if (!(sel c.err && sel c.err.extra)) { ret 5; }
+    ret 0;
+}
+
+test parse__reads_a_batch_run_and_keeps_run_as_a_file_otherwise {
+    val a: res[Args, Error] = line("run", "gun.rle", "--gens", "90", "--rule", "B36/S23", "--out", "o.cells", "--quiet");
+    if (!sel a.ok)                   { ret 1; }
+    if (a.ok.command != COMMAND_RUN) { ret 1; }
+    val o: Run = a.ok.run;
+    if (!str_equals(o.pattern, "gun.rle") || o.gens != 90 || !str_equals(o.rule, "B36/S23") || !str_equals(o.out, "o.cells") || !o.quiet) { ret 2; }
+    val b: res[Args, Error] = line("run", "--gens", "0", "--", "--x.rle");
+    if (!sel b.ok)                                                                               { ret 3; }
+    if (b.ok.command != COMMAND_RUN)                                                             { ret 3; }
+    if (!str_equals(b.ok.run.pattern, "--x.rle") || b.ok.run.rule != nil || b.ok.run.out != nil) { ret 4; }
+    # only the first argument names the command
+    val c: res[Args, Error] = line("--capture", "s.png", "run");
+    if (!sel c.ok)                                                    { ret 5; }
+    if (c.ok.command != COMMAND_APP || !str_equals(c.ok.open, "run")) { ret 5; }
+    val d: res[Args, Error] = line("--", "run");
+    if (!sel d.ok)                                                    { ret 6; }
+    if (d.ok.command != COMMAND_APP || !str_equals(d.ok.open, "run")) { ret 6; }
+    ret 0;
+}
+
+test parse__refuses_a_batch_run_missing_or_misgiving_its_arguments {
+    val a: res[Args, Error] = line("run", "gun.rle");
+    if (!(sel a.err && sel a.err.absent)) { ret 1; }
+    var buf: [128]u8;
+    if (sel a.err && !str_equals(error_message(a.err, ?buf[0]), "run needs --gens")) { ret 2; }
+    val b: res[Args, Error] = line("run", "--gens", "4");
+    if (!(sel b.err && sel b.err.absent)) { ret 3; }
+    val c: res[Args, Error] = line("run", "gun.rle", "--gens", "four");
+    if (!(sel c.err && sel c.err.value)) { ret 4; }
+    val d: res[Args, Error] = line("run", "gun.rle", "--gens", "99999999999999999999");
+    if (!(sel d.err && sel d.err.value)) { ret 5; }
+    val e: res[Args, Error] = line("run", "gun.rle", "--gens", "4", "--gens", "5");
+    if (!(sel e.err && sel e.err.twice)) { ret 6; }
+    val f: res[Args, Error] = line("run", "gun.rle", "--gens");
+    if (!(sel f.err && sel f.err.missing)) { ret 7; }
+    val g: res[Args, Error] = line("run", "a.rle", "b.rle", "--gens", "4");
+    if (!(sel g.err && sel g.err.extra)) { ret 8; }
+    # the session's options are not the batch run's
+    val h: res[Args, Error] = line("run", "gun.rle", "--gens", "4", "--capture", "s.png");
+    if (!(sel h.err && sel h.err.unknown)) { ret 9; }
+    val i: res[Args, Error] = line("run", "gun.rle", "--gens", "4", "--rule");
+    if (!(sel i.err && sel i.err.missing)) { ret 10; }
+    # a refused run is shown the run's usage, and anything else both forms
+    var v: [3]str;
+    v[0] = "cellar";
+    v[1] = "run";
+    v[2] = "--capture";
+    if (!str_equals(usage(3, ?v[0]), RUN_USAGE)) { ret 11; }
+    v[1] = "--capture";
+    v[2] = "run";
+    if (!str_equals(usage(3, ?v[0]), USAGE)) { ret 12; }
+    if (!str_equals(usage(1, ?v[0]), USAGE)) { ret 13; }
     ret 0;
 }
