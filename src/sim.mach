@@ -61,11 +61,15 @@ use cellar.gpu;
 use cellar.hashlife;
 use cellar.history;
 use cellar.rule;
+use ruletable: cellar.rules.table;
+use cellar.rules.table.load;
+use cellar.rules.table.store;
 use cellar.rules.weighted;
 use cellar.rules.weighted.word;
 use cellar.snapshot;
 use cellar.space;
 use cellar.team;
+use cellar.text;
 use cellar.topology;
 use allo: std.allocator;
 use std.allocator.page;
@@ -2034,6 +2038,342 @@ test generations__brians_brain_and_star_wars_match_a_reference_stepper {
         dnit(?s);
         k = k + 1;
     }
+    ret 0;
+}
+
+# a WireWorld circuit, 3 wire, 1 an electron's head and 2 its tail: above, a
+# clock sends electrons through a diode the way it passes them, and below, an
+# identical clock sends them at the same diode from its far side
+#[testing]
+val WIRE: [7]str = [7]str{
+    ".213300000003333000000000000000000000",
+    "3....333333333..33333333333333.......",
+    ".3333.......3........................",
+    ".....................................",
+    "............3333...............33120.",
+    "......33333333..333333333333333....3.",
+    "............3..................3333..",
+};
+
+# Langton's loop as he gave it, 2 the sheath and the signal in 1, 4 and 7
+#[testing]
+val LOOP: [10]str = [10]str{
+    "022222222000000",
+    "217014014200000",
+    "202222220200000",
+    "272000021200000",
+    "212000021200000",
+    "202000021200000",
+    "272000021200000",
+    "212222221222220",
+    "207107107111112",
+    "022222222222220",
+};
+
+# the side of the reference grids, whose centre is the world's origin
+#[testing]
+val REF_SIDE: i64 = 96;
+
+# a picture's state at (x, y): '.' and ' ' are 0, a digit its state
+#[testing]
+fun picture_state(rows: *str, x: usize, y: usize) u8 {
+    val c: u8 = rows[y][x];
+    if (c >= '0' && c <= '9') { ret c - '0'; }
+    ret 0;
+}
+
+# write a picture into a reference grid with its corner at (x0, y0)
+#[testing]
+fun picture_into(g: *u8, rows: *str, n: usize, x0: i64, y0: i64) {
+    mem.zero[u8](g, (REF_SIDE * REF_SIDE)::usize);
+    var y: usize = 0;
+    for (y < n) {
+        var x: usize = 0;
+        for (rows[y][x] != 0) {
+            g[((y0 + y::i64) * REF_SIDE + x0 + x::i64)::usize] = picture_state(rows, x, y);
+            x                                                  = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+# fill a world with a picture placed as picture_into places it in a grid
+#[testing]
+fun picture_fill(s: *Sim, rows: *str, n: usize, x0: i64, y0: i64) {
+    fill_begin(s);
+    var y: usize = 0;
+    for (y < n) {
+        var x: usize = 0;
+        for (rows[y][x] != 0) {
+            val st: u8 = picture_state(rows, x, y);
+            if (st != 0) { fill_cell(s, x0 + x::i64 - REF_SIDE / 2, y0 + y::i64 - REF_SIDE / 2, st::u32); }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    fill_end(s);
+}
+
+#[testing]
+fun seed_wire(s: *Sim) {
+    picture_fill(s, ?WIRE[0], 7, 30, 40);
+}
+
+#[testing]
+fun seed_loop(s: *Sim) {
+    picture_fill(s, ?LOOP[0], 10, 30, 40);
+}
+
+# one generation of WireWorld over a reference grid, cells beyond its edge
+# empty: the rule as Silverman states it, written apart from the table
+#[testing]
+fun wireworld_reference(g: *u8, out: *u8) {
+    var y: i64 = 0;
+    for (y < REF_SIDE) {
+        var x: i64 = 0;
+        for (x < REF_SIDE) {
+            val c: u8 = g[(y * REF_SIDE + x)::usize];
+            var v: u8 = c;
+            if (c == 1) { v = 2; }
+            or (c == 2) { v = 3; }
+            or (c == 3) {
+                var heads: u32 = 0;
+                var dy:    i64 = -1;
+                for (dy <= 1) {
+                    var dx: i64 = -1;
+                    for (dx <= 1) {
+                        val yy: i64 = y + dy;
+                        val xx: i64 = x + dx;
+                        if ((dx != 0 || dy != 0) && yy >= 0 && yy < REF_SIDE && xx >= 0 && xx < REF_SIDE) {
+                            if (g[(yy * REF_SIDE + xx)::usize] == 1) { heads = heads + 1; }
+                        }
+                        dx = dx + 1;
+                    }
+                    dy = dy + 1;
+                }
+                if (heads == 1 || heads == 2) { v = 1; }
+            }
+            out[(y * REF_SIDE + x)::usize] = v;
+            x                              = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+# Langton's transitions as a lookup by cell, north, east, south and west, 8
+# states each: every rotation of every line of the rule file's table, the first
+# line to give a neighbourhood keeping it, 255 where none does. read from the
+# lines of six digits alone, apart from the table family's loader
+#[testing]
+fun langton_lookup(lut: *u8) {
+    mem.fill[u8](lut, 255, 32768);
+    var len: usize = 0;
+    val p:   *u8   = store.built_in_text(1, ?len);
+    var at:  usize = 0;
+    for (at < len) {
+        var e: usize = at;
+        for (e < len && p[e] != '\n') { e = e + 1; }
+        var digits: bool  = e - at == 6;
+        var i:      usize = at;
+        for (i < e && digits) {
+            if (p[i] < '0' || p[i] > '7') { digits = false; }
+            i = i + 1;
+        }
+        if (digits) {
+            var d: [6]u32;
+            i = 0;
+            for (i < 6) {
+                d[i] = (p[at + i] - '0')::u32;
+                i    = i + 1;
+            }
+            var r: usize = 0;
+            for (r < 4) {
+                # rotated r quarter turns: the neighbours north, east, south, west
+                val n:   u32   = d[1 + r % 4];
+                val ea:  u32   = d[1 + (r + 1) % 4];
+                val so:  u32   = d[1 + (r + 2) % 4];
+                val we:  u32   = d[1 + (r + 3) % 4];
+                val key: usize = ((((d[0] * 8 + n) * 8 + ea) * 8 + so) * 8 + we)::usize;
+                if (lut[key] == 255) { lut[key] = d[5]::u8; }
+                r = r + 1;
+            }
+        }
+        at = e + 1;
+    }
+}
+
+# one generation of Langton's Loops over a reference grid through the lookup
+#[testing]
+fun langton_reference(g: *u8, out: *u8, lut: *u8) {
+    var y: i64 = 0;
+    for (y < REF_SIDE) {
+        var x: i64 = 0;
+        for (x < REF_SIDE) {
+            val c: u32 = g[(y * REF_SIDE + x)::usize]::u32;
+            var n: u32 = 0;
+            var e: u32 = 0;
+            var s: u32 = 0;
+            var w: u32 = 0;
+            if (y > 0)            { n = g[((y - 1) * REF_SIDE + x)::usize]::u32; }
+            if (x + 1 < REF_SIDE) { e = g[(y * REF_SIDE + x + 1)::usize]::u32; }
+            if (y + 1 < REF_SIDE) { s = g[((y + 1) * REF_SIDE + x)::usize]::u32; }
+            if (x > 0)            { w = g[(y * REF_SIDE + x - 1)::usize]::u32; }
+            var v: u8 = lut[((((c * 8 + n) * 8 + e) * 8 + s) * 8 + w)::usize];
+            if (v == 255) { v = c::u8; }
+            out[(y * REF_SIDE + x)::usize] = v;
+            x                              = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+# whether a world holds a reference grid's states, and nothing outside it
+#[testing]
+fun holds_states(s: *Sim, g: *u8) bool {
+    var live: usize = 0;
+    var y:    i64   = 0;
+    for (y < REF_SIDE) {
+        var x: i64 = 0;
+        for (x < REF_SIDE) {
+            val want: u8 = g[(y * REF_SIDE + x)::usize];
+            if (rule.state(?s.rule, cell(s, x - REF_SIDE / 2, y - REF_SIDE / 2)) != want::u32) {
+                print.eprintlnf("{} differs at ({}, {})", s.generation, x - REF_SIDE / 2, y - REF_SIDE / 2);
+                ret false;
+            }
+            if (want != 0) { live = live + 1; }
+            # nothing reaches the grid's edge, where the world would carry on
+            if (want != 0 && (x == 0 || y == 0 || x == REF_SIDE - 1 || y == REF_SIDE - 1)) { ret false; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    ret population(s) == live;
+}
+
+test table__wireworld_and_langtons_loops_match_a_reference_stepper_on_both_engines {
+    var g:   [9216]u8;
+    var h:   [9216]u8;
+    var lut: [32768]u8;
+    langton_lookup(?lut[0]);
+    var k: usize = 0;
+    for (k < 2) {
+        var t:    Rig;
+        var code: i32 = 0;
+        var gens: u64 = 120;
+        if (k == 0) {
+            code = rig_open(?t, sample_rule(2, 0), seed_wire);
+            picture_into(?g[0], ?WIRE[0], 7, 30, 40);
+        }
+        or {
+            code = rig_open(?t, sample_rule(2, 1), seed_loop);
+            picture_into(?g[0], ?LOOP[0], 10, 30, 40);
+            gens = 151;
+        }
+        if (code != 0)                    { ret code; }
+        if (!holds_states(?t.cpu, ?g[0])) { ret 2; }
+        # electrons reaching the far end of the diode each way
+        var through: u32 = 0;
+        var back:    u32 = 0;
+        var gen:     u64 = 0;
+        for (gen < gens) {
+            rig_step(?t, 1);
+            if (k == 0) { wireworld_reference(?g[0], ?h[0]); }
+            or          { langton_reference(?g[0], ?h[0], ?lut[0]); }
+            mem.copy[u8](?g[0], ?h[0], 9216);
+            if (!holds_states(?t.cpu, ?g[0]))        { ret (100 * (k + 1))::i32 + 3; }
+            if (g[(41 * REF_SIDE + 59)::usize] == 1) { through = through + 1; }
+            if (g[(45 * REF_SIDE + 36)::usize] == 1) { back = back + 1; }
+            gen = gen + 1;
+            if (gen == gens / 2 || gen == gens) {
+                if (!rig_same(?t)) { ret (100 * (k + 1))::i32 + 4; }
+            }
+        }
+        if (k == 0 && (through == 0 || back != 0)) { ret 5; }
+        if (k == 1) {
+            # the daughter stands whole 11 cells east, as the loop began, and
+            # the parent is still there, growing its next arm
+            var y: usize = 0;
+            for (y < 10) {
+                var x: usize = 0;
+                for (x < 15) {
+                    val at: usize = (40 + y) * REF_SIDE::usize + 30 + 11 + x;
+                    if (g[at] != picture_state(?LOOP[0], x, y)) { ret 6; }
+                    x = x + 1;
+                }
+                y = y + 1;
+            }
+            if (g[(41 * REF_SIDE + 31)::usize] == 0) { ret 7; }
+        }
+        rig_close(?t);
+        k = k + 1;
+    }
+    ret 0;
+}
+
+# a rule of 128 states whose tree outgrows the rule buffer the frame's command
+# stream carries (cellar.gpu sync_table): a live state below a cell passes on,
+# one more each cell, from 127 round to 1, and a cell with none above keeps
+#[testing]
+fun drip_text(buf: *u8) usize {
+    var o: usize = text.buf_str(buf, 0, "@RULE Drip\n@TABLE\nn_states:128\nneighborhood:vonNeumann\nsymmetries:none\nvar a={0");
+    var v: u64   = 1;
+    for (v < 128) {
+        o = text.buf_str(buf, o, ",");
+        o = text.buf_u64(buf, o, v);
+        v = v + 1;
+    }
+    o = text.buf_str(buf, o, "}\nvar b=a\nvar c=a\nvar d=a\n");
+    v = 1;
+    for (v < 128) {
+        o = text.buf_str(buf, o, "a,");
+        o = text.buf_u64(buf, o, v);
+        o = text.buf_str(buf, o, ",b,c,d,");
+        o = text.buf_u64(buf, o, v % 127 + 1);
+        o = text.buf_str(buf, o, "\n");
+        v = v + 1;
+    }
+    ret o;
+}
+
+#[testing]
+fun seed_drip(s: *Sim) {
+    fill_begin(s);
+    var i: i64 = 0;
+    for (i < 12) {
+        fill_cell(s, i * 3 - 20, i - 30, (i * 11 + 120)::u32 % 127 + 1);
+        i = i + 1;
+    }
+    fill_end(s);
+}
+
+test table__a_tree_past_the_inline_upload_steps_alike_on_both_engines {
+    var buf: [8192]u8;
+    val n:   usize                = drip_text(?buf[0]);
+    val id:  res[u32, load.Fault] = store.intern(?buf[0], n);
+    if (sel id.err) { ret 1; }
+    val r: rule.Rule = rule.of(rule.Kind.table{ruletable.Rule{id: id.ok}});
+    if (rule.table_words(?r) * 4 <= 65536) { ret 2; }
+    var t:    Rig;
+    val code: i32 = rig_open(?t, r, seed_drip);
+    if (code != 0) { ret code; }
+    rig_step(?t, 40);
+    if (!rig_same(?t)) { ret 3; }
+    # each seed's column carries its state on down, one more each cell
+    var i: i64 = 0;
+    for (i < 12) {
+        val x:  i64 = i * 3 - 20;
+        val y0: i64 = i - 30;
+        var st: u32 = (i * 11 + 120)::u32 % 127 + 1;
+        var d:  i64 = 0;
+        for (d <= 40) {
+            if (rule.state(?t.cpu.rule, cell(?t.cpu, x, y0 + d)) != st) { ret 4; }
+            st = st % 127 + 1;
+            d  = d + 1;
+        }
+        if (cell(?t.cpu, x, y0 + 41) != 0) { ret 5; }
+        i = i + 1;
+    }
+    rig_close(?t);
     ret 0;
 }
 
