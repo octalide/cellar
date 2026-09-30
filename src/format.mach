@@ -6,16 +6,22 @@
 # so a format that cannot hold its pattern in memory, such as a Macrocell
 # quadtree larger than the chunk pool, is as easy to write as a dense one.
 #
-# decoding runs more than once, see cellar.formats.load. the first pass has no
-# sink and only validates the input and gathers its Info, a sink that plans sees
-# the runs next without keeping them, and the last pass streams into the sink
-# once the input is known to be good and to fit. so a decoder must be a pure
-# function of its bytes: same input, same runs, and no effect outside its Emit.
-# the work a decode does may be far more than its bytes, as a quadtree's is, so
-# it stops as soon as emit is refused. it emits
+# decoding runs more than once, see cellar.formats.load: a validating pass with
+# no sink that gathers the Info, a fitting pass that offers the runs to a sink
+# that measures them, and a writing pass that streams them into the sink once
+# the input is known to be good and to fit. so a decoder must be a pure function
+# of its bytes: same input, same runs, and no effect outside its Emit. it emits
 # only live cells, as runs of one nonzero state in any order that does not
 # overlap, with absolute coordinates, so a sink may rely on each cell arriving
 # at most once. dead cells are implicit.
+#
+# the validating pass has no sink to feed, so a decoder may fill the Info with
+# gather rather than emit its runs there, as long as the Info comes out as the
+# runs would have made it. a format whose runs can far outnumber its bytes, as
+# a quadtree's can, must, so validating a file costs no more than reading it.
+# on the other passes a decoder stops as soon as emit is refused, and a sink
+# that fits refuses once a pattern is past what it can hold, so no pass does
+# more than its sink can take.
 #
 # coordinates are i64 and a run's length a usize, so a format may describe
 # patterns far larger than memory. every number a decoder reads from its input
@@ -197,35 +203,40 @@ fun lower(c: u8) u8 {
 
 # a place cells are written to, one run at a time
 #
-# a load calls open once with the validated Info. when the sink plans, every
-# live run is offered to plan before any is written, so a sink can measure what
-# the pattern needs and refuse it with nothing kept. then run takes every live
-# run, and close ends the load once open has accepted it, whatever happened in
-# between.
+# a load asks the sink in order: plan with the validated Info, fit for every
+# live run when the sink fits, open, run for every live run, and close. plan
+# and fit only judge, and leave the destination as it was, so a pattern they
+# refuse costs nothing. open is the first step that changes the destination.
+# close is called once for every load plan accepted, whatever happened after,
+# and releases what plan and open took.
 # ---
 # ctx:   the sink's own state, passed back to each callback
-# open:  the pattern is valid and lies inside info's box; false refuses it
-# plan:  n cells of state v from (x, y) rightward are coming; false refuses the
-#        pattern. nil when the sink takes whatever fits as it comes
+# plan:  the pattern is valid and lies inside info's box; false refuses it as
+#        one the sink cannot hold. nil when the box alone refuses nothing
+# fit:   n cells of state v from (x, y) rightward are coming; false refuses the
+#        pattern. nil when the sink needs only the box
+# open:  begin writing the pattern plan accepted; false when the destination
+#        cannot be written
 # run:   n cells of state v from (x, y) rightward; false when they cannot be kept
-# close: the stream ended; false when the destination lost anything
+# close: the load ended; false when the destination lost anything
 pub rec Sink {
     ctx:   *u8;
+    plan:  fun(*u8, *Info) bool;
+    fit:   fun(*u8, i64, i64, usize, u8) bool;
     open:  fun(*u8, *Info) bool;
-    plan:  fun(*u8, i64, i64, usize, u8) bool;
     run:   fun(*u8, i64, i64, usize, u8) bool;
     close: fun(*u8) bool;
 }
 
 # the decoder's view of where its cells go
 # ---
-# sink:  the destination, nil on the validating pass
-# info:  what the decode gathers: metadata, bounds, counts
-# plans: the runs go to the sink's plan rather than its run
+# sink: the destination, nil on the validating pass
+# info: what the decode gathers: metadata, bounds, counts
+# fits: the runs go to the sink's fit rather than its run
 pub rec Emit {
-    sink:  *Sink;
-    info:  *Info;
-    plans: bool;
+    sink: *Sink;
+    info: *Info;
+    fits: bool;
 }
 
 # report n live cells of state v from (x, y) rightward
@@ -240,12 +251,27 @@ pub rec Emit {
 # ret: false when the sink refused the run
 pub fun emit(e: *Emit, x: i64, y: i64, n: usize, v: u8) bool {
     if (n == 0 || v == 0) { ret true; }
-    cover(e.info, x, y, x + n::i64, y + 1);
-    if (v::u32 >= e.info.states) { e.info.states = v::u32 + 1; }
-    e.info.live = e.info.live + n::u64;
+    gather(e.info, x, y, x + n::i64, y + 1, n::u64, v);
     if (e.sink == nil) { ret true; }
-    if (e.plans)       { ret e.sink.plan(e.sink.ctx, x, y, n, v); }
+    if (e.fits)        { ret e.sink.fit(e.sink.ctx, x, y, n, v); }
     ret e.sink.run(e.sink.ctx, x, y, n, v);
+}
+
+# fold live cells into an Info as emitting them would, for a decoder that
+# knows their extent, count and highest state without listing them
+# ---
+# i:    the Info
+# x0:   leftmost live column, inclusive
+# y0:   top live row, inclusive
+# x1:   right edge, exclusive
+# y1:   bottom edge, exclusive
+# live: how many
+# top:  the highest state among them, nonzero
+pub fun gather(i: *Info, x0: i64, y0: i64, x1: i64, y1: i64, live: u64, top: u8) {
+    if (live == 0) { ret; }
+    cover(i, x0, y0, x1, y1);
+    if (top::u32 >= i.states) { i.states = top::u32 + 1; }
+    i.live = i.live + live;
 }
 
 # one run of live cells read from a Source

@@ -119,9 +119,9 @@ pub fun by_bytes(p: *u8, n: usize, out: *format.Format) bool {
 # ret:  ok, or why the bytes were refused
 pub fun validate(a: *allo.Allocator, f: *format.Format, p: *u8, n: usize, info: *format.Info) err[format.Error] {
     var e: format.Emit;
-    e.sink  = nil;
-    e.info  = info;
-    e.plans = false;
+    e.sink = nil;
+    e.info = info;
+    e.fits = false;
     val r: err[format.Error] = f.decode(a, p, n, ?e);
     if (sel r.err) { ret r; }
     format.settle(info);
@@ -130,12 +130,13 @@ pub fun validate(a: *allo.Allocator, f: *format.Format, p: *u8, n: usize, info: 
 
 # decode bytes into a sink, validating the whole input before applying any of it
 #
-# the decoder runs once with no sink to validate and gather info, and only when
-# that passes does the sink open. a sink that plans is then offered every run,
-# and only once it has taken them all does it receive them. so malformed or
-# truncated input, and a pattern the sink plans and finds too large, are
-# refused having written nothing. a sink that does not plan can still refuse a
-# valid pattern part way, for lack of room. an opened sink is closed either way.
+# the decoder runs once with no sink to validate and gather info. only when
+# that passes is the sink asked to plan for the info's box and, when it fits,
+# offered every run, and only once it has taken them all is it opened and
+# given them. so malformed or truncated input, and a pattern the sink judges
+# too large, are refused having changed nothing. a sink that neither plans nor
+# fits can still refuse a valid pattern part way, for lack of room. a load the
+# sink planned is closed either way.
 # ---
 # a:    allocator for the decoder's scratch
 # f:    the format
@@ -146,26 +147,28 @@ pub fun validate(a: *allo.Allocator, f: *format.Format, p: *u8, n: usize, info: 
 # ret:  ok, or why the bytes were refused or not kept
 pub fun load(a: *allo.Allocator, f: *format.Format, p: *u8, n: usize, sink: *format.Sink, info: *format.Info) err[format.Error] {
     val ok: err[format.Error] = validate(a, f, p, n, info);
-    if (sel ok.err)                 { ret ok; }
-    if (!sink.open(sink.ctx, info)) { ret err[format.Error].err{format.Error.sink{}}; }
+    if (sel ok.err)                                     { ret ok; }
+    if (sink.plan != nil && !sink.plan(sink.ctx, info)) { ret err[format.Error].err{format.Error.sink{}}; }
     var r: err[format.Error] = err[format.Error].ok{};
-    if (sink.plan != nil) { r = pass(a, f, p, n, sink, true); }
+    if (sink.fit != nil) { r = pass(a, f, p, n, sink, true); }
     val fits: bool = sel r.ok;
-    if (fits) { r = pass(a, f, p, n, sink, false); }
+    if (fits && !sink.open(sink.ctx, info)) { r = err[format.Error].err{format.Error.sink{}}; }
+    val opened: bool = sel r.ok;
+    if (opened) { r = pass(a, f, p, n, sink, false); }
     val kept: bool = sink.close(sink.ctx);
     if (sel r.err) { ret r; }
     if (!kept)     { ret err[format.Error].err{format.Error.sink{}}; }
     ret err[format.Error].ok{};
 }
 
-# decode validated bytes into a sink's plan or run, gathering a scratch Info
-fun pass(a: *allo.Allocator, f: *format.Format, p: *u8, n: usize, sink: *format.Sink, plans: bool) err[format.Error] {
+# decode validated bytes into a sink's fit or run, gathering a scratch Info
+fun pass(a: *allo.Allocator, f: *format.Format, p: *u8, n: usize, sink: *format.Sink, fits: bool) err[format.Error] {
     var again: format.Info;
     format.info_init(?again, a);
     var e: format.Emit;
-    e.sink  = sink;
-    e.info  = ?again;
-    e.plans = plans;
+    e.sink = sink;
+    e.info = ?again;
+    e.fits = fits;
     val r: err[format.Error] = f.decode(a, p, n, ?e);
     format.info_dnit(?again);
     ret r;
