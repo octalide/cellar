@@ -30,6 +30,7 @@ Built-in kernels: Conway's Life (`B3/S23`), HighLife (`B36/S23`), Seeds
 | `R`                    | randomize                               |
 | `C`                    | clear                                   |
 | `D`, `E`, `T`          | draw, erase or stamp tool               |
+| `Z`, `X`               | rotate the stamp, flip the stamp        |
 | left mouse             | use the tool                            |
 | right or middle mouse  | drag to pan                             |
 | scroll                 | zoom toward the cursor                  |
