@@ -29,6 +29,10 @@
 #   table_words(r: *R) usize         the words of the rule buffer r needs
 #   pack_table(r: *R, w: *u32)       its rule, into table_words(r) words of
 #                                    the rule buffer, for its stage
+#   colour(r: *R, state: u32) opt[u32]
+#                                    the colour, 0xrrggbb, the rule draws a
+#                                    live cell of a state in, or none to draw
+#                                    it in the view's solid colour
 #   stage(len: *usize) *u8           its step stage's SPIR-V
 #   SAMPLE_COUNT, sample(i) str      rule strings the per-family tests run
 #
@@ -78,6 +82,7 @@
 
 use cellar.layout;
 use cellar.rules.generations;
+use ruletable: cellar.rules.table;
 use cellar.rules.weighted;
 use wword: cellar.rules.weighted.word;
 use cellar.space;
@@ -101,9 +106,11 @@ use std.types.string.str;
 # weighted:    a weighted outer-totalistic kernel, the Life family and its
 #              radius, weight and range generalizations
 # generations: a Life-like rule whose cells die through dying states
+# table:       a rule table or tree of up to 256 states, Golly's .rule files
 pub tag Kind: u8 {
     weighted:    weighted.Kernel;
     generations: generations.Rule;
+    table:       ruletable.Rule;
 }
 
 # a rule: a family's rule and the grid it runs on
@@ -121,9 +128,10 @@ pub fun of(k: Kind) Rule {
 }
 
 # rule families this version runs
-pub val FAMILIES: usize = 2;
+pub val FAMILIES: usize = 3;
 
-# the longest rule string any family's format writes, less its NUL
+# the longest rule string any family's format writes, less its NUL, the
+# weighted family's being the longest (see dispatch__every_function_handles_every_family)
 val FAMILY_MAX: usize = weighted.FORMAT_MAX;
 # the longest rule string format writes, grid included, less its NUL
 pub val FORMAT_MAX: usize = FAMILY_MAX + topology.FORMAT_MAX;
@@ -150,6 +158,7 @@ pub rec Caps {
 
 # the id family i's rule strings are recorded under, in world and settings files
 pub fun family_id(i: usize) str {
+    if (i == 2) { ret "table"; }
     if (i == 1) { ret "generations"; }
     ret "weighted";
 }
@@ -171,6 +180,7 @@ pub fun family_named(id: str) opt[usize] {
 pub fun family_of(r: *Rule) usize {
     if (sel r.kind.weighted)    { ret 0; }
     if (sel r.kind.generations) { ret 1; }
+    if (sel r.kind.table)       { ret 2; }
     unmatched();
     ret 0;
 }
@@ -186,12 +196,14 @@ fun unmatched() {
 # len: receives its length in bytes
 # ret: its first byte
 pub fun stage(i: usize, len: *usize) *u8 {
+    if (i == 2) { ret ruletable.stage(len); }
     if (i == 1) { ret generations.stage(len); }
     ret weighted.stage(len);
 }
 
 # whether family i's step stage binds a rule buffer
 pub fun table(i: usize) bool {
+    if (i == 2) { ret ruletable.TABLE; }
     if (i == 1) { ret generations.TABLE; }
     ret weighted.TABLE;
 }
@@ -204,12 +216,14 @@ pub fun bindings(i: usize) usize {
 
 # how many sample rule strings family i gives its tests
 pub fun sample_count(i: usize) usize {
+    if (i == 2) { ret ruletable.SAMPLE_COUNT; }
     if (i == 1) { ret generations.SAMPLE_COUNT; }
     ret weighted.SAMPLE_COUNT;
 }
 
 # family i's sample rule string n
 pub fun sample(i: usize, n: usize) str {
+    if (i == 2) { ret ruletable.sample(n); }
     if (i == 1) { ret generations.sample(n); }
     ret weighted.sample(n);
 }
@@ -223,6 +237,11 @@ fun holds_as_is(k: *Kind) bool {
 
 # read family i's part of a rule string
 fun parse_kind(i: usize, s: str) res[Kind, str] {
+    if (i == 2) {
+        val t: res[ruletable.Rule, str] = ruletable.parse(s);
+        if (sel t.err) { ret res[Kind, str].err{t.err}; }
+        ret res[Kind, str].ok{Kind.table{t.ok}};
+    }
     if (i == 1) {
         val g: res[generations.Rule, str] = generations.parse(s);
         if (sel g.err) { ret res[Kind, str].err{g.err}; }
@@ -315,6 +334,7 @@ pub fun parse(s: str) res[Rule, str] {
 pub fun format(r: *Rule, buf: *u8) str {
     if (sel r.kind.weighted)    { weighted.format(?r.kind.weighted, buf); }
     or (sel r.kind.generations) { generations.format(?r.kind.generations, buf); }
+    or (sel r.kind.table)       { ruletable.format(?r.kind.table, buf); }
     or                          { unmatched(); }
     topology.format(?r.grid, buf, string.str_len(buf));
     ret buf;
@@ -333,6 +353,7 @@ pub val DISPLAY_MAX: usize = FAMILY_DISPLAY_MAX + topology.FORMAT_MAX;
 pub fun display(r: *Rule, buf: *u8) str {
     if (sel r.kind.weighted)    { weighted.display(?r.kind.weighted, buf); }
     or (sel r.kind.generations) { generations.display(?r.kind.generations, buf); }
+    or (sel r.kind.table)       { ruletable.display(?r.kind.table, buf); }
     or                          { unmatched(); }
     topology.format(?r.grid, buf, string.str_len(buf));
     ret buf;
@@ -351,6 +372,9 @@ fun same_kind(a: *Kind, b: *Kind) bool {
     if (sel a.generations) {
         if (sel b.generations) { ret generations.same_rule(?a.generations, ?b.generations); }
     }
+    if (sel a.table) {
+        if (sel b.table) { ret ruletable.same_rule(?a.table, ?b.table); }
+    }
     ret false;
 }
 
@@ -358,6 +382,7 @@ fun same_kind(a: *Kind, b: *Kind) bool {
 pub fun states(r: *Rule) u32 {
     if (sel r.kind.weighted)    { ret weighted.states(?r.kind.weighted); }
     if (sel r.kind.generations) { ret generations.states(?r.kind.generations); }
+    if (sel r.kind.table)       { ret ruletable.states(?r.kind.table); }
     unmatched();
     ret 0;
 }
@@ -370,6 +395,7 @@ pub fun states(r: *Rule) u32 {
 pub fun word(r: *Rule, state: u32) u32 {
     if (sel r.kind.weighted)    { ret weighted.word_of(?r.kind.weighted, state); }
     if (sel r.kind.generations) { ret generations.word_of(?r.kind.generations, state); }
+    if (sel r.kind.table)       { ret ruletable.word_of(?r.kind.table, state); }
     unmatched();
     ret 0;
 }
@@ -378,6 +404,7 @@ pub fun word(r: *Rule, state: u32) u32 {
 pub fun state(r: *Rule, c: u32) u32 {
     if (sel r.kind.weighted)    { ret weighted.state_of(c); }
     if (sel r.kind.generations) { ret generations.state_of(c); }
+    if (sel r.kind.table)       { ret ruletable.state_of(c); }
     unmatched();
     ret 0;
 }
@@ -387,6 +414,7 @@ pub fun sense(r: *Rule) layout.Sense {
     var none: layout.Sense;
     if (sel r.kind.weighted)    { ret weighted.sense(); }
     if (sel r.kind.generations) { ret generations.sense(); }
+    if (sel r.kind.table)       { ret ruletable.sense(); }
     unmatched();
     ret none;
 }
@@ -395,6 +423,7 @@ pub fun sense(r: *Rule) layout.Sense {
 pub fun radius(r: *Rule) usize {
     if (sel r.kind.weighted)    { ret weighted.radius(?r.kind.weighted); }
     if (sel r.kind.generations) { ret generations.radius(?r.kind.generations); }
+    if (sel r.kind.table)       { ret ruletable.radius(?r.kind.table); }
     unmatched();
     ret 0;
 }
@@ -416,6 +445,10 @@ fun kind_caps(k: *Kind) Caps {
         val c: generations.Caps = generations.caps(?k.generations);
         ret Caps{b0: c.b0, isotropic: c.isotropic, hashlife: c.hashlife, bounded: c.bounded, life_like: c.life_like};
     }
+    if (sel k.table) {
+        val c: ruletable.Caps = ruletable.caps(?k.table);
+        ret Caps{b0: c.b0, isotropic: c.isotropic, hashlife: c.hashlife, bounded: c.bounded, life_like: c.life_like};
+    }
     unmatched();
     var none: Caps;
     ret none;
@@ -435,6 +468,10 @@ pub fun step_chunk(r: *Rule, b: *space.Block, t: *space.Tally) {
         generations.step_chunk(?r.kind.generations, b, t);
         ret;
     }
+    if (sel r.kind.table) {
+        ruletable.step_chunk(?r.kind.table, b, t);
+        ret;
+    }
     unmatched();
 }
 
@@ -446,6 +483,7 @@ pub fun step_chunk(r: *Rule, b: *space.Block, t: *space.Tally) {
 pub fun next(r: *Rule, nb: *u32) u32 {
     if (sel r.kind.weighted)    { ret weighted.next_of(?r.kind.weighted, nb); }
     if (sel r.kind.generations) { ret generations.next_of(?r.kind.generations, nb); }
+    if (sel r.kind.table)       { ret ruletable.next_of(?r.kind.table, nb); }
     unmatched();
     ret 0;
 }
@@ -463,6 +501,10 @@ pub fun pack(r: *Rule, w: *u32) {
         generations.pack(?r.kind.generations, w);
         ret;
     }
+    if (sel r.kind.table) {
+        ruletable.pack(?r.kind.table, w);
+        ret;
+    }
     unmatched();
 }
 
@@ -470,6 +512,7 @@ pub fun pack(r: *Rule, w: *u32) {
 pub fun table_words(r: *Rule) usize {
     if (sel r.kind.weighted)    { ret weighted.table_words(?r.kind.weighted); }
     if (sel r.kind.generations) { ret generations.table_words(?r.kind.generations); }
+    if (sel r.kind.table)       { ret ruletable.table_words(?r.kind.table); }
     unmatched();
     ret 0;
 }
@@ -487,7 +530,24 @@ pub fun pack_table(r: *Rule, w: *u32) {
         generations.pack_table(?r.kind.generations, w);
         ret;
     }
+    if (sel r.kind.table) {
+        ruletable.pack_table(?r.kind.table, w);
+        ret;
+    }
     unmatched();
+}
+
+# the colour a live cell of a state is drawn in
+# ---
+# r:     the rule
+# state: below states(r)
+# ret:   0xrrggbb, or none to draw it in the view's solid colour
+pub fun colour(r: *Rule, state: u32) opt[u32] {
+    if (sel r.kind.weighted)    { ret weighted.colour(?r.kind.weighted, state); }
+    if (sel r.kind.generations) { ret generations.colour(?r.kind.generations, state); }
+    if (sel r.kind.table)       { ret ruletable.colour(?r.kind.table, state); }
+    unmatched();
+    ret opt[u32].none{};
 }
 
 # a built-in rule
@@ -619,6 +679,8 @@ test dispatch__every_function_handles_every_family {
             vector.dnit[u32](?tab);
             label(?r);
             match_preset(?r);
+            colour(?r, states(?r) - 1);
+            if (string.str_len(format(?r, ?buf[0])) > FAMILY_MAX) { ret 15; }
             # a busy step of an empty chunk alone leaves it empty, at either parity
             var i: usize = 0;
             for (i < 4096) {
