@@ -233,6 +233,92 @@ pub fun notation(k: *Kernel, buf: *u8) str {
     ret buf;
 }
 
+# bytes structure may write, less its NUL: radius, two masks and 81 weights
+pub val STRUCTURE_MAX: usize = 1100;
+
+# write a kernel whole as "<radius> <birth> <survive> <weights...>", the masks
+# as unsigned decimals and the (2r+1)^2 weights signed and row-major, into buf,
+# NUL-terminated
+#
+# unlike notation it holds any kernel, weighted or wide, and reads back exactly
+# through from_structure.
+# ---
+# k:   the kernel
+# buf: at least STRUCTURE_MAX + 1 bytes
+# ret: buf
+pub fun structure(k: *Kernel, buf: *u8) str {
+    var o: usize = text.buf_u64(buf, 0, k.radius::u64);
+    buf[o] = ' ';
+    o      = text.buf_u64(buf, o + 1, k.birth);
+    buf[o] = ' ';
+    o      = text.buf_u64(buf, o + 1, k.survive);
+    val n: usize = (2 * k.radius + 1) * (2 * k.radius + 1);
+    var i: usize = 0;
+    for (i < n) {
+        buf[o] = ' ';
+        o      = text.buf_i64(buf, o + 1, k.weights[i]::i64);
+        i      = i + 1;
+    }
+    buf[o] = 0;
+    ret buf;
+}
+
+# read a decimal of at most hi at s[@i], after any blanks, with a leading minus when neg_ok
+fun read_num(s: str, i: *usize, hi: u64, neg_ok: bool, out: *u64, neg: *bool) bool {
+    for (s[@i] == ' ' || s[@i] == '\t') { @i = @i + 1; }
+    @neg = false;
+    if (neg_ok && s[@i] == '-') {
+        @neg = true;
+        @i   = @i + 1;
+    }
+    if (s[@i] < '0' || s[@i] > '9') { ret false; }
+    var v: u64 = 0;
+    for (s[@i] >= '0' && s[@i] <= '9') {
+        val d: u64 = (s[@i] - '0')::u64;
+        if (v > (hi - d) / 10) { ret false; }
+        v  = v * 10 + d;
+        @i = @i + 1;
+    }
+    @out = v;
+    ret true;
+}
+
+# read a kernel structure wrote
+#
+# the kernel is named after the preset it matches, or "custom".
+# ---
+# s:   NUL-terminated text
+# ret: the kernel, or none when s is not one this version can run
+pub fun from_structure(s: str) opt[Kernel] {
+    var k: Kernel;
+    var i: usize = 0;
+    for (i < 81) {
+        k.weights[i] = 0;
+        i            = i + 1;
+    }
+    var p:   usize = 0;
+    var v:   u64   = 0;
+    var neg: bool  = false;
+    if (!read_num(s, ?p, MAX_RADIUS::u64, false, ?v, ?neg) || v < 1) { ret opt[Kernel].none{}; }
+    k.radius = v::usize;
+    if (!read_num(s, ?p, 0xffffffffffffffff, false, ?k.birth, ?neg))   { ret opt[Kernel].none{}; }
+    if (!read_num(s, ?p, 0xffffffffffffffff, false, ?k.survive, ?neg)) { ret opt[Kernel].none{}; }
+    val n: usize = (2 * k.radius + 1) * (2 * k.radius + 1);
+    i = 0;
+    for (i < n) {
+        if (!read_num(s, ?p, 2147483648, true, ?v, ?neg) || (!neg && v > 2147483647)) { ret opt[Kernel].none{}; }
+        k.weights[i] = v::i64::i32;
+        if (neg) { k.weights[i] = (0 - v::i64)::i32; }
+        i = i + 1;
+    }
+    for (s[p] == ' ' || s[p] == '\t') { p = p + 1; }
+    if (s[p] != 0) { ret opt[Kernel].none{}; }
+    k.name = "custom";
+    val m: opt[usize] = match_preset(?k);
+    if (sel m.some) { k.name = preset(m.some).name; }
+    ret opt[Kernel].some{k};
+}
+
 # whether two kernels apply the same rule, whatever they are called
 # ---
 # a:   one kernel
@@ -449,6 +535,29 @@ test parse__reads_both_notations_in_any_case {
     val g: opt[Kernel] = parse("");
     val h: opt[Kernel] = parse("B3");
     if (sel e.some || sel f.some || sel g.some || sel h.some) { ret 5; }
+    ret 0;
+}
+
+test structure__round_trips_a_wide_weighted_kernel {
+    var k: Kernel = life();
+    set_radius(?k, 2);
+    set_weight(?k, -2, -2, -3);
+    set_weight(?k, 2, 1, 5);
+    k.birth   = set_bit(set_bit(0, 7), 40);
+    k.survive = set_bit(0, 63);
+    var b: [1101]u8;
+    val r: opt[Kernel] = from_structure(structure(?k, ?b[0]));
+    if (!sel r.some)                                   { ret 1; }
+    if (!same_rule(?r.some, ?k) || r.some.radius != 2) { ret 2; }
+    var lf: Kernel      = life();
+    val p:  opt[Kernel] = from_structure(structure(?lf, ?b[0]));
+    if (!sel p.some)              { ret 3; }
+    if (!same_rule(?p.some, ?lf)) { ret 3; }
+    val bad1: opt[Kernel] = from_structure("5 8 12 0");
+    val bad2: opt[Kernel] = from_structure("1 8 12 1 1 1 1 0 1 1 1");
+    val bad3: opt[Kernel] = from_structure("1 8 12 1 1 1 1 0 1 1 1 1 1");
+    val bad4: opt[Kernel] = from_structure("1 8 12 1 1 1 1 0 1 1 1 3000000000");
+    if (sel bad1.some || sel bad2.some || sel bad3.some || sel bad4.some) { ret 4; }
     ret 0;
 }
 
