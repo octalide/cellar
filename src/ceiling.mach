@@ -1,0 +1,159 @@
+# the ceilings a run pauses at, which keep a runaway world from eating the machine
+#
+# each ceiling bounds one measure of the world: its population, the chunks of
+# the pool in use, the memory HashLife's nodes take, and how long a step took.
+# each is on or off with a limit in its own unit, and a measure is compared in
+# its raw form (cells, chunks, bytes, nanoseconds) against the limit times the
+# unit's scale, so a ceiling added later is a row of the tables below.
+#
+# the simulation checks them once a step completes (cellar.sim) and pauses a
+# run that crossed one. resuming carries the run past that ceiling, which then
+# stays quiet until its measure falls back under it.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+# live cells
+pub val POPULATION: usize = 0;
+# chunks of the pool in use
+pub val POOL: usize = 1;
+# memory HashLife's nodes take, in MiB
+pub val MEMORY: usize = 2;
+# milliseconds one step took, 2^k generations on HashLife
+pub val STEP: usize = 3;
+# ceilings there are, and the index that names none
+pub val COUNT: usize = 4;
+
+# every ceiling's setting
+# ---
+# on:    each ceiling pauses the run
+# limit: each ceiling's limit in its unit, kept while it is off
+pub rec Ceilings {
+    on:    [4]bool;
+    limit: [4]u64;
+}
+
+# the ceilings a fresh install runs with: the pool and HashLife's memory are
+# held well inside what the machine has, and the population and step time are
+# left to the user
+pub fun defaults() Ceilings {
+    var c: Ceilings;
+    c.on[POPULATION]    = false;
+    c.limit[POPULATION] = 100000000;
+    c.on[POOL]          = true;
+    c.limit[POOL]       = 20000;
+    c.on[MEMORY]        = true;
+    c.limit[MEMORY]     = 500;
+    c.on[STEP]          = false;
+    c.limit[STEP]       = 1000;
+    ret c;
+}
+
+# what a ceiling bounds, for a message
+pub fun name(k: usize) str {
+    if (k == POPULATION) { ret "the population"; }
+    if (k == POOL)       { ret "the chunk pool"; }
+    if (k == MEMORY)     { ret "HashLife's memory"; }
+    ret "a step's time";
+}
+
+# a ceiling's short label, for the panel
+pub fun label(k: usize) str {
+    if (k == POPULATION) { ret "Population"; }
+    if (k == POOL)       { ret "Chunks"; }
+    if (k == MEMORY)     { ret "HashLife memory"; }
+    ret "Step time";
+}
+
+# the unit a ceiling's limit is in
+pub fun unit(k: usize) str {
+    if (k == POPULATION) { ret "cells"; }
+    if (k == POOL)       { ret "chunks"; }
+    if (k == MEMORY)     { ret "MiB"; }
+    ret "ms";
+}
+
+# the `cellar run` option that sets a ceiling
+pub fun flag(k: usize) str {
+    if (k == POPULATION) { ret "--max-population"; }
+    if (k == POOL)       { ret "--max-chunks"; }
+    if (k == MEMORY)     { ret "--max-memory"; }
+    ret "--max-step-ms";
+}
+
+# the ceiling a `cellar run` option sets, or COUNT for none
+pub fun of_flag(s: str) usize {
+    var k: usize = 0;
+    for (k < COUNT) {
+        if (str_equals(s, flag(k))) { ret k; }
+        k = k + 1;
+    }
+    ret COUNT;
+}
+
+# the raw measure one unit of a ceiling's limit stands for
+fun scale(k: usize) u64 {
+    if (k == MEMORY) { ret 1048576; }
+    if (k == STEP)   { ret 1000000; }
+    ret 1;
+}
+
+# a ceiling's limit as a raw measure, held at the u64 ceiling
+pub fun raw(c: *Ceilings, k: usize) u64 {
+    val l: u64 = c.limit[k];
+    val s: u64 = scale(k);
+    if (l > 0xffffffffffffffff / s) { ret 0xffffffffffffffff; }
+    ret l * s;
+}
+
+# whether a raw measure lies past a ceiling that is on
+pub fun over(c: *Ceilings, k: usize, measure: u64) bool {
+    ret c.on[k] && measure > raw(c, k);
+}
+
+# the limit of a step of the panel's slider: 1, 2 and 5 times each power of ten
+pub fun notch(i: usize) u64 {
+    var v: u64   = 1;
+    var p: usize = 0;
+    for (p < i / 3) {
+        v = v * 10;
+        p = p + 1;
+    }
+    if (i % 3 == 1) { ret v * 2; }
+    if (i % 3 == 2) { ret v * 5; }
+    ret v;
+}
+
+# the slider step nearest a limit, at or below it
+pub fun notch_of(limit: u64) usize {
+    var i: usize = 0;
+    for (i < 57 && notch(i + 1) <= limit) { i = i + 1; }
+    ret i;
+}
+
+# the slider steps a ceiling's limit runs over, first and last
+pub fun notch_lo(k: usize) usize {
+    if (k == POPULATION) { ret notch_of(1000); }
+    ret notch_of(10);
+}
+
+pub fun notch_hi(k: usize) usize {
+    if (k == POPULATION) { ret notch_of(1000000000000); }
+    if (k == POOL)       { ret notch_of(50000); }
+    if (k == MEMORY)     { ret notch_of(100000); }
+    ret notch_of(100000);
+}
+
+test notch__runs_one_two_five_and_finds_its_way_back {
+    if (notch(0) != 1 || notch(1) != 2 || notch(2) != 5 || notch(3) != 10 || notch(8) != 500) { ret 1; }
+    if (notch_of(500) != 8 || notch_of(499) != 7 || notch_of(1) != 0)                         { ret 2; }
+    var c: Ceilings = defaults();
+    if (over(?c, POPULATION, 0xffffffffffffffff))                                { ret 3; }
+    if (!over(?c, MEMORY, 500 * 1048576 + 1) || over(?c, MEMORY, 500 * 1048576)) { ret 4; }
+    if (of_flag("--max-chunks") != POOL || of_flag("--max") != COUNT)            { ret 5; }
+    ret 0;
+}

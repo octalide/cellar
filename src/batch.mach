@@ -11,8 +11,13 @@
 # straight into the tree rather than through the pool. the stages are separate
 # calls on a Batch so a script can drive them in any order and read the world
 # between them, and run strings them together for `cellar run`.
+#
+# a run honours the ceilings the app pauses at (cellar.ceiling), which the job
+# carries. crossing one stops it where it stood: the world is still written,
+# and the report names the ceiling.
 
 use cellar.args;
+use cellar.ceiling;
 use cellar.format;
 use cellar.formats;
 use cellar.formats.adapt;
@@ -60,9 +65,11 @@ pub rec Batch {
 # ---
 # generation: completed generations, counted from the file's own
 # population: live cells
+# stopped:    the ceiling the run stopped at, ceiling.COUNT when it ran out
 pub rec Report {
     generation: u64;
     population: usize;
+    stopped:    usize;
 }
 
 # what `cellar run` asks of a batch
@@ -74,12 +81,14 @@ pub rec Report {
 #          quadtree
 # out:     the file to write, its format by its extension, or nil for
 #          DEFAULT_FORMAT on stdout
+# ceil:    the ceilings the run stops at
 pub rec Job {
     pattern: str;
     rule:    str;
     gens:    u64;
     engine:  u8;
     out:     str;
+    ceil:    ceiling.Ceilings;
 }
 
 # why a batch stopped
@@ -91,6 +100,7 @@ pub rec Job {
 # foreign: the file names a rule this cellar cannot run and none was given
 # full:    the world outgrew the pool or HashLife's node table, so stepping
 #          on would go wrong
+# ceiling: the world crossed this ceiling
 # engine:  the engine asked for cannot run the rule or take the world
 # format:  the world could not be written, see cellar.format.Error
 # write:   the output file could not be written
@@ -102,6 +112,7 @@ pub tag Error: u8 {
     rule:  str;
     foreign;
     full;
+    ceiling: usize;
     engine;
     format: format.Error;
     write:  fs.FsError;
@@ -119,6 +130,7 @@ pub fun error_message(e: Error) str {
     if (sel e.rule)    { ret e.rule; }
     if (sel e.foreign) { ret "the file's rule is not one cellar can run; name one with --rule"; }
     if (sel e.full)    { ret "the world outgrew what cellar can hold"; }
+    if (sel e.ceiling) { ret "the world crossed a ceiling"; }
     if (sel e.engine)  { ret "HashLife cannot run the rule; it runs radius 1 rules without B0 on the unbounded plane"; }
     if (sel e.format)  { ret format.error_message(e.format); }
     if (sel e.write)   { ret "the output file could not be written"; }
@@ -200,12 +212,23 @@ pub fun use_hashlife(b: *Batch, tree: bool) err[Error] {
     ret err[Error].ok{};
 }
 
+# stop at these ceilings from now on
+pub fun set_ceilings(b: *Batch, c: ceiling.Ceilings) {
+    sim.set_ceilings(?b.s, c);
+}
+
+# why stepping stopped: the ceiling crossed, else full
+fun halted(b: *Batch) err[Error] {
+    if (sim.tripped(?b.s) != ceiling.COUNT) { ret err[Error].err{Error.ceiling{sim.tripped(?b.s)}}; }
+    ret err[Error].err{Error.full{}};
+}
+
 # advance the world n generations
 # ---
 # b:   batch
 # n:   generations
-# ret: ok, or full once the world outgrew the pool or the node table, the
-#      generations stepped before it counted
+# ret: ok, or full once the world outgrew the pool or the node table, or
+#      ceiling once it crossed one, the generations stepped before it counted
 pub fun step(b: *Batch, n: u64) err[Error] {
     if (sim.on_tree(?b.s)) {
         # straight to the generation, in pieces jump takes
@@ -213,7 +236,7 @@ pub fun step(b: *Batch, n: u64) err[Error] {
         for (left > 0) {
             var d: u64 = left;
             if (d > (1::u64 << 48))                  { d = 1::u64 << 48; }
-            if (!sim.jump(?b.s, b.s.generation + d)) { ret err[Error].err{Error.full{}}; }
+            if (!sim.jump(?b.s, b.s.generation + d)) { ret halted(b); }
             left = left - d;
         }
         ret err[Error].ok{};
@@ -221,15 +244,15 @@ pub fun step(b: *Batch, n: u64) err[Error] {
     var i: u64 = 0;
     for (i < n) {
         sim.step(?b.s);
-        if (b.s.full) { ret err[Error].err{Error.full{}}; }
+        if (b.s.full || sim.tripped(?b.s) != ceiling.COUNT) { ret halted(b); }
         i = i + 1;
     }
     ret err[Error].ok{};
 }
 
-# the world's generation and population
+# the world's generation and population, and the ceiling it stopped at
 pub fun report(b: *Batch) Report {
-    ret Report{generation: b.s.generation, population: sim.population(?b.s)};
+    ret Report{generation: b.s.generation, population: sim.population(?b.s), stopped: sim.tripped(?b.s)};
 }
 
 # encode the world's live cells, where they lie, under the rule it runs
@@ -305,22 +328,26 @@ fun drive(b: *Batch, j: *Job, f: *format.Format, out: *Vector[u8]) err[Error] {
         val moved: err[Error] = use_hashlife(b, true);
         if (sel moved.err) { ret moved; }
     }
+    set_ceilings(b, j.ceil);
     val stepped: err[Error] = step(b, j.gens);
-    if (sel stepped.err) { ret stepped; }
+    # a ceiling stops the run where it stood, which is still written
+    if (sel stepped.err && !(sel stepped.err.ceiling)) { ret stepped; }
     val coded: err[Error] = encode(b, f, out);
     if (sel coded.err) { ret coded; }
     ret deliver(b, j, out);
 }
 
-# open a file, run it under the job's rule or else its own, step it, and write
-# the result, all headless
+# open a file, run it under the job's rule or else its own, step it until the
+# generations run out or it crosses a ceiling, and write the result, all
+# headless
 #
 # the rule and the output format are judged before the file is read, so a job
 # asking for either wrongly reads and writes nothing.
 # ---
 # a:   allocator for the world and the buffers
 # j:   the job
-# ret: where the world stood once written, or why the job stopped
+# ret: where the world stood once written, the ceiling it stopped at among it,
+#      or why the job failed
 pub fun run(a: *allo.Allocator, j: *Job) res[Report, Error] {
     if (j.rule != nil) {
         val r: res[rule.Rule, str] = rule.parse(j.rule);
@@ -581,6 +608,35 @@ test encode__writes_every_dying_cell_of_a_generations_world {
     ret 0;
 }
 
+test run__stops_at_a_ceiling_on_either_engine_and_writes_the_world_where_it_stood {
+    var a: allo.Allocator;
+    page.make(?a);
+    val dir: err[fs.FsError] = persist.make_parent(?a, "out/test/batch_ceiling/gun.rle");
+    if (sel dir.err) { ret 1; }
+    val w: err[fs.FsError] = fs.write_bytes("out/test/batch_ceiling/gun.rle", GUN, string.str_len(GUN), persist.FILE_MODE);
+    if (sel w.err) { ret 1; }
+    var c: ceiling.Ceilings = ceiling.defaults();
+    c.on[ceiling.POPULATION]    = true;
+    c.limit[ceiling.POPULATION] = 60;
+    var e: u8 = args.ENGINE_CPU;
+    for (e <= args.ENGINE_HASHLIFE) {
+        fs.remove_file("out/test/batch_ceiling/out.rle");
+        var j: Job                = Job{pattern: "out/test/batch_ceiling/gun.rle", rule: nil, gens: 1000, engine: e, out: "out/test/batch_ceiling/out.rle", ceil: c};
+        val r: res[Report, Error] = run(?a, ?j);
+        if (sel r.err)                                                   { ret 2; }
+        if (r.ok.stopped != ceiling.POPULATION || r.ok.population <= 60) { ret 3; }
+        if (r.ok.generation == 0 || r.ok.generation >= 1000)             { ret 4; }
+        val got: res[Vector[u8], fs.FsError] = fs.read_bytes(?a, "out/test/batch_ceiling/out.rle");
+        if (sel got.err) { ret 5; }
+        var v: Vector[u8] = got.ok;
+        vector.dnit[u8](?v);
+        e = e + 2;
+    }
+    fs.remove_file("out/test/batch_ceiling/gun.rle");
+    fs.remove_file("out/test/batch_ceiling/out.rle");
+    ret 0;
+}
+
 test run__on_hashlife_writes_what_the_chunk_engine_does {
     var a: allo.Allocator;
     page.make(?a);
@@ -588,8 +644,8 @@ test run__on_hashlife_writes_what_the_chunk_engine_does {
     if (sel dir.err) { ret 1; }
     val w: err[fs.FsError] = fs.write_bytes("out/test/batch_engine/gun.rle", GUN, string.str_len(GUN), persist.FILE_MODE);
     if (sel w.err) { ret 1; }
-    var pool: Job                = Job{pattern: "out/test/batch_engine/gun.rle", rule: nil, gens: 1000, engine: args.ENGINE_CPU, out: "out/test/batch_engine/pool.rle"};
-    var tree: Job                = Job{pattern: "out/test/batch_engine/gun.rle", rule: nil, gens: 1000, engine: args.ENGINE_HASHLIFE, out: "out/test/batch_engine/tree.rle"};
+    var pool: Job                = Job{pattern: "out/test/batch_engine/gun.rle", rule: nil, gens: 1000, engine: args.ENGINE_CPU, out: "out/test/batch_engine/pool.rle", ceil: ceiling.defaults()};
+    var tree: Job                = Job{pattern: "out/test/batch_engine/gun.rle", rule: nil, gens: 1000, engine: args.ENGINE_HASHLIFE, out: "out/test/batch_engine/tree.rle", ceil: ceiling.defaults()};
     val p:    res[Report, Error] = run(?a, ?pool);
     val t:    res[Report, Error] = run(?a, ?tree);
     if (sel p.err) { ret 2; }
@@ -621,12 +677,12 @@ test run__on_hashlife_writes_what_the_chunk_engine_does {
     vector.dnit[u8](?tmv);
 
     # a rule HashLife cannot run is refused, naming the engine
-    var wide: Job                = Job{pattern: "out/test/batch_engine/gun.rle", rule: weighted.sample(1), gens: 10, engine: args.ENGINE_HASHLIFE, out: "out/test/batch_engine/wide.rle"};
+    var wide: Job                = Job{pattern: "out/test/batch_engine/gun.rle", rule: weighted.sample(1), gens: 10, engine: args.ENGINE_HASHLIFE, out: "out/test/batch_engine/wide.rle", ceil: ceiling.defaults()};
     val r:    res[Report, Error] = run(?a, ?wide);
     if (!(sel r.err && sel r.err.engine))                                                  { ret 7; }
     if (sel r.err && !string.str_equals(error_subject(r.err, ?wide), "--engine hashlife")) { ret 8; }
     # and so is a bounded grid, which only the pool runs
-    var torus: Job                = Job{pattern: "out/test/batch_engine/gun.rle", rule: "B3/S23:T200,200", gens: 10, engine: args.ENGINE_HASHLIFE, out: "out/test/batch_engine/torus.rle"};
+    var torus: Job                = Job{pattern: "out/test/batch_engine/gun.rle", rule: "B3/S23:T200,200", gens: 10, engine: args.ENGINE_HASHLIFE, out: "out/test/batch_engine/torus.rle", ceil: ceiling.defaults()};
     val tr:    res[Report, Error] = run(?a, ?torus);
     if (!(sel tr.err && sel tr.err.engine)) { ret 9; }
     fs.remove_file("out/test/batch_engine/gun.rle");
@@ -643,10 +699,10 @@ test run__on_hashlife_writes_what_the_chunk_engine_does {
 # file on the pool to RLE
 #[testing]
 fun same_as_rle(a: *allo.Allocator, from: str, engine: u8, mc: str, rle: str) bool {
-    var there: Job                = Job{pattern: from, rule: nil, gens: 1000, engine: engine, out: mc};
+    var there: Job                = Job{pattern: from, rule: nil, gens: 1000, engine: engine, out: mc, ceil: ceiling.defaults()};
     val r:     res[Report, Error] = run(a, ?there);
     if (sel r.err) { ret false; }
-    var back: Job                = Job{pattern: mc, rule: nil, gens: 0, engine: args.ENGINE_CPU, out: rle};
+    var back: Job                = Job{pattern: mc, rule: nil, gens: 0, engine: args.ENGINE_CPU, out: rle, ceil: ceiling.defaults()};
     val k:    res[Report, Error] = run(a, ?back);
     if (sel k.err) { ret false; }
     ret k.ok.population == r.ok.population;
@@ -663,7 +719,7 @@ test run__writes_the_gun_at_two_to_the_thirty_to_macrocell_and_reopens_it_from_i
     # the time of a few thousand nodes
     val start: time.InstantClock = time.instant();
     if (sel start.err) { ret 2; }
-    var far: Job                = Job{pattern: "out/test/batch_far/gun.rle", rule: nil, gens: 1073741824, engine: args.ENGINE_HASHLIFE, out: "out/test/batch_far/far.mc"};
+    var far: Job                = Job{pattern: "out/test/batch_far/gun.rle", rule: nil, gens: 1073741824, engine: args.ENGINE_HASHLIFE, out: "out/test/batch_far/far.mc", ceil: ceiling.defaults()};
     val r:   res[Report, Error] = run(?a, ?far);
     if (sel r.err) { ret 3; }
     val took: time.Elapsed = time.elapsed(start.ok);
@@ -689,7 +745,7 @@ test run__writes_the_gun_at_two_to_the_thirty_to_macrocell_and_reopens_it_from_i
     # time a few thousand nodes take too
     val again: time.InstantClock = time.instant();
     if (sel again.err) { ret 12; }
-    var back: Job                = Job{pattern: "out/test/batch_far/far.mc", rule: nil, gens: 0, engine: args.ENGINE_HASHLIFE, out: "out/test/batch_far/back.mc"};
+    var back: Job                = Job{pattern: "out/test/batch_far/far.mc", rule: nil, gens: 0, engine: args.ENGINE_HASHLIFE, out: "out/test/batch_far/back.mc", ceil: ceiling.defaults()};
     val k:    res[Report, Error] = run(?a, ?back);
     if (sel k.err) { ret 13; }
     val took_back: time.Elapsed = time.elapsed(again.ok);
