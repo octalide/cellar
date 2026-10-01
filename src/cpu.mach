@@ -18,6 +18,17 @@
 #
 # a chunk whose cells the step changed is marked space.DIRTY_CELLS, since the
 # host's cells are the world's, so a GPU that only draws sends only those.
+#
+# where the pool keeps pyramids for a draw (space.set_pyramids), each chunk the
+# draw can see while it reads them has its pyramid built from its back cells
+# as it steps, across the team, so the draw sends them as they stand.
+#
+# a step is two halves. compute writes only the back cells, their pyramids and
+# the census, so the front cells and pyramids, the page table and the dirty
+# marks stay the last completed generation while it runs, and a draw may read
+# them from another thread.
+# commit then marks what changed, swaps the buffers and settles the pool, and
+# is the only half that changes what a draw reads.
 
 use cellar.layout;
 use cellar.rule;
@@ -67,18 +78,30 @@ fun step_slot(arg: *u8, s: usize) {
     if (!b.busy && sp.before[s * space.CENSUS + 1] == 0) { mem.zero[u32](out, space.CELLS); }
     or                                                   { rule.step_chunk(rd.r, ?b, ?t); }
     space.tally_census(?t, cn, e[layout.INCARNATION_AT::usize]);
-    note_change(sp, s, ?t);
+    build(sp, s, rd.sens);
 }
 
-# mark a stepped chunk DIRTY_CELLS unless its cells were all zero and stay so,
-# so only a changed chunk is sent to the draw again
-# ---
-# sp: the pool
-# s:  the slot
-# t:  the tally of the cells the step wrote
-fun note_change(sp: *space.Space, s: usize, t: *space.Tally) {
-    val was: *u32 = ?sp.before[s * space.CENSUS];
-    if (was[0] != 0 || was[1] != 0 || t.live != 0 || t.warm != 0) { sp.dirty[s] = sp.dirty[s] | space.DIRTY_CELLS; }
+# build a stepped chunk's pyramid from its back cells, where the pool keeps them
+fun build(sp: *space.Space, s: usize, sn: layout.Sense) {
+    if (!space.builds_pyramid(sp, s)) { ret; }
+    space.pyramid(?sp.back[s * space.CELLS], sn, ?sp.mips_back[s * space.MIP]);
+}
+
+# mark every stepped chunk DIRTY_CELLS unless its cells were all zero and stay
+# so, from its census before and after the step, so only a changed chunk is
+# sent to the draw again, and DIRTY_MIP where its pyramid was built with it
+fun note_changes(sp: *space.Space) {
+    var s: usize = 0;
+    for (s < sp.hi) {
+        val was: *u32 = ?sp.before[s * space.CENSUS];
+        val now: *u32 = ?sp.census[s * space.CENSUS];
+        if (space.used(sp, s) && (was[0] != 0 || was[1] != 0 || now[0] != 0 || now[1] != 0)) {
+            sp.dirty[s] = sp.dirty[s] | space.DIRTY_CELLS;
+            if (space.builds_pyramid(sp, s)) { sp.dirty[s] = sp.dirty[s] | space.DIRTY_MIP; }
+            or                               { sp.dirty[s] = sp.dirty[s] & ~space.DIRTY_MIP; }
+        }
+        s = s + 1;
+    }
 }
 
 # the frames of a seamed chunk's block, gathered one chunk at a time
@@ -126,7 +149,7 @@ fun step_seamed(rd: *Round, s: usize, fr: *u32) {
         i = i + 1;
     }
     space.tally_census(?u, ?sp.census[s * space.CENSUS], space.incarnation(sp, s));
-    note_change(sp, s, ?u);
+    build(sp, s, rd.sens);
 }
 
 # step every seamed chunk of the pool, after the rest
@@ -152,6 +175,18 @@ fun step_seams(rd: *Round) {
 # t:   the team to split the chunks across
 # ret: false when the pool could not hold a chunk the world grew into
 pub fun step(sp: *space.Space, r: *rule.Rule, gen: u64, t: *team.Team) bool {
+    compute(sp, r, gen, t);
+    ret commit(sp);
+}
+
+# the first half of a step: every chunk steps into its back cells and writes
+# its census, leaving the front cells, the page table and the dirty marks alone
+# ---
+# sp:  the pool, with back cells, whose sense is the rule's
+# r:   the rule
+# gen: the generation the pool's cells hold
+# t:   the team to split the chunks across
+pub fun compute(sp: *space.Space, r: *rule.Rule, gen: u64, t: *team.Team) {
     var rd: Round;
     rd.sp   = sp;
     rd.r    = r;
@@ -160,13 +195,25 @@ pub fun step(sp: *space.Space, r: *rule.Rule, gen: u64, t: *team.Team) bool {
     mem.copy[u32](sp.before, sp.census, sp.hi * space.CENSUS);
     team.run(t, step_slot, (?rd)::*u8, sp.hi);
     if (topology.bounded(?sp.grid)) { step_seams(?rd); }
+}
+
+# the second half of a step: the back cells compute wrote become the front, and
+# the census settles the pool around them
+# ---
+# sp:  the pool compute stepped
+# ret: false when the pool could not hold a chunk the world grew into
+pub fun commit(sp: *space.Space) bool {
+    note_changes(sp);
     val front: *u32 = sp.cells;
     sp.cells = sp.back;
     sp.back  = front;
+    val mips: *u32 = sp.mips;
+    sp.mips      = sp.mips_back;
+    sp.mips_back = mips;
     ret space.settle(sp, sp.census, sp.hi, true);
 }
 
-test step__a_glider_crosses_chunk_borders_and_the_pool_follows {
+test step__a_glider_crosses_chunk_borders_and_the_pool_and_its_pyramids_follow {
     var a: allo.Allocator;
     page.make(?a);
     var sp:   space.Space;
@@ -187,6 +234,15 @@ test step__a_glider_crosses_chunk_borders_and_the_pool_follows {
     c[62 * 64 + 62] = rule.word(?r, 1);
     space.recount(?sp, s);
     space.settle(?sp, sp.census, sp.hi, false);
+    # a draw that reads the pyramids of the chunk at the origin alone
+    val kept: err[allo.Error] = space.set_pyramids(?sp, true);
+    if (sel kept.err) { ret 8; }
+    var box: [4]i64;
+    box[0] = 0;
+    box[1] = 0;
+    box[2] = 0;
+    box[3] = 0;
+    space.aim_pyramids(?sp, true, ?box[0]);
 
     # 4 generations move it one cell diagonally; after 40 it lies inside (0, 0)
     var g: usize = 0;
@@ -203,6 +259,13 @@ test step__a_glider_crosses_chunk_borders_and_the_pool_follows {
     if (!space.live(?sp, d[8 * 64 + 7]) || !space.live(?sp, d[8 * 64 + 8]))                                    { ret 6; }
     # the chunk it started in is cold and empty by now, and its far corner freed
     if (space.find(?sp, -2, -2) != space.NONE) { ret 7; }
+    # the step built the pyramid it was aimed at, and only that one
+    var want: [space.MIP]u32;
+    space.pyramid(d, sp.sense, ?want[0]);
+    if (!mem.equal[u32](?want[0], ?sp.mips[o::usize * space.MIP], space.MIP)) { ret 9; }
+    if ((sp.dirty[o::usize] & space.DIRTY_MIP) == 0)                          { ret 10; }
+    val w: u32 = space.find(?sp, -1, -1);
+    if (w == space.NONE || (sp.dirty[w::usize] & space.DIRTY_MIP) != 0) { ret 11; }
     team.stop(?t);
     space.dnit(?sp);
     ret 0;

@@ -5,6 +5,9 @@
 # on the world below goes to the member that holds it:
 #
 #   step, collect, record, sync      advance the world and show it
+#   advance, commit, show            step in two halves, the first of which
+#                                    changes nothing a draw reads, and draw
+#                                    the last completed generation meanwhile
 #   clear, fill_*, randomize         replace it
 #   read_*, edit_*, paint,           read and write cells by area, or lay
 #   clear_outside, merge_*           the tree's own squares over it
@@ -401,7 +404,7 @@ pub fun set_rule(s: *Sim, r: rule.Rule) bool {
     val n:  u32   = rule.states(?s.rule);
     var sl: usize = 0;
     for (sl < sp.hi) {
-        if (space.used(sp, sl) && same) { sp.dirty[sl] = sp.dirty[sl] | space.DIRTY_CELLS; }
+        if (space.used(sp, sl) && same) { space.touch(sp, sl); }
         or (space.used(sp, sl)) {
             val c: *u32  = ?sp.cells[sl * space.CELLS];
             var i: usize = 0;
@@ -411,7 +414,7 @@ pub fun set_rule(s: *Sim, r: rule.Rule) bool {
                 c[i] = rule.word(?s.rule, st);
                 i    = i + 1;
             }
-            sp.dirty[sl] = sp.dirty[sl] | space.DIRTY_CELLS;
+            space.touch(sp, sl);
         }
         sl = sl + 1;
     }
@@ -477,8 +480,10 @@ pub fun attach(s: *Sim, g: *gpu.Gpu) {
         t                = t + 1;
     }
     gpu.note_bulk(g);
-    # the GPU's pool is the world from now on, so the host needs no back cells
+    # the GPU's pool is the world from now on, so the host needs no back cells.
+    # a GPU that only draws the CPU's steps reads their pyramids
     if (g.stepping)  { space.set_stepped(?s.space, false); }
+    or               { space.set_pyramids(?s.space, true); }
     if (!on_tree(s)) { s.engine = pool_engine(s); }
     s.seen.valid = false;
 }
@@ -608,6 +613,13 @@ pub fun set_exponent(s: *Sim, k: u32) {
 # advance the tree one step of 2^k generations, collecting and trying once
 # more when its table fills
 fun tree_step(s: *Sim) bool {
+    if (!tree_advance(s)) { ret false; }
+    tree_commit(s);
+    ret true;
+}
+
+# the tree's step itself, which leaves the generation and the drawn pool alone
+fun tree_advance(s: *Sim) bool {
     val t: *hashlife.Tree = ?s.tree;
     if (!hashlife.step(t)) {
         hashlife.collect(t, hashlife.NONE);
@@ -616,10 +628,14 @@ fun tree_step(s: *Sim) bool {
             ret false;
         }
     }
-    s.generation = s.generation + ((1::u64) << t.k::u64);
+    ret true;
+}
+
+# count the tree's step
+fun tree_commit(s: *Sim) {
+    s.generation = s.generation + ((1::u64) << s.tree.k::u64);
     touched(s);
     history.add(?s.history, s.generation, population(s)::u64);
-    ret true;
 }
 
 # advance one generation, or 2^k on the tree, or ask the GPU for one. a step
@@ -627,16 +643,38 @@ fun tree_step(s: *Sim) bool {
 # ---
 # s: simulation
 pub fun step(s: *Sim) {
-    if (s.full) { ret; }
-    if (on_tree(s)) {
-        tree_step(s);
-        ret;
-    }
+    if (advance(s)) { commit(s); }
+}
+
+# the first half of a step, which changes nothing a draw reads: the CPU steps
+# into the back cells, the tree steps, and the GPU is asked for a generation
+# (see cellar.runner, which runs it where the interface's draw may read the
+# world at once)
+#
+# a step the pool or the tree could not hold stops the world, uncounted.
+# ---
+# s:   simulation
+# ret: whether commit is owed to finish the step
+pub fun advance(s: *Sim) bool {
+    if (s.full)     { ret false; }
+    if (on_tree(s)) { ret tree_advance(s); }
     if (on_gpu(s)) {
         if (s.pending < MAX_PENDING) { s.pending = s.pending + 1; }
+        ret false;
+    }
+    cpu.compute(?s.space, ?s.rule, s.generation, ?s.team);
+    ret true;
+}
+
+# the second half of a step advance began: make its generation the world's
+# ---
+# s: simulation, after advance asked for it
+pub fun commit(s: *Sim) {
+    if (on_tree(s)) {
+        tree_commit(s);
         ret;
     }
-    if (!cpu.step(?s.space, ?s.rule, s.generation, ?s.team)) {
+    if (!cpu.commit(?s.space)) {
         overflow(s);
         ret;
     }
@@ -758,7 +796,7 @@ fun show_square(ctx: *u8, qx: i64, qy: i64, n: u32) {
         if ((new >> layout.SUMMARY_HEAT) > heat) { heat = new >> layout.SUMMARY_HEAT; }
         sp.cells[i] = live | (heat << layout.SUMMARY_HEAT);
     }
-    sp.dirty[sl::usize] = sp.dirty[sl::usize] | space.DIRTY_CELLS;
+    space.touch(sp, sl::usize);
 }
 
 # fill the pool with the tree as the look sees it, and set the look to draw it
@@ -777,25 +815,13 @@ fun show_tree(s: *Sim, look: *gpu.Look) {
         ppc   = ppc * 2.0;
         shift = shift + 1;
     }
-    val scale: f64 = pow2(shift);
-    val wx:    f64 = ((look.base_cx::i64 - space.BIAS) * space.SIDE)::f64 + look.frac_x::f64;
-    val wy:    f64 = ((look.base_cy::i64 - space.BIAS) * space.SIDE)::f64 + look.frac_y::f64;
-    val dx:    f64 = wx / scale;
-    val dy:    f64 = wy / scale;
-    val bx:    i64 = floor64(dx / 64.0);
-    val by:    i64 = floor64(dy / 64.0);
-    look.base_cx = (bx + space.BIAS)::u32;
-    look.base_cy = (by + space.BIAS)::u32;
-    look.frac_x  = (dx - (bx * 64)::f64)::f32;
-    look.frac_y  = (dy - (by * 64)::f64)::f32;
-    look.ppc     = ppc;
-    look.shift   = shift;
-    if (look.mode == render.MODE_AGE::u32) { look.mode = render.MODE_SOLID::u32; }
-    if (shift != 0)                        { look.gutter = 0; }
+    tree_look(look, shift);
+    val dx: f64 = ((look.base_cx::i64 - space.BIAS) * 64)::f64 + look.frac_x::f64;
+    val dy: f64 = ((look.base_cy::i64 - space.BIAS) * 64)::f64 + look.frac_y::f64;
 
     # the drawn cells in view, a chunk beyond each side
-    val hw:  f64 = (look.half_w / ppc)::f64 + 64.0;
-    val hh:  f64 = (look.half_h / ppc)::f64 + 64.0;
+    val hw:  f64 = (look.half_w / look.ppc)::f64 + 64.0;
+    val hh:  f64 = (look.half_h / look.ppc)::f64 + 64.0;
     var box: [4]i64;
     box[0] = floor64(dx - hw);
     box[1] = floor64(dy - hh);
@@ -816,6 +842,76 @@ fun show_tree(s: *Sim, look: *gpu.Look) {
     }
     space.reset(?s.space);
     hashlife.squares(?s.tree, shift, ?b[0], show_square, s::*u8);
+}
+
+# move a look in cells into the units of drawn cells 2^shift cells on a side,
+# the squares of the tree the pool shows. the look keeps its colour mode, but
+# for age, which the tree does not keep and is drawn solid
+# ---
+# look:  the camera and colours, in cells, changed in place
+# shift: the level of the squares a drawn cell stands for
+pub fun tree_look(look: *gpu.Look, shift: u32) {
+    val scale: f64 = pow2(shift);
+    val wx:    f64 = ((look.base_cx::i64 - space.BIAS) * space.SIDE)::f64 + look.frac_x::f64;
+    val wy:    f64 = ((look.base_cy::i64 - space.BIAS) * space.SIDE)::f64 + look.frac_y::f64;
+    val dx:    f64 = wx / scale;
+    val dy:    f64 = wy / scale;
+    val bx:    i64 = floor64(dx / 64.0);
+    val by:    i64 = floor64(dy / 64.0);
+    look.base_cx = (bx + space.BIAS)::u32;
+    look.base_cy = (by + space.BIAS)::u32;
+    look.frac_x  = (dx - (bx * 64)::f64)::f32;
+    look.frac_y  = (dy - (by * 64)::f64)::f32;
+    look.ppc     = (look.ppc::f64 * scale)::f32;
+    look.shift   = shift;
+    if (look.mode == render.MODE_AGE::u32) { look.mode = render.MODE_SOLID::u32; }
+    if (shift != 0)                        { look.gutter = 0; }
+}
+
+# the level of the squares of the tree the pool last showed
+pub fun shown_shift(s: *Sim) u32 {
+    ret s.seen.shift;
+}
+
+# fill the pool with the tree as the look sees it, where the pool is what the
+# GPU draws of it, for a draw from another thread to show (cellar.runner)
+# ---
+# s:    simulation
+# look: the camera, in cells
+pub fun show_view(s: *Sim, look: gpu.Look) {
+    if (!on_tree(s)) { ret; }
+    var l: gpu.Look = look;
+    show_tree(s, ?l);
+}
+
+# have the CPU's steps build the coverage pyramids a look draws from, of the
+# chunks it can see, or none when it draws the cells
+# ---
+# s:    simulation
+# look: the camera the draw last aimed, in cells
+pub fun aim_pyramids(s: *Sim, look: *gpu.Look) {
+    var b: [4]i64;
+    gpu.view_chunks(look, ?b[0]);
+    space.aim_pyramids(?s.space, gpu.reads_pyramids(look), ?b[0]);
+}
+
+# ready the draw of the last completed generation without stepping or reading
+# anything a step changes: the cells the CPU last committed, or the squares of
+# the tree show_view last put in the pool. the GPU's own steps are recorded by
+# record, on the thread that owns the world
+# ---
+# s:    simulation, whose step may be running on another thread
+# look: the camera and colours for the draw, in cells
+# ret:  ok, or why the frame could not be recorded
+pub fun show(s: *Sim, look: *gpu.Look) err[gfx.Error] {
+    if (on_tree(s)) {
+        tree_look(look, s.seen.shift);
+        ret gpu.show(s.gpu, ?s.space, ?s.rule, s.generation, look);
+    }
+    if (on_gpu(s)) { ret gpu.aim(s.gpu, look); }
+    val done: res[usize, gfx.Error] = gpu.frame(s.gpu, ?s.space, ?s.rule, s.generation, 0, look);
+    if (sel done.err) { ret err[gfx.Error].err{done.err}; }
+    ret err[gfx.Error].ok{};
 }
 
 # record the frame's generations on the GPU, or on the tree draw it
@@ -904,8 +1000,8 @@ pub fun fill_cell(s: *Sim, x: i64, y: i64, state: u32) bool {
     val sl: u32 = space.alloc(?s.space, space.chunk_of(x), space.chunk_of(y));
     if (sl == space.NONE) { ret false; }
     val i: usize = sl::usize * space.CELLS + space.local_of(y) * 64 + space.local_of(x);
-    s.space.cells[i]         = rule.word(?s.rule, state);
-    s.space.dirty[sl::usize] = s.space.dirty[sl::usize] | space.DIRTY_CELLS;
+    s.space.cells[i] = rule.word(?s.rule, state);
+    space.touch(?s.space, sl::usize);
     ret true;
 }
 
@@ -932,7 +1028,7 @@ pub fun fill_chunk(s: *Sim, cx: i64, cy: i64, cells: *u32) bool {
     val sl: u32 = space.alloc(?s.space, cx, cy);
     if (sl == space.NONE) { ret false; }
     mem.copy[u32](?s.space.cells[sl::usize * space.CELLS], cells, space.CELLS);
-    s.space.dirty[sl::usize] = s.space.dirty[sl::usize] | space.DIRTY_CELLS;
+    space.touch(?s.space, sl::usize);
     space.mask(?s.space, sl::usize);
     ret true;
 }
@@ -1178,8 +1274,8 @@ fun stage(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64, pull: bool, mark: bool) b
         if (mark && on_gpu(s)) { gpu.forget_writes(s.gpu, sl, run); }
         var k: usize = 0;
         for (mark && k < run) {
-            sp.dirty[sl + k] = sp.dirty[sl + k] | space.DIRTY_CELLS;
-            k                = k + 1;
+            space.touch(sp, sl + k);
+            k = k + 1;
         }
         sl = sl + run;
     }
@@ -1367,7 +1463,7 @@ fun put_sparse(s: *Sim, x: i64, y: i64, v: u8) bool {
     # the GPU's copy takes the cell alone while it steps, and the chunk whole
     # while it only draws
     if (on_gpu(s)) { gpu.note_write(s.gpu, sp, slot, i); }
-    or             { sp.dirty[slot] = sp.dirty[slot] | space.DIRTY_CELLS; }
+    or             { space.touch(sp, slot); }
     ret true;
 }
 
@@ -1426,7 +1522,7 @@ pub fun edit_run(s: *Sim, x: i64, y: i64, n: usize, w: u8) bool {
                 if (sl != space.NONE) {
                     val i: usize = sl::usize * space.CELLS + space.local_of(y) * 64 + space.local_of(a);
                     mem.fill[u32](?s.space.cells[i], cell_of(s, v), (b - a)::usize);
-                    s.space.dirty[sl::usize] = s.space.dirty[sl::usize] | space.DIRTY_CELLS;
+                    space.touch(?s.space, sl::usize);
                 }
                 or (v != 0) { ok = false; }
             }
@@ -1481,7 +1577,7 @@ pub fun edit_chunk(s: *Sim, cx: i64, cy: i64, cells: *u32) bool {
     val to: *u32 = ?sp.cells[sl::usize * space.CELLS];
     if (cells == nil) { mem.zero[u32](to, space.CELLS); }
     or                { mem.copy[u32](to, cells, space.CELLS); }
-    sp.dirty[sl::usize] = sp.dirty[sl::usize] | space.DIRTY_CELLS;
+    space.touch(sp, sl::usize);
     ret true;
 }
 
@@ -2979,7 +3075,7 @@ pub fun same_snapshot(a: *snapshot.Snapshot, b: *snapshot.Snapshot) bool {
 # advance a world n generations, and on the GPU until they are recorded and
 # the device is idle
 #[testing]
-fun advance(r: *gfx.Renderer, s: *Sim, n: u64) bool {
+fun advance_frames(r: *gfx.Renderer, s: *Sim, n: u64) bool {
     var i: u64 = 0;
     for (i < n) {
         step(s);
@@ -3001,21 +3097,21 @@ fun run_reset_run(r: *gfx.Renderer, s: *Sim, a: *allo.Allocator, runs: *snapshot
     seed_world(s);
     # on the GPU the device runs on past the host's staging cells before the
     # start is taken, so taking it must pull
-    if (!advance(r, s, 5)) { ret 1; }
+    if (!advance_frames(r, s, 5)) { ret 1; }
     var start: snapshot.Snapshot;
     snapshot.init(?start, a);
     if (!take(s, ?start)) { ret 2; }
     var pass: usize = 0;
     for (pass < 2) {
-        if (!advance(r, s, 40))    { ret 3; }
-        if (!take(s, ?runs[pass])) { ret 4; }
+        if (!advance_frames(r, s, 40)) { ret 3; }
+        if (!take(s, ?runs[pass]))     { ret 4; }
         if (pass == 0) {
             # the weighted family's radius-2 sample
             set_rule(s, sample_rule(0, 1));
             if (!restore(s, ?start) || s.generation != 5 || s.running != 0) { ret 5; }
             var life: rule.Rule = rule.preset_rule(0);
             if (!rule.same(?s.rule, ?life)) { ret 6; }
-            if (!advance(r, s, 0))          { ret 7; }
+            if (!advance_frames(r, s, 0))   { ret 7; }
             var back: snapshot.Snapshot;
             snapshot.init(?back, a);
             if (!take(s, ?back) || !same_snapshot(?back, ?start)) { ret 8; }
