@@ -54,6 +54,8 @@ use std.types.size.usize;
 pub val SIDE: i64 = layout.SIDE::i64;
 # cells in a chunk
 pub val CELLS: usize = layout.CELLS::usize;
+# texels of a chunk's coverage pyramid
+pub val MIP: usize = layout.MIP::usize;
 # page-table words per slot
 pub val ENTRY: usize = layout.ENTRY::usize;
 # census words per slot: live count, warm, incarnation, halo mask, extent
@@ -136,6 +138,8 @@ pub val DIRTY_ENTRY: u8 = 1;
 pub val DIRTY_CELLS: u8 = 2;
 # a slot was allocated empty, which a mirror clears on its side
 pub val DIRTY_ZERO: u8 = 4;
+# a slot's coverage pyramid in mips was built from its cells as they stand
+pub val DIRTY_MIP: u8 = 8;
 
 # a copy of the pool kept elsewhere, a device's, which must make room before
 # the pool grows
@@ -159,9 +163,13 @@ pub rec Mirror {
 # table:     the page table, cap * ENTRY words
 # cells:     the front cells, cap * CELLS
 # back:      the back cells, cap * CELLS, or nil when the GPU steps
+# mips:      each slot's coverage pyramid (layout.MIP texels), cap * MIP, for a
+#            draw of the cells the CPU steps, or nil
+# mips_back: the pyramids of the back cells, which a step builds as it goes
 # census:    per slot live count, warm, incarnation, mask and extent, from the
 #            last step
-# dirty:     per slot DIRTY_ENTRY and DIRTY_CELLS, for a mirror to upload
+# dirty:     per slot DIRTY_ENTRY, DIRTY_CELLS, DIRTY_ZERO and DIRTY_MIP, for
+#            a mirror to upload
 # asked:     per slot whether a live chunk's mask asked for it, while settling
 # frees:     free slots below hi
 # nfree:     how many frees holds
@@ -186,6 +194,8 @@ pub rec Space {
     table:     *u32;
     cells:     *u32;
     back:      *u32;
+    mips:      *u32;
+    mips_back: *u32;
     census:    *u32;
     before:    *u32;
     dirty:     *u8;
@@ -428,6 +438,13 @@ fun alloc_arrays(sp: *Space, cap: usize) err[allo.Error] {
     val cells: *u32            = zwords(a, cap * CELLS);
     var back:  *u32            = nil;
     if (sp.stepped) { back = zwords(a, cap * CELLS); }
+    val pyr:   bool = sp.mips != nil;
+    var mips:  *u32 = nil;
+    var mback: *u32 = nil;
+    if (pyr) {
+        mips  = zwords(a, cap * MIP);
+        mback = zwords(a, cap * MIP);
+    }
     val census: *u32                 = zwords(a, cap * CENSUS);
     val before: *u32                 = zwords(a, cap * CENSUS);
     val frees:  *u32                 = zwords(a, cap);
@@ -440,10 +457,13 @@ fun alloc_arrays(sp: *Space, cap: usize) err[allo.Error] {
     val ra:    res[*u8, allo.Error] = allo.zallocate[u8](a, cap);
     if (sel ra.ok) { asked = ra.ok; }
     if (table == nil || cells == nil || (sp.stepped && back == nil) || census == nil
-        || before == nil || frees == nil || hash == nil || dirty == nil || asked == nil) {
+        || before == nil || frees == nil || hash == nil || dirty == nil || asked == nil
+        || (pyr && (mips == nil || mback == nil))) {
         if (table != nil)  { allo.deallocate[u32](a, table, cap * ENTRY); }
         if (cells != nil)  { allo.deallocate[u32](a, cells, cap * CELLS); }
         if (back != nil)   { allo.deallocate[u32](a, back, cap * CELLS); }
+        if (mips != nil)   { allo.deallocate[u32](a, mips, cap * MIP); }
+        if (mback != nil)  { allo.deallocate[u32](a, mback, cap * MIP); }
         if (census != nil) { allo.deallocate[u32](a, census, cap * CENSUS); }
         if (before != nil) { allo.deallocate[u32](a, before, cap * CENSUS); }
         if (frees != nil)  { allo.deallocate[u32](a, frees, cap); }
@@ -457,23 +477,26 @@ fun alloc_arrays(sp: *Space, cap: usize) err[allo.Error] {
         mem.copy[u32](table, sp.table, sp.hi * ENTRY);
         mem.copy[u32](cells, sp.cells, sp.hi * CELLS);
         if (back != nil) { mem.copy[u32](back, sp.back, sp.hi * CELLS); }
+        if (pyr)         { mem.copy[u32](mips, sp.mips, sp.hi * MIP); }
         mem.copy[u32](census, sp.census, sp.hi * CENSUS);
         mem.copy[u8](dirty, sp.dirty, sp.hi);
         mem.copy[u8](asked, sp.asked, sp.hi);
         mem.copy[u32](frees, sp.frees, sp.nfree);
         free_arrays(sp);
     }
-    sp.table  = table;
-    sp.cells  = cells;
-    sp.back   = back;
-    sp.census = census;
-    sp.before = before;
-    sp.dirty  = dirty;
-    sp.asked  = asked;
-    sp.frees  = frees;
-    sp.hash   = hash;
-    sp.cap    = cap;
-    sp.hcap   = hcap;
+    sp.table     = table;
+    sp.cells     = cells;
+    sp.back      = back;
+    sp.mips      = mips;
+    sp.mips_back = mback;
+    sp.census    = census;
+    sp.before    = before;
+    sp.dirty     = dirty;
+    sp.asked     = asked;
+    sp.frees     = frees;
+    sp.hash      = hash;
+    sp.cap       = cap;
+    sp.hcap      = hcap;
     mem.fill[u32](sp.hash, NONE, sp.hcap);
     var s: usize = 0;
     for (s < sp.hi) {
@@ -488,6 +511,10 @@ fun free_arrays(sp: *Space) {
     allo.deallocate[u32](a, sp.table, sp.cap * ENTRY);
     allo.deallocate[u32](a, sp.cells, sp.cap * CELLS);
     if (sp.back != nil) { allo.deallocate[u32](a, sp.back, sp.cap * CELLS); }
+    if (sp.mips != nil) {
+        allo.deallocate[u32](a, sp.mips, sp.cap * MIP);
+        allo.deallocate[u32](a, sp.mips_back, sp.cap * MIP);
+    }
     allo.deallocate[u32](a, sp.census, sp.cap * CENSUS);
     allo.deallocate[u32](a, sp.before, sp.cap * CENSUS);
     allo.deallocate[u8](a, sp.dirty, sp.cap);
@@ -512,6 +539,8 @@ pub fun init(sp: *Space, a: *allo.Allocator, stepped: bool) err[allo.Error] {
     sp.nfree     = 0;
     sp.serial    = 0;
     sp.stepped   = stepped;
+    sp.mips      = nil;
+    sp.mips_back = nil;
     mem.zero[u8]((?sp.sense)::*u8, $size_of(layout.Sense));
     sp.wide = false;
     sp.grid = topology.open();
@@ -558,6 +587,116 @@ pub fun set_stepped(sp: *Space, stepped: bool) err[allo.Error] {
     sp.back    = rb.ok;
     sp.stepped = true;
     ret err[allo.Error].ok{};
+}
+
+# keep each slot's coverage pyramid, built as the CPU steps, for a draw of the
+# pool that reads it, or stop keeping them
+# ---
+# sp:  the pool
+# on:  keep them
+# ret: ok, or the allocator's refusal, which leaves the pool as it was
+pub fun set_pyramids(sp: *Space, on: bool) err[allo.Error] {
+    if (on == (sp.mips != nil)) { ret err[allo.Error].ok{}; }
+    if (!on) {
+        allo.deallocate[u32](sp.a, sp.mips, sp.cap * MIP);
+        allo.deallocate[u32](sp.a, sp.mips_back, sp.cap * MIP);
+        sp.mips      = nil;
+        sp.mips_back = nil;
+        ret err[allo.Error].ok{};
+    }
+    val rf: res[*u32, allo.Error] = allo.zallocate[u32](sp.a, sp.cap * MIP);
+    if (sel rf.err) { ret err[allo.Error].err{rf.err}; }
+    val rb: res[*u32, allo.Error] = allo.zallocate[u32](sp.a, sp.cap * MIP);
+    if (sel rb.err) {
+        allo.deallocate[u32](sp.a, rf.ok, sp.cap * MIP);
+        ret err[allo.Error].err{rb.err};
+    }
+    sp.mips      = rf.ok;
+    sp.mips_back = rb.ok;
+    # none of them is built yet
+    var s: usize = 0;
+    for (s < sp.hi) {
+        sp.dirty[s] = (sp.dirty[s] | DIRTY_CELLS) & ~DIRTY_MIP;
+        s           = s + 1;
+    }
+    ret err[allo.Error].ok{};
+}
+
+# a chunk's coverage pyramid built from its cells, as the GPU's reduce stage
+# builds it: each level's texel holds the live count, the greatest heat and
+# the mean age of the live cells of its square, the counts and the sum of the
+# ages carried up from the level below, so every level is exactly what its
+# cells give
+# ---
+# cells: the chunk's CELLS cells
+# sn:    how a cell is read, the rule's sense
+# out:   receives MIP texels
+pub fun pyramid(cells: *u32, sn: layout.Sense, out: *u32) {
+    var live: [1024]u32;
+    var heat: [1024]u32;
+    var ages: [1024]u32;
+    val side: u32 = layout.SIDE;
+    var t:    u32 = 0;
+    # level 1 from the cells, two by two
+    val s1: u32 = layout.mip_side(1);
+    for (t < s1 * s1) {
+        val ox: u32 = (t % s1) * 2;
+        val oy: u32 = (t / s1) * 2;
+        var l:  u32 = 0;
+        var h:  u32 = 0;
+        var g:  u32 = 0;
+        var i:  u32 = 0;
+        for (i < 4) {
+            val c: u32 = cells[((oy + i / 2) * side + ox + i % 2)::usize];
+            if (layout.live(c, sn.live_mask, sn.live_lo, sn.live_hi) != 0) {
+                l = l + 1;
+                g = g + layout.texel_age(c, sn.age_shift, sn.age_mask);
+            }
+            val ch: u32 = layout.texel_heat(c, sn.heat_shift, sn.heat_mask);
+            if (ch > h) { h = ch; }
+            i = i + 1;
+        }
+        live[t::usize] = l;
+        heat[t::usize] = h;
+        ages[t::usize] = g;
+        out[t::usize]  = layout.texel(l, h, g);
+        t              = t + 1;
+    }
+    # each further level from the one below, in place
+    var lv: u32 = 2;
+    for (lv <= layout.LEVELS) {
+        val n:  u32 = layout.mip_side(lv);
+        val m:  u32 = n * 2;
+        val at: u32 = layout.mip_at(lv);
+        t = 0;
+        for (t < n * n) {
+            val x: u32 = (t % n) * 2;
+            val y: u32 = (t / n) * 2;
+            var l: u32 = 0;
+            var h: u32 = 0;
+            var g: u32 = 0;
+            var i: u32 = 0;
+            for (i < 4) {
+                val k: usize = ((y + i / 2) * m + x + i % 2)::usize;
+                l = l + live[k];
+                g = g + ages[k];
+                if (heat[k] > h) { h = heat[k]; }
+                i = i + 1;
+            }
+            out[(at + t)::usize] = layout.texel(l, h, g);
+            live[t::usize]       = l;
+            heat[t::usize]       = h;
+            ages[t::usize]       = g;
+            t                    = t + 1;
+        }
+        lv = lv + 1;
+    }
+}
+
+# mark a slot's cells changed outside a step, so a mirror sends them again and
+# its pyramid is no longer the one they give
+pub fun touch(sp: *Space, s: usize) {
+    sp.dirty[s] = (sp.dirty[s] | DIRTY_CELLS) & ~DIRTY_MIP;
 }
 
 # free every slot, keeping the capacity
@@ -648,8 +787,8 @@ pub fun mask(sp: *Space, s: usize) {
     var i: usize = 0;
     for (i < CELLS) {
         if (c[i] != 0 && layout.edge_side(e, (i & 63)::i32, (i >> 6)::i32) != 4) {
-            c[i]        = 0;
-            sp.dirty[s] = sp.dirty[s] | DIRTY_CELLS;
+            c[i] = 0;
+            touch(sp, s);
         }
         i = i + 1;
     }
@@ -747,6 +886,10 @@ pub fun alloc(sp: *Space, cx: i64, cy: i64) u32 {
     hash_put(sp, s);
     sp.live     = sp.live + 1;
     sp.dirty[s] = DIRTY_ENTRY | DIRTY_ZERO;
+    if (sp.mips != nil) {
+        mem.zero[u32](?sp.mips[s * MIP], MIP);
+        sp.dirty[s] = sp.dirty[s] | DIRTY_MIP;
+    }
 
     if (bounded) {
         link(sp, s);
