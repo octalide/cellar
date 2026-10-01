@@ -1,8 +1,8 @@
 # the world view: a camera over the unbounded plane, and the colours cells
 # are drawn in
 #
-# the camera is a world point at the centre of the window and a zoom in pixels
-# per cell, so panning and zooming never meet an edge, and it answers the
+# the camera is a world point at the centre of the port, the part of the window
+# the world shows through, and a zoom in pixels per cell, so panning and zooming never meet an edge, and it answers the
 # inverse, the cell under a cursor, for the editor. cells are drawn by the GPU
 # straight from the pool (cellar.gpu); this builds what that draw reads: the
 # camera as the chunk the centre lies in plus an offset, so it stays exact far
@@ -26,17 +26,34 @@ pub val MODE_HEAT: u8 = 1;
 # live cells coloured by the age palette
 pub val MODE_AGE: u8 = 2;
 
+# the part of the window the world shows through, in whole window pixels
+# ---
+# x0: left
+# y0: top
+# w:  width
+# h:  height
+pub rec Port {
+    x0: f32;
+    y0: f32;
+    w:  f32;
+    h:  f32;
+}
+
 # the view for one frame
 # ---
-# x:   world column at the window's centre, in cells
-# y:   world row at the window's centre, in cells
+# x:   world column at the port's centre, in cells
+# y:   world row at the port's centre, in cells
 # ppc: pixels per cell
-# sw:  window width in pixels
-# sh:  window height in pixels
+# x0:  the port's left in window pixels
+# y0:  the port's top in window pixels
+# sw:  port width in pixels
+# sh:  port height in pixels
 pub rec Camera {
     x:   f64;
     y:   f64;
     ppc: f32;
+    x0:  f32;
+    y0:  f32;
     sw:  f32;
     sh:  f32;
 }
@@ -44,28 +61,20 @@ pub rec Camera {
 # the camera the user's zoom and pan give
 # ---
 # zoom:  zoom multiplier, BASE_PPC pixels per cell at 1
-# pan_x: world column at the window's centre
-# pan_y: world row at the window's centre
-# sw:    window width in pixels
-# sh:    window height in pixels
+# pan_x: world column at the port's centre
+# pan_y: world row at the port's centre
+# pt:    the port
 # ret:   the camera for this frame
-pub fun camera(zoom: f32, pan_x: f64, pan_y: f64, sw: f32, sh: f32) Camera {
+pub fun camera(zoom: f32, pan_x: f64, pan_y: f64, pt: Port) Camera {
     var cam: Camera;
     cam.x   = pan_x;
     cam.y   = pan_y;
     cam.ppc = BASE_PPC * zoom;
-    cam.sw  = sw;
-    cam.sh  = sh;
+    cam.x0  = pt.x0;
+    cam.y0  = pt.y0;
+    cam.sw  = pt.w;
+    cam.sh  = pt.h;
     ret cam;
-}
-
-# the part of the window the world shows through, in pixels, from the top-left
-# ---
-# w: width
-# h: height
-pub rec Port {
-    w: f32;
-    h: f32;
 }
 
 # the world point under screen pixel (px, py), unrounded
@@ -76,18 +85,18 @@ pub rec Port {
 # wx:  receives the column
 # wy:  receives the row
 pub fun world_at(cam: Camera, px: f32, py: f32, wx: *f64, wy: *f64) {
-    @wx = cam.x + ((px - cam.sw / 2.0) / cam.ppc)::f64;
-    @wy = cam.y + ((py - cam.sh / 2.0) / cam.ppc)::f64;
+    @wx = cam.x + ((px - cam.x0 - cam.sw / 2.0) / cam.ppc)::f64;
+    @wy = cam.y + ((py - cam.y0 - cam.sh / 2.0) / cam.ppc)::f64;
 }
 
 # screen x of world column x
 pub fun screen_x(cam: Camera, x: f64) f32 {
-    ret cam.sw / 2.0 + ((x - cam.x) * cam.ppc::f64)::f32;
+    ret cam.x0 + cam.sw / 2.0 + ((x - cam.x) * cam.ppc::f64)::f32;
 }
 
 # screen y of world row y
 pub fun screen_y(cam: Camera, y: f64) f32 {
-    ret cam.sh / 2.0 + ((y - cam.y) * cam.ppc::f64)::f32;
+    ret cam.y0 + cam.sh / 2.0 + ((y - cam.y) * cam.ppc::f64)::f32;
 }
 
 # a rectangle on the screen, in pixels, from (x0, y0) to (x1, y1)
@@ -117,8 +126,8 @@ fun floor64(v: f64) i64 {
 # cx:  receives the column
 # cy:  receives the row
 pub fun cell_at(cam: Camera, px: f32, py: f32, cx: *i64, cy: *i64) {
-    @cx = floor64(cam.x + ((px - cam.sw / 2.0) / cam.ppc)::f64);
-    @cy = floor64(cam.y + ((py - cam.sh / 2.0) / cam.ppc)::f64);
+    @cx = floor64(cam.x + ((px - cam.x0 - cam.sw / 2.0) / cam.ppc)::f64);
+    @cy = floor64(cam.y + ((py - cam.y0 - cam.sh / 2.0) / cam.ppc)::f64);
 }
 
 fun put(out: *f32, r: f32, g: f32, b: f32, srgb: bool) {
@@ -169,13 +178,14 @@ pub fun palettes(heat: *f32, age: *f32, srgb: bool) {
 # what the draw reads this frame
 # ---
 # cam:    the camera
-# win_w:  the window width in pixels, of which the camera sees the left cam.sw
+# win_w:  the window width in pixels, which holds the camera's port
+# win_h:  the window height in pixels
 # mode:   colour mode, a MODE_*
 # gutter: 1 to show grid lines
 # solid:  solid-mode live-cell colour, sRGB hex
 # srgb:   whether the window encodes sRGB
 # ret:    the look
-pub fun look(cam: Camera, win_w: f32, mode: u8, gutter: u8, solid: u32, srgb: bool) gpu.Look {
+pub fun look(cam: Camera, win_w: f32, win_h: f32, mode: u8, gutter: u8, solid: u32, srgb: bool) gpu.Look {
     var l:  gpu.Look;
     val bx: i64 = floor64(cam.x / 64.0);
     val by: i64 = floor64(cam.y / 64.0);
@@ -188,7 +198,11 @@ pub fun look(cam: Camera, win_w: f32, mode: u8, gutter: u8, solid: u32, srgb: bo
     l.ppc     = cam.ppc;
     l.half_w  = cam.sw / 2.0;
     l.half_h  = cam.sh / 2.0;
+    l.org_x   = cam.x0;
+    l.org_y   = cam.y0;
     l.win_w   = win_w;
+    l.win_h   = win_h;
+    l.pad     = 0;
     l.shift   = 0;
     l.ink     = 0;
     put(?l.solid[0], unit(theme.red(solid)), unit(theme.green(solid)), unit(theme.blue(solid)), srgb);
@@ -197,18 +211,18 @@ pub fun look(cam: Camera, win_w: f32, mode: u8, gutter: u8, solid: u32, srgb: bo
 }
 
 test cell_at__maps_pixels_to_signed_cells_either_side_of_the_origin {
-    var cam: Camera;
-    cam.x   = 0.0;
-    cam.y   = 0.0;
-    cam.ppc = 10.0;
-    cam.sw  = 100.0;
-    cam.sh  = 100.0;
-    var cx: i64 = 0;
-    var cy: i64 = 0;
+    var cam: Camera = camera(10.0 / BASE_PPC, 0.0, 0.0, Port{x0: 0.0, y0: 0.0, w: 100.0, h: 100.0});
+    var cx:  i64    = 0;
+    var cy:  i64    = 0;
     cell_at(cam, 51.0, 49.0, ?cx, ?cy);
     if (cx != 0 || cy != -1) { ret 1; }
     cell_at(cam, 5.0, 95.0, ?cx, ?cy);
     if (cx != -5 || cy != 4) { ret 2; }
+    # a port away from the window's corner centres the camera in it
+    cam = camera(10.0 / BASE_PPC, 0.0, 0.0, Port{x0: 300.0, y0: 40.0, w: 100.0, h: 100.0});
+    cell_at(cam, 351.0, 89.0, ?cx, ?cy);
+    if (cx != 0 || cy != -1)                                       { ret 3; }
+    if (screen_x(cam, 0.0) != 350.0 || screen_y(cam, 0.0) != 90.0) { ret 4; }
     ret 0;
 }
 
@@ -217,6 +231,8 @@ test cell_at__is_exact_at_two_to_the_thirty_second {
     cam.x   = 4294967296.0;
     cam.y   = 4294967296.0;
     cam.ppc = 10.0;
+    cam.x0  = 0.0;
+    cam.y0  = 0.0;
     cam.sw  = 100.0;
     cam.sh  = 100.0;
     var cx: i64 = 0;

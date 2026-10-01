@@ -1,7 +1,7 @@
 # everything about how the user is viewing and editing the world
 #
 # the simulation owns the cells and the rule. this owns the camera, the tool,
-# the colours, the panel and what it shows, and the messages it flashes.
+# the colours, the panels and what they show, and the messages it flashes.
 
 use blit;
 use cellar.brush;
@@ -69,6 +69,15 @@ pub val TOOL_COUNT: usize = 5;
 # the most digits a bound's size has
 pub val SIZE_DIGITS: usize = 10;
 
+# a tool's name, as the toolbar labels it
+pub fun tool_name(t: usize) str {
+    if (t == TOOL_ERASE)  { ret "Erase"; }
+    if (t == TOOL_STAMP)  { ret "Stamp"; }
+    if (t == TOOL_SELECT) { ret "Select"; }
+    if (t == TOOL_BOUNDS) { ret "Bounds"; }
+    ret "Draw";
+}
+
 # number of interface scales offered
 pub val SCALE_COUNT: usize = 4;
 
@@ -110,20 +119,18 @@ pub val ZOOM_TREE_MIN: f32 = 0.000000000001;
 # pan_y:        world row at the view's centre
 # refit:        frame fit, or the randomize area, on the next frame
 # fit:          the cells to frame, none for the randomize area
-# panel:        1 while the side panel is shown
-# open_run:     the run section is expanded
-# open_draw:    the draw section is expanded
-# open_rule:    the rule section is expanded
+# panel:        1 while the panels are shown
 # rule_text:    the rule section's rule string field
 # birth_list:   the wide kernel editor's birth sums
 # survive_list: the wide kernel editor's survive sums
 # brush:        the wide kernel editor's brush and view
-# open_view:    the view section is expanded
-# open_files:   the files section is expanded
 # scale_idx:    index into the interface scales
 # engine_tree:  the chosen engine is HashLife, which the settings keep
 # engine_cpu:   the chosen pool engine is the CPU rather than the GPU
-# side:         the side panel docked to the window's right edge, and its scroll
+# layout:       the panels' layout as the settings keep it, blit's store
+#               document NUL-terminated, empty for none; once attach has run
+# relayout:     the panels are to return to the default layout on the next frame
+# files_seen:   the files panel was drawn last frame
 # help:         1 while the key reference is shown
 # full_said:    the full pool was reported, until the world is cleared
 # ceil_said:    the ceiling the run paused at was reported, until it resumes
@@ -144,7 +151,6 @@ pub val ZOOM_TREE_MIN: f32 = 0.000000000001;
 # dragging:     the selection is being dragged out
 # anchor_x:     the cell the drag started on
 # anchor_y:     the cell the drag started on
-# open_bounds:  the bounds section is expanded
 # sizing:       the bounds are being dragged
 # edges:        the grid's edges the drag moves (cellar.bounds), 0 for a new box
 # sized:        the bounds as dragged so far, half-open
@@ -163,6 +169,7 @@ pub val ZOOM_TREE_MIN: f32 = 0.000000000001;
 # clip_ready:   clip holds text not yet put on the clipboard
 # identifier:   classifies a selection off the frame
 # id_limits:    the limits a selection is classified under
+# identified:   the last classification of a selection, empty for none
 pub rec App {
     speed:        f32;
     mode:         usize;
@@ -189,19 +196,16 @@ pub rec App {
     refit:        bool;
     fit:          opt[space.Box];
     panel:        u8;
-    open_run:     u8;
-    open_draw:    u8;
-    open_rule:    u8;
     rule_text:    ruletext.RuleText;
     birth_list:   sumlist.SumList;
     survive_list: sumlist.SumList;
     brush:        brush.Brush;
-    open_view:    u8;
-    open_files:   u8;
     scale_idx:    usize;
     engine_tree:  bool;
     engine_cpu:   bool;
-    side:         blit.dock.Dock;
+    layout:       Vector[u8];
+    relayout:     bool;
+    files_seen:   bool;
     help:         u8;
     full_said:    bool;
     ceil_said:    bool;
@@ -222,7 +226,6 @@ pub rec App {
     dragging:     bool;
     anchor_x:     i64;
     anchor_y:     i64;
-    open_bounds:  u8;
     sizing:       bool;
     edges:        u8;
     sized:        space.Box;
@@ -240,6 +243,7 @@ pub rec App {
     clip_ready:   bool;
     identifier:   worker.Worker;
     id_limits:    identify.Limits;
+    identified:   [641]u8;
 }
 
 # the message shown while a selection is being identified
@@ -406,6 +410,7 @@ pub fun attach(a: *App, alloc: *allo.Allocator) err[format.Error] {
     journal.init(?a.log, alloc);
     a.clip       = vector.init[u8](alloc);
     a.clip_ready = false;
+    a.layout     = vector.init[u8](alloc);
     val l: err[format.Error] = library.init(?a.library, alloc);
     if (sel l.err) { ret l; }
     val p: err[allo.Error] = pattern.init(?a.picked, alloc, 0, 0, "");
@@ -426,7 +431,30 @@ pub fun dnit(a: *App) {
     snapshot.dnit(?a.start);
     journal.dnit(?a.log);
     vector.dnit[u8](?a.clip);
+    vector.dnit[u8](?a.layout);
     worker.cancel(?a.identifier);
+}
+
+# keep a layout for the settings, n bytes of blit's store document, or none
+# when n is 0
+# ---
+# a:   application state, attached
+# s:   the document
+# n:   its length, less any NUL
+# ret: false when there was no room, leaving no layout
+pub fun keep_layout(a: *App, s: *u8, n: usize) bool {
+    vector.clear[u8](?a.layout);
+    if (n == 0) { ret true; }
+    val room: res[usize, allo.Error] = vector.reserve[u8](?a.layout, n + 1);
+    if (sel room.err) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        a.layout.data[i] = s[i];
+        i                = i + 1;
+    }
+    a.layout.data[n] = 0;
+    a.layout.len     = n + 1;
+    ret true;
 }
 
 # choose a library pattern to stamp and browse its category, or the custom pattern
@@ -616,22 +644,17 @@ pub fun init(a: *App) {
     a.pan_x    = 0.0;
     a.pan_y    = 0.0;
     frame_area(a);
-    a.panel     = 1;
-    a.open_run  = 1;
-    a.open_draw = 1;
-    a.open_rule = 0;
+    a.panel = 1;
     ruletext.init(?a.rule_text);
     sumlist.init(?a.birth_list);
     sumlist.init(?a.survive_list);
     brush.init(?a.brush);
-    a.open_view   = 1;
-    a.open_files  = 0;
     a.scale_idx   = 0;
     a.engine_tree = false;
     a.engine_cpu  = false;
-    a.side.side   = blit.context.Side.right{};
-    a.side.size   = 0.0;
-    a.side.scroll = blit.widget.Scroll{offset: 0.0, content: 0.0};
+    a.layout      = vector.init[u8](nil);
+    a.relayout    = true;
+    a.files_seen  = false;
     a.help        = 0;
     a.full_said   = false;
     a.ceil_said   = false;
@@ -640,22 +663,22 @@ pub fun init(a: *App) {
     a.said[0]     = 0;
     blit.field.init(?a.name, ?a.name_buf[0], saves.NAME_MAX + 1, 0, saves.name_char);
     blit.field.init(?a.go_to, ?a.go_to_buf[0], GO_TO_MAX + 1, 0, digit);
-    a.stroke      = false;
-    a.last_x      = 0;
-    a.last_y      = 0;
-    a.shot        = false;
-    a.selected    = false;
-    a.dragging    = false;
-    a.open_bounds = 0;
-    a.sizing      = false;
-    a.edges       = 0;
-    a.grid_shape  = 0;
+    a.stroke     = false;
+    a.last_x     = 0;
+    a.last_y     = 0;
+    a.shot       = false;
+    a.selected   = false;
+    a.dragging   = false;
+    a.sizing     = false;
+    a.edges      = 0;
+    a.grid_shape = 0;
     blit.field.init(?a.size_w, ?a.size_w_buf[0], SIZE_DIGITS + 1, 0, digit);
     blit.field.init(?a.size_h, ?a.size_h_buf[0], SIZE_DIGITS + 1, 0, digit);
     a.sized_grid = topology.open();
     a.alloc      = nil;
     worker.init(?a.identifier);
-    a.id_limits = identify.limits();
+    a.id_limits     = identify.limits();
+    a.identified[0] = 0;
 }
 
 # classify a pattern off the frame under a rule, replacing a classification
@@ -685,9 +708,8 @@ pub fun identify_poll(a: *App) {
         ret;
     }
     if (sel c.ready) {
-        var r:    identify.Result = c.ready;
-        var line: [641]u8;
-        say_why(a, "selection", identify.describe(?r, ?line[0]));
+        var r: identify.Result = c.ready;
+        say_why(a, "selection", identify.describe(?r, ?a.identified[0]));
     }
 }
 

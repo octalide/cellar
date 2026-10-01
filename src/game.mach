@@ -47,6 +47,7 @@ use cellar.arrange;
 use cellar.bounds;
 use cellar.command;
 use cellar.config;
+use cellar.desk;
 use cellar.exec;
 use cellar.format;
 use cellar.gpu;
@@ -247,11 +248,16 @@ pub fun on_init(ctx: *Context) {
     g.srgb        = gfx.renderer_is_srgb(?g.renderer);
     sketch.init(?g.sketches, ?g.a, gfx.renderer_device(?g.renderer));
     g.gui_ok = gui.init(?g.gui, ?g.a, gfx.renderer_device(?g.renderer), ctx);
+    if (g.gui_ok) {
+        val pe: err[blit.state.Error] = panel.persist(?g.gui.ui);
+        g.gui_ok = !(sel pe.err);
+    }
     if (!g.gui_ok) {
         gui.dnit(?g.gui);
         give_up(ctx, "could not set up the interface");
         ret;
     }
+    panel.restore(?g.gui.ui, ?g.app);
 
     # the palettes are converted once, into the space the window stores
     var heat: [1024]f32;
@@ -391,7 +397,7 @@ fun keys(ctx: *Context, g: *Game) {
     if (inp.key_pressed(in, inp.KEY_T))                                    { a.tool = app.TOOL_STAMP; }
     if (inp.key_pressed(in, inp.KEY_Q))                                    { app.step_ink(a, rule.states(?g.shown.rule), shift); }
     if (inp.key_pressed(in, inp.KEY_V) && !ctrl)                           { a.tool = app.TOOL_SELECT; }
-    if (inp.key_pressed(in, inp.KEY_W))                                    { bounds.arm(a); }
+    if (inp.key_pressed(in, inp.KEY_W))                                    { a.tool = app.TOOL_BOUNDS; }
     if (inp.key_pressed(in, inp.KEY_V) && ctrl)                            { paste(ctx, a, shift); }
     if (z && !ctrl)                                                        { a.orient = pattern.orient_turn(a.orient); }
     if (z && ctrl && !shift)                                               { app.submit(a, command.Command.undo{}); }
@@ -464,7 +470,7 @@ fun tick(ctx: *Context) {
 
 # the camera the view is drawn and edited through
 fun camera(a: *app.App, pt: render.Port) render.Camera {
-    ret render.camera(a.zoom, a.pan_x, a.pan_y, pt.w, pt.h);
+    ret render.camera(a.zoom, a.pan_x, a.pan_y, pt);
 }
 
 # zoom by scroll notches, keeping the world point under (mx, my) where it is
@@ -565,11 +571,11 @@ fun edit_world(g: *Game, cam: render.Camera) {
 fun grid_edge(g: *Game, d: *paint.Paint, cam: render.Camera) {
     var gr: topology.Grid = g.shown.rule.grid;
     if (!topology.bounded(?gr)) { ret; }
-    # an unbounded axis runs past the screen
-    var x0: f32 = -2.0;
-    var x1: f32 = cam.sw + 2.0;
-    var y0: f32 = -2.0;
-    var y1: f32 = cam.sh + 2.0;
+    # an unbounded axis runs past the port
+    var x0: f32 = cam.x0 - 2.0;
+    var x1: f32 = cam.x0 + cam.sw + 2.0;
+    var y0: f32 = cam.y0 - 2.0;
+    var y1: f32 = cam.y0 + cam.sh + 2.0;
     if (gr.w != 0) {
         x0 = render.screen_x(cam, topology.left(?gr)::f64);
         x1 = render.screen_x(cam, (topology.left(?gr) + gr.w)::f64);
@@ -578,10 +584,14 @@ fun grid_edge(g: *Game, d: *paint.Paint, cam: render.Camera) {
         y0 = render.screen_y(cam, topology.top(?gr)::f64);
         y1 = render.screen_y(cam, (topology.top(?gr) + gr.h)::f64);
     }
-    paint.rect(d, 0.0, 0.0, cam.sw, y0, theme.BG, 1.0);
-    paint.rect(d, 0.0, y1, cam.sw, cam.sh, theme.BG, 1.0);
-    paint.rect(d, 0.0, y0, x0, y1, theme.BG, 1.0);
-    paint.rect(d, x1, y0, cam.sw, y1, theme.BG, 1.0);
+    val l: f32 = cam.x0;
+    val t: f32 = cam.y0;
+    val r: f32 = cam.x0 + cam.sw;
+    val b: f32 = cam.y0 + cam.sh;
+    paint.rect(d, l, t, r, y0, theme.BG, 1.0);
+    paint.rect(d, l, y1, r, b, theme.BG, 1.0);
+    paint.rect(d, l, y0, x0, y1, theme.BG, 1.0);
+    paint.rect(d, x1, y0, r, y1, theme.BG, 1.0);
     paint.frame(d, x0 - 1.0, y0 - 1.0, x1 + 1.0, y1 + 1.0, 1.0, theme.WORLD_EDGE, 1.0);
 }
 
@@ -626,8 +636,8 @@ fun ghost(g: *Game, d: *paint.Paint, pt: render.Port, cam: render.Camera) {
     val y0: f32 = render.screen_y(cam, oy::f64);
     val c:  f32 = cam.ppc;
     paint.frame(d, x0 - 1.0, y0 - 1.0, x0 + pw::f32 * c + 1.0, y0 + ph::f32 * c + 1.0, 1.0, theme.ACCENT, 0.5);
-    val vx: Shown = shown(x0, c, pw, pt.w);
-    val vy: Shown = shown(y0, c, ph, pt.h);
+    val vx: Shown = shown(x0 - pt.x0, c, pw, pt.w);
+    val vy: Shown = shown(y0 - pt.y0, c, ph, pt.h);
     if (vx.lo >= vx.hi || vy.lo >= vy.hi) { ret; }
     if (sketch.large(vx.hi - vx.lo, vy.hi - vy.lo)) {
         sketch.draw(d, ?g.sketches, ?g.sketches.ghost, p, o, x0, y0, c, theme.ACCENT, 0.55);
@@ -723,18 +733,42 @@ pub fun on_draw(ctx: *Context) {
     }
     app.identify_poll(a);
     app.note_full(a, world.full(?g.shown), world.full_reason(?g.shown));
-    val sc: f32         = app.scale(a.scale_idx);
-    val pt: render.Port = panel.port(a, sc, sw, sh);
+    val sc: f32 = app.scale(a.scale_idx);
+
+    # the interface's frame comes first, since its toolbar and docks say where
+    # the world shows: the world claims its port beneath everything else, so
+    # the pointer reaches it only where no control is on top. a capture has no
+    # user, so any pointer over its window is not one
+    val pointer: bool          = ctx.input.pointer_in && g.capture == nil;
+    val bu:      *bctx.Context = ?g.gui.ui;
+    gui.begin(?g.gui, sw, sh, sc, pointer);
+    var scene: panel.Scene = panel.Scene{l: g.gui.look, a: a, s: ?g.shown, p: ?g.paths, sk: ?g.sketches};
+    var pt:    render.Port = render.Port{x0: 0.0, y0: 0.0, w: sw, h: sh};
+    if (g.bench == args.BENCH_NONE) { pt = desk.draw(bu, ?scene); }
     if (a.refit) {
         frame(a, pt);
         a.refit = false;
     }
+    val seen: render.Camera = camera(a, pt);
+    g.world = bint.hit(bu, bctx.id_of(bu, "world"), pt.x0, pt.y0, pt.x0 + pt.w, pt.y0 + pt.h, binp.BUTTON_LEFT);
+    hud.selection_size(bu, g.gui.look, a, seen);
+    bounds.label(bu, g.gui.look, a, seen);
+    if (g.bench == args.BENCH_NONE) {
+        hud.readout(bu, g.gui.look, a, ?g.shown, pt);
+        hud.position(bu, g.gui.look, seen, pt, over_world(g), g.world.mx, g.world.my);
+        hud.toast(bu, a, pt);
+        hud.help(bu, a, sw, sh);
+        val notches: f32 = gui.notches(?g.gui);
+        if (notches != 0.0 && over_world(g)) { zoom_at(a, pt, g.world.mx, g.world.my, notches); }
+        edit_world(g, seen);
+    }
+    gui.end(?g.gui, ctx);
     val cam: render.Camera = camera(a, pt);
 
     # record the frame's generations and the view, or show the last completed
     # generation while the thread steps the next; edits made after this wait
     # in the queue for a frame that holds the world
-    var look: gpu.Look       = render.look(cam, sw, a.mode::u8, a.gutter, a.solid, g.srgb);
+    var look: gpu.Look       = render.look(cam, sw, sh, a.mode::u8, a.gutter, a.solid, g.srgb);
     var rec:  err[gfx.Error] = err[gfx.Error].ok{};
     if (held) {
         # the capped generations the thread owes the GPU, while it runs
@@ -773,27 +807,6 @@ pub fun on_draw(ctx: *Context) {
     desc.clear = opt[gm.Vec4].some{gm.vec4(clear[0], clear[1], clear[2], 1.0)};
     var pass: gfx.Pass = gfx.pass_begin(?g.renderer, ?desc);
     gpu.draw(?g.gpu, ?pass);
-
-    # the interface's frame: the world claims its port beneath everything else,
-    # so the pointer reaches it only where no control is on top
-    # a capture has no user, so any pointer over its window is not one
-    val pointer: bool          = ctx.input.pointer_in && g.capture == nil;
-    val bu:      *bctx.Context = ?g.gui.ui;
-    gui.begin(?g.gui, sw, sh, sc, pointer);
-    g.world = bint.hit(bu, bctx.id_of(bu, "world"), 0.0, 0.0, pt.w, pt.h, binp.BUTTON_LEFT);
-    hud.selection_size(bu, g.gui.look, a, cam);
-    if (g.bench == args.BENCH_NONE) {
-        hud.readout(bu, g.gui.look, a, ?g.shown);
-        hud.position(bu, g.gui.look, cam, over_world(g), g.world.mx, g.world.my);
-        panel.draw(bu, g.gui.look, a, ?g.shown, ?g.paths, ?g.sketches, sw);
-        bounds.label(bu, g.gui.look, a, cam);
-        hud.toast(bu, a, pt);
-        hud.help(bu, a, sw, sh);
-        val notches: f32 = gui.notches(?g.gui);
-        if (notches != 0.0 && over_world(g)) { zoom_at(a, pt, g.world.mx, g.world.my, notches); }
-        edit_world(g, cam);
-    }
-    gui.end(?g.gui, ctx);
 
     # the world's overlays, then the interface over everything
     var d: paint.Paint = paint.Paint{pass: ?pass, srgb: g.srgb};
@@ -868,6 +881,7 @@ pub fun on_dnit(ctx: *Context) {
     val g: *Game = game_of(ctx);
     runner.stop(?g.runner);
     if (g.sim_ok && g.paths.ok && g.bench == args.BENCH_NONE && g.capture == nil) {
+        if (g.gui_ok) { panel.keep(?g.gui.ui, ?g.app); }
         var sp:    [1088]u8;
         val saved: err[persist.Error] = config.save(?g.a, ?g.app, ?g.sim, settings(g, ?sp[0]));
         if (sel saved.err) {

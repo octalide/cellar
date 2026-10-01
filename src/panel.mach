@@ -1,545 +1,344 @@
-# the side panel: every control, grouped by task into collapsible sections
+# the panels: every group of controls is a blit window, docked by default into
+# a dock space at the window's left or right edge
 #
-# run for stepping, speed, the population graph, the engine and the ceilings a
-# run pauses at, draw for the tool and the patterns, rule for the kernel, view
-# for colour and the camera, and files for the named worlds and patterns in
-# the data directory. the panel is a blit side panel docked to the window's
-# right edge, its body scrolling when its sections are taller than the
-# window, under a header pinned over its top. on a narrow window the world
-# runs on under it rather than squeezing beside it (see port).
+# a panel is data: a title, which is also its window's key, where the default
+# layout puts it, whether it starts closed, the size it floats at and the
+# page it draws. each one docks, floats, tabs with another and closes through
+# blit, and the panels menu (cellar.toolbar) reopens a closed one. the left and
+# right dock spaces are carved from the window below the toolbar only while
+# they hold an open panel, and what they leave is the world's port.
+#
+# the layout lives in blit's state store, which the settings keep (persist,
+# keep) and restore at startup (restore). with no layout to restore, or on
+# reset, the default one is built: patterns and files tabbed at the left, rule,
+# world and view tabbed at the right over the stats, and the settings floating,
+# closed.
 
 use blit;
 use bctx:  blit.context;
 use bdock: blit.dock;
-use binp:  blit.input;
-use bint:  blit.interact;
-use blay:  blit.layout;
-use bov:   blit.overlay;
-use bth:   blit.theme;
+use bid:   blit.id;
+use bst:   blit.state;
 use bw:    blit.widget;
 use cellar.app;
 use cellar.arrange;
-use cellar.bounds;
-use cellar.ceiling;
-use cellar.command;
-use cellar.format;
-use cellar.hashlife;
-use cellar.history;
 use cellar.kedit;
 use cellar.look;
+use cellar.pages;
 use cellar.paths;
 use cellar.render;
-use cellar.saves;
-use cellar.sim;
 use cellar.sketch;
-use cellar.text;
-use cellar.theme;
 use cellar.world;
 use allo: std.allocator;
 use std.allocator.page;
-use fs: std.filesystem;
+use std.data.toml;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
-use std.types.option.opt;
+use std.types.result.res;
 use std.types.size.usize;
+use std.types.string;
 use std.types.string.str;
 
-# unscaled panel width
+# unscaled width of a side dock
 val WIDTH: f32 = 300.0;
-# below this many unscaled pixels of window, the world runs on under the panel
-val DOCK_MIN: f32 = 760.0;
-# unscaled height of the population graph
-val GRAPH: f32 = 64.0;
-# unscaled side of the header's buttons and the restore button
-val BUTTON: f32 = 28.0;
-# the version shown in the header
-val VERSION: str = $mach.project.version;
+# the most of the window's width a side dock takes
+val WIDTH_SHARE: f32 = 0.3;
+# the stats' share of the right dock's height in the default layout
+val STATS_SHARE: f32 = 0.3;
+# the dock spaces' keys
+val LEFT:  str = "left dock";
+val RIGHT: str = "right dock";
 
-# the panel's width in pixels for a window sw wide at interface scale s
-fun width(s: f32, sw: f32) f32 {
-    var w: f32 = WIDTH * s;
-    if (w > sw * 0.85) { w = sw * 0.85; }
-    ret w;
-}
+# where a panel goes in the default layout
+pub val HOME_LEFT:  u8 = 0;
+pub val HOME_RIGHT: u8 = 1;
+pub val HOME_STATS: u8 = 2;
+pub val HOME_FLOAT: u8 = 3;
 
-# the part of the window the world shows through, at interface scale s
+# the panels, in the order the menu lists them and the default layout tabs them
+pub val PATTERNS: usize = 0;
+pub val FILES:    usize = 1;
+pub val RULE:     usize = 2;
+pub val WORLD:    usize = 3;
+pub val VIEW:     usize = 4;
+pub val STATS:    usize = 5;
+pub val SETTINGS: usize = 6;
+pub val COUNT:    usize = 7;
+
+# what a panel draws from
 # ---
-# a:   application state
-# s:   the interface scale
-# sw:  window width in pixels
-# sh:  window height in pixels
-# ret: the port, the whole window while the panel is hidden or the window narrow
-pub fun port(a: *app.App, s: f32, sw: f32, sh: f32) render.Port {
-    var w: f32 = sw;
-    if (a.panel != 0 && sw >= DOCK_MIN * s) { w = sw - width(s, sw); }
-    ret render.Port{w: w, h: sh};
-}
-
-# the population over the recent samples, each held until the generation of
-# the next, and scaled so the largest fills the height
-fun graph(ui: *bctx.Context, l: look.Look, s: *world.Shown) {
-    val h:  *history.History = world.recent(s);
-    val gh: f32              = bctx.px(ui, GRAPH);
-    val r:  bctx.Area        = bw.place(ui, blay.fill(1.0), blay.fixed(gh), 0.0, gh);
-    bctx.quad(ui, r.x0, r.y0, r.x1, r.y1, look.colour(theme.WORLD, 1.0));
-    val peak: u64 = history.peak(h);
-    if (h.len != 0 && peak != 0) {
-        val pad:   f32             = bctx.px(ui, 4.0);
-        val first: u64             = history.gen_at(h, 0);
-        val span:  f32             = (history.gen_at(h, h.len - 1) - first + 1)::f32;
-        val gw:    f32             = (r.x1 - r.x0 - pad * 2.0) / span;
-        val ht:    f32             = r.y1 - r.y0 - pad * 2.0;
-        val bar:   blit.draw.Color = look.colour(theme.ACCENT, 0.8);
-        var i:     usize           = 0;
-        for (i < h.len) {
-            var end: f32 = span;
-            if (i + 1 < h.len) { end = (history.gen_at(h, i + 1) - first)::f32; }
-            val x0:  f32 = r.x0 + pad + (history.gen_at(h, i) - first)::f32 * gw;
-            val x1:  f32 = r.x0 + pad + end * gw;
-            val top: f32 = r.y1 - pad - ht * history.pop_at(h, i)::f32 / peak::f32;
-            bctx.quad(ui, x0, top, x1, r.y1 - pad, bar);
-            i = i + 1;
-        }
-    }
-    var rd: [48]u8;
-    var o:  usize = text.buf_str(?rd[0], 0, "Population, peak ");
-    o     = text.buf_u64(?rd[0], o, peak);
-    rd[o] = 0;
-    look.note(ui, l, ?rd[0]);
-}
-
-fun run(ui: *bctx.Context, l: look.Look, a: *app.App, s: *world.Shown) {
-    if (!look.heading(ui, l, "RUN", ?a.open_run)) { ret; }
-    var acts: [3]str;
-    acts[0] = "Play###go";
-    acts[1] = "Step";
-    acts[2] = "Reset";
-    var on: usize = 3;
-    if (world.running(s)) {
-        acts[0] = "Pause###go";
-        on      = 0;
-    }
-    val hit: usize = bw.button_grid(ui, ?acts[0], 3, 3, on);
-    if (hit == 0) { app.submit(a, command.Command.toggle{}); }
-    if (hit == 1) { app.submit(a, command.Command.step{}); }
-    if (hit == 2) { app.submit(a, command.Command.reset{}); }
-    graph(ui, l, s);
-
-    var rd: [32]u8;
-    var o:  usize = 0;
-    if (a.uncapped != 0) { o = text.buf_str(?rd[0], 0, "as fast as it goes"); }
-    or {
-        o = text.buf_u64(?rd[0], 0, (a.speed + 0.5)::u64);
-        o = text.buf_str(?rd[0], o, " gen/s");
-    }
-    rd[o] = 0;
-    bw.slider(ui, "Speed", ?rd[0], ?a.speed, 1.0, 120.0);
-    bw.toggle(ui, "Uncapped", ?a.uncapped);
-
-    var more: [2]str;
-    more[0] = "Randomize";
-    more[1] = "Clear";
-    val act: usize = bw.buttons(ui, ?more[0], 2);
-    if (act == 0) { app.submit(a, command.Command.randomize{app.bounds_size(a.bounds_idx)}); }
-    if (act == 1) { app.submit(a, command.Command.clear{}); }
-    look.note(ui, l, "Randomize fills a square this wide");
-    var areas: [8]str;
-    areas[0] = "32";
-    areas[1] = "64";
-    areas[2] = "128";
-    areas[3] = "256";
-    areas[4] = "512";
-    areas[5] = "1k";
-    areas[6] = "2k";
-    areas[7] = "4k";
-    val area: usize = bw.button_grid(ui, ?areas[0], app.BOUNDS_COUNT, 4, a.bounds_idx);
-    if (area < app.BOUNDS_COUNT) { a.bounds_idx = area; }
-    engine(ui, l, a, s);
-    ceilings(ui, l, a, s);
-}
-
-# the ceilings a run pauses at, each switched on or off, its limit dragged along
-# 1, 2 and 5 times the powers of ten
-fun ceilings(ui: *bctx.Context, l: look.Look, a: *app.App, s: *world.Shown) {
-    look.note(ui, l, "Pause a run that passes");
-    var c:       ceiling.Ceilings = world.ceilings(s);
-    var changed: bool             = false;
-    var k:       usize            = 0;
-    for (k < ceiling.COUNT) {
-        bctx.push_id_int(ui, k::u64);
-        var on: u8 = 0;
-        if (c.on[k]) { on = 1; }
-        if (bw.toggle(ui, ceiling.label(k), ?on)) {
-            c.on[k] = on != 0;
-            changed = true;
-        }
-        if (c.on[k]) {
-            var rd: [48]u8;
-            var o:  usize = text.buf_grouped(?rd[0], 0, c.limit[k]);
-            o     = text.buf_str(?rd[0], o, " ");
-            o     = text.buf_str(?rd[0], o, ceiling.unit(k));
-            rd[o] = 0;
-            var v: f32 = ceiling.notch_of(c.limit[k])::f32;
-            if (bw.slider(ui, "Limit", ?rd[0], ?v, ceiling.notch_lo(k)::f32, ceiling.notch_hi(k)::f32)) {
-                val n: u64 = ceiling.notch((v + 0.5)::usize);
-                if (n != c.limit[k]) {
-                    c.limit[k] = n;
-                    changed    = true;
-                }
-            }
-        }
-        bctx.pop_id(ui);
-        k = k + 1;
-    }
-    if (changed) { app.submit(a, command.Command.ceilings{c}); }
-}
-
-# the engine choice, and on HashLife the step exponent and going to a generation
-fun engine(ui: *bctx.Context, l: look.Look, a: *app.App, s: *world.Shown) {
-    look.note(ui, l, "Engine");
-    val on: bool = world.hashlife(s);
-    if (!on && !world.hashlife_runs(s)) {
-        look.note(ui, l, "HashLife runs radius 1 rules without B0 on the unbounded plane");
-        ret;
-    }
-    var names: [2]str;
-    names[0] = "Chunks";
-    names[1] = "HashLife";
-    var pick: usize = 0;
-    if (on) { pick = 1; }
-    if (bw.segmented(ui, ?names[0], 2, ?pick)) {
-        a.engine_tree = pick == 1;
-        app.submit(a, command.Command.engine{pick == 1});
-    }
-    if (!on) { ret; }
-
-    val k:  u32   = world.exponent(s);
-    var rd: [32]u8;
-    var o:  usize = text.buf_str(?rd[0], 0, "2^");
-    o     = text.buf_u64(?rd[0], o, k::u64);
-    o     = text.buf_str(?rd[0], o, " gens");
-    rd[o] = 0;
-    var v: f32 = k::f32;
-    if (bw.slider(ui, "Step###exponent", ?rd[0], ?v, 0.0, hashlife.MAX_EXPONENT::f32)) {
-        val nk: u32 = (v + 0.5)::u32;
-        if (nk != k) { app.submit(a, command.Command.exponent{nk}); }
-    }
-
-    val typed: u8   = bw.text_field(ui, "go to", ?a.go_to, "Generation to go to");
-    val go:    bool = bw.button(ui, "Go to generation");
-    if (go || (typed & blit.field.ENTERED) != 0) {
-        val t:   str   = blit.field.text(?a.go_to);
-        var gen: u64   = 0;
-        var i:   usize = 0;
-        for (t[i] != 0) {
-            gen = gen * 10 + (t[i] - '0')::u64;
-            i   = i + 1;
-        }
-        if (i == 0) { app.say(a, "type a generation to go to"); }
-        or          { app.submit(a, command.Command.jump{gen}); }
-    }
-}
-
-# the solid colours as swatches across the column, the chosen one framed
-fun swatches(ui: *bctx.Context, a: *app.App) {
-    val n:  usize     = theme.SWATCH_COUNT;
-    val av: bctx.Area = bw.avail(ui);
-    val g:  f32       = bctx.px(ui, 4.0);
-    val sz: f32       = (av.x1 - av.x0 - g * (n - 1)::f32) / n::f32;
-    val r:  bctx.Area = bw.place(ui, blay.fill(1.0), blay.fixed(sz), 0.0, sz);
-    val t:  f32       = bctx.px(ui, 2.0);
-    val in: f32       = bctx.px(ui, 4.0);
-    var i:  usize     = 0;
-    for (i < n) {
-        val x0: f32 = r.x0 + i::f32 * (sz + g);
-        bctx.push_id_int(ui, i::u64);
-        val h: bint.Hit = bint.hit(ui, bctx.id_of(ui, "swatch"), x0, r.y0, x0 + sz, r.y0 + sz, binp.BUTTON_LEFT);
-        bctx.pop_id(ui);
-        val c: u32 = theme.swatch(i);
-        if (c == a.solid) { bctx.frame(ui, x0, r.y0, x0 + sz, r.y0 + sz, t, look.colour(theme.TEXT, 1.0)); }
-        or (h.hot)        { bctx.frame(ui, x0, r.y0, x0 + sz, r.y0 + sz, t, look.colour(theme.TEXT_DIM, 1.0)); }
-        bctx.quad(ui, x0 + in, r.y0 + in, x0 + sz - in, r.y0 + sz - in, look.colour(c, 1.0));
-        if (h.clicked) { a.solid = c; }
-        i = i + 1;
-    }
-}
-
-fun view(ui: *bctx.Context, l: look.Look, a: *app.App, s: *world.Shown) {
-    if (!look.heading(ui, l, "VIEW", ?a.open_view)) { ret; }
-    # the colour modes are what the engine keeps: trails need heat and age needs age
-    val c:     sim.Caps = world.caps(s);
-    val solid: bool     = a.mode == render.MODE_SOLID::usize || !c.heat || !c.age;
-    if (c.heat && c.age) {
-        var modes: [3]str;
-        modes[0] = "Solid";
-        modes[1] = "Trails";
-        modes[2] = "Age";
-        bw.segmented(ui, ?modes[0], app.MODE_COUNT, ?a.mode);
-    }
-    or         { look.note(ui, l, "HashLife keeps no heat or age, so draws solid"); }
-    if (solid) { swatches(ui, a); }
-    bw.toggle(ui, "Grid lines", ?a.gutter);
-
-    look.note(ui, l, "Interface size");
-    var scales: [4]str;
-    scales[0] = "100%";
-    scales[1] = "125%";
-    scales[2] = "150%";
-    scales[3] = "200%";
-    bw.segmented(ui, ?scales[0], app.SCALE_COUNT, ?a.scale_idx);
-
-    if (bw.button(ui, "Frame the randomize area")) { app.frame_area(a); }
-}
-
-# save the world or the custom pattern under the typed name
-fun save(a: *app.App, p: *paths.Paths, kind: u8) {
-    val name: str = blit.field.text(?a.name);
-    if (!saves.usable(name)) {
-        app.say(a, "type a name to save under");
-        ret;
-    }
-    var fname: [80]u8;
-    var path:  [1152]u8;
-    paths.file(p, saves.file_name(name, kind, ?fname[0]), ?path[0]);
-    val f: opt[command.File] = app.file(a, ?path[0]);
-    if (sel f.none)               { ret; }
-    if (kind == saves.KIND_WORLD) { app.submit(a, command.Command.save_world{f.some}); }
-    or                            { app.submit(a, command.Command.save_pattern{f.some}); }
-}
-
-# load a listed file, a world as the world and a pattern as the custom pattern,
-# taking its name as the one to save under, or run a rule table on the world
-fun load(a: *app.App, p: *paths.Paths, e: *saves.Entry) {
-    var path: [1152]u8;
-    paths.file(p, e.name, ?path[0]);
-    val f: opt[command.File] = app.file(a, ?path[0]);
-    if (sel f.none) { ret; }
-    if (e.kind == saves.KIND_RULE) {
-        app.submit(a, command.Command.open{f.some});
-        ret;
-    }
-    var name: [80]u8;
-    blit.field.set(?a.name, saves.stem(e.name, ?name[0]));
-    if (e.kind == saves.KIND_WORLD) { app.submit(a, command.Command.load_world{f.some}); }
-    or                              { app.submit(a, command.Command.load_pattern{f.some}); }
-}
-
-# a file's kind as the list shows it
-fun kind_name(e: *saves.Entry) str {
-    if (e.kind == saves.KIND_WORLD) { ret "world"; }
-    if (e.kind == saves.KIND_RULE)  { ret "rule"; }
-    ret "pattern";
-}
-
-# a listed file as a row, its name cut from the front to fit and its kind at
-# the right; ret whether it was clicked
-fun entry(ui: *bctx.Context, l: look.Look, e: *saves.Entry) bool {
-    val rh:   f32        = bctx.px(ui, 24.0);
-    val r:    bctx.Area  = bw.place(ui, blay.fill(1.0), blay.fixed(rh), 0.0, rh);
-    val h:    bint.Hit   = bint.hit(ui, bctx.id_of(ui, "file"), r.x0, r.y0, r.x1, r.y1, binp.BUTTON_LEFT);
-    val st:   u8         = bth.pick(h.hot, h.active, false, false);
-    val ink:  *bth.Paint = bctx.paint_of(ui, bth.LIST_ITEM, st);
-    val pad:  f32        = bctx.px(ui, 8.0);
-    val kind: str        = kind_name(e);
-    bctx.box(ui, bth.LIST_ITEM, st, r.x0, r.y0, r.x1, r.y1);
-    bctx.push_style(ui, l.small);
-    val kw: f32 = bctx.text_width(ui, kind);
-    look.text_mid(ui, kind, r.x1 - pad - kw, r.y0, r.y1, ink.mark);
-    bctx.pop_style(ui);
-    val ty: f32 = r.y0 + (rh - bctx.line_height(ui)) / 2.0;
-    blit.text.fit_at(ui, e.name, r.x0 + pad, ty, r.x1 - r.x0 - kw - pad * 3.0, blit.text.CUT_START, ink.text);
-    ret h.clicked;
-}
-
-# the end of a path that fits across the column, in the small face
-fun path_line(ui: *bctx.Context, l: look.Look, s: str) {
-    bctx.push_style(ui, l.small);
-    val lh: f32       = bctx.line_height(ui);
-    val r:  bctx.Area = bw.place(ui, blay.fill(1.0), blay.fixed(lh), 0.0, lh);
-    blit.text.fit_at(ui, s, r.x0, r.y0, r.x1 - r.x0, blit.text.CUT_START, look.colour(theme.TEXT_DIM, 1.0));
-    bctx.pop_style(ui);
-}
-
-fun files(ui: *bctx.Context, l: look.Look, a: *app.App, p: *paths.Paths) {
-    val was: u8 = a.open_files;
-    if (!look.heading(ui, l, "FILES", ?a.open_files)) { ret; }
-    if (!p.ok) {
-        look.note(ui, l, "no user data directory is known");
-        ret;
-    }
-    # read the directory as the section opens and after each save
-    if (was == 0) { a.saves.stale = true; }
-    if (a.saves.stale) {
-        val listed: err[fs.FsError] = saves.refresh(?a.saves, paths.dir(p));
-        if (sel listed.err) { app.say(a, "the data directory could not be read"); }
-    }
-
-    bw.text_field(ui, "name", ?a.name, "Name to save as");
-    var sl: [2]str;
-    sl[0] = "Save world";
-    sl[1] = "Save pattern";
-    val w: usize = bw.buttons(ui, ?sl[0], 2);
-    if (w == 0) { save(a, p, saves.KIND_WORLD); }
-    if (w == 1) { save(a, p, saves.KIND_PATTERN); }
-
-    if (a.saves.items.len == 0) { look.note(ui, l, "No saved worlds or patterns yet"); }
-    or {
-        look.note(ui, l, "Click a world to load it, a pattern to edit it, a rule to run it");
-        var i: usize = 0;
-        for (i < a.saves.items.len) {
-            bctx.push_id_int(ui, i::u64);
-            val clicked: bool = entry(ui, l, ?a.saves.items.data[i]);
-            bctx.pop_id(ui);
-            if (clicked) { load(a, p, ?a.saves.items.data[i]); }
-            i = i + 1;
-        }
-    }
-    bw.space(ui, bctx.px(ui, 4.0));
-    if (bw.button(ui, "Screenshot")) { a.shot = true; }
-    path_line(ui, l, paths.dir(p));
-}
-
-# the header pinned over the panel's top: name, version, and the help and
-# hide buttons; it claims its strip, so the sections scrolled under it are
-# out of reach there
-fun header(ui: *bctx.Context, l: look.Look, a: *app.App, r: bctx.Area) {
-    val s: bov.Shown = bov.begin(ui, "header", bov.on_rect(r, bov.TOP_LEFT, bov.TOP_LEFT));
-    val w: f32       = r.x1 - r.x0;
-    val h: f32       = bctx.px(ui, look.HEADER);
-    val b: bctx.Area = bw.place(ui, blay.fixed(w), blay.fixed(h), w, h);
-    bint.hit(ui, 0, b.x0, b.y0, b.x1, b.y1, 0);
-    bctx.quad(ui, b.x0, b.y0, b.x1, b.y1, look.colour(theme.HEADER, 1.0));
-    bctx.quad(ui, b.x0, b.y1 - 1.0, b.x1, b.y1, look.colour(theme.PANEL_EDGE, 1.0));
-    val pad: f32 = bctx.px(ui, look.PAD);
-    val pen: f32 = look.text_mid(ui, "cellar", b.x0 + pad, b.y0, b.y1, look.colour(theme.TEXT, 1.0));
-    bctx.push_style(ui, l.small);
-    look.text_mid(ui, VERSION, pen + bctx.px(ui, 8.0), b.y0, b.y1, look.colour(theme.TEXT_FAINT, 1.0));
-    bctx.pop_style(ui);
-
-    val bs: f32 = bctx.px(ui, BUTTON);
-    val by: f32 = b.y0 + (h - bs) / 2.0;
-    val hx: f32 = b.x1 - pad - bs;
-    val gx: f32 = hx - bs - bctx.px(ui, 6.0);
-    if (bw.button_at(ui, "»", hx, by, hx + bs, by + bs, false))       { a.panel = 0; }
-    if (bw.button_at(ui, "?", gx, by, gx + bs, by + bs, a.help != 0)) { a.help = 1 - a.help; }
-    bov.end(ui, s);
-}
-
-# the button that brings a hidden panel back, in the window's top right corner
-fun restore(ui: *bctx.Context, a: *app.App) {
-    var o: bov.Overlay = bov.on_surface(bov.TOP_RIGHT);
-    o.dx = 0.0 - bctx.px(ui, 10.0);
-    o.dy = bctx.px(ui, 10.0);
-    val s:  bov.Shown = bov.begin(ui, "restore", o);
-    val bs: f32       = bctx.px(ui, BUTTON);
-    val b:  bctx.Area = bw.place(ui, blay.fixed(bs), blay.fixed(bs), bs, bs);
-    if (bw.button_at(ui, "«", b.x0, b.y0, b.x1, b.y1, false)) { a.panel = 1; }
-    bov.end(ui, s);
-}
-
-# draw the panel and apply its controls
-# ---
-# ui: the interface, its frame begun
 # l:  cellar's look
 # a:  application state
 # s:  the world as shown
 # p:  the data directory
 # sk: the sketches large patterns are drawn from
-# sw: window width in pixels
-pub fun draw(ui: *bctx.Context, l: look.Look, a: *app.App, s: *world.Shown, p: *paths.Paths, sk: *sketch.Sketches, sw: f32) {
-    if (a.panel == 0) {
-        restore(ui, a);
-        ret;
-    }
-    a.side.size = width(bctx.scale_of(ui), sw);
-    val d: bdock.DockArea = bdock.begin_dock(ui, "panel", ?a.side);
-    bctx.push_id_str(ui, "run");
-    run(ui, l, a, s);
-    bctx.pop_id(ui);
-    bctx.push_id_str(ui, "draw");
-    arrange.section(ui, l, a, s, sk);
-    bctx.pop_id(ui);
-    bctx.push_id_str(ui, "rule");
-    kedit.section(ui, l, a, s);
-    bctx.pop_id(ui);
-    bctx.push_id_str(ui, "bounds");
-    bounds.section(ui, l, a, s);
-    bctx.pop_id(ui);
-    bctx.push_id_str(ui, "view");
-    view(ui, l, a, s);
-    bctx.pop_id(ui);
-    bctx.push_id_str(ui, "files");
-    files(ui, l, a, p);
-    bctx.pop_id(ui);
-    bdock.end_dock(ui, ?a.side, d);
-    header(ui, l, a, d.area);
-}
-
-# what the panel test draws
-#[testing]
-rec Probe {
+pub rec Scene {
+    l:  look.Look;
     a:  *app.App;
     s:  *world.Shown;
-    p:  paths.Paths;
-    sk: sketch.Sketches;
-    l:  look.Look;
+    p:  *paths.Paths;
+    sk: *sketch.Sketches;
 }
 
-#[testing]
-fun probe_ui(ui: *bctx.Context, user: ptr) {
-    val pr: *Probe = user::*Probe;
-    draw(ui, pr.l, pr.a, pr.s, ?pr.p, ?pr.sk, ui.sw);
+# a panel
+# ---
+# title: its window's title and key
+# home:  where the default layout puts it, a HOME_*
+# shut:  it starts closed
+# w:     unscaled width it floats at
+# h:     unscaled height it floats at
+# page:  draws its content into its padded column
+pub rec Panel {
+    title: str;
+    home:  u8;
+    shut:  bool;
+    w:     f32;
+    h:     f32;
+    page:  fun(*bctx.Context, *Scene);
 }
 
-test draw__every_section_draws_and_its_controls_act {
-    var al:   allo.Allocator;
-    val made: err[allo.Error] = page.make(?al);
-    if (sel made.err) { ret 1; }
-    var s:  sim.Sim;
-    val sm: err[allo.Error] = sim.init(?s, ?al);
-    if (sel sm.err) { ret 1; }
-    var a: app.App;
-    app.init(?a);
-    val at: err[format.Error] = app.attach(?a, ?al);
-    if (sel at.err) { ret 1; }
-    a.open_rule   = 1;
-    a.open_bounds = 1;
-    a.open_files  = 1;
-    var shown: world.Shown;
-    world.observe(?s, ?shown);
+fun patterns_page(ui: *bctx.Context, sc: *Scene) {
+    arrange.patterns(ui, sc.l, sc.a, sc.s, sc.sk);
+}
 
-    var pr: Probe;
-    pr.a    = ?a;
-    pr.s    = ?shown;
-    pr.p.ok = false;
-    sketch.init(?pr.sk, ?al, nil);
-    var d:  blit.driver.Driver;
-    val di: err[allo.Error] = blit.driver.init(?d, ?al, 1280.0, 4000.0, probe_ui, (?pr)::ptr);
-    if (sel di.err) { ret 1; }
-    val l: opt[look.Look] = look.apply(?d.ctx);
-    if (sel l.none) { ret 2; }
-    pr.l = l.some;
+fun files_page(ui: *bctx.Context, sc: *Scene) {
+    pages.files_page(ui, sc.l, sc.a, sc.p);
+}
 
-    # every section open, every widget keyed apart from the rest
-    blit.driver.steps(?d, 2);
-    if (bctx.collisions(?d.ctx) != 0)                                   { ret 3; }
-    if (!blit.driver.click(?d, blit.driver.find(?d, "panel/run/Step"))) { ret 4; }
-    if (a.queue.items.len != 1)                                         { ret 5; }
-    if (!sel a.queue.items.data[0].step)                                { ret 6; }
+fun rule_page(ui: *bctx.Context, sc: *Scene) {
+    kedit.panel(ui, sc.l, sc.a, sc.s);
+}
 
-    # a rule string no family reads keeps the keyboard, to be put right
-    val field: u64 = blit.driver.find(?d, "panel/rule/rule string");
-    if (!blit.driver.click(?d, field)) { ret 7; }
-    blit.driver.type_text(?d, "x");
-    blit.driver.key(?d, binp.KEY_ENTER, 0);
-    blit.driver.step(?d);
-    if (!blit.driver.focused(?d, field) || a.rule_text.error == nil) { ret 8; }
+fun world_page(ui: *bctx.Context, sc: *Scene) {
+    pages.world_page(ui, sc.l, sc.a, sc.s);
+}
 
-    val freed: err[allo.Error] = blit.driver.free(?d);
-    if (sel freed.err) { ret 1; }
-    app.dnit(?a);
-    sim.dnit(?s);
-    ret 0;
+fun view_page(ui: *bctx.Context, sc: *Scene) {
+    pages.view_page(ui, sc.l, sc.a, sc.s);
+}
+
+fun stats_page(ui: *bctx.Context, sc: *Scene) {
+    pages.stats_page(ui, sc.l, sc.a, sc.s);
+}
+
+fun settings_page(ui: *bctx.Context, sc: *Scene) {
+    pages.settings_page(ui, sc.l, sc.a, sc.s);
+}
+
+# the panel at index i, below COUNT
+pub fun panel(i: usize) Panel {
+    if (i == FILES)    { ret Panel{title: "Files", home: HOME_LEFT, shut: false, w: WIDTH, h: 480.0, page: files_page}; }
+    if (i == RULE)     { ret Panel{title: "Rule", home: HOME_RIGHT, shut: false, w: WIDTH, h: 480.0, page: rule_page}; }
+    if (i == WORLD)    { ret Panel{title: "World", home: HOME_RIGHT, shut: false, w: WIDTH, h: 360.0, page: world_page}; }
+    if (i == VIEW)     { ret Panel{title: "View", home: HOME_RIGHT, shut: false, w: WIDTH, h: 240.0, page: view_page}; }
+    if (i == STATS)    { ret Panel{title: "Stats", home: HOME_STATS, shut: false, w: WIDTH, h: 300.0, page: stats_page}; }
+    if (i == SETTINGS) { ret Panel{title: "Settings", home: HOME_FLOAT, shut: true, w: 320.0, h: 500.0, page: settings_page}; }
+    ret Panel{title: "Patterns", home: HOME_LEFT, shut: false, w: WIDTH, h: 560.0, page: patterns_page};
+}
+
+# a panel's window id, which its title keys at the interface's root
+pub fun id(i: usize) u64 {
+    ret bid.of_label(bid.ROOT, panel(i).title);
+}
+
+# whether a panel is open
+pub fun shown(ui: *bctx.Context, i: usize) bool {
+    ret bst.get[bw.WindowState](ui, id(i)).closed == 0;
+}
+
+# open or close a panel; opening one shows the panels if Tab hid them
+pub fun show(ui: *bctx.Context, a: *app.App, i: usize, on: bool) {
+    val st: *bw.WindowState = bst.get[bw.WindowState](ui, id(i));
+    st.closed = 1;
+    if (on) {
+        st.closed = 0;
+        a.panel   = 1;
+    }
+    bctx.redraw(ui);
+}
+
+# whether a dock space holds an open panel, so it takes room
+fun live(ui: *bctx.Context, sid: u64) bool {
+    var i: usize = 0;
+    for (i < COUNT) {
+        val n: *bdock.Node = bst.find[bdock.Node](ui, bdock.node_of(ui, id(i)));
+        if (n != nil && n.space == sid && shown(ui, i)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# keep every panel's window state while the panels are hidden, so the layout
+# the settings save holds them all
+fun hold(ui: *bctx.Context) {
+    var i: usize = 0;
+    for (i < COUNT) {
+        bst.pin[bw.WindowState](ui, id(i), 1);
+        i = i + 1;
+    }
+}
+
+# dock a panel into a leaf at a place among its tabs
+fun dock_at(ui: *bctx.Context, leaf: u64, i: usize, rank: f64) {
+    bdock.add(ui, leaf, id(i));
+    val dk: *bw.Docked = bst.find[bw.Docked](ui, id(i));
+    if (dk != nil) { dk.rank = rank; }
+}
+
+# show the first of a leaf's tabs
+fun front(ui: *bctx.Context, leaf: u64, i: usize) {
+    val n: *bdock.Node = bst.find[bdock.Node](ui, leaf);
+    if (n != nil) { n.front = id(i); }
+}
+
+# build the default layout, undocking every panel and opening each as it starts
+fun relayout(ui: *bctx.Context) {
+    var i: usize = 0;
+    for (i < COUNT) {
+        bdock.remove(ui, id(i));
+        val st: *bw.WindowState = bst.get[bw.WindowState](ui, id(i));
+        st.placed    = 0;
+        st.collapsed = 0;
+        st.closed    = 0;
+        if (panel(i).shut) { st.closed = 1; }
+        i = i + 1;
+    }
+    hold(ui);
+    val left:  u64 = bdock.root(ui, bctx.id_of(ui, LEFT));
+    val right: u64 = bdock.root(ui, bctx.id_of(ui, RIGHT));
+    val stats: u64 = bdock.split(ui, right, bctx.Side.bottom{}, STATS_SHARE);
+    var ranks: [3]f64;
+    ranks[0] = 0.0;
+    ranks[1] = 0.0;
+    ranks[2] = 0.0;
+    var leaves: [3]u64;
+    leaves[HOME_LEFT]  = left;
+    leaves[HOME_RIGHT] = right;
+    leaves[HOME_STATS] = stats;
+    i                  = 0;
+    for (i < COUNT) {
+        val h: u8 = panel(i).home;
+        if (h != HOME_FLOAT) {
+            dock_at(ui, leaves[h], i, ranks[h]);
+            ranks[h] = ranks[h] + 1.0;
+        }
+        i = i + 1;
+    }
+    # each leaf shows its first tab, which docking the rest moved off
+    i = COUNT;
+    for (i > 0) {
+        i = i - 1;
+        val h: u8 = panel(i).home;
+        if (h != HOME_FLOAT) { front(ui, leaves[h], i); }
+    }
+}
+
+# make the layout persist with the interface's state store: the dock spaces,
+# where each panel docks, and each window's place and open state
+# ---
+# ui:  the interface
+# ret: ok, or the registry's refusal
+pub fun persist(ui: *bctx.Context) err[bst.Error] {
+    val d: err[bst.Error] = bdock.persist(ui);
+    if (sel d.err) { ret d; }
+    val w: err[bst.Error] = bw.persist_windows(ui);
+    if (sel w.err) { ret w; }
+    bst.keep[bw.WindowState](ui, 1);
+    ret err[bst.Error].ok{};
+}
+
+# restore the layout the settings kept, or ask for the default one when they
+# kept none or it does not read
+# ---
+# ui: the interface, persisting (see persist)
+# a:  application state, its settings loaded
+pub fun restore(ui: *bctx.Context, a: *app.App) {
+    a.relayout = true;
+    if (a.layout.len == 0) { ret; }
+    val read: err[toml.TomlError] = bst.load(ui, a.layout.data::str);
+    if (sel read.err) { ret; }
+    hold(ui);
+    a.relayout = false;
+}
+
+# keep the layout for the settings to save
+# ---
+# ui: the interface, persisting
+# a:  application state
+pub fun keep(ui: *bctx.Context, a: *app.App) {
+    val doc: res[str, allo.Error] = bst.save(ui);
+    if (sel doc.err) { ret; }
+    app.keep_layout(a, doc.ok::*u8, string.str_len(doc.ok));
+}
+
+# the width of a side dock at interface scale s in a window sw wide
+fun side_width(s: f32, sw: f32) f32 {
+    var w: f32 = WIDTH * s;
+    if (w > sw * WIDTH_SHARE) { w = sw * WIDTH_SHARE; }
+    ret w;
+}
+
+# the whole pixels inside an area
+fun inside(r: bctx.Area) render.Port {
+    val x0: f32 = (r.x0 + 0.999)::i64::f32;
+    val y0: f32 = (r.y0 + 0.999)::i64::f32;
+    var w:  f32 = r.x1::i64::f32 - x0;
+    var h:  f32 = r.y1::i64::f32 - y0;
+    if (w < 1.0) { w = 1.0; }
+    if (h < 1.0) { h = 1.0; }
+    ret render.Port{x0: x0, y0: y0, w: w, h: h};
+}
+
+# carve the dock spaces from what the toolbar left, and give what they leave
+# to the world; call at the interface's root after the toolbar
+# ---
+# ui:  the interface, its frame begun
+# a:   application state
+# ret: the world's port
+pub fun docks(ui: *bctx.Context, a: *app.App) render.Port {
+    if (a.relayout) {
+        relayout(ui);
+        a.relayout = false;
+    }
+    if (a.panel != 0) {
+        val w: f32 = side_width(bctx.scale_of(ui), ui.sw);
+        if (live(ui, bctx.id_of(ui, LEFT)))  { bdock.space(ui, LEFT, bctx.carve(ui, bctx.Side.left{}, w)); }
+        if (live(ui, bctx.id_of(ui, RIGHT))) { bdock.space(ui, RIGHT, bctx.carve(ui, bctx.Side.right{}, w)); }
+    }
+    ret inside(bctx.free_area(ui));
+}
+
+# draw the panels and apply their controls; call after docks
+# ---
+# ui: the interface
+# sc: what the panels draw from
+pub fun draw(ui: *bctx.Context, sc: *Scene) {
+    val a:     *app.App = sc.a;
+    var drawn: [COUNT]bool;
+    var i:     usize    = 0;
+    for (i < COUNT) {
+        drawn[i] = false;
+        i        = i + 1;
+    }
+    i = 0;
+    for (a.panel != 0 && i < COUNT) {
+        val p:   Panel         = panel(i);
+        val s:   f32           = bctx.scale_of(ui);
+        val w:   f32           = p.w * s;
+        val h:   f32           = p.h * s;
+        var win: bw.Window     = bw.window(p.title, (ui.sw - w) / 2.0, (ui.sh - h) / 3.0, w, h);
+        val wa:  bw.WindowArea = bw.begin_window(ui, win);
+        if (wa.body != 0) {
+            look.begin_body(ui);
+            p.page(ui, sc);
+            look.end_body(ui);
+            drawn[i] = true;
+        }
+        bw.end_window(ui, wa);
+        i = i + 1;
+    }
+    if (!drawn[RULE]) { kedit.idle(a); }
+    a.files_seen = drawn[FILES];
 }
