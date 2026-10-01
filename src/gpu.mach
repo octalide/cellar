@@ -18,6 +18,17 @@
 # anything can reach past it, so no generation is recorded that could outrun
 # the last census the pool was settled from.
 #
+# a frame steps no more than its span of slots, counting every generation's
+# slots, so one generation over a large pool is dispatched in ranges of slots
+# across several frames. the span follows the frame time against the display's
+# refresh interval: the time a frame's dispatches take shows as the next
+# frames arriving late, which cuts the span, and frames on time that the span
+# cut short let it grow. while a generation is part way through, its finished
+# ranges lie in the back cells, so the draw, the census and the pyramids read
+# the front, the last completed generation, and only a frame that completes
+# one counts and reduces it again. an edit, a growth or another rule since the
+# generation began starts it over from the front, under the same serial.
+#
 # the halo is the ring of adjacent chunks, 32 cells of reach, unless uncapped
 # stepping keeps running into the budget, when it widens to chunks two away and
 # 96 cells, at nearly three times the slots. the budget rises only once a
@@ -98,9 +109,24 @@ val INLINE_MAX: usize = 65536;
 pub val MIP: usize = layout.MIP::usize;
 # entries in each palette
 pub val SHADES: usize = 256;
-# generations one frame may record, leaving storage binding sets for the
-# clear, the growth, the census, the reduction and the draw
+# step dispatches one frame may record, leaving storage binding sets for the
+# clear, the growth, the census, the reduction and the draw, which also bounds
+# the generations it records
 pub val MAX_STEPS: usize = 240;
+# the span a frame starts with, before the frame time has adapted it
+val FIRST_SPAN: usize = 4096;
+# the least a span shrinks to
+val MIN_SPAN: usize = 64;
+# the most a span grows to: every generation a frame may record of the largest
+# pool
+pub val MAX_SPAN: usize = layout.MAX_SLOTS::usize * MAX_STEPS;
+# frames recorded before a late one is seen, whose lateness the span was
+# already cut for
+val CALM: u32 = 2;
+# the share a span grows by each frame on time it cut short, until a frame
+# first comes late and after
+val GROW_FAST: usize = 8;
+val GROW_SLOW: usize = 64;
 # consecutive uncapped frames the budget cut short before the halo widens
 val WIDEN_AFTER: u32 = 8;
 # the most that grows to while widening keeps failing to pay off
@@ -112,8 +138,6 @@ val NARROW_AFTER: u32 = 8;
 val NO_HOLD: u64 = 0xffffffffffffffff;
 # the refresh rate assumed when the display's cannot be read
 val FALLBACK_HZ: f32 = 60.0;
-# generations the first uncapped frame asks for, before pacing has adapted it
-val FIRST_PACE: usize = 16;
 # censuses in flight a frame can look back over
 val RING: usize = 8;
 # dirty entries or chunks past which one stalled upload beats many recorded ones
@@ -278,15 +302,28 @@ rec Pool {
 # settled:  the seq of the last census settled
 # lag:      spread recorded since the last census settled, as it landed
 # stepped:  spread the last frame recorded
+# cut:      the budget cut the last frame's generations short
 # bulk:     bulk edits: clears, fills
 # edits:    every edit, bulk or painted
 # writes:   painted cells to upload
 # zeros:    slots to clear this frame
 # stamped:  slots whose stamps to set current this frame
-# pace:     generations the next uncapped frame asks for
-# last:     when the last uncapped frame was recorded
-# timed:    last holds an uncapped frame
+# span:     slots the next frame may step, over every generation it records
+# fixed:    span is held where it was set rather than following the frame time
+# found:    a frame came late since the span began following it
+# calm:     frames left before lateness cuts the span again
+# worked:   slots the last frame stepped
+# limited:  the span cut the last frame's steps short
+# quick:    the last frame kept up with the display
+# last:     when the last frame was recorded
+# timed:    last holds a frame
 # pace_us:  the frame-time thresholds for the display
+# going:    a generation is part way through: front holds the one before it and
+#           the back the ranges finished so far
+# at:       the slot the generation going resumes from
+# began:    the edit count when the generation going began
+# rule:     the rule the generation going began under
+# counted:  the last census and reduction read the front as it stands
 # cursor:   the slot the next frame's upload of the CPU's chunks starts from
 # head:     the meta header staged for upload
 # built:    a pyramid built on the host, staged for upload
@@ -340,15 +377,27 @@ pub rec Gpu {
     settled:  u64;
     lag:      u64;
     stepped:  u64;
+    cut:      bool;
     bulk:     u64;
     edits:    u64;
     writes:   Vector[Write];
     zeros:    Vector[u32];
     stamped:  Vector[u32];
-    pace:     usize;
+    span:     usize;
+    fixed:    bool;
+    found:    bool;
+    calm:     u32;
+    worked:   usize;
+    limited:  bool;
+    quick:    bool;
     last:     Instant;
     timed:    bool;
     pace_us:  Pace;
+    going:    bool;
+    at:       usize;
+    began:    u64;
+    rule:     rule.Rule;
+    counted:  bool;
     cursor:   usize;
     head:     [128]u32;
     built:    [layout.MIP]u32;
@@ -601,8 +650,18 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     g.writes   = vector.init[Write](a);
     g.zeros    = vector.init[u32](a);
     g.stamped  = vector.init[u32](a);
-    g.pace     = FIRST_PACE;
+    g.cut      = false;
+    g.span     = FIRST_SPAN;
+    g.fixed    = false;
+    g.found    = false;
+    g.calm     = 0;
+    g.worked   = 0;
+    g.limited  = false;
+    g.quick    = false;
     g.timed    = false;
+    g.going    = false;
+    g.at       = 0;
+    g.counted  = false;
     g.pace_us  = pace_for(0.0);
     g.cursor   = 0;
     g.words    = 0;
@@ -888,46 +947,68 @@ pub fun note_write(g: *Gpu, sp: *space.Space, s: usize, i: usize) {
     vector.push[u32](?g.stamped, s::u32);
 }
 
-# the generations an uncapped frame should ask for: as many as kept the frames
-# smooth so far, which the budget then limits
-pub fun stride(g: *Gpu) usize {
-    ret g.pace;
+# hold the span at slots, rather than following the frame time, so a test
+# can force a generation across frames in ranges as small as it likes
+#[testing]
+pub fun fix_span(g: *Gpu, slots: usize) {
+    g.span  = slots;
+    g.fixed = true;
 }
 
-# adapt the stride to how the frames are running, once per uncapped frame
+# time the frame against the last, and follow the span to it
 #
-# a frame that arrives late after the last shrinks the stride, and one on time
-# that used everything it asked for grows it, so the GPU steps as many
-# generations as the frame budget holds. the halo widens once the budget cut
-# several frames in a row short that kept up with the display, reach rather
-# than frame time bounding them, and narrows once several in a row fell behind
-# the display or would have fit the ring. each such narrowing doubles how many
-# frames the next widening waits for, until stepping stops being uncapped.
-# ---
-# g:     the GPU side
-# asked: generations the frame asked for
-# done:  generations it recorded
-pub fun tune(g: *Gpu, asked: usize, done: usize) {
+# a late frame cuts the span to three quarters of what the last frame stepped,
+# then waits out the frames already recorded before another cut. a frame on
+# time that the span cut short grows it by an eighth until the first late
+# frame and by a sixty-fourth after, so the frames settle just inside the
+# refresh interval and seldom miss it.
+fun follow(g: *Gpu) {
     val now: time.InstantClock = time.instant();
     if (sel now.err) { ret; }
     var quick: bool = false;
+    var slow:  bool = false;
     if (g.timed) {
         val us: u64 = (time.instant_sub(now.ok, g.last) / 1000)::u64;
         quick = us <= g.pace_us.quick_us;
-        if (us > g.pace_us.slow_us) {
-            g.pace = g.pace - g.pace / 4;
-            if (g.pace == 0) { g.pace = 1; }
-        }
-        or (done >= asked) {
-            g.pace = g.pace + g.pace / 8 + 1;
-            if (g.pace > MAX_STEPS) { g.pace = MAX_STEPS; }
-        }
+        slow  = us > g.pace_us.slow_us;
     }
     g.last  = now.ok;
     g.timed = true;
+    g.quick = quick;
+    if (g.fixed) { ret; }
+    if (g.calm > 0) {
+        g.calm = g.calm - 1;
+        ret;
+    }
+    if (slow && g.worked != 0) {
+        var was: usize = g.span;
+        if (g.worked < was) { was = g.worked; }
+        g.span = was - was / 4;
+        if (g.span < MIN_SPAN) { g.span = MIN_SPAN; }
+        g.calm  = CALM;
+        g.found = true;
+    }
+    or (quick && g.limited) {
+        var share: usize = GROW_FAST;
+        if (g.found) { share = GROW_SLOW; }
+        g.span = g.span + g.span / share + 1;
+        if (g.span > MAX_SPAN) { g.span = MAX_SPAN; }
+    }
+}
 
-    var argues: bool = done < asked && quick;
-    if (g.wide) { argues = !quick || (done >= asked && g.lag + g.stepped <= reach(false)); }
+# follow how the uncapped frames are running with the halo, once per uncapped
+# frame
+#
+# the halo widens once the budget cut several frames in a row short that kept
+# up with the display, reach rather than frame time bounding them, and narrows
+# once several in a row fell behind the display or would have fit the ring.
+# each such narrowing doubles how many frames the next widening waits for,
+# until stepping stops being uncapped.
+# ---
+# g: the GPU side, after the frame
+pub fun tune(g: *Gpu) {
+    var argues: bool = g.cut && g.quick;
+    if (g.wide) { argues = !g.quick || (!g.cut && g.lag + g.stepped <= reach(false)); }
     if (argues) { g.streak = g.streak + 1; }
     or          { g.streak = 0; }
     if (!g.wide && g.streak >= g.patience) {
@@ -944,10 +1025,8 @@ pub fun tune(g: *Gpu, asked: usize, done: usize) {
     }
 }
 
-# forget the last uncapped frame's time, and the wide halo, once stepping is
-# no longer uncapped
+# forget the wide halo once stepping is no longer uncapped
 pub fun rest(g: *Gpu) {
-    g.timed    = false;
     g.want     = false;
     g.streak   = 0;
     g.patience = WIDEN_AFTER;
@@ -1183,6 +1262,12 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool) err[gfx.Error] {
         if ((sp.dirty[s] & space.DIRTY_CELLS) != 0) { chunks = chunks + 1; }
         s = s + 1;
     }
+    # cells the host changed land in the front, under the ranges a generation
+    # part way through already stepped, and a growth leaves its back cells
+    # behind, so it starts over. chunks a census settled are not among them:
+    # the budget keeps any generation from reaching one it allocates or frees
+    if (grew || chunks != 0 || g.writes.len != 0)                 { g.going = false; }
+    if (grew || chunks != 0 || entries != 0 || g.writes.len != 0) { g.counted = false; }
 
     if (entries > BULK) {
         # one recorded write of the span the dirty entries lie in, which never
@@ -1431,6 +1516,24 @@ fun write_head(g: *Gpu, r: *rule.Rule, gen: u64) {
     rule.pack(r, ?g.head[layout.SHARED]);
 }
 
+# record one step of the generation going over a range of slots: the step
+# serial past the last completed one, and the range's first slot
+fun step_range(g: *Gpu, step: *gfx.Compute, bound: usize, lo: usize, n: usize) err[gfx.Error] {
+    val serial: u32            = g.serial + 1;
+    val base:   u32            = lo::u32;
+    val es:     err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.meta, layout.SERIAL_AT::usize * 4, (?serial)::*u8, 4);
+    if (sel es.err) { ret es; }
+    val eb: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.meta, layout.BASE_AT::usize * 4, (?base)::*u8, 4);
+    if (sel eb.err) { ret eb; }
+    var bufs: [5]*gfx.StorageBuffer;
+    bufs[0]                           = ?g.p.cells[g.front];
+    bufs[1]                           = ?g.p.cells[1 - g.front];
+    bufs[2]                           = ?g.p.meta;
+    bufs[3]                           = ?g.p.flags;
+    bufs[layout.TABLE_BINDING::usize] = ?g.table;
+    ret gfx.renderer_dispatch(g.r, step, ?bufs[0], bound, 8, n::u32, 1);
+}
+
 # record a frame's work: bring the pool level, step, count, and set the view
 #
 # call once a frame between renderer_begin_frame and the first pass, after
@@ -1440,9 +1543,10 @@ fun write_head(g: *Gpu, r: *rule.Rule, gen: u64) {
 # sp:    the host's pool
 # r:     the rule
 # gen:   the generation the cells hold as the frame begins
-# steps: generations wanted; fewer are recorded when the budget is short
+# steps: generations wanted; fewer are completed when the budget or the span
+#        is short, and the last may be left part way for the next frame
 # look:  the camera and colours for the draw
-# ret:   the generations recorded, or why recording failed
+# ret:   the generations completed, or why recording failed
 pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, look: *Look) res[usize, gfx.Error] {
     val e14: err[gfx.Error] = flush(g, sp, false);
     if (sel e14.err) { ret res[usize, gfx.Error].err{e14.err}; }
@@ -1465,42 +1569,76 @@ pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, 
         ret res[usize, gfx.Error].ok{0};
     }
 
-    var n:      usize = steps;
+    follow(g);
     val radius: usize = rule.radius(r);
-    val b:      usize = budget(g, radius);
-    if (n > b) { n = b; }
-    val fam: usize = rule.family_of(r);
-    # a family the device could not build a stage for is refused before it
-    # runs (cellar.sim), so it is never asked to step here
-    if (!g.ready[fam]) { n = 0; }
-    if (n > 0 && g.hi != 0 && rule.table(fam)) {
-        val et: err[gfx.Error] = sync_table(g, r);
-        if (sel et.err) { ret res[usize, gfx.Error].err{et.err}; }
+    val fam:    usize = rule.family_of(r);
+    # an edit or another rule since the generation in flight began leaves the
+    # ranges it finished stale
+    if (g.going && (g.edits != g.began || !rule.same(r, ?g.rule))) {
+        g.going   = false;
+        g.counted = false;
     }
     val step:  *gfx.Compute = ?g.steps[fam];
     val bound: usize        = rule.bindings(fam);
-
-    var i: usize = 0;
-    for (i < n) {
-        if (g.hi != 0) {
-            g.serial = g.serial + 1;
-            val es: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.meta, layout.SERIAL_AT::usize * 4, (?g.serial)::*u8, 4);
-            if (sel es.err) { ret res[usize, gfx.Error].err{es.err}; }
-            var bufs: [5]*gfx.StorageBuffer;
-            bufs[0]                           = ?g.p.cells[g.front];
-            bufs[1]                           = ?g.p.cells[1 - g.front];
-            bufs[2]                           = ?g.p.meta;
-            bufs[3]                           = ?g.p.flags;
-            bufs[layout.TABLE_BINDING::usize] = ?g.table;
-            val e18: err[gfx.Error] = gfx.renderer_dispatch(g.r, step, ?bufs[0], bound, 8, g.hi::u32, 1);
-            if (sel e18.err) { ret res[usize, gfx.Error].err{e18.err}; }
-            g.front = 1 - g.front;
+    var room:  usize        = g.span;
+    var calls: usize        = 0;
+    var n:     usize        = 0;
+    g.cut     = false;
+    g.limited = false;
+    g.worked  = 0;
+    for (n < steps) {
+        if (!g.going) {
+            # a family the device could not build a stage for is refused before
+            # it runs (cellar.sim), so it is never asked to step here
+            if (!g.ready[fam]) { brk; }
+            if (budget(g, radius) == 0) {
+                g.cut = true;
+                brk;
+            }
+            if (g.hi != 0 && rule.table(fam)) {
+                val et: err[gfx.Error] = sync_table(g, r);
+                if (sel et.err) { ret res[usize, gfx.Error].err{et.err}; }
+            }
+            g.going = true;
+            g.at    = 0;
+            g.began = g.edits;
+            g.rule  = @r;
         }
-        g.spread = g.spread + radius::u64;
-        g.gens   = g.gens + 1;
-        i        = i + 1;
+        if (g.at < g.hi) {
+            if (room == 0 || calls >= MAX_STEPS) {
+                g.limited = true;
+                brk;
+            }
+            var run: usize = g.hi - g.at;
+            if (run > room) { run = room; }
+            val es: err[gfx.Error] = step_range(g, step, bound, g.at, run);
+            if (sel es.err) { ret res[usize, gfx.Error].err{es.err}; }
+            g.at     = g.at + run;
+            g.worked = g.worked + run;
+            room     = room - run;
+            calls    = calls + 1;
+            if (g.at < g.hi) {
+                g.limited = true;
+                brk;
+            }
+        }
+        # the generation is complete, and the back cells become the world
+        if (g.at != 0) {
+            g.serial = g.serial + 1;
+            g.front  = 1 - g.front;
+        }
+        g.going   = false;
+        g.counted = false;
+        g.spread  = g.spread + radius::u64;
+        g.gens    = g.gens + 1;
+        n         = n + 1;
     }
     g.stepped = n::u64 * radius::u64;
+    if (g.going) {
+        # the census, the reduction and the draw read the completed generation
+        val ec: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.meta, layout.SERIAL_AT::usize * 4, (?g.serial)::*u8, 4);
+        if (sel ec.err) { ret res[usize, gfx.Error].err{ec.err}; }
+    }
 
     # a narrower halo frees chunks the budget may already have spread into, so
     # the budget drops to what the ring holds from this census on, and stays
@@ -1515,6 +1653,10 @@ pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, 
         }
     }
 
+    # while a generation is part way through, the front is counted and reduced
+    # again only once it changed
+    if (g.going && g.counted) { ret res[usize, gfx.Error].ok{0}; }
+    g.counted = true;
     if (g.hi != 0) {
         var rb: [4]*gfx.StorageBuffer;
         rb[0] = ?g.p.cells[g.front];
