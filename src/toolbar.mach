@@ -1,0 +1,383 @@
+# the toolbar across the window's top: running the world, the tool, the pen's
+# state, the engine, and the panels
+#
+# it holds play or pause, step and reset, the speed and uncapped, a button for
+# each tool (app.tool_name), the state the pen paints under a rule of more
+# than two states, picked from a popup of the rule's states, the engine and,
+# on HashLife, its step and going to a generation. at its right end are the
+# panels menu, which opens or closes each panel and resets the layout, and
+# the settings and help buttons. its groups run left to right and wrap onto a
+# further row when the window is too narrow for them, so the toolbar is as
+# tall as its rows; it is carved from the top of the window before the docks.
+
+use blit;
+use bctx:  blit.context;
+use bint:  blit.interact;
+use blay:  blit.layout;
+use bmenu: blit.menu;
+use bst:   blit.state;
+use bth:   blit.theme;
+use bw:    blit.widget;
+use cellar.app;
+use cellar.arrange;
+use cellar.command;
+use cellar.hashlife;
+use cellar.look;
+use cellar.panel;
+use cellar.rule;
+use cellar.text;
+use cellar.theme;
+use cellar.world;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+
+# unscaled padding around the rows and between them
+val PAD: f32 = 6.0;
+# unscaled space between groups, and between the items of one
+val GAP:  f32 = 14.0;
+val ITEM: f32 = 6.0;
+# unscaled widths of the speed and step sliders and the generation field
+val SPEED_W:    f32 = 190.0;
+val EXPONENT_W: f32 = 160.0;
+val GO_W:       f32 = 120.0;
+# unscaled width of the state picker's popup
+val INKS_W: f32 = 280.0;
+
+# the groups, in the order they run
+val G_RUN:    usize = 0;
+val G_SPEED:  usize = 1;
+val G_TOOLS:  usize = 2;
+val G_INK:    usize = 3;
+val G_ENGINE: usize = 4;
+val G_TREE:   usize = 5;
+val G_END:    usize = 6;
+val GROUPS:   usize = 7;
+
+# the toolbar as it lays its groups out
+# ---
+# ui:   the interface
+# l:    cellar's look
+# a:    application state
+# s:    the world as shown
+# x0:   its left
+# x1:   its right
+# x:    where the next group goes
+# y:    the top of the row it goes on
+# rh:   a row's height
+# rows: rows laid out so far
+pub rec Bar {
+    ui:   *bctx.Context;
+    l:    look.Look;
+    a:    *app.App;
+    s:    *world.Shown;
+    x0:   f32;
+    x1:   f32;
+    x:    f32;
+    y:    f32;
+    rh:   f32;
+    rows: usize;
+}
+
+# whether the popup of the pen's states is open, kept under the picker's id
+rec Picker {
+    open: u8;
+}
+
+# a button's width for a label
+fun button_w(ui: *bctx.Context, s: str) f32 {
+    val in: bth.Edges = bctx.px_edges(ui, bctx.look_of(ui, bth.BUTTON).inset);
+    ret bctx.text_width(ui, s) + in.l + in.r;
+}
+
+# the width of a row of n buttons as wide as the widest of their labels
+fun buttons_w(ui: *bctx.Context, labels: *str, n: usize) f32 {
+    var most: f32   = 0.0;
+    var i:    usize = 0;
+    for (i < n) {
+        val w: f32 = button_w(ui, labels[i]);
+        if (w > most) { most = w; }
+        i = i + 1;
+    }
+    ret most * n::f32 + bctx.px(ui, ITEM) * (n - 1)::f32;
+}
+
+# a switch's width for a label
+fun toggle_w(ui: *bctx.Context, s: str) f32 {
+    val st: *bth.Style = bctx.look_of(ui, bth.TOGGLE);
+    val in: bth.Edges  = bctx.px_edges(ui, st.inset);
+    val pd: bth.Edges  = bctx.px_edges(ui, st.pad);
+    ret bctx.text_width(ui, s) + in.r + (bw.control_height(ui) - pd.t - pd.b) * 2.0 + pd.r;
+}
+
+fun tool_labels(out: *str) {
+    var t: usize = 0;
+    for (t < app.TOOL_COUNT) {
+        out[t] = app.tool_name(t);
+        t      = t + 1;
+    }
+}
+
+fun engine_labels(out: *str) {
+    out[0] = "Chunks";
+    out[1] = "HashLife";
+}
+
+# the label the state picker shows for the pen's state
+fun ink_label(a: *app.App, buf: *u8) str {
+    var o: usize = text.buf_str(buf, 0, "State ");
+    o      = text.buf_u64(buf, o, a.ink::u64);
+    buf[o] = 0;
+    ret buf;
+}
+
+# a group's width, 0 while it is not shown
+fun width(b: *Bar, g: usize) f32 {
+    val ui: *bctx.Context = b.ui;
+    val it: f32           = bctx.px(ui, ITEM);
+    if (g == G_RUN)   { ret button_w(ui, "Pause") + button_w(ui, "Step") + button_w(ui, "Reset") + it * 2.0; }
+    if (g == G_SPEED) { ret bctx.px(ui, SPEED_W) + it + toggle_w(ui, "Uncapped"); }
+    if (g == G_TOOLS) {
+        var tools: [app.TOOL_COUNT]str;
+        tool_labels(?tools[0]);
+        ret buttons_w(ui, ?tools[0], app.TOOL_COUNT);
+    }
+    if (g == G_INK) {
+        if (rule.states(world.rule(b.s)) <= 2) { ret 0.0; }
+        ret b.rh + button_w(ui, "State 255");
+    }
+    if (g == G_ENGINE) {
+        var names: [2]str;
+        engine_labels(?names[0]);
+        ret buttons_w(ui, ?names[0], 2);
+    }
+    if (g == G_TREE) {
+        if (!world.hashlife(b.s)) { ret 0.0; }
+        ret bctx.px(ui, EXPONENT_W) + bctx.px(ui, GO_W) + button_w(ui, "Go to") + it * 2.0;
+    }
+    val hd: bth.Edges = bctx.px_edges(ui, bctx.look_of(ui, bth.MENU_TITLE).inset);
+    ret bctx.text_width(ui, "Panels") + hd.l + hd.r + it + button_w(ui, "Settings") + it + b.rh;
+}
+
+# the rect the next group of width w takes, wrapping onto a new row when it
+# does not fit on this one; the last group sits at the right end of its row
+fun next(b: *Bar, g: usize, w: f32) bctx.Area {
+    val pad: f32 = bctx.px(b.ui, PAD);
+    if (b.x + w > b.x1 - pad && b.x > b.x0 + pad) {
+        b.x    = b.x0 + pad;
+        b.y    = b.y + b.rh + pad;
+        b.rows = b.rows + 1;
+    }
+    var x: f32 = b.x;
+    if (g == G_END && b.x1 - pad - w > x) { x = b.x1 - pad - w; }
+    b.x = x + w + bctx.px(b.ui, GAP);
+    ret bctx.Area{x0: x, y0: b.y, x1: x + w, y1: b.y + b.rh};
+}
+
+# start laying the groups out from the top of a strip
+fun start(b: *Bar, y0: f32) {
+    val pad: f32 = bctx.px(b.ui, PAD);
+    b.x    = b.x0 + pad;
+    b.y    = y0 + pad;
+    b.rows = 1;
+}
+
+# lay a widget of the current column out in a rect, as one row
+fun open_cell(ui: *bctx.Context, r: bctx.Area) {
+    bctx.push_layout(ui, blay.column(r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0, 0.0));
+}
+
+fun run(b: *Bar, r: bctx.Area) {
+    val ui: *bctx.Context = b.ui;
+    val it: f32           = bctx.px(ui, ITEM);
+    var go: str           = "Play###go";
+    if (world.running(b.s)) { go = "Pause###go"; }
+    val w0: f32 = button_w(ui, "Pause");
+    val w1: f32 = button_w(ui, "Step");
+    val x1: f32 = r.x0 + w0 + it;
+    val x2: f32 = x1 + w1 + it;
+    if (bw.button_at(ui, go, r.x0, r.y0, r.x0 + w0, r.y1, world.running(b.s))) { app.submit(b.a, command.Command.toggle{}); }
+    if (bw.button_at(ui, "Step", x1, r.y0, x1 + w1, r.y1, false))              { app.submit(b.a, command.Command.step{}); }
+    if (bw.button_at(ui, "Reset", x2, r.y0, r.x1, r.y1, false))                { app.submit(b.a, command.Command.reset{}); }
+}
+
+fun speed(b: *Bar, r: bctx.Area) {
+    val ui: *bctx.Context = b.ui;
+    val a:  *app.App      = b.a;
+    var rd: [32]u8;
+    var o:  usize         = text.buf_u64(?rd[0], 0, (a.speed + 0.5)::u64);
+    o     = text.buf_str(?rd[0], o, " gen/s");
+    rd[o] = 0;
+    val sx: f32 = r.x0 + bctx.px(ui, SPEED_W);
+    open_cell(ui, bctx.Area{x0: r.x0, y0: r.y0, x1: sx, y1: r.y1});
+    bw.slider(ui, "Speed", ?rd[0], ?a.speed, 1.0, 120.0);
+    bctx.pop_layout(ui);
+    open_cell(ui, bctx.Area{x0: sx + bctx.px(ui, ITEM), y0: r.y0, x1: r.x1, y1: r.y1});
+    bw.toggle(ui, "Uncapped", ?a.uncapped);
+    bctx.pop_layout(ui);
+}
+
+fun tools(b: *Bar, r: bctx.Area) {
+    var labels: [app.TOOL_COUNT]str;
+    tool_labels(?labels[0]);
+    open_cell(b.ui, r);
+    bw.segmented(b.ui, ?labels[0], app.TOOL_COUNT, ?b.a.tool);
+    bctx.pop_layout(b.ui);
+}
+
+# the pen's state as a button with its colour, opening the rule's states to
+# pick another
+fun ink(b: *Bar, r: bctx.Area) {
+    val ui:  *bctx.Context = b.ui;
+    val a:   *app.App      = b.a;
+    val rl:  *rule.Rule    = world.rule(b.s);
+    val pid: u64           = bctx.id_of(ui, "state picker");
+    val pk:  *Picker       = bst.get[Picker](ui, pid);
+    if (bw.button_at(ui, "###state", r.x0, r.y0, r.x1, r.y1, pk.open != 0)) { pk.open = 1 - pk.open; }
+    val in: f32 = bctx.px(ui, 6.0);
+    val sz: f32 = r.y1 - r.y0 - in * 2.0;
+    bctx.quad(ui, r.x0 + in, r.y0 + in, r.x0 + in + sz, r.y1 - in, look.colour(arrange.pen_colour(a, rl), 1.0));
+    var lb: [24]u8;
+    look.text_mid(ui, ink_label(a, ?lb[0]), r.x0 + in * 2.0 + sz, r.y0, r.y1, look.colour(theme.TEXT, 1.0));
+
+    val pop: bw.Popup = bw.begin_popup(ui, "states", pk.open, r.x0, r.y1 + bctx.px(ui, 4.0), bctx.px(ui, INKS_W));
+    if (pop.open != 0) {
+        if (arrange.inks(ui, b.l, a, rl) || pop.dismissed != 0) { pk.open = 0; }
+    }
+    bw.end_popup(ui, pop);
+}
+
+fun engine(b: *Bar, r: bctx.Area) {
+    val ui:    *bctx.Context = b.ui;
+    val on:    bool          = world.hashlife(b.s);
+    var names: [2]str;
+    engine_labels(?names[0]);
+    var pick: usize = 0;
+    if (on) { pick = 1; }
+    bctx.begin_disabled(ui, !on && !world.hashlife_runs(b.s));
+    open_cell(ui, r);
+    if (bw.segmented(ui, ?names[0], 2, ?pick)) {
+        b.a.engine_tree = pick == 1;
+        app.submit(b.a, command.Command.engine{pick == 1});
+    }
+    bctx.pop_layout(ui);
+    bctx.end_disabled(ui);
+}
+
+# HashLife's step exponent and going to a generation
+fun tree(b: *Bar, r: bctx.Area) {
+    val ui: *bctx.Context = b.ui;
+    val a:  *app.App      = b.a;
+    val it: f32           = bctx.px(ui, ITEM);
+    val k:  u32           = world.exponent(b.s);
+    var rd: [32]u8;
+    var o:  usize         = text.buf_str(?rd[0], 0, "2^");
+    o     = text.buf_u64(?rd[0], o, k::u64);
+    o     = text.buf_str(?rd[0], o, " gens");
+    rd[o] = 0;
+    var v:  f32 = k::f32;
+    val sx: f32 = r.x0 + bctx.px(ui, EXPONENT_W);
+    open_cell(ui, bctx.Area{x0: r.x0, y0: r.y0, x1: sx, y1: r.y1});
+    if (bw.slider(ui, "Step###exponent", ?rd[0], ?v, 0.0, hashlife.MAX_EXPONENT::f32)) {
+        val nk: u32 = (v + 0.5)::u32;
+        if (nk != k) { app.submit(a, command.Command.exponent{nk}); }
+    }
+    bctx.pop_layout(ui);
+    val fx:    f32  = sx + it;
+    val gx:    f32  = fx + bctx.px(ui, GO_W);
+    val typed: u8   = bw.text_field_at(ui, "go to", ?a.go_to, "Generation", fx, r.y0, gx, r.y1);
+    val go:    bool = bw.button_at(ui, "Go to", gx + it, r.y0, r.x1, r.y1, false);
+    if (go || (typed & blit.field.ENTERED) != 0) {
+        val t:   str   = blit.field.text(?a.go_to);
+        var gen: u64   = 0;
+        var i:   usize = 0;
+        for (t[i] != 0) {
+            gen = gen * 10 + (t[i] - '0')::u64;
+            i   = i + 1;
+        }
+        if (i == 0) { app.say(a, "type a generation to go to"); }
+        or          { app.submit(a, command.Command.jump{gen}); }
+    }
+}
+
+# the panels menu, and the settings and help buttons
+fun end(b: *Bar, r: bctx.Area) {
+    val ui: *bctx.Context = b.ui;
+    val a:  *app.App      = b.a;
+    val it: f32           = bctx.px(ui, ITEM);
+    val hd: bth.Edges     = bctx.px_edges(ui, bctx.look_of(ui, bth.MENU_TITLE).inset);
+    val mw: f32           = bctx.text_width(ui, "Panels") + hd.l + hd.r;
+    open_cell(ui, bctx.Area{x0: r.x0, y0: r.y0, x1: r.x0 + mw, y1: r.y1});
+    var bar: bmenu.Menu = bmenu.begin_bar(ui, "menu");
+    var m:   bmenu.Menu = bmenu.begin_menu(ui, ?bar, "Panels");
+    var i:   usize      = 0;
+    for (i < panel.COUNT) {
+        var on: u8 = 0;
+        if (panel.shown(ui, i)) { on = 1; }
+        var item: bmenu.Item = bmenu.of(panel.panel(i).title);
+        item.check = ?on;
+        if (bmenu.item(ui, ?m, item)) { panel.show(ui, a, i, on != 0); }
+        i = i + 1;
+    }
+    bmenu.separator(ui, ?m);
+    if (bmenu.item(ui, ?m, bmenu.of("Reset layout"))) {
+        a.relayout = true;
+        a.panel    = 1;
+    }
+    bmenu.end_menu(ui, ?m);
+    bmenu.end_bar(ui, ?bar);
+    bctx.pop_layout(ui);
+
+    val sx: f32  = r.x0 + mw + it;
+    val sw: f32  = button_w(ui, "Settings");
+    val on: bool = panel.shown(ui, panel.SETTINGS);
+    if (bw.button_at(ui, "Settings", sx, r.y0, sx + sw, r.y1, on))                { panel.show(ui, a, panel.SETTINGS, !on); }
+    if (bw.button_at(ui, "?###help", r.x1 - b.rh, r.y0, r.x1, r.y1, a.help != 0)) { a.help = 1 - a.help; }
+}
+
+fun group(b: *Bar, g: usize, r: bctx.Area) {
+    if (g == G_RUN)    { run(b, r); }
+    if (g == G_SPEED)  { speed(b, r); }
+    if (g == G_TOOLS)  { tools(b, r); }
+    if (g == G_INK)    { ink(b, r); }
+    if (g == G_ENGINE) { engine(b, r); }
+    if (g == G_TREE)   { tree(b, r); }
+    if (g == G_END)    { end(b, r); }
+}
+
+# draw the toolbar across the top of what is free of the window and apply its
+# controls; call at the interface's root, before the docks
+# ---
+# ui: the interface, its frame begun
+# l:  cellar's look
+# a:  application state
+# s:  the world as shown
+pub fun draw(ui: *bctx.Context, l: look.Look, a: *app.App, s: *world.Shown) {
+    val free: bctx.Area = bctx.free_area(ui);
+    var b:    Bar       = Bar{ui: ui, l: l, a: a, s: s, x0: free.x0, x1: free.x1, x: 0.0, y: 0.0, rh: bw.control_height(ui), rows: 0};
+    var ws:   [GROUPS]f32;
+    var g:    usize     = 0;
+    start(?b, 0.0);
+    for (g < GROUPS) {
+        ws[g] = width(?b, g);
+        if (ws[g] > 0.0) { next(?b, g, ws[g]); }
+        g = g + 1;
+    }
+    val pad: f32       = bctx.px(ui, PAD);
+    val h:   f32       = b.rows::f32 * (b.rh + pad) + pad;
+    val r:   bctx.Area = bctx.carve(ui, bctx.Side.top{}, h);
+    bint.hit(ui, 0, r.x0, r.y0, r.x1, r.y1, 0);
+    bctx.quad(ui, r.x0, r.y0, r.x1, r.y1, look.colour(theme.HEADER, 1.0));
+    bctx.quad(ui, r.x0, r.y1 - bctx.px(ui, 1.0), r.x1, r.y1, look.colour(theme.PANEL_EDGE, 1.0));
+
+    bctx.push_id_str(ui, "toolbar");
+    start(?b, r.y0);
+    g = 0;
+    for (g < GROUPS) {
+        if (ws[g] > 0.0) { group(?b, g, next(?b, g, ws[g])); }
+        g = g + 1;
+    }
+    bctx.pop_id(ui);
+}

@@ -6,6 +6,23 @@ All notable changes to cellar are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-01
+
+### Added
+
+- A Bounds tool. Drag a box around a pattern to make it the world's grid, drag its edges to resize it, or set the shape and size in the World panel. The world shifts so nothing moves on screen, cells outside are dropped with a toast, and undo brings them back (#155).
+- Growth ceilings on population, chunks, HashLife memory and step time, each optional, that pause a runaway world with a toast. HashLife stays inside its memory ceiling, stepping down to smaller steps before it gives up. `cellar run` honours them, with flags to override, and exits with status 3 when one stops it (#146).
+- A toast naming why the world left HashLife, whichever change caused it (#160).
+
+### Changed
+
+- The interface is a docked layout: a toolbar across the top, Patterns and Files on the left, Rule, World and View tabs with Stats on the right, and Settings in its own window. Panels dock, float, tab and close, and the layout is saved (#154).
+- The interface is built on blit, with TrueType text at every scale (#118).
+- The simulation steps on its own thread on every engine, so the interface keeps the display's refresh rate however slow a generation is (#143).
+- Pause and every other command cancel the step under way, so they take effect within a frame or two (#144).
+- A GPU generation is split across frames on large worlds, so a frame never waits on a whole generation (#145).
+- Built on boom 0.40, with blit 0.10 and glfw 0.11.
+
 ## [0.5.0] - 2026-09-30
 
 ### Added

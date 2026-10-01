@@ -29,9 +29,19 @@
 # the root's result as the new root.
 #
 # the table holds at most max nodes. collect frees every node the root and the
-# empty squares do not reach, and forgets the results that named one. a node
+# empty squares do not reach, and forgets the results that named one. tidy
+# collects as the nodes in use near what the table can reach under a budget,
+# the max unless a ceiling on the tree's memory sets a lower one (set_budget). a node
 # the table cannot make is NONE, which every function passes up, so a step or
 # an edit that fills the table stops whole and says so rather than going wrong.
+#
+# a step can also be cancelled part way, through the same NONE: when growing
+# the table would pass the budget, counting the old table beside the new one
+# unless the allocator resizes it in place, when it runs past a deadline (set_deadline), or
+# when another thread asks (ask_cancel). the root is left as it was, the
+# results worked out so far stay as the valid cache entries they are, and
+# cancelled says why, for the caller to collect, pause or carry on. only a step
+# is cancelled, so an edit or a load may still pass the budget.
 #
 # edits and reads go through a cache of 64 by 64 chunks of states over the
 # tree: a chunk is copied out of the tree the first time an edit or a read
@@ -44,11 +54,14 @@ use cellar.layout;
 use cellar.rule;
 use allo: std.allocator;
 use std.allocator.page;
+use std.chrono.duration.MILLISECOND;
+use std.chrono.time;
 use std.collections.map;
 use std.collections.map.Map;
 use std.collections.vector;
 use std.collections.vector.Vector;
 use mem: std.memory;
+use std.sync.atomic;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -64,8 +77,9 @@ pub val MAX_STATES: u32 = 256;
 pub val MAX_LEVEL: u32 = 60;
 # the largest step exponent, which leaves the root room to be padded for it
 pub val MAX_EXPONENT: u32 = 48;
-# nodes a table may hold unless told otherwise, 48 bytes each
-pub val DEFAULT_MAX: usize = 4194304;
+# nodes a table may hold unless told otherwise, NODE_BYTES each: room for a
+# memory ceiling well past the default to be run past
+pub val DEFAULT_MAX: usize = 134217728;
 # the level of a chunk, 64 cells on a side
 pub val CHUNK: u32 = 6;
 # the shallowest root, so every chunk is a node below it
@@ -102,6 +116,21 @@ rec Node {
     live:  u64;
 }
 
+# the memory a node takes: itself and its share of the buckets, of which there
+# are at most two a node
+pub val NODE_BYTES: usize = $size_of(Node) + 2 * $size_of(u32);
+
+# why a step was cancelled (cancelled): it was not
+pub val CANCEL_NONE: u8 = 0;
+# it would have taken a node past the budget
+pub val CANCEL_BUDGET: u8 = 1;
+# it ran past its deadline
+pub val CANCEL_TIME: u8 = 2;
+# another thread asked
+pub val CANCEL_ASKED: u8 = 3;
+# results worked out between looks at the clock and at an ask
+val POLL: u32 = 1024;
+
 # Node.flags
 val USED: u8 = 1;
 val MARK: u8 = 2;
@@ -125,52 +154,69 @@ rec Cache {
 
 # the tree
 # ---
-# a:      allocator behind the table and the cache
-# made:   the table is allocated
-# max:    the most nodes the table may hold
-# nodes:  the table
-# cap:    nodes allocated
-# hi:     ids in use lie below this
-# used:   nodes in use, the cells included
-# free:   the first free id below hi, NONE when none
-# heads:  first node per hash bucket
-# hcap:   buckets, a power of two
-# empty:  the empty node of each level, NONE until made
-# r:      the rule
-# states: states a cell of the rule can be in
-# lit:    each state is one the rule's sense counts live
-# hue:    the heat the rule's word for each state carries
-# table:  next state of every 3 by 3 block of a two-state rule, bit i of the
-#         index the block's cell i
-# tabled: table holds the rule's
-# k:      the step exponent
-# root:   the world
-# level:  the root's level
-# full:   the table could not make a node
-# cache:  the chunks taken out for editing
+# a:        allocator behind the table and the cache
+# made:     the table is allocated
+# max:      the most nodes the table may hold
+# budget:   nodes the table, and any copy a growth makes, may take while a step
+#           is under way, which tidy collects ahead of; at most max
+# in_place: a growth resizes the table where it lies (set_in_place)
+# nodes:    the table
+# cap:      nodes allocated
+# hi:       ids in use lie below this
+# used:     nodes in use, the cells included
+# free:     the first free id below hi, NONE when none
+# heads:    first node per hash bucket
+# hcap:     buckets, a power of two
+# empty:    the empty node of each level, NONE until made
+# r:        the rule
+# states:   states a cell of the rule can be in
+# lit:      each state is one the rule's sense counts live
+# hue:      the heat the rule's word for each state carries
+# table:    next state of every 3 by 3 block of a two-state rule, bit i of the
+#           index the block's cell i
+# tabled:   table holds the rule's
+# k:        the step exponent
+# root:     the world
+# level:    the root's level
+# full:     the table could not make a node
+# cache:    the chunks taken out for editing
+# armed:    a step is under way, which the budget, the deadline and an ask cancel
+# cancel:   why the last step was cancelled, CANCEL_*
+# timed:    a step is cancelled past deadline
+# deadline: when
+# asked:    1 once another thread asks the step under way to cancel
+# polls:    results left before the next look at the clock and at asked
 pub rec Tree {
-    a:      *allo.Allocator;
-    made:   bool;
-    max:    usize;
-    nodes:  *Node;
-    cap:    usize;
-    hi:     usize;
-    used:   usize;
-    free:   u32;
-    heads:  *u32;
-    hcap:   usize;
-    empty:  [61]u32;
-    r:      rule.Rule;
-    states: u32;
-    lit:    [256]u8;
-    hue:    [256]u8;
-    table:  [512]u8;
-    tabled: bool;
-    k:      u32;
-    root:   u32;
-    level:  u32;
-    full:   bool;
-    cache:  Cache;
+    a:        *allo.Allocator;
+    made:     bool;
+    max:      usize;
+    budget:   usize;
+    in_place: bool;
+    nodes:    *Node;
+    cap:      usize;
+    hi:       usize;
+    used:     usize;
+    free:     u32;
+    heads:    *u32;
+    hcap:     usize;
+    empty:    [61]u32;
+    r:        rule.Rule;
+    states:   u32;
+    lit:      [256]u8;
+    hue:      [256]u8;
+    table:    [512]u8;
+    tabled:   bool;
+    k:        u32;
+    root:     u32;
+    level:    u32;
+    full:     bool;
+    cache:    Cache;
+    armed:    bool;
+    cancel:   u8;
+    timed:    bool;
+    deadline: time.Instant;
+    asked:    i64;
+    polls:    u32;
 }
 
 # a tree with nothing allocated, to hold at most max nodes once it is made
@@ -179,12 +225,19 @@ pub rec Tree {
 # a:   allocator for the table
 # max: the most nodes, at least a few thousand
 pub fun init(t: *Tree, a: *allo.Allocator, max: usize) {
-    t.a    = a;
-    t.made = false;
-    t.max  = max;
-    t.cap  = 0;
-    t.k    = 0;
-    t.full = false;
+    t.a        = a;
+    t.made     = false;
+    t.max      = max;
+    t.budget   = max;
+    t.in_place = $mach.build.os == $mach.os.linux;
+    t.cap      = 0;
+    t.k        = 0;
+    t.full     = false;
+    t.armed    = false;
+    t.cancel   = CANCEL_NONE;
+    t.timed    = false;
+    t.asked    = 0;
+    t.polls    = 0;
     # until a rule is set, every state but 0 shows as a live cell at full heat
     var i: usize = 0;
     for (i < MAX_STATES::usize) {
@@ -245,25 +298,63 @@ fun rehash(t: *Tree) {
     }
 }
 
+# the nodes a full table grows to: double, at most max, and while a step is
+# under way no more than the budget holds with the table it grows from, unless
+# the allocator resizes it in place
+fun next_cap(t: *Tree) usize {
+    var cap: usize = t.cap * 2;
+    if (cap > t.max) { cap = t.max; }
+    if (t.armed && t.budget < t.max) {
+        var room: usize = t.budget;
+        if (!t.in_place) {
+            room = 0;
+            if (t.budget > t.cap) { room = t.budget - t.cap; }
+        }
+        if (cap > room) { cap = room; }
+    }
+    ret cap;
+}
+
+# the most nodes the table reaches under the budget: all of it when the table
+# is resized in place, and half when a growth holds the old table beside the new
+fun attainable(t: *Tree) usize {
+    var b: usize = t.budget;
+    if (b > t.max)   { b = t.max; }
+    if (!t.in_place) { b = b / 2; }
+    ret b;
+}
+
 # the table at cap nodes, the old one carried over
+#
+# it is resized in place where the allocator can, so a growth never holds the
+# old table and the new one at once. a node past hi is written whole before it
+# is used, so the room added is not cleared.
 fun grow(t: *Tree, cap: usize) bool {
-    val rn: res[*Node, allo.Error] = allo.zallocate[Node](t.a, cap);
-    if (sel rn.err) { ret false; }
-    val hcap: usize                 = buckets(cap);
-    val rh:   res[*u32, allo.Error] = allo.allocate[u32](t.a, hcap);
-    if (sel rh.err) {
-        allo.deallocate[Node](t.a, rn.ok, cap);
-        ret false;
+    val hcap: usize = buckets(cap);
+    if (t.cap == 0) {
+        val rn: res[*Node, allo.Error] = allo.zallocate[Node](t.a, cap);
+        if (sel rn.err) { ret false; }
+        val rh: res[*u32, allo.Error] = allo.allocate[u32](t.a, hcap);
+        if (sel rh.err) {
+            allo.deallocate[Node](t.a, rn.ok, cap);
+            ret false;
+        }
+        t.nodes = rn.ok;
+        t.heads = rh.ok;
     }
-    if (t.cap != 0) {
-        mem.copy[Node](rn.ok, t.nodes, t.hi);
-        allo.deallocate[Node](t.a, t.nodes, t.cap);
-        allo.deallocate[u32](t.a, t.heads, t.hcap);
+    or {
+        val rn: res[*Node, allo.Error] = allo.reallocate[Node](t.a, t.nodes, t.cap, cap);
+        if (sel rn.err) { ret false; }
+        t.nodes = rn.ok;
+        t.cap   = cap;
+        if (hcap != t.hcap) {
+            val rh: res[*u32, allo.Error] = allo.reallocate[u32](t.a, t.heads, t.hcap, hcap);
+            if (sel rh.err) { ret false; }
+            t.heads = rh.ok;
+        }
     }
-    t.nodes = rn.ok;
-    t.cap   = cap;
-    t.heads = rh.ok;
-    t.hcap  = hcap;
+    t.cap  = cap;
+    t.hcap = hcap;
     # the free list runs through next, which rehash rewrites for nodes in use only
     rehash(t);
     ret true;
@@ -402,8 +493,12 @@ pub fun node(t: *Tree, nw: u32, ne: u32, sw: u32, se: u32) u32 {
             ret NONE;
         }
         if (t.hi == t.cap) {
-            var cap: usize = t.cap * 2;
-            if (cap > t.max) { cap = t.max; }
+            val cap: usize = next_cap(t);
+            # a step stops rather than grow the table past the budget
+            if (cap <= t.cap) {
+                t.cancel = CANCEL_BUDGET;
+                ret NONE;
+            }
             if (!grow(t, cap)) {
                 t.full = true;
                 ret NONE;
@@ -549,12 +644,13 @@ fun base(t: *Tree, n: u32) u32 {
 # n:   a node of level 2 or more, or NONE
 # ret: the result, or NONE when the table filled
 fun result(t: *Tree, n: u32) u32 {
-    if (n == NONE) { ret NONE; }
+    if (n == NONE || t.cancel != CANCEL_NONE) { ret NONE; }
     val l:    u32  = level_of(t, n);
     val fast: bool = l - 2 <= t.k;
     if (t.nodes[n::usize].pop == 0)                                                  { ret empty(t, l - 1); }
     if (fast && t.nodes[n::usize].full != NONE)                                      { ret t.nodes[n::usize].full; }
     if (!fast && t.nodes[n::usize].slow != NONE && t.nodes[n::usize].sk::u32 == t.k) { ret t.nodes[n::usize].slow; }
+    if (t.armed && halt(t))                                                          { ret NONE; }
     var r: u32 = NONE;
     if (l == 2) { r = base(t, n); }
     or {
@@ -734,9 +830,79 @@ pub fun collect(t: *Tree, extra: u32) {
     t.full = false;
 }
 
-# collect when the table is three quarters full
+# collect when the nodes in use reach three quarters of what the table can reach
 pub fun tidy(t: *Tree, extra: u32) {
-    if (t.used >= t.max - t.max / 4) { collect(t, extra); }
+    val b: usize = attainable(t);
+    if (t.used >= b - b / 4) { collect(t, extra); }
+}
+
+# say whether the allocator resizes the table where it lies, so a growth never
+# holds a second copy. the page allocator does on linux (mremap)
+pub fun set_in_place(t: *Tree, on: bool) {
+    t.in_place = on;
+}
+
+# set the nodes tidy keeps the table within, the table's max for none
+pub fun set_budget(t: *Tree, nodes: usize) {
+    t.budget = nodes;
+}
+
+# the bytes the nodes in use take, the cells' included
+pub fun memory(t: *Tree) usize {
+    if (!t.made) { ret 0; }
+    ret t.used * NODE_BYTES;
+}
+
+# whether the step under way is to stop, looking at the clock and for an ask
+# once every POLL results it works out
+fun halt(t: *Tree) bool {
+    if (t.polls > 0) {
+        t.polls = t.polls - 1;
+        ret false;
+    }
+    t.polls = POLL;
+    if (atomic.load(?t.asked) != 0) {
+        atomic.store(?t.asked, 0);
+        t.cancel = CANCEL_ASKED;
+        ret true;
+    }
+    if (!t.timed) { ret false; }
+    val now: time.InstantClock = time.instant();
+    if (sel now.ok && time.instant_before(t.deadline, now.ok)) {
+        t.cancel = CANCEL_TIME;
+        ret true;
+    }
+    ret false;
+}
+
+# cancel steps that run past a deadline, or none
+pub fun set_deadline(t: *Tree, at: opt[time.Instant]) {
+    t.timed = false;
+    if (sel at.some) {
+        t.timed    = true;
+        t.deadline = at.some;
+    }
+}
+
+# the deadline ms milliseconds after start
+pub fun deadline_after(start: time.Instant, ms: u64) time.Instant {
+    ret time.instant_add(start, (ms::i64) * MILLISECOND);
+}
+
+# ask the step under way to cancel, from any thread. an ask between steps
+# cancels the next one
+pub fun ask_cancel(t: *Tree) {
+    atomic.store(?t.asked, 1);
+}
+
+# withdraw an ask no step met, while no step is under way
+pub fun unask(t: *Tree) {
+    atomic.store(?t.asked, 0);
+}
+
+# why the last step was cancelled, CANCEL_NONE when it was not
+pub fun cancelled(t: *Tree) u8 {
+    ret t.cancel;
 }
 
 # whether the root's live cells all lie in its centre quarter
@@ -760,11 +926,14 @@ fun pad_to(t: *Tree, level: u32) bool {
 
 # advance the world 2^k generations
 #
-# a failure leaves the world as it was, and collect then retry may succeed.
+# a failure leaves the world as it was, and collect then retry may succeed
+# unless the step was cancelled for its time or by an ask.
 # ---
 # t:   the tree, made
-# ret: false when the table filled or the root would pass MAX_LEVEL
+# ret: false when the table filled, the root would pass MAX_LEVEL, or the step
+#      was cancelled, which cancelled says
 pub fun step(t: *Tree) bool {
+    t.cancel = CANCEL_NONE;
     tidy(t, NONE);
     if (!pad_to(t, t.k + 3)) { ret false; }
     for (!centred(t)) {
@@ -774,7 +943,10 @@ pub fun step(t: *Tree) bool {
         }
         if (!pad_to(t, t.level + 1)) { ret false; }
     }
+    t.armed = true;
+    t.polls = 0;
     val r: u32 = result(t, t.root);
+    t.armed = false;
     if (r == NONE) { ret false; }
     t.root  = r;
     t.level = t.level - 1;

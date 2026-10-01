@@ -18,6 +18,17 @@
 # anything can reach past it, so no generation is recorded that could outrun
 # the last census the pool was settled from.
 #
+# a frame steps no more than its span of slots, counting every generation's
+# slots, so one generation over a large pool is dispatched in ranges of slots
+# across several frames. the span follows the frame time against the display's
+# refresh interval: the time a frame's dispatches take shows as the next
+# frames arriving late, which cuts the span, and frames on time that the span
+# cut short let it grow. while a generation is part way through, its finished
+# ranges lie in the back cells, so the draw, the census and the pyramids read
+# the front, the last completed generation, and only a frame that completes
+# one counts and reduces it again. an edit, a growth or another rule since the
+# generation began starts it over from the front, under the same serial.
+#
 # the halo is the ring of adjacent chunks, 32 cells of reach, unless uncapped
 # stepping keeps running into the budget, when it widens to chunks two away and
 # 96 cells, at nearly three times the slots. the budget rises only once a
@@ -44,8 +55,8 @@
 #
 # where the compute stages cannot be built, the CPU steps and this only draws,
 # uploading the chunks in view whose cells changed since they were last sent,
-# with their pyramids. the CPU steps on a thread of its own while uncapped, so
-# a growth it asks for there is only noted, and the next frame makes the
+# with their pyramids. the CPU steps on the simulation thread (cellar.runner),
+# so a growth it asks for there is only noted, and the next frame makes the
 # buffers on the thread that owns the device. where the world is not in the
 # pool at all, the host fills the pool with what is to be drawn and show
 # uploads it, stepping nothing.
@@ -88,7 +99,7 @@ val FRAG_SPV:   [_]u8;
 pub val HEAD: usize = layout.HEAD::usize;
 # words of the view buffer ahead of the palettes: the look, then the heat, age
 # and rule palettes of SHADES entries of four floats each
-pub val LOOK: usize = 20;
+pub val LOOK: usize = 24;
 # the words of the view buffer where the rule palette starts
 val INK_AT: usize = LOOK + SHADES * 8;
 # the largest rule buffer uploaded in the frame's command stream: a larger one
@@ -98,9 +109,24 @@ val INLINE_MAX: usize = 65536;
 pub val MIP: usize = layout.MIP::usize;
 # entries in each palette
 pub val SHADES: usize = 256;
-# generations one frame may record, leaving storage binding sets for the
-# clear, the growth, the census, the reduction and the draw
+# step dispatches one frame may record, leaving storage binding sets for the
+# clear, the growth, the census, the reduction and the draw, which also bounds
+# the generations it records
 pub val MAX_STEPS: usize = 240;
+# the span a frame starts with, before the frame time has adapted it
+val FIRST_SPAN: usize = 4096;
+# the least a span shrinks to
+val MIN_SPAN: usize = 64;
+# the most a span grows to: every generation a frame may record of the largest
+# pool
+pub val MAX_SPAN: usize = layout.MAX_SLOTS::usize * MAX_STEPS;
+# frames recorded before a late one is seen, whose lateness the span was
+# already cut for
+val CALM: u32 = 2;
+# the share a span grows by each frame on time it cut short, until a frame
+# first comes late and after
+val GROW_FAST: usize = 8;
+val GROW_SLOW: usize = 64;
 # consecutive uncapped frames the budget cut short before the halo widens
 val WIDEN_AFTER: u32 = 8;
 # the most that grows to while widening keeps failing to pay off
@@ -112,14 +138,19 @@ val NARROW_AFTER: u32 = 8;
 val NO_HOLD: u64 = 0xffffffffffffffff;
 # the refresh rate assumed when the display's cannot be read
 val FALLBACK_HZ: f32 = 60.0;
-# generations the first uncapped frame asks for, before pacing has adapted it
-val FIRST_PACE: usize = 16;
 # censuses in flight a frame can look back over
 val RING: usize = 8;
 # dirty entries or chunks past which one stalled upload beats many recorded ones
 val BULK: usize = 32;
-# chunks in view uploaded per frame while the CPU steps
-val MAX_VIEW: usize = 4096;
+# the share of the refresh interval a frame spends sending the CPU's chunks
+val VIEW_SHARE: u64 = 4;
+# a held slot's pyramid was sent
+val SENT_MIP: u8 = 1;
+# a held slot's cells were sent
+val SENT_CELLS: u8 = 2;
+# a held slot's pyramid on the host was built from its cells, so it is sent
+# as it stands rather than built in the frame
+val BUILT: u8 = 4;
 
 # the camera and colours the draw reads, uploaded each frame
 # ---
@@ -130,13 +161,17 @@ val MAX_VIEW: usize = 4096;
 # frac_x:  the centre's column inside its chunk, in cells
 # frac_y:  the centre's row inside its chunk, in cells
 # ppc:     pixels per cell
-# half_w:  half the viewport width in pixels
-# half_h:  half the viewport height in pixels
-# win_w:   the window width in pixels; the view is its left half_w * 2
+# half_w:  half the port's width in pixels
+# half_h:  half the port's height in pixels
 # shift:   0 when a drawn cell is a cell; else it stands for a square of
 #          2^shift cells a side and holds its summary (layout.SUMMARY_LIVE)
 # ink:     1 when a live cell is drawn in the rule's colour for its heat
 #          rather than the solid colour, as the GPU side sets it (sync_ink)
+# pad:     keeps what follows four-float aligned
+# org_x:   the port's left in window pixels, the first of the shaders' port
+# org_y:   the port's top in window pixels
+# win_w:   the window width in pixels
+# win_h:   the window height in pixels
 # solid:   the solid live colour, in the target's space
 # back:    the backdrop, in the target's space
 pub rec Look {
@@ -149,9 +184,13 @@ pub rec Look {
     ppc:     f32;
     half_w:  f32;
     half_h:  f32;
-    win_w:   f32;
     shift:   u32;
     ink:     u32;
+    pad:     u32;
+    org_x:   f32;
+    org_y:   f32;
+    win_w:   f32;
+    win_h:   f32;
     solid:   [4]f32;
     back:    [4]f32;
 }
@@ -199,8 +238,9 @@ rec Write {
 # rb:     the census readback
 # got:    where a landed census is copied
 # landed: the landed census unpacked to space.CENSUS words per slot
-# held:   per slot 1 once its cells and pyramid were sent while the CPU steps
-#         and have not changed on the host since
+# held:   per slot, while the CPU steps, SENT_MIP and SENT_CELLS for what was
+#         sent of it since it last changed on the host, and BUILT while the
+#         host's pyramid of it is current
 # cap:    slots the buffers hold
 rec Pool {
     cells:  [2]gfx.StorageBuffer;
@@ -270,15 +310,29 @@ rec Pool {
 # settled:  the seq of the last census settled
 # lag:      spread recorded since the last census settled, as it landed
 # stepped:  spread the last frame recorded
+# cut:      the budget cut the last frame's generations short
 # bulk:     bulk edits: clears, fills
 # edits:    every edit, bulk or painted
 # writes:   painted cells to upload
 # zeros:    slots to clear this frame
 # stamped:  slots whose stamps to set current this frame
-# pace:     generations the next uncapped frame asks for
-# last:     when the last uncapped frame was recorded
-# timed:    last holds an uncapped frame
+# span:     slots the next frame may step, over every generation it records
+# fixed:    span is held where it was set rather than following the frame time
+# found:    a frame came late since the span began following it
+# calm:     frames left before lateness cuts the span again
+# worked:   slots the last frame stepped
+# limited:  the span cut the last frame's steps short
+# quick:    the last frame kept up with the display
+# last:     when the last frame was recorded
+# timed:    last holds a frame
 # pace_us:  the frame-time thresholds for the display
+# going:    a generation is part way through: front holds the one before it and
+#           the back the ranges finished so far
+# at:       the slot the generation going resumes from
+# began:    the edit count when the generation going began
+# rule:     the rule the generation going began under
+# counted:  the last census and reduction read the front as it stands
+# cursor:   the slot the next frame's upload of the CPU's chunks starts from
 # head:     the meta header staged for upload
 # built:    a pyramid built on the host, staged for upload
 pub rec Gpu {
@@ -331,15 +385,28 @@ pub rec Gpu {
     settled:  u64;
     lag:      u64;
     stepped:  u64;
+    cut:      bool;
     bulk:     u64;
     edits:    u64;
     writes:   Vector[Write];
     zeros:    Vector[u32];
     stamped:  Vector[u32];
-    pace:     usize;
+    span:     usize;
+    fixed:    bool;
+    found:    bool;
+    calm:     u32;
+    worked:   usize;
+    limited:  bool;
+    quick:    bool;
     last:     Instant;
     timed:    bool;
     pace_us:  Pace;
+    going:    bool;
+    at:       usize;
+    began:    u64;
+    rule:     rule.Rule;
+    counted:  bool;
+    cursor:   usize;
     head:     [128]u32;
     built:    [layout.MIP]u32;
 }
@@ -591,9 +658,20 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     g.writes   = vector.init[Write](a);
     g.zeros    = vector.init[u32](a);
     g.stamped  = vector.init[u32](a);
-    g.pace     = FIRST_PACE;
+    g.cut      = false;
+    g.span     = FIRST_SPAN;
+    g.fixed    = false;
+    g.found    = false;
+    g.calm     = 0;
+    g.worked   = 0;
+    g.limited  = false;
+    g.quick    = false;
     g.timed    = false;
+    g.going    = false;
+    g.at       = 0;
+    g.counted  = false;
     g.pace_us  = pace_for(0.0);
+    g.cursor   = 0;
     g.words    = 0;
     g.tabled   = false;
     g.packed   = vector.init[u32](a);
@@ -786,8 +864,8 @@ fun sync_ink(g: *Gpu, r: *rule.Rule, look: *Look) err[gfx.Error] {
 pub fun reserve(g: *Gpu, cap: usize) bool {
     if (cap <= g.p.cap || (g.reserved && cap <= g.next.cap)) { ret true; }
     if (!g.stepping) {
-        # the CPU may be stepping on its own thread, which must not call the
-        # device, so the next frame makes the buffers
+        # the CPU may be stepping on the simulation thread, which must not
+        # call the device, so the next frame makes the buffers
         if (cap > g.slots) { ret false; }
         if (cap > g.owed)  { g.owed = cap; }
         ret true;
@@ -877,46 +955,68 @@ pub fun note_write(g: *Gpu, sp: *space.Space, s: usize, i: usize) {
     vector.push[u32](?g.stamped, s::u32);
 }
 
-# the generations an uncapped frame should ask for: as many as kept the frames
-# smooth so far, which the budget then limits
-pub fun stride(g: *Gpu) usize {
-    ret g.pace;
+# hold the span at slots, rather than following the frame time, so a test
+# can force a generation across frames in ranges as small as it likes
+#[testing]
+pub fun fix_span(g: *Gpu, slots: usize) {
+    g.span  = slots;
+    g.fixed = true;
 }
 
-# adapt the stride to how the frames are running, once per uncapped frame
+# time the frame against the last, and follow the span to it
 #
-# a frame that arrives late after the last shrinks the stride, and one on time
-# that used everything it asked for grows it, so the GPU steps as many
-# generations as the frame budget holds. the halo widens once the budget cut
-# several frames in a row short that kept up with the display, reach rather
-# than frame time bounding them, and narrows once several in a row fell behind
-# the display or would have fit the ring. each such narrowing doubles how many
-# frames the next widening waits for, until stepping stops being uncapped.
-# ---
-# g:     the GPU side
-# asked: generations the frame asked for
-# done:  generations it recorded
-pub fun tune(g: *Gpu, asked: usize, done: usize) {
+# a late frame cuts the span to three quarters of what the last frame stepped,
+# then waits out the frames already recorded before another cut. a frame on
+# time that the span cut short grows it by an eighth until the first late
+# frame and by a sixty-fourth after, so the frames settle just inside the
+# refresh interval and seldom miss it.
+fun follow(g: *Gpu) {
     val now: time.InstantClock = time.instant();
     if (sel now.err) { ret; }
     var quick: bool = false;
+    var slow:  bool = false;
     if (g.timed) {
         val us: u64 = (time.instant_sub(now.ok, g.last) / 1000)::u64;
         quick = us <= g.pace_us.quick_us;
-        if (us > g.pace_us.slow_us) {
-            g.pace = g.pace - g.pace / 4;
-            if (g.pace == 0) { g.pace = 1; }
-        }
-        or (done >= asked) {
-            g.pace = g.pace + g.pace / 8 + 1;
-            if (g.pace > MAX_STEPS) { g.pace = MAX_STEPS; }
-        }
+        slow  = us > g.pace_us.slow_us;
     }
     g.last  = now.ok;
     g.timed = true;
+    g.quick = quick;
+    if (g.fixed) { ret; }
+    if (g.calm > 0) {
+        g.calm = g.calm - 1;
+        ret;
+    }
+    if (slow && g.worked != 0) {
+        var was: usize = g.span;
+        if (g.worked < was) { was = g.worked; }
+        g.span = was - was / 4;
+        if (g.span < MIN_SPAN) { g.span = MIN_SPAN; }
+        g.calm  = CALM;
+        g.found = true;
+    }
+    or (quick && g.limited) {
+        var share: usize = GROW_FAST;
+        if (g.found) { share = GROW_SLOW; }
+        g.span = g.span + g.span / share + 1;
+        if (g.span > MAX_SPAN) { g.span = MAX_SPAN; }
+    }
+}
 
-    var argues: bool = done < asked && quick;
-    if (g.wide) { argues = !quick || (done >= asked && g.lag + g.stepped <= reach(false)); }
+# follow how the uncapped frames are running with the halo, once per uncapped
+# frame
+#
+# the halo widens once the budget cut several frames in a row short that kept
+# up with the display, reach rather than frame time bounding them, and narrows
+# once several in a row fell behind the display or would have fit the ring.
+# each such narrowing doubles how many frames the next widening waits for,
+# until stepping stops being uncapped.
+# ---
+# g: the GPU side, after the frame
+pub fun tune(g: *Gpu) {
+    var argues: bool = g.cut && g.quick;
+    if (g.wide) { argues = !g.quick || (!g.cut && g.lag + g.stepped <= reach(false)); }
     if (argues) { g.streak = g.streak + 1; }
     or          { g.streak = 0; }
     if (!g.wide && g.streak >= g.patience) {
@@ -933,10 +1033,8 @@ pub fun tune(g: *Gpu, asked: usize, done: usize) {
     }
 }
 
-# forget the last uncapped frame's time, and the wide halo, once stepping is
-# no longer uncapped
+# forget the wide halo once stepping is no longer uncapped
 pub fun rest(g: *Gpu) {
-    g.timed    = false;
     g.want     = false;
     g.streak   = 0;
     g.patience = WIDEN_AFTER;
@@ -1172,6 +1270,12 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool) err[gfx.Error] {
         if ((sp.dirty[s] & space.DIRTY_CELLS) != 0) { chunks = chunks + 1; }
         s = s + 1;
     }
+    # cells the host changed land in the front, under the ranges a generation
+    # part way through already stepped, and a growth leaves its back cells
+    # behind, so it starts over. chunks a census settled are not among them:
+    # the budget keeps any generation from reaching one it allocates or frees
+    if (grew || chunks != 0 || g.writes.len != 0)                 { g.going = false; }
+    if (grew || chunks != 0 || entries != 0 || g.writes.len != 0) { g.counted = false; }
 
     if (entries > BULK) {
         # one recorded write of the span the dirty entries lie in, which never
@@ -1278,10 +1382,15 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool) err[gfx.Error] {
     }
     vector.clear[u32](?g.stamped);
 
-    # while the CPU steps, a chunk the host changed is sent again with its pyramid
+    # while the CPU steps, a chunk the host changed is sent again with its
+    # pyramid, which the step built unless something else changed it since
     s = 0;
     for (s < top) {
-        if (!g.stepping && (sp.dirty[s] & (space.DIRTY_CELLS | space.DIRTY_ZERO)) != 0) { g.p.held[s] = 0; }
+        val d: u8 = sp.dirty[s];
+        if (!g.stepping && (d & (space.DIRTY_CELLS | space.DIRTY_ZERO)) != 0) {
+            g.p.held[s] = 0;
+            if ((d & space.DIRTY_MIP) != 0 && sp.mips != nil) { g.p.held[s] = BUILT; }
+        }
         sp.dirty[s] = 0;
         s           = s + 1;
     }
@@ -1289,80 +1398,83 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool) err[gfx.Error] {
     ret err[gfx.Error].ok{};
 }
 
+# the chunks a look can see, a chunk beyond each side: columns and rows x0, y0,
+# x1, y1, inclusive
+# ---
+# look: the camera
+# out:  receives the four
+pub fun view_chunks(look: *Look, out: *i64) {
+    val bx: i64 = look.base_cx::i64 - space.BIAS;
+    val by: i64 = look.base_cy::i64 - space.BIAS;
+    val hw: f32 = look.half_w / look.ppc;
+    val hh: f32 = look.half_h / look.ppc;
+    out[0] = bx + ((look.frac_x - hw) / 64.0 - 1.0)::i64;
+    out[1] = by + ((look.frac_y - hh) / 64.0 - 1.0)::i64;
+    out[2] = bx + ((look.frac_x + hw) / 64.0 + 1.0)::i64;
+    out[3] = by + ((look.frac_y + hh) / 64.0 + 1.0)::i64;
+}
+
+# whether a look draws from the coverage pyramids rather than the cells: at
+# half a pixel per cell or less (see cells_frag)
+pub fun reads_pyramids(look: *Look) bool {
+    ret look.ppc > 0.0 && look.ppc <= 0.5;
+}
+
 # while the CPU steps, upload the chunks the view can see that changed since
-# they were last sent
+# they were last sent, for as long as VIEW_SHARE of the refresh interval
+# allows, going on from where the last frame stopped so every chunk takes its
+# turn. what does not fit is sent by the frames after, so the view may lag the
+# world a generation but the frame never waits on it. the pyramids come built
+# from the step (space.pyramid), and only a chunk changed some other way has its
+# own built here. the draw reads either the cells or, at half a pixel per cell
+# or less, the pyramids, so only the one it reads is sent
 fun upload_view(g: *Gpu, sp: *space.Space, look: *Look) err[gfx.Error] {
     # a pyramid reads its cells through the rule's sense
     if (!mem.equal[u8]((?g.drawn)::*u8, (?sp.sense)::*u8, $size_of(layout.Sense))) {
         mem.zero[u8](g.p.held, g.p.cap);
         g.drawn = sp.sense;
     }
-    if (look.ppc <= 0.0) { ret err[gfx.Error].ok{}; }
-    val bx:   i64   = look.base_cx::i64 - space.BIAS;
-    val by:   i64   = look.base_cy::i64 - space.BIAS;
-    val cx:   f32   = look.frac_x;
-    val cy:   f32   = look.frac_y;
-    val hw:   f32   = look.half_w / look.ppc;
-    val hh:   f32   = look.half_h / look.ppc;
-    val x0:   i64   = bx + ((cx - hw) / 64.0 - 1.0)::i64;
-    val x1:   i64   = bx + ((cx + hw) / 64.0 + 1.0)::i64;
-    val y0:   i64   = by + ((cy - hh) / 64.0 - 1.0)::i64;
-    val y1:   i64   = by + ((cy + hh) / 64.0 + 1.0)::i64;
-    var sent: usize = 0;
-    var s:    usize = 0;
-    for (s < sp.hi && sent < MAX_VIEW) {
-        if (space.used(sp, s) && g.p.held[s] == 0) {
+    if (look.ppc <= 0.0 || sp.hi == 0) { ret err[gfx.Error].ok{}; }
+    var box: [4]i64;
+    view_chunks(look, ?box[0]);
+    var want: u8 = SENT_CELLS;
+    if (reads_pyramids(look)) { want = SENT_MIP; }
+    val t0: time.InstantClock = time.instant();
+    if (sel t0.err) { ret err[gfx.Error].ok{}; }
+    val budget: u64   = g.pace_us.quick_us * 1000 / VIEW_SHARE;
+    var s:      usize = g.cursor;
+    if (s >= sp.hi) { s = 0; }
+    var n: usize = 0;
+    for (n < sp.hi) {
+        val h: u8 = g.p.held[s];
+        if (space.used(sp, s) && (h & want) != want) {
             val x: i64 = space.slot_x(sp, s);
             val y: i64 = space.slot_y(sp, s);
-            if (x >= x0 && x <= x1 && y >= y0 && y <= y1) {
-                g.p.held[s] = 1;
-                val e: err[gfx.Error] = upload_cells(g, sp, s, 1, false);
-                if (sel e.err) { ret e; }
-                pyramid(?sp.cells[s * space.CELLS], sp.sense, ?g.built[0]);
-                val em: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.mip, s * MIP * 4, (?g.built[0])::*u8, MIP * 4);
-                if (sel em.err) { ret em; }
-                sent = sent + 1;
+            if (x >= box[0] && x <= box[2] && y >= box[1] && y <= box[3]) {
+                val now: time.InstantClock = time.instant();
+                if (sel now.ok) {
+                    if (time.instant_sub(now.ok, t0.ok)::u64 > budget) { brk; }
+                }
+                if (want == SENT_CELLS) {
+                    val e: err[gfx.Error] = upload_cells(g, sp, s, 1, false);
+                    if (sel e.err) { ret e; }
+                }
+                or {
+                    var m: *u32 = ?g.built[0];
+                    if ((h & BUILT) != 0) { m = ?sp.mips[s * MIP]; }
+                    or                    { space.pyramid(?sp.cells[s * space.CELLS], sp.sense, m); }
+                    val em: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.mip, s * MIP * 4, m::*u8, MIP * 4);
+                    if (sel em.err) { ret em; }
+                }
+                g.p.held[s] = h | want;
             }
         }
         s = s + 1;
+        if (s >= sp.hi) { s = 0; }
+        n = n + 1;
     }
+    g.cursor = s;
     ret err[gfx.Error].ok{};
-}
-
-# a chunk's coverage pyramid built from its cells, as the reduce stage builds it
-# ---
-# cells: the chunk's space.CELLS cells
-# sn:    how a cell is read, the rule's sense
-# out:   receives MIP texels
-pub fun pyramid(cells: *u32, sn: layout.Sense, out: *u32) {
-    var l: u32 = 1;
-    for (l <= layout.LEVELS) {
-        val s:    u32 = 1 << l;
-        val side: u32 = layout.mip_side(l);
-        val at:   u32 = layout.mip_at(l);
-        var t:    u32 = 0;
-        for (t < side * side) {
-            val ox:   u32 = (t % side) * s;
-            val oy:   u32 = (t / side) * s;
-            var live: u32 = 0;
-            var heat: u32 = 0;
-            var ages: u32 = 0;
-            var i:    u32 = 0;
-            for (i < s * s) {
-                val c: u32 = cells[((oy + i / s) * layout.SIDE + ox + i % s)::usize];
-                if (layout.live(c, sn.live_mask, sn.live_lo, sn.live_hi) != 0) {
-                    live = live + 1;
-                    ages = ages + layout.texel_age(c, sn.age_shift, sn.age_mask);
-                }
-                val h: u32 = layout.texel_heat(c, sn.heat_shift, sn.heat_mask);
-                if (h > heat) { heat = h; }
-                i = i + 1;
-            }
-            out[(at + t)::usize] = layout.texel(live, heat, ages);
-            t                    = t + 1;
-        }
-        l = l + 1;
-    }
 }
 
 # whether the GPU's pyramid of every chunk the host's staging holds as the GPU
@@ -1375,7 +1487,7 @@ pub fun pyramids_hold(g: *Gpu, sp: *space.Space) bool {
         if (space.used(sp, s) && sp.dirty[s] == 0) {
             val e: err[gfx.Error] = gfx.storage_buffer_read(g.d, ?g.p.mip, s * MIP * 4, (?got[0])::*u8, MIP * 4);
             if (sel e.err) { ret false; }
-            pyramid(?sp.cells[s * space.CELLS], sp.sense, ?g.built[0]);
+            space.pyramid(?sp.cells[s * space.CELLS], sp.sense, ?g.built[0]);
             var i: usize = 0;
             for (i < MIP) {
                 if (got[i] != g.built[i]) { ret false; }
@@ -1412,6 +1524,24 @@ fun write_head(g: *Gpu, r: *rule.Rule, gen: u64) {
     rule.pack(r, ?g.head[layout.SHARED]);
 }
 
+# record one step of the generation going over a range of slots: the step
+# serial past the last completed one, and the range's first slot
+fun step_range(g: *Gpu, step: *gfx.Compute, bound: usize, lo: usize, n: usize) err[gfx.Error] {
+    val serial: u32            = g.serial + 1;
+    val base:   u32            = lo::u32;
+    val es:     err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.meta, layout.SERIAL_AT::usize * 4, (?serial)::*u8, 4);
+    if (sel es.err) { ret es; }
+    val eb: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.meta, layout.BASE_AT::usize * 4, (?base)::*u8, 4);
+    if (sel eb.err) { ret eb; }
+    var bufs: [5]*gfx.StorageBuffer;
+    bufs[0]                           = ?g.p.cells[g.front];
+    bufs[1]                           = ?g.p.cells[1 - g.front];
+    bufs[2]                           = ?g.p.meta;
+    bufs[3]                           = ?g.p.flags;
+    bufs[layout.TABLE_BINDING::usize] = ?g.table;
+    ret gfx.renderer_dispatch(g.r, step, ?bufs[0], bound, 8, n::u32, 1);
+}
+
 # record a frame's work: bring the pool level, step, count, and set the view
 #
 # call once a frame between renderer_begin_frame and the first pass, after
@@ -1421,9 +1551,10 @@ fun write_head(g: *Gpu, r: *rule.Rule, gen: u64) {
 # sp:    the host's pool
 # r:     the rule
 # gen:   the generation the cells hold as the frame begins
-# steps: generations wanted; fewer are recorded when the budget is short
+# steps: generations wanted; fewer are completed when the budget or the span
+#        is short, and the last may be left part way for the next frame
 # look:  the camera and colours for the draw
-# ret:   the generations recorded, or why recording failed
+# ret:   the generations completed, or why recording failed
 pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, look: *Look) res[usize, gfx.Error] {
     val e14: err[gfx.Error] = flush(g, sp, false);
     if (sel e14.err) { ret res[usize, gfx.Error].err{e14.err}; }
@@ -1446,42 +1577,76 @@ pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, 
         ret res[usize, gfx.Error].ok{0};
     }
 
-    var n:      usize = steps;
+    follow(g);
     val radius: usize = rule.radius(r);
-    val b:      usize = budget(g, radius);
-    if (n > b) { n = b; }
-    val fam: usize = rule.family_of(r);
-    # a family the device could not build a stage for is refused before it
-    # runs (cellar.sim), so it is never asked to step here
-    if (!g.ready[fam]) { n = 0; }
-    if (n > 0 && g.hi != 0 && rule.table(fam)) {
-        val et: err[gfx.Error] = sync_table(g, r);
-        if (sel et.err) { ret res[usize, gfx.Error].err{et.err}; }
+    val fam:    usize = rule.family_of(r);
+    # an edit or another rule since the generation in flight began leaves the
+    # ranges it finished stale
+    if (g.going && (g.edits != g.began || !rule.same(r, ?g.rule))) {
+        g.going   = false;
+        g.counted = false;
     }
     val step:  *gfx.Compute = ?g.steps[fam];
     val bound: usize        = rule.bindings(fam);
-
-    var i: usize = 0;
-    for (i < n) {
-        if (g.hi != 0) {
-            g.serial = g.serial + 1;
-            val es: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.meta, layout.SERIAL_AT::usize * 4, (?g.serial)::*u8, 4);
-            if (sel es.err) { ret res[usize, gfx.Error].err{es.err}; }
-            var bufs: [5]*gfx.StorageBuffer;
-            bufs[0]                           = ?g.p.cells[g.front];
-            bufs[1]                           = ?g.p.cells[1 - g.front];
-            bufs[2]                           = ?g.p.meta;
-            bufs[3]                           = ?g.p.flags;
-            bufs[layout.TABLE_BINDING::usize] = ?g.table;
-            val e18: err[gfx.Error] = gfx.renderer_dispatch(g.r, step, ?bufs[0], bound, 8, g.hi::u32, 1);
-            if (sel e18.err) { ret res[usize, gfx.Error].err{e18.err}; }
-            g.front = 1 - g.front;
+    var room:  usize        = g.span;
+    var calls: usize        = 0;
+    var n:     usize        = 0;
+    g.cut     = false;
+    g.limited = false;
+    g.worked  = 0;
+    for (n < steps) {
+        if (!g.going) {
+            # a family the device could not build a stage for is refused before
+            # it runs (cellar.sim), so it is never asked to step here
+            if (!g.ready[fam]) { brk; }
+            if (budget(g, radius) == 0) {
+                g.cut = true;
+                brk;
+            }
+            if (g.hi != 0 && rule.table(fam)) {
+                val et: err[gfx.Error] = sync_table(g, r);
+                if (sel et.err) { ret res[usize, gfx.Error].err{et.err}; }
+            }
+            g.going = true;
+            g.at    = 0;
+            g.began = g.edits;
+            g.rule  = @r;
         }
-        g.spread = g.spread + radius::u64;
-        g.gens   = g.gens + 1;
-        i        = i + 1;
+        if (g.at < g.hi) {
+            if (room == 0 || calls >= MAX_STEPS) {
+                g.limited = true;
+                brk;
+            }
+            var run: usize = g.hi - g.at;
+            if (run > room) { run = room; }
+            val es: err[gfx.Error] = step_range(g, step, bound, g.at, run);
+            if (sel es.err) { ret res[usize, gfx.Error].err{es.err}; }
+            g.at     = g.at + run;
+            g.worked = g.worked + run;
+            room     = room - run;
+            calls    = calls + 1;
+            if (g.at < g.hi) {
+                g.limited = true;
+                brk;
+            }
+        }
+        # the generation is complete, and the back cells become the world
+        if (g.at != 0) {
+            g.serial = g.serial + 1;
+            g.front  = 1 - g.front;
+        }
+        g.going   = false;
+        g.counted = false;
+        g.spread  = g.spread + radius::u64;
+        g.gens    = g.gens + 1;
+        n         = n + 1;
     }
     g.stepped = n::u64 * radius::u64;
+    if (g.going) {
+        # the census, the reduction and the draw read the completed generation
+        val ec: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.meta, layout.SERIAL_AT::usize * 4, (?g.serial)::*u8, 4);
+        if (sel ec.err) { ret res[usize, gfx.Error].err{ec.err}; }
+    }
 
     # a narrower halo frees chunks the budget may already have spread into, so
     # the budget drops to what the ring holds from this census on, and stays
@@ -1496,6 +1661,10 @@ pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, 
         }
     }
 
+    # while a generation is part way through, the front is counted and reduced
+    # again only once it changed
+    if (g.going && g.counted) { ret res[usize, gfx.Error].ok{0}; }
+    g.counted = true;
     if (g.hi != 0) {
         var rb: [4]*gfx.StorageBuffer;
         rb[0] = ?g.p.cells[g.front];
@@ -1550,6 +1719,16 @@ pub fun show(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, look: *Look) er
     if (sel ev.err) { ret ev; }
     write_head(g, r, gen);
     ret gfx.renderer_buffer_update(g.r, ?g.p.meta, 0, (?g.head[0])::*u8, HEAD * 4);
+}
+
+# move the camera of the draw alone, over the cells already on the GPU, for a
+# frame that cannot reach the world's to send any
+# ---
+# g:    the GPU side
+# look: the camera and colours
+# ret:  ok, or why the upload failed
+pub fun aim(g: *Gpu, look: *Look) err[gfx.Error] {
+    ret gfx.renderer_buffer_update(g.r, ?g.view, 0, look::*u8, LOOK * 4);
 }
 
 # draw every chunk into an open pass

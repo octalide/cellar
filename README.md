@@ -4,7 +4,7 @@ An interactive cellular-automata editor and visualizer written in
 [Mach](https://github.com/briar-systems/mach), built on the
 [boom](https://github.com/briar-systems/boom) engine.
 
-![cellar running Life, with its side panel](doc/screenshot.png)
+![cellar running Life, with its toolbar and docked panels](doc/screenshot.png)
 
 The world is unbounded: a sparse pool of 64 by 64 chunks that holds only the
 regions with live cells and their neighbours, growing in any direction. It is
@@ -17,8 +17,9 @@ quadtree stepped by Gosper's algorithm, a power of two generations at a time,
 and drawn from the tree at the current zoom, so a Gosper gun reaches
 generation 2^30 in a moment. HashLife keeps no heat or age, so it draws in the
 solid colour. boom owns the window, input, Vulkan renderer and frame loop; the
-interface is drawn over the cells in the same overlay pass by a small
-immediate-mode layer of cellar's own, with text from an embedded TrueType face.
+interface is built with [blit](https://github.com/briar-systems/blit) and drawn
+over the cells in the same overlay pass through boom's blit renderer, with text
+from an embedded TrueType face.
 
 A kernel is a `(2r+1)x(2r+1)` integer-weight footprint, of radius up to 16 and
 negative weights allowed, plus birth and survive sets over the saturated
@@ -99,7 +100,7 @@ dropped.
 | `F`                      | frame the randomize area                                         |
 | `M`                      | next colour mode                                                 |
 | `G`                      | grid lines                                                       |
-| `Tab`                    | hide / show the panel                                            |
+| `Tab`                    | hide / show the panels                                           |
 | `H`, `F1`                | key reference                                                    |
 | `F11`                    | toggle borderless fullscreen                                     |
 | `F12`                    | screenshot                                                       |
@@ -112,41 +113,58 @@ where play started, and undo or redo while running pauses first. Any new
 change clears what could be redone.
 
 A readout of the generation, population, rule and speed sits in the top-left
-corner, and the side panel groups every control by task:
+corner of the world. A toolbar runs across the top, and the panels are docked
+at the sides, grouped by purpose:
 
-- **run**: play, step, speed, uncapped stepping, randomize and clear, the
-  area randomize fills, from 32 to 4096 cells square, and the engine: the chunk
-  pool, or HashLife where the rule allows, with its step of 2^k generations
-  and a generation to go straight to
-- **draw**: the tool, with a rule of more than two states the state the pen
-  and the custom pattern's editor paint, each in the rule's colour for it, a
-  library of about three hundred classic patterns (still lifes, oscillators,
-  spaceships, guns, puffers, methuselahs and growth) to browse by category or
-  search by name, a custom pattern drawn in place, and a preview of the
-  selected one, and with the select tool the operations on the selection.
-  copying or cutting a selection makes it the custom pattern and arms the
-  stamp. The library's sources are listed in
+- **toolbar**: play, step, reset, speed and uncapped stepping, the tool (draw,
+  erase, stamp, select), with a rule of more than two states the state the pen
+  and the custom pattern's editor paint, each in the rule's colour for it, the
+  engine: the chunk pool, or HashLife where the rule allows, with its step of
+  2^k generations and a generation to go straight to, the panels menu, and the
+  settings and the key reference
+- **patterns**: a library of about three hundred classic patterns (still
+  lifes, oscillators, spaceships, guns, puffers, methuselahs and growth) to
+  browse by category or search by name, a custom pattern drawn in place, and a
+  preview of the selected one. The library's sources are listed in
   [res/patterns](res/patterns/README.md)
-- **rule**: presets, the rule in B/S notation, radius, a clickable weight grid
-  whose cells cycle from 0 up to 4 and on through -4 to -1, and birth and
-  survive toggles over the reachable sums
-- **view**: colour mode (a solid colour from a set of swatches, fading trails,
-  or colour by age; a rule table's states show in its own colours in place of
-  the solid one), grid lines, and the interface size from 100 to 200 percent
 - **files**: named saves of the world and the custom pattern, a list of every
   world, pattern and `.rule` file in the data directory to load or run, and
   screenshots
+- **rule**: presets, the rule in B/S notation, radius, a clickable weight grid
+  whose cells cycle from 0 up to 4 and on through -4 to -1, and birth and
+  survive toggles over the reachable sums
+- **world**: randomize, the area it fills, from 32 to 4096 cells square, clear,
+  and the operations on a selection. Copying or cutting a selection makes it
+  the custom pattern and arms the stamp
+- **view**: colour mode (a solid colour from a set of swatches, fading trails,
+  or colour by age; a rule table's states show in its own colours in place of
+  the solid one), grid lines, and framing the randomize area
+- **stats**: the population graph, the readout in full, and what the last
+  identified selection holds
+- **settings**, a floating window closed at first: the ceilings a run pauses
+  at, and the interface size from 100 to 200 percent
+
+Each panel is a window that can be docked at either side, tabbed with another,
+floated or closed, and the panels menu reopens a closed one or resets the
+layout. The layout is kept with the settings.
 
 Settings and the rule are kept between runs. They, saved worlds and patterns,
 and screenshots live in the platform's user data directory:
 `$XDG_DATA_HOME/cellar` (or `~/.local/share/cellar`) on linux,
 `~/Library/Application Support/cellar` on macOS and `%APPDATA%\cellar` on
-windows. The engine chosen in the run section and HashLife's step exponent are
+windows. The engine chosen in the toolbar and HashLife's step exponent are
 kept too. `--engine` overrides the saved engine for that run and leaves the
-saved choice alone until the panel changes it, and a saved HashLife that cannot
+saved choice alone until the toolbar changes it, and a saved HashLife that cannot
 run the loaded rule starts on the chunk engine with a message. The first run
 brings over anything an older version left in
 `arrangements/` in the working directory.
+
+A run pauses with a message when it crosses a ceiling: a population, chunks of
+the pool in use (20,000 by default), the memory HashLife's nodes take (500 MiB
+by default, collected before it counts), or the time one step takes. Each is
+switched on or off in the settings and kept with them. Playing on
+carries the run past the ceiling it paused at, which stays quiet until the world
+falls back under it.
 
 `cellar <file>` opens a file at startup: a `.cellar` world loads as the world,
 a `.rule` file's rule runs on the world, and a pattern in any format cellar reads (RLE, plaintext `.cells`, Life 1.05
@@ -172,7 +190,10 @@ a world or pattern headless, with no window and no GPU. The file opens as it
 would at startup, runs under `--rule` or else its own rule for `n`
 generations on the CPU, and is written in the format `--out`'s extension names
 (`.rle`, `.cells`, `.mc`), or as RLE on stdout without one. The
-generation and population go to stderr unless `--quiet`.
+generation and population go to stderr unless `--quiet`. It honours the saved
+ceilings, which `--max-population`, `--max-chunks`, `--max-memory` (MiB) and
+`--max-step-ms` set to a limit or `off` for that run. A run that crosses one
+stops there, writes the world as it stood, says which and exits with status 3.
 
 ## Install
 

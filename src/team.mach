@@ -33,6 +33,7 @@ val CPU_LIST: usize = 256;
 # arg:     its argument
 # total:   indices in the round
 # next:    the next index to take, shared through atomics
+# stop:    the round's stop flag, nil for none
 # busy:    helpers still in the round
 # round:   rounds started
 # quit:    the helpers should exit
@@ -46,6 +47,7 @@ pub rec Team {
     arg:     *u8;
     total:   i64;
     next:    i64;
+    stop:    *i64;
     busy:    i64;
     round:   u64;
     quit:    bool;
@@ -53,6 +55,7 @@ pub rec Team {
 
 fun take(t: *Team) {
     for (true) {
+        if (t.stop != nil && atomic.load(t.stop) != 0) { ret; }
         val i: i64 = atomic.fetch_add(?t.next, 1);
         if (i >= t.total) { ret; }
         t.job(t.arg, i::usize);
@@ -90,6 +93,7 @@ pub fun start(t: *Team) {
     t.quit    = false;
     t.total   = 0;
     t.next    = 0;
+    t.stop    = nil;
     t.busy    = 0;
     var cpus:  [256]usize;
     var count: usize = 0;
@@ -106,18 +110,32 @@ pub fun start(t: *Team) {
 
 # run job over indices [0, count) across the team, returning when all are done
 pub fun run(t: *Team, job: Job, arg: *u8, count: usize) {
+    run_until(t, job, arg, count, nil);
+}
+
+# run job over indices [0, count) across the team until stop is raised
+# ---
+# t:     the team
+# job:   the job
+# arg:   its argument
+# count: indices to run
+# stop:  a flag another thread may set to non-zero, read atomically, or nil
+# ret:   every index ran; false when stop cut the round short
+pub fun run_until(t: *Team, job: Job, arg: *u8, count: usize, stop: *i64) bool {
     if (t.helpers == 0 || count < 2) {
         var i: usize = 0;
         for (i < count) {
+            if (stop != nil && atomic.load(stop) != 0) { ret false; }
             job(arg, i);
             i = i + 1;
         }
-        ret;
+        ret true;
     }
     mutex.lock(?t.lock);
     t.job   = job;
     t.arg   = arg;
     t.total = count::i64;
+    t.stop  = stop;
     atomic.store(?t.next, 0);
     t.busy  = t.helpers::i64;
     t.round = t.round + 1;
@@ -126,7 +144,10 @@ pub fun run(t: *Team, job: Job, arg: *u8, count: usize) {
     take(t);
     mutex.lock(?t.lock);
     for (t.busy != 0) { condition.wait(?t.done, ?t.lock); }
+    t.stop = nil;
     mutex.unlock(?t.lock);
+    # an index is run by whoever took it, so a counter past the end ran them all
+    ret atomic.load(?t.next) >= t.total;
 }
 
 # stop and join every helper
@@ -167,6 +188,48 @@ test run__visits_every_index_once_over_many_rounds {
         }
         round = round + 1;
     }
+    stop(?t);
+    ret 0;
+}
+
+# a job that raises the round's stop flag once a tenth of the indices ran
+rec Cut {
+    seen: *u8;
+    ran:  i64;
+    stop: i64;
+}
+
+fun cut_at(arg: *u8, i: usize) {
+    val c: *Cut = arg::*Cut;
+    c.seen[i] = c.seen[i] + 1;
+    if (atomic.fetch_add(?c.ran, 1) == 99) { atomic.store(?c.stop, 1); }
+}
+
+test run_until__a_raised_stop_ends_the_round_part_way {
+    var t: Team;
+    start(?t);
+    var seen: [1000]u8;
+    var c:    Cut;
+    c.seen = ?seen[0];
+    var i: usize = 0;
+    for (i < 1000) {
+        seen[i] = 0;
+        i       = i + 1;
+    }
+    c.ran  = 0;
+    c.stop = 0;
+    if (run_until(?t, cut_at, (?c)::*u8, 1000, ?c.stop)) { ret 1; }
+    # each member finishes at most the index it holds once the flag is up
+    if (c.ran < 100 || c.ran > 100 + t.helpers::i64) { ret 2; }
+    i = 0;
+    for (i < 1000) {
+        if (seen[i] > 1) { ret 3; }
+        i = i + 1;
+    }
+    # a flag never raised runs the round whole
+    c.ran  = -1000000;
+    c.stop = 0;
+    if (!run_until(?t, cut_at, (?c)::*u8, 1000, ?c.stop)) { ret 4; }
     stop(?t);
     ret 0;
 }

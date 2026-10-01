@@ -1,4 +1,4 @@
-# the rule section: presets, the rule's short form, its string, and the kernel
+# the rule panel: presets, the rule's short form, its string, and the kernel
 # editor
 #
 # edits a copy of the simulation's rule and submits it as a command: a preset
@@ -8,19 +8,26 @@
 # to MAXW and then from -MAXW back up to 0, and a toggle for every reachable
 # sum. a wider one has too many cells and sums for that: its grid zooms and
 # scrolls and is painted with a brush (cellar.brush), and its sets are sum
-# lists typed in place (cellar.sumlist).
+# lists typed in place (cellar.sumlist). a paint stroke on the wide grid ends
+# when the panel is not drawn (idle).
 
+use blit;
+use bctx: blit.context;
+use binp: blit.input;
+use bint: blit.interact;
+use blay: blit.layout;
+use bth:  blit.theme;
+use bw:   blit.widget;
 use cellar.app;
 use cellar.brush;
 use cellar.command;
+use cellar.look;
 use cellar.rule;
 use kernel: cellar.rules.weighted;
 use cellar.ruletext;
-use cellar.sim;
 use cellar.sumlist;
 use cellar.text;
 use cellar.theme;
-use cellar.ui;
 use cellar.world;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -77,41 +84,56 @@ fun shade(m: i32) f32 {
     ret m::f32 / MAXW::f32;
 }
 
-# the clickable weight grid, centred in the column
-fun weights(u: *ui.Ui, k: *kernel.Kernel) bool {
-    val r: i64 = k.radius::i64;
-    val n: i64 = 2 * r + 1;
-    var c: f32 = ui.px(u, CELL);
-    if (c * n::f32 > u.w) { c = u.w / n::f32; }
-    val x0: f32  = u.x + (u.w - c * n::f32) / 2.0;
-    val y0: f32  = u.y;
-    var ed: bool = false;
+# a cell of a weight grid: its face, its weight's shade, the centre framed,
+# and the weight in the small face when it fits
+fun cell(ui: *bctx.Context, x0: f32, y0: f32, x1: f32, y1: f32, face: u32, centre: bool, wv: i32) {
+    bctx.quad(ui, x0, y0, x1, y1, look.colour(face, 1.0));
+    if (wv > 0) { bctx.quad(ui, x0, y0, x1, y1, look.colour(theme.ACCENT, 0.2 + 0.8 * shade(wv))); }
+    or (wv < 0) { bctx.quad(ui, x0, y0, x1, y1, look.colour(theme.WARN, 0.2 + 0.8 * shade(0 - wv))); }
+    if (centre) { bctx.frame(ui, x0, y0, x1, y1, bctx.px(ui, 1.0), look.colour(theme.TEXT_DIM, 1.0)); }
+    var num: [24]u8;
+    num[text.buf_i64(?num[0], 0, wv::i64)] = 0;
+    var ink: u32 = theme.TEXT_FAINT;
+    if (wv != 0) { ink = theme.ACCENT_INK; }
+    # a label wider than its cell is left out, as on a wide footprint
+    if (bctx.text_width(ui, ?num[0]) <= x1 - x0) { look.text_centre(ui, ?num[0], x0, y0, x1, y1, look.colour(ink, 1.0)); }
+}
 
+# the fill of a control in a state, as the theme paints a button
+fun face(hot: bool, held: bool, on: bool) u32 {
+    if (on)   { ret theme.ACCENT; }
+    if (held) { ret theme.CONTROL_ON; }
+    if (hot)  { ret theme.CONTROL_HOT; }
+    ret theme.CONTROL;
+}
+
+# the clickable weight grid, centred in the column
+fun weights(ui: *bctx.Context, l: look.Look, k: *kernel.Kernel) bool {
+    val r:  i64       = k.radius::i64;
+    val n:  i64       = 2 * r + 1;
+    val av: bctx.Area = bw.avail(ui);
+    val w:  f32       = av.x1 - av.x0;
+    var c:  f32       = bctx.px(ui, CELL);
+    if (c * n::f32 > w) { c = w / n::f32; }
+    val g:  bctx.Area = bw.place(ui, blay.fill(1.0), blay.fixed(c * n::f32), 0.0, c * n::f32);
+    val x0: f32       = g.x0 + (w - c * n::f32) / 2.0;
+    val y0: f32       = g.y0;
+    val sp: f32       = bctx.px(ui, 2.0);
+    var ed: bool      = false;
+
+    bctx.push_style(ui, l.small);
     var dy: i64 = 0 - r;
     for (dy <= r) {
         var dx: i64 = 0 - r;
         for (dx <= r) {
-            val cx0: f32    = x0 + (dx + r)::f32 * c;
-            val cy0: f32    = y0 + (dy + r)::f32 * c;
-            val cx1: f32    = cx0 + c - ui.px(u, 2.0);
-            val cy1: f32    = cy0 + c - ui.px(u, 2.0);
-            val hh:  ui.Hit = ui.region(u, cx0, cy0, cx1, cy1);
-            val wv:  i32    = kernel.weight_at(k, dx, dy);
-            ui.rect(u, cx0, cy0, cx1, cy1, ui.fill(hh, false), 1.0);
-            if (wv > 0) {
-                ui.rect(u, cx0, cy0, cx1, cy1, theme.ACCENT, 0.2 + 0.8 * shade(wv));
-            }
-            or (wv < 0) {
-                ui.rect(u, cx0, cy0, cx1, cy1, theme.WARN, 0.2 + 0.8 * shade(0 - wv));
-            }
-            if (dx == 0 && dy == 0) { ui.frame(u, cx0, cy0, cx1, cy1, ui.px(u, 1.0), theme.TEXT_DIM, 1.0); }
-            var num: [24]u8;
-            num[text.buf_i64(?num[0], 0, wv::i64)] = 0;
-            var ink: u32 = theme.TEXT_FAINT;
-            if (wv != 0) { ink = theme.ACCENT_INK; }
-            # a label wider than its cell is left out, as on a wide footprint
-            if (ui.measure(u.small, ?num[0]) <= c) { ui.text_centre(u, u.small, ?num[0], cx0, cy0, cx1, cy1, ink, 1.0); }
-            if (hh.clicked) {
+            val cx0: f32 = x0 + (dx + r)::f32 * c;
+            val cy0: f32 = y0 + (dy + r)::f32 * c;
+            bctx.push_id_int(ui, ((dy + r) * n + dx + r)::u64);
+            val h: bint.Hit = bint.hit(ui, bctx.id_of(ui, "weight"), cx0, cy0, cx0 + c - sp, cy0 + c - sp, binp.BUTTON_LEFT);
+            bctx.pop_id(ui);
+            val wv: i32 = kernel.weight_at(k, dx, dy);
+            cell(ui, cx0, cy0, cx0 + c - sp, cy0 + c - sp, face(h.hot, h.held, false), dx == 0 && dy == 0, wv);
+            if (h.clicked) {
                 kernel.set_weight(k, dx, dy, cycle(wv));
                 ed = true;
             }
@@ -119,67 +141,76 @@ fun weights(u: *ui.Ui, k: *kernel.Kernel) bool {
         }
         dy = dy + 1;
     }
-    ui.advance(u, c * n::f32);
+    bctx.pop_style(ui);
     ret ed;
 }
 
 # one labelled, wrapping row of sum toggles over a set
-fun sums(u: *ui.Ui, label: str, m: *kernel.Sums, most: i32) bool {
-    ui.note(u, label);
-    val g:   f32   = ui.px(u, 3.0);
-    var t:   f32   = ui.px(u, TOG);
-    var per: usize = ((u.w + g) / (t + g))::usize;
+fun sums(ui: *bctx.Context, l: look.Look, label: str, m: *kernel.Sums, most: i32) bool {
+    look.note(ui, l, label);
+    val av:  bctx.Area = bw.avail(ui);
+    val w:   f32       = av.x1 - av.x0;
+    val g:   f32       = bctx.px(ui, 3.0);
+    var t:   f32       = bctx.px(ui, TOG);
+    var per: usize     = ((w + g) / (t + g))::usize;
     if (per < 1) { per = 1; }
-    t = (u.w + g) / per::f32 - g;
-    val count: usize = (most + 1)::usize;
-    var ed:    bool  = false;
-    var i:     usize = 0;
+    t = (w + g) / per::f32 - g;
+    val count: usize     = (most + 1)::usize;
+    val rows:  usize     = (count + per - 1) / per;
+    val box:   bctx.Area = bw.place(ui, blay.fill(1.0), blay.fixed(rows::f32 * (t + g) - g), 0.0, rows::f32 * (t + g) - g);
+    var ed:    bool      = false;
+    bctx.push_style(ui, l.small);
+    bctx.push_id_str(ui, label);
+    var i: usize = 0;
     for (i < count) {
-        val x0: f32    = u.x + (i % per)::f32 * (t + g);
-        val y0: f32    = u.y + (i / per)::f32 * (t + g);
-        val on: bool   = kernel.has(m, i) != 0;
-        val hh: ui.Hit = ui.region(u, x0, y0, x0 + t, y0 + t);
-        ui.rect(u, x0, y0, x0 + t, y0 + t, ui.fill(hh, on), 1.0);
+        val x0: f32  = box.x0 + (i % per)::f32 * (t + g);
+        val y0: f32  = box.y0 + (i / per)::f32 * (t + g);
+        val on: bool = kernel.has(m, i) != 0;
+        bctx.push_id_int(ui, i::u64);
+        val h: bint.Hit = bint.hit(ui, bctx.id_of(ui, "sum"), x0, y0, x0 + t, y0 + t, binp.BUTTON_LEFT);
+        bctx.pop_id(ui);
+        val st: u8 = bth.pick(h.hot, h.held, on, false);
+        bctx.box(ui, bth.BUTTON, st, x0, y0, x0 + t, y0 + t);
         var num: [8]u8;
         val o:   usize = text.buf_u64(?num[0], 0, i::u64);
         num[o] = 0;
-        ui.text_centre(u, u.small, ?num[0], x0, y0, x0 + t, y0 + t, ui.ink(on), 1.0);
-        if (hh.clicked) {
+        look.text_centre(ui, ?num[0], x0, y0, x0 + t, y0 + t, bctx.paint_of(ui, bth.BUTTON, st).text);
+        if (h.clicked) {
             kernel.toggle(m, i);
             ed = true;
         }
         i = i + 1;
     }
-    val rows: usize = (count + per - 1) / per;
-    ui.advance(u, rows::f32 * (t + g) - g);
+    bctx.pop_id(ui);
+    bctx.pop_style(ui);
     ret ed;
 }
 
 # a labelled stepper, its value between - and + buttons at the right
 # ---
-# u:     the interface
-# label: the label
+# ui:    the interface
+# label: the label, and the stepper's key
 # value: the value shown
 # ret:   -1 for -, 1 for +, 0 for neither
-fun stepper(u: *ui.Ui, label: str, value: str) i32 {
-    val h:  f32 = ui.px(u, ui.ROW);
-    val y0: f32 = u.y;
-    ui.text_mid(u, u.body, label, u.x, y0, y0 + h, theme.TEXT, 1.0);
-    val b:  f32 = h;
-    val x1: f32 = u.x + u.w;
-    var d:  i32 = 0;
-    if (ui.button_at(u, "+", x1 - b, y0, x1, y0 + h, false)) { d = 1; }
-    ui.text_centre(u, u.body, value, x1 - b * 2.0, y0, x1 - b, y0 + h, theme.TEXT, 1.0);
-    if (ui.button_at(u, "-", x1 - b * 3.0, y0, x1 - b * 2.0, y0 + h, false)) { d = -1; }
-    ui.advance(u, h);
+fun stepper(ui: *bctx.Context, label: str, value: str) i32 {
+    val h:   f32             = bw.control_height(ui);
+    val r:   bctx.Area       = bw.place(ui, blay.fill(1.0), blay.fixed(h), 0.0, h);
+    val ink: blit.draw.Color = look.colour(theme.TEXT, 1.0);
+    look.text_mid(ui, label, r.x0, r.y0, r.y1, ink);
+    var d: i32 = 0;
+    bctx.push_id_str(ui, label);
+    if (bw.button_at(ui, "+", r.x1 - h, r.y0, r.x1, r.y1, false)) { d = 1; }
+    look.text_centre(ui, value, r.x1 - h * 2.0, r.y0, r.x1 - h, r.y1, ink);
+    if (bw.button_at(ui, "-", r.x1 - h * 3.0, r.y0, r.x1 - h * 2.0, r.y1, false)) { d = -1; }
+    bctx.pop_id(ui);
     ret d;
 }
 
 # the radius stepper
-fun radius(u: *ui.Ui, k: *kernel.Kernel) bool {
+fun radius(ui: *bctx.Context, k: *kernel.Kernel) bool {
     var num: [24]u8;
     num[text.buf_u64(?num[0], 0, k.radius::u64)] = 0;
-    val d: i32 = stepper(u, "Radius", ?num[0]);
+    val d: i32 = stepper(ui, "Radius", ?num[0]);
     if (d > 0 && k.radius < kernel.MAX_RADIUS) {
         kernel.set_radius(k, k.radius + 1);
         ret true;
@@ -191,12 +222,19 @@ fun radius(u: *ui.Ui, k: *kernel.Kernel) bool {
     ret false;
 }
 
-# the wide grid's cell size: the footprint fitted to the column, larger at a zoom level
-fun wide_cell(u: *ui.Ui, zoom: usize, n: i64) f32 {
-    var c: f32 = ui.px(u, CELL);
-    if (c * n::f32 > u.w)                                { c = u.w / n::f32; }
-    if (zoom > 0 && ui.px(u, brush.zoom_cell(zoom)) > c) { c = ui.px(u, brush.zoom_cell(zoom)); }
+# the wide grid's cell size in a column w wide: the footprint fitted to it,
+# larger at a zoom level
+fun wide_cell(ui: *bctx.Context, w: f32, zoom: usize, n: i64) f32 {
+    var c: f32 = bctx.px(ui, CELL);
+    if (c * n::f32 > w)                                     { c = w / n::f32; }
+    if (zoom > 0 && bctx.px(ui, brush.zoom_cell(zoom)) > c) { c = bctx.px(ui, brush.zoom_cell(zoom)); }
     ret c;
+}
+
+# the column's width
+fun column(ui: *bctx.Context) f32 {
+    val av: bctx.Area = bw.avail(ui);
+    ret av.x1 - av.x0;
 }
 
 # whether an offset is among n images
@@ -209,12 +247,6 @@ fun among(at: *brush.Offset, n: usize, dx: i64, dy: i64) bool {
     ret false;
 }
 
-# the fill of a scroll bar's thumb
-fun thumb(h: ui.Hit) u32 {
-    if (h.held || h.hot) { ret theme.TEXT_FAINT; }
-    ret theme.CONTROL_ON;
-}
-
 # a first cell and a view of shown cells clamped into n, centred on c
 fun first_cell(c: i64, r: i64, shown: i64, n: i64) i64 {
     var f: i64 = c + r - shown / 2;
@@ -223,22 +255,38 @@ fun first_cell(c: i64, r: i64, shown: i64, n: i64) i64 {
     ret f;
 }
 
+# a scroll bar over the wide grid, its thumb the view's share of the
+# footprint; ret where a drag on it puts the view's centre, as a fraction
+# of the footprint, or none
+fun bar(ui: *bctx.Context, key: str, x0: f32, y0: f32, x1: f32, y1: f32, lo: f32, hi: f32, across: bool) opt[f32] {
+    val h: bint.Hit = bint.hit(ui, bctx.id_of(ui, key), x0, y0, x1, y1, binp.BUTTON_LEFT);
+    bctx.box(ui, bth.SCROLLBAR, bth.NORMAL, x0, y0, x1, y1);
+    val st: u8 = bth.pick(h.hot, h.held, false, false);
+    if (across)  { bctx.box(ui, bth.SCROLLBAR_THUMB, st, x0 + (x1 - x0) * lo, y0, x0 + (x1 - x0) * hi, y1); }
+    or           { bctx.box(ui, bth.SCROLLBAR_THUMB, st, x0, y0 + (y1 - y0) * lo, x1, y0 + (y1 - y0) * hi); }
+    if (!h.held) { ret opt[f32].none{}; }
+    if (across)  { ret opt[f32].some{(h.mx - x0) / (x1 - x0)}; }
+    ret opt[f32].some{(h.my - y0) / (y1 - y0)};
+}
+
 # the wide weight grid: a zoomed, scrolled view of the footprint painted by
 # dragging, the hovered cell's images outlined, and a readout of the cell
 # ---
-# u:   the interface
+# ui:  the interface
+# l:   cellar's look
 # b:   the brush and view
 # k:   the kernel, painted in place
 # ret: whether a weight changed
-fun wide_weights(u: *ui.Ui, b: *brush.Brush, k: *kernel.Kernel) bool {
+fun wide_weights(ui: *bctx.Context, l: look.Look, b: *brush.Brush, k: *kernel.Kernel) bool {
     val r:     i64 = k.radius::i64;
     val n:     i64 = 2 * r + 1;
-    val bw:    f32 = ui.px(u, BAR);
-    val g:     f32 = ui.px(u, 3.0);
-    val c:     f32 = wide_cell(u, b.zoom, n);
+    val w:     f32 = column(ui);
+    val bw_:   f32 = bctx.px(ui, BAR);
+    val g:     f32 = bctx.px(ui, 3.0);
+    val c:     f32 = wide_cell(ui, w, b.zoom, n);
     var shown: i64 = n;
-    if (c * n::f32 > u.w + 0.5) {
-        shown = ((u.w - bw - g) / c)::i64;
+    if (c * n::f32 > w + 0.5) {
+        shown = ((w - bw_ - g) / c)::i64;
         if (shown < 1) { shown = 1; }
     }
     val fx: i64 = first_cell(b.cx, r, shown, n);
@@ -248,75 +296,56 @@ fun wide_weights(u: *ui.Ui, b: *brush.Brush, k: *kernel.Kernel) bool {
     val bars: bool = shown < n;
     val side: f32  = c * shown::f32;
     var room: f32  = side;
-    if (bars) { room = side + g + bw; }
-    val x0:   f32    = u.x + (u.w - room) / 2.0;
-    val y0:   f32    = u.y;
-    val hh:   ui.Hit = ui.region(u, x0, y0, x0 + side, y0 + side);
-    val over: bool   = ui.inside(u, x0, y0, x0 + side, y0 + side);
-    var hx:   i64    = 0;
-    var hy:   i64    = 0;
+    if (bars) { room = side + g + bw_; }
+    val area: bctx.Area = bw.place(ui, blay.fill(1.0), blay.fixed(room), 0.0, room);
+    val x0:   f32       = area.x0 + (w - room) / 2.0;
+    val y0:   f32       = area.y0;
+    val h:    bint.Hit  = bint.hit(ui, bctx.id_of(ui, "grid"), x0, y0, x0 + side, y0 + side, binp.BUTTON_LEFT);
+    val in:   bool      = h.mx >= x0 && h.mx < x0 + side && h.my >= y0 && h.my < y0 + side;
+    val over: bool      = h.hot || (h.held && in);
+    var hx:   i64       = 0;
+    var hy:   i64       = 0;
     var at:   [8]brush.Offset;
-    var na:   usize  = 0;
-    var ed:   bool   = false;
+    var na:   usize     = 0;
+    var ed:   bool      = false;
     if (over) {
-        hx = fx + ((u.mx - x0) / c)::i64 - r;
-        hy = fy + ((u.my - y0) / c)::i64 - r;
+        hx = fx + ((h.mx - x0) / c)::i64 - r;
+        hy = fy + ((h.my - y0) / c)::i64 - r;
         if (hx > r) { hx = r; }
         if (hy > r) { hy = r; }
         na = brush.images(hx, hy, b.sym, ?at[0]);
-        if (hh.held && brush.paint(k, hx, hy, b.weight, b.sym)) { ed = true; }
+        if (h.held && brush.paint(k, hx, hy, b.weight, b.sym)) { ed = true; }
     }
 
-    var gap: f32 = ui.px(u, 2.0);
-    if (c < ui.px(u, 10.0)) { gap = ui.px(u, 1.0); }
+    var gap: f32 = bctx.px(ui, 2.0);
+    if (c < bctx.px(ui, 10.0)) { gap = bctx.px(ui, 1.0); }
+    bctx.push_style(ui, l.small);
     var iy: i64 = 0;
     for (iy < shown) {
         var ix: i64 = 0;
         for (ix < shown) {
-            val dx:   i64  = fx + ix - r;
-            val dy:   i64  = fy + iy - r;
-            val cx0:  f32  = x0 + ix::f32 * c;
-            val cy0:  f32  = y0 + iy::f32 * c;
-            val cx1:  f32  = cx0 + c - gap;
-            val cy1:  f32  = cy0 + c - gap;
-            val wv:   i32  = kernel.weight_at(k, dx, dy);
-            val hot:  bool = na > 0 && among(?at[0], na, dx, dy);
-            var back: u32  = theme.CONTROL;
-            if (hot) { back = theme.CONTROL_HOT; }
-            ui.rect(u, cx0, cy0, cx1, cy1, back, 1.0);
-            if (wv > 0) {
-                ui.rect(u, cx0, cy0, cx1, cy1, theme.ACCENT, 0.2 + 0.8 * shade(wv));
-            }
-            or (wv < 0) {
-                ui.rect(u, cx0, cy0, cx1, cy1, theme.WARN, 0.2 + 0.8 * shade(0 - wv));
-            }
-            if (dx == 0 && dy == 0) { ui.frame(u, cx0, cy0, cx1, cy1, ui.px(u, 1.0), theme.TEXT_DIM, 1.0); }
-            if (hot)                { ui.frame(u, cx0, cy0, cx1, cy1, ui.px(u, 1.0), theme.TEXT, 0.8); }
-            var num: [24]u8;
-            num[text.buf_i64(?num[0], 0, wv::i64)] = 0;
-            var ink: u32 = theme.TEXT_FAINT;
-            if (wv != 0)                                 { ink = theme.ACCENT_INK; }
-            if (ui.measure(u.small, ?num[0]) <= c - gap) { ui.text_centre(u, u.small, ?num[0], cx0, cy0, cx1, cy1, ink, 1.0); }
+            val dx:  i64  = fx + ix - r;
+            val dy:  i64  = fy + iy - r;
+            val cx0: f32  = x0 + ix::f32 * c;
+            val cy0: f32  = y0 + iy::f32 * c;
+            val hot: bool = na > 0 && among(?at[0], na, dx, dy);
+            cell(ui, cx0, cy0, cx0 + c - gap, cy0 + c - gap, face(hot, false, false), dx == 0 && dy == 0, kernel.weight_at(k, dx, dy));
+            if (hot) { bctx.frame(ui, cx0, cy0, cx0 + c - gap, cy0 + c - gap, bctx.px(ui, 1.0), look.colour(theme.TEXT, 0.8)); }
             ix = ix + 1;
         }
         iy = iy + 1;
     }
+    bctx.pop_style(ui);
 
     if (bars) {
         # the bars show the view's share of the footprint, and a drag on one centres the view there
-        val tx0: f32    = x0;
-        val ty0: f32    = y0 + side + g;
-        val hb:  ui.Hit = ui.region(u, tx0, ty0, tx0 + side, ty0 + bw);
-        ui.rect(u, tx0, ty0, tx0 + side, ty0 + bw, theme.CONTROL, 1.0);
-        ui.rect(u, tx0 + side * fx::f32 / n::f32, ty0, tx0 + side * (fx + shown)::f32 / n::f32, ty0 + bw, thumb(hb), 1.0);
-        if (hb.held) { b.cx = ((u.mx - tx0) / side * n::f32)::i64 - r; }
-        val vx0: f32    = x0 + side + g;
-        val vb:  ui.Hit = ui.region(u, vx0, y0, vx0 + bw, y0 + side);
-        ui.rect(u, vx0, y0, vx0 + bw, y0 + side, theme.CONTROL, 1.0);
-        ui.rect(u, vx0, y0 + side * fy::f32 / n::f32, vx0 + bw, y0 + side * (fy + shown)::f32 / n::f32, thumb(vb), 1.0);
-        if (vb.held) { b.cy = ((u.my - y0) / side * n::f32)::i64 - r; }
+        val sx: opt[f32] = bar(ui, "across", x0, y0 + side + g, x0 + side, y0 + side + g + bw_, fx::f32 / n::f32,
+            (fx + shown)::f32 / n::f32, true);
+        if (sel sx.some) { b.cx = (sx.some * n::f32)::i64 - r; }
+        val vx: f32      = x0 + side + g;
+        val sy: opt[f32] = bar(ui, "down", vx, y0, vx + bw_, y0 + side, fy::f32 / n::f32, (fy + shown)::f32 / n::f32, false);
+        if (sel sy.some) { b.cy = (sy.some * n::f32)::i64 - r; }
     }
-    ui.advance(u, room);
 
     var line: [64]u8;
     var o:    usize = 0;
@@ -330,16 +359,16 @@ fun wide_weights(u: *ui.Ui, b: *brush.Brush, k: *kernel.Kernel) bool {
     }
     or { o = text.buf_str(?line[0], 0, "drag to paint the brush's weight"); }
     line[o] = 0;
-    ui.text(u, u.small, ?line[0], u.x, u.y, theme.TEXT_DIM, 1.0);
-    u.y = u.y + ui.line(u.small) + ui.px(u, ui.GAP);
+    look.line(ui, l.small, ?line[0], theme.TEXT_DIM);
     ret ed;
 }
 
 # the zoom, brush weight and symmetry of the wide grid
-fun brush_controls(u: *ui.Ui, b: *brush.Brush, k: *kernel.Kernel) {
+fun brush_controls(ui: *bctx.Context, l: look.Look, b: *brush.Brush, k: *kernel.Kernel) {
     val n:   i64   = 2 * k.radius::i64 + 1;
-    val fit: f32   = wide_cell(u, 0, n);
-    val c:   f32   = wide_cell(u, b.zoom, n);
+    val w:   f32   = column(ui);
+    val fit: f32   = wide_cell(ui, w, 0, n);
+    val c:   f32   = wide_cell(ui, w, b.zoom, n);
     var num: [24]u8;
     var o:   usize = 0;
     if (b.zoom == 0) { o = text.buf_str(?num[0], 0, "fit"); }
@@ -351,160 +380,157 @@ fun brush_controls(u: *ui.Ui, b: *brush.Brush, k: *kernel.Kernel) {
         o = text.buf_str(?num[0], o, "x");
     }
     num[o] = 0;
-    val z: i32 = stepper(u, "Zoom", ?num[0]);
+    val z: i32 = stepper(ui, "Zoom", ?num[0]);
     # a level adds nothing once a cell is as large as it gets
-    if (z > 0 && b.zoom < brush.ZOOMS && c < ui.px(u, CELL)) {
+    if (z > 0 && b.zoom < brush.ZOOMS && c < bctx.px(ui, CELL)) {
         b.zoom = b.zoom + 1;
-        for (b.zoom < brush.ZOOMS && ui.px(u, brush.zoom_cell(b.zoom)) <= c) { b.zoom = b.zoom + 1; }
+        for (b.zoom < brush.ZOOMS && bctx.px(ui, brush.zoom_cell(b.zoom)) <= c) { b.zoom = b.zoom + 1; }
     }
     if (z < 0 && b.zoom > 0) {
         b.zoom = b.zoom - 1;
-        for (b.zoom > 0 && ui.px(u, brush.zoom_cell(b.zoom)) <= fit) { b.zoom = b.zoom - 1; }
+        for (b.zoom > 0 && bctx.px(ui, brush.zoom_cell(b.zoom)) <= fit) { b.zoom = b.zoom - 1; }
     }
 
     num[text.buf_i64(?num[0], 0, b.weight::i64)] = 0;
-    val w: i32 = stepper(u, "Brush weight", ?num[0]);
-    if (w > 0 && b.weight < MAXW)     { b.weight = b.weight + 1; }
-    if (w < 0 && b.weight > 0 - MAXW) { b.weight = b.weight - 1; }
+    val wt: i32 = stepper(ui, "Brush weight", ?num[0]);
+    if (wt > 0 && b.weight < MAXW)     { b.weight = b.weight + 1; }
+    if (wt < 0 && b.weight > 0 - MAXW) { b.weight = b.weight - 1; }
 
     var syms: [3]str;
     syms[0] = "None";
     syms[1] = "4-fold";
     syms[2] = "8-fold";
-    ui.note(u, "Symmetry");
-    ui.segmented(u, ?syms[0], 3, ?b.sym);
+    look.note(ui, l, "Symmetry");
+    bw.segmented(ui, ?syms[0], 3, ?b.sym);
 }
 
 # a labelled sum list for a wide kernel's set
 # ---
-# u:    the interface
-# l:    the list's field
-# name: "Birth" or "Survive"
+# ui:   the interface
+# lk:   cellar's look
+# s:    the list's field
+# name: "Birth" or "Survive", and the field's key
 # m:    the set, replaced when a list is entered
 # most: the greatest sum the kernel reaches
 # ret:  whether the set was replaced
-fun sum_list(u: *ui.Ui, l: *sumlist.SumList, name: str, m: *kernel.Sums, most: usize) bool {
+fun sum_list(ui: *bctx.Context, lk: look.Look, s: *sumlist.SumList, name: str, m: *kernel.Sums, most: usize) bool {
     var lb: [64]u8;
     var o:  usize = text.buf_str(?lb[0], 0, name);
     o     = text.buf_str(?lb[0], o, " sums, 0 to ");
     o     = text.buf_u64(?lb[0], o, most::u64);
     lb[o] = 0;
-    ui.note(u, ?lb[0]);
+    look.note(ui, lk, ?lb[0]);
     var ed:  bool = false;
-    val did: u8   = ui.text_field(u, ?l.field, "none, or like 34-45, 58");
-    if (did == ui.FIELD_EDITED) { sumlist.edited(l, most); }
-    if (did == ui.FIELD_ENTERED) {
-        val got: opt[kernel.Sums] = sumlist.enter(l, most);
+    val did: u8   = bw.text_field(ui, name, ?s.field, "none, or like 34-45, 58");
+    val id:  u64  = bctx.id_of(ui, name);
+    if ((did & blit.field.ENTERED) != 0) {
+        val got: opt[kernel.Sums] = sumlist.enter(s, most);
         if (sel got.some) {
             if (!kernel.same_sums(?got.some, m)) {
                 @m = got.some;
                 ed = true;
             }
         }
-        or { ui.focus(u, ?l.field); }
+        # a refused list stays in the field to be put right
+        or { bctx.focus(ui, id); }
     }
+    or ((did & blit.field.EDITED) != 0) { sumlist.edited(s, most); }
     # an entered set runs from the next frame, so this one leaves the field as enter set it
-    if (did != ui.FIELD_ENTERED && u.focus != ?l.field) { sumlist.sync(l, m, most); }
-    if (l.error != nil) {
-        ui.text(u, u.small, l.error, u.x, u.y, theme.WARN, 1.0);
-        u.y = u.y + ui.line(u.small) + ui.px(u, ui.GAP);
-    }
+    if ((did & blit.field.ENTERED) == 0 && !bctx.focused(ui, id)) { sumlist.sync(s, m, most); }
+    if (s.error != nil)                                           { look.line(ui, lk.small, s.error, theme.WARN); }
     ret ed;
 }
 
-# draw the rule section and apply its edits
+# draw the rule panel and apply its edits
 # ---
-# u: the interface
-# a: application state
-# s: the simulation whose kernel is edited, locked by the caller
-pub fun section(u: *ui.Ui, a: *app.App, s: *sim.Sim) {
-    if (!ui.heading(u, "RULE", ?a.open_rule)) {
-        a.brush.stroke = false;
-        ret;
-    }
+# ui: the interface
+# l:  cellar's look
+# a:  application state
+# s:  the world as shown, whose kernel is edited
+pub fun panel(ui: *bctx.Context, l: look.Look, a: *app.App, s: *world.Shown) {
     # edits go to a copy, which replaces the rule when the frame applies commands
     var copy: rule.Rule = @world.rule(s);
     var ed:   bool      = false;
 
-    val m: opt[usize] = world.rule_preset(s);
-    val h: f32        = ui.px(u, ui.ROW);
-    var i: usize      = 0;
+    val m:      opt[usize] = world.rule_preset(s);
+    var labels: [rule.PRESET_COUNT]str;
+    var i:      usize      = 0;
     for (i < rule.PRESET_COUNT) {
-        val col: usize = i % 2;
-        val on:  bool  = sel m.some && m.some == i;
-        if (ui.button_at(u, rule.preset(i).label, ui.cell_x0(u, col, 2), u.y, ui.cell_x1(u, col, 2), u.y + h, on)) {
-            copy = rule.preset_rule(i);
-            ed   = true;
-        }
-        if (col == 1) { ui.advance(u, h); }
-        i = i + 1;
+        labels[i] = rule.preset(i).label;
+        i         = i + 1;
+    }
+    var on: usize = rule.PRESET_COUNT;
+    if (sel m.some) { on = m.some; }
+    val hit: usize = bw.button_grid(ui, ?labels[0], rule.PRESET_COUNT, 2, on);
+    if (hit < rule.PRESET_COUNT) {
+        copy = rule.preset_rule(hit);
+        ed   = true;
     }
 
     var rb: [rule.DISPLAY_MAX + 1]u8;
-    ui.text(u, u.body, world.rule_string(s, ?rb[0]), u.x, u.y, theme.ACCENT, 1.0);
-    u.y = u.y + ui.line(u.body) + ui.px(u, ui.GAP);
-    rule_field(u, a, s);
+    look.line(ui, blit.font.STYLE_BODY, world.rule_string(s, ?rb[0]), theme.ACCENT);
+    rule_field(ui, l, a, s);
 
     if (sel copy.kind.weighted) {
-        if (kernel_editor(u, a, ?copy.kind.weighted)) { ed = true; }
+        if (kernel_editor(ui, l, a, ?copy.kind.weighted)) { ed = true; }
     }
     if (ed) { app.submit(a, command.Command.rule{copy}); }
 }
 
 # the rule string field, and what is wrong with a string it refused
 # ---
-# u: the interface
-# a: application state
-# s: the simulation, locked by the caller
-fun rule_field(u: *ui.Ui, a: *app.App, s: *sim.Sim) {
+# ui: the interface
+# l:  cellar's look
+# a:  application state
+# s:  the world as shown
+fun rule_field(ui: *bctx.Context, l: look.Look, a: *app.App, s: *world.Shown) {
     val t:   *ruletext.RuleText = ?a.rule_text;
-    val did: u8                 = ui.text_field(u, ?t.field, "Rule, like B3/S23 or R2,C0,S2-3,B3");
-    if (did == ui.FIELD_EDITED) { ruletext.edited(t); }
-    if (did == ui.FIELD_ENTERED) {
+    val did: u8                 = bw.text_field(ui, "rule string", ?t.field, "Rule, like B3/S23 or R2,C0,S2-3,B3");
+    val id:  u64                = bctx.id_of(ui, "rule string");
+    if ((did & blit.field.ENTERED) != 0) {
         val r: opt[rule.Rule] = ruletext.enter(t);
         if (sel r.some) { app.submit(a, command.Command.rule{r.some}); }
         # a refused string stays in the field to be put right
-        or { ui.focus(u, ?t.field); }
+        or { bctx.focus(ui, id); }
     }
+    or ((did & blit.field.EDITED) != 0) { ruletext.edited(t); }
     # an entered rule runs from the next frame, so this one leaves the field as enter set it
-    if (did != ui.FIELD_ENTERED && u.focus != ?t.field) { ruletext.sync(t, world.rule(s)); }
-    if (t.error != nil) {
-        ui.text(u, u.small, t.error, u.x, u.y, theme.WARN, 1.0);
-        u.y = u.y + ui.line(u.small) + ui.px(u, ui.GAP);
-    }
+    if ((did & blit.field.ENTERED) == 0 && !bctx.focused(ui, id)) { ruletext.sync(t, world.rule(s)); }
+    if (t.error != nil)                                           { look.line(ui, l.small, t.error, theme.WARN); }
 }
 
 # the weighted kernel's radius, weights and sums
 # ---
-# u:   the interface
+# ui:  the interface
+# l:   cellar's look
 # a:   application state, holding the wide editor's brush and lists
 # k:   the kernel, edited in place
 # ret: whether anything was edited
-fun kernel_editor(u: *ui.Ui, a: *app.App, k: *kernel.Kernel) bool {
+fun kernel_editor(ui: *bctx.Context, l: look.Look, a: *app.App, k: *kernel.Kernel) bool {
     val b:  *brush.Brush = ?a.brush;
     var ed: bool         = false;
     # a stroke shows what it has painted, and applies it as one edit once the button is up
     if (b.stroke && b.pending.radius != k.radius) { b.stroke = false; }
     if (b.stroke) {
         @k = b.pending;
-        if (!u.down) {
+        if (binp.held(ui.in, binp.BUTTON_LEFT) == 0) {
             b.stroke = false;
             ed       = true;
         }
     }
 
-    if (radius(u, k)) { ed = true; }
+    if (radius(ui, k)) { ed = true; }
     val wide: bool = k.radius > SMALL;
-    if (!wide && weights(u, k)) { ed = true; }
-    if (wide && wide_weights(u, b, k)) {
+    if (!wide && weights(ui, l, k)) { ed = true; }
+    if (wide && wide_weights(ui, l, b, k)) {
         b.stroke  = true;
         b.pending = @k;
     }
-    if (wide) { brush_controls(u, b, k); }
+    if (wide) { brush_controls(ui, l, b, k); }
     var acts: [2]str;
     acts[0] = "Clear weights";
     acts[1] = "Moore";
-    val hit: usize = ui.buttons(u, ?acts[0], 2);
+    val hit: usize = bw.buttons(ui, ?acts[0], 2);
     if (hit == 0) {
         clear_weights(k);
         ed = true;
@@ -515,13 +541,18 @@ fun kernel_editor(u: *ui.Ui, a: *app.App, k: *kernel.Kernel) bool {
     }
     val most: i32 = kernel.max_sum(k);
     if (wide) {
-        if (sum_list(u, ?a.birth_list, "Birth", ?k.birth, most::usize))       { ed = true; }
-        if (sum_list(u, ?a.survive_list, "Survive", ?k.survive, most::usize)) { ed = true; }
+        if (sum_list(ui, l, ?a.birth_list, "Birth", ?k.birth, most::usize))       { ed = true; }
+        if (sum_list(ui, l, ?a.survive_list, "Survive", ?k.survive, most::usize)) { ed = true; }
         ret ed;
     }
-    if (sums(u, "Birth", ?k.birth, most))     { ed = true; }
-    if (sums(u, "Survive", ?k.survive, most)) { ed = true; }
+    if (sums(ui, l, "Birth", ?k.birth, most))     { ed = true; }
+    if (sums(ui, l, "Survive", ?k.survive, most)) { ed = true; }
     ret ed;
+}
+
+# the rule panel is not drawn this frame, so no stroke carries on from it
+pub fun idle(a: *app.App) {
+    a.brush.stroke = false;
 }
 
 test cycle__runs_through_every_weight_negatives_included {
