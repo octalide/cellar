@@ -71,6 +71,12 @@
 # part way (hashlife's cancel point) with the world as it was, and the run
 # pauses at that ceiling, after one more try on a collected tree for memory.
 #
+# another thread may cancel the step under way (ask_cancel), so the interface
+# applies what it holds without waiting: the CPU's at the next chunk it takes
+# (cellar.cpu), the tree's at its cancel point with CANCEL_ASKED. either leaves
+# the world at the last completed generation, owing no commit. the GPU's generations are
+# recorded by the frame, between whose ranges nothing is under way to cancel.
+#
 # the world is unbounded unless the rule names a bounded grid
 # (cellar.topology), and then a cell written off the grid is dropped, as
 # Golly clips a pattern to its grid. only the pool runs one, since
@@ -101,6 +107,7 @@ use cellar.text;
 use cellar.topology;
 use allo: std.allocator;
 use std.allocator.page;
+use std.chrono.duration.MILLISECOND;
 use std.chrono.duration.SECOND;
 use std.chrono.time;
 use std.collections.set;
@@ -108,6 +115,8 @@ use std.collections.set.Set;
 use mem: std.memory;
 use std.print;
 use std.rand;
+use std.sync.atomic;
+use std.sync.thread;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -251,6 +260,7 @@ pub rec Watch {
 # began:      when the step under way began, if the step ceiling times it
 # fit:        the largest step exponent the run to a generation under way found
 #             fits the memory ceiling
+# asked:      1 once another thread asks the CPU's step under way to cancel
 pub rec Sim {
     space:      space.Space;
     rule:       rule.Rule;
@@ -277,6 +287,7 @@ pub rec Sim {
     tripped:    usize;
     began:      opt[time.Instant];
     fit:        u32;
+    asked:      i64;
 }
 
 # an empty world stepped by the CPU, with the first preset's rule
@@ -310,6 +321,7 @@ pub fun init(s: *Sim, a: *allo.Allocator) err[allo.Error] {
     s.ceil  = ceiling.defaults();
     s.began = opt[time.Instant].none{};
     s.fit   = hashlife.MAX_EXPONENT;
+    s.asked = 0;
     disarm(s);
     ret e;
 }
@@ -730,8 +742,9 @@ pub fun step(s: *Sim) {
 # world at once)
 #
 # a step the pool or the tree could not hold stops the world, uncounted, and a
-# world full or paused at a ceiling does not step. a tree step cancelled part
-# way leaves the world as it was and owes no commit.
+# world full or paused at a ceiling does not step. a step cancelled part way
+# (ask_cancel, or a ceiling on the tree) leaves the world as it was and owes no
+# commit.
 # ---
 # s:   simulation
 # ret: whether commit is owed to finish the step
@@ -743,8 +756,27 @@ pub fun advance(s: *Sim) bool {
         ret false;
     }
     s.began = clock(s);
-    cpu.compute(?s.space, ?s.rule, s.generation, ?s.team);
-    ret true;
+    if (cpu.compute(?s.space, ?s.rule, s.generation, ?s.team, ?s.asked)) { ret true; }
+    atomic.store(?s.asked, 0);
+    ret false;
+}
+
+# ask the step under way to cancel, from any thread, leaving the world at the
+# last completed generation. an ask between steps cancels the next one, unless
+# unask withdraws it first
+# ---
+# s: simulation
+pub fun ask_cancel(s: *Sim) {
+    atomic.store(?s.asked, 1);
+    hashlife.ask_cancel(?s.tree);
+}
+
+# withdraw an ask no step met, while no step is under way
+# ---
+# s: simulation
+pub fun unask(s: *Sim) {
+    atomic.store(?s.asked, 0);
+    hashlife.unask(?s.tree);
 }
 
 # the second half of a step advance began: make its generation the world's,
@@ -2330,6 +2362,9 @@ pub fun toggle_running(s: *Sim) {
         ret;
     }
     s.running = 1 - s.running;
+    # a pause drops the generations the run asked of the GPU and it has not
+    # recorded, so the frame stops stepping at once
+    if (s.running == 0) { s.pending = 0; }
 }
 
 test overflow__gates_step_and_running_until_clear {
@@ -2558,6 +2593,63 @@ test ceiling__a_run_to_a_generation_takes_smaller_steps_past_the_step_deadline {
     if (t.fit != 0 || !same_as_tree(?p, ?t))              { ret 7; }
     dnit(?p);
     dnit(?t);
+    ret 0;
+}
+
+# cancel the step under way a moment after it begins, from another thread
+fun cancel_soon(arg: *u8) {
+    val s:  *Sim              = arg::*Sim;
+    val t0: time.InstantClock = time.instant();
+    if (sel t0.ok) {
+        var waited: i64 = 0;
+        for (waited < 2 * MILLISECOND) {
+            val t: time.InstantClock = time.instant();
+            if (sel t.ok) { waited = time.instant_sub(t.ok, t0.ok); }
+        }
+    }
+    ask_cancel(s);
+}
+
+test step__a_cpu_step_cancelled_part_way_leaves_the_world_as_it_was {
+    var a: allo.Allocator;
+    page.make(?a);
+    var p:     Sim;
+    var q:     Sim;
+    val made:  err[allo.Error] = init(?p, ?a);
+    val made2: err[allo.Error] = init(?q, ?a);
+    if (sel made.err || sel made2.err) { ret 1; }
+    set_rule(?p, rule_named("B2/S"));
+    randomize(?p, 0.3, 2048);
+    var sn: snapshot.Snapshot;
+    snapshot.init(?sn, ?a);
+    if (!take(?p, ?sn) || !restore(?q, ?sn)) { ret 2; }
+    # an ask between steps cancels the next, which leaves the world alone
+    ask_cancel(?p);
+    if (advance(?p) || !same_world(?p, ?q)) { ret 3; }
+    # an ask part way cancels the step, wherever it lands, or misses it
+    var th:      thread.Thread;
+    val spawned: thread.Operation = thread.spawn_with(cancel_soon, (?p)::*u8, ?th);
+    if (sel spawned.err) { ret 4; }
+    val ok: bool = advance(?p);
+    thread.join(?th);
+    # an ask that came after the step is withdrawn, as the runner does
+    unask(?p);
+    if (ok) { commit(?p); }
+    or {
+        if (p.generation != 0 || !same_world(?p, ?q)) { ret 5; }
+        step(?p);
+    }
+    # the run after it is the run that was never cancelled
+    var g: usize = 0;
+    for (g < 4) {
+        step(?q);
+        if (g > 0) { step(?p); }
+        g = g + 1;
+    }
+    if (p.generation != 4 || q.generation != 4 || !same_world(?p, ?q)) { ret 6; }
+    snapshot.dnit(?sn);
+    dnit(?p);
+    dnit(?q);
     ret 0;
 }
 

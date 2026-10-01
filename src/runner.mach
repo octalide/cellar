@@ -13,7 +13,10 @@
 # command queue (cellar.exec), and recording the GPU's generations. take never
 # waits. it succeeds when the thread is between steps, and otherwise asks the
 # thread to stop at the next one (asked), so commands apply between steps, a
-# frame or so later, and the interface draws on in the meantime. while the
+# frame or so later, and the interface draws on in the meantime. the ask also
+# cancels the step under way (sim.ask_cancel), as quit does, so whatever the
+# interface needs applies within a chunk or a cancel point of being asked, on
+# the last completed generation, and only a partial step is lost. while the
 # thread is not stepping the world, paused, full or on the GPU, the interface
 # takes it every frame and the world runs as if there were no thread.
 #
@@ -227,7 +230,8 @@ pub fun start(r: *Runner, s: *sim.Sim) err[thread.ThreadError] {
 
 # take the world, without waiting, when the thread is not stepping it, or when
 # need asks for it and the thread is between steps. a need that finds the
-# thread stepping asks it to stop at the next step and give the world over
+# thread stepping cancels the step under way and asks the thread to give the
+# world over instead of starting the next
 # ---
 # r:    the runner
 # need: the interface has commands to apply, or must hold the world this frame
@@ -239,8 +243,13 @@ pub fun take(r: *Runner, need: bool) bool {
     if (got) {
         r.holder = HOLD_UI;
         atomic.store(?r.asked, 0);
+        # a cancel asked of a step that ended first is not left for the next
+        sim.unask(r.sim);
     }
-    or (need) { atomic.store(?r.asked, 1); }
+    or (need) {
+        atomic.store(?r.asked, 1);
+        if (r.holder == HOLD_SIM) { sim.ask_cancel(r.sim); }
+    }
     mutex.unlock(?r.lock);
     ret got;
 }
@@ -322,13 +331,14 @@ pub fun unview(r: *Runner) {
     mutex.unlock(?r.view);
 }
 
-# stop the thread once its step ends, and wait for it to exit
+# stop the thread, cancelling the step under way, and wait for it to exit
 # ---
 # r: the runner
 pub fun stop(r: *Runner) {
     if (!r.started) { ret; }
     mutex.lock(?r.lock);
     r.quit = true;
+    if (r.holder == HOLD_SIM) { sim.ask_cancel(r.sim); }
     condition.signal(?r.wake);
     mutex.unlock(?r.lock);
     thread.join(?r.worker);
@@ -367,7 +377,8 @@ test runner__steps_while_running_and_gives_the_world_between_steps {
     }
     if (shown.generation < 8) { ret 5; }
 
-    # a need is met between steps, and the world then stands still
+    # a need cancels the step under way, is met between steps, and the world
+    # then stands still
     var got: bool = false;
     tries = 0;
     for (!got && tries < 100000000) {
@@ -390,6 +401,8 @@ test runner__steps_while_running_and_gives_the_world_between_steps {
     for (!take(?r, true)) {}
     val secs: f64 = time.instant_sub(now(), t0)::f64 / SECOND::f64;
     if ((s.generation - from)::f64 > secs * 20.0 + 2.0) { ret 9; }
+    # no cancel was left over from the take to stop the run
+    if (s.generation == from) { ret 11; }
     give(?r);
 
     stop(?r);
