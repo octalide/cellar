@@ -29,6 +29,12 @@
 # them from another thread.
 # commit then marks what changed, swaps the buffers and settles the pool, and
 # is the only half that changes what a draw reads.
+#
+# compute can be cancelled part way from another thread through a stop flag,
+# which every member of the team looks at before it takes another chunk. the
+# back cells it wrote are left for the next compute to overwrite and the census
+# is put back as the step found it, so the pool holds the last completed
+# generation as if the step had never begun, and nothing is owed to commit.
 
 use cellar.layout;
 use cellar.rule;
@@ -39,6 +45,7 @@ use cellar.topology;
 use allo: std.allocator;
 use std.allocator.page;
 use mem: std.memory;
+use std.sync.atomic;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -152,15 +159,19 @@ fun step_seamed(rd: *Round, s: usize, fr: *u32) {
     build(sp, s, rd.sens);
 }
 
-# step every seamed chunk of the pool, after the rest
-fun step_seams(rd: *Round) {
+# step every seamed chunk of the pool, after the rest, until stop is raised
+# ---
+# ret: every seamed chunk was stepped
+fun step_seams(rd: *Round, stop: *i64) bool {
     var fr: [FRAMES]u32;
     val sp: *space.Space = rd.sp;
     var s:  usize        = 0;
     for (s < sp.hi) {
+        if (stop != nil && atomic.load(stop) != 0)    { ret false; }
         if (space.used(sp, s) && space.seamed(sp, s)) { step_seamed(rd, s, ?fr[0]); }
         s = s + 1;
     }
+    ret true;
 }
 
 # advance the pool one generation and reshape it around the result
@@ -175,26 +186,31 @@ fun step_seams(rd: *Round) {
 # t:   the team to split the chunks across
 # ret: false when the pool could not hold a chunk the world grew into
 pub fun step(sp: *space.Space, r: *rule.Rule, gen: u64, t: *team.Team) bool {
-    compute(sp, r, gen, t);
+    compute(sp, r, gen, t, nil);
     ret commit(sp);
 }
 
 # the first half of a step: every chunk steps into its back cells and writes
 # its census, leaving the front cells, the page table and the dirty marks alone
 # ---
-# sp:  the pool, with back cells, whose sense is the rule's
-# r:   the rule
-# gen: the generation the pool's cells hold
-# t:   the team to split the chunks across
-pub fun compute(sp: *space.Space, r: *rule.Rule, gen: u64, t: *team.Team) {
+# sp:   the pool, with back cells, whose sense is the rule's
+# r:    the rule
+# gen:  the generation the pool's cells hold
+# t:    the team to split the chunks across
+# stop: a flag another thread may raise to cancel the step, or nil
+# ret:  the step is complete and owes commit; false when it was cancelled,
+#       which leaves the pool as it was
+pub fun compute(sp: *space.Space, r: *rule.Rule, gen: u64, t: *team.Team, stop: *i64) bool {
     var rd: Round;
     rd.sp   = sp;
     rd.r    = r;
     rd.gen  = gen;
     rd.sens = sp.sense;
     mem.copy[u32](sp.before, sp.census, sp.hi * space.CENSUS);
-    team.run(t, step_slot, (?rd)::*u8, sp.hi);
-    if (topology.bounded(?sp.grid)) { step_seams(?rd); }
+    var done: bool = team.run_until(t, step_slot, (?rd)::*u8, sp.hi, stop);
+    if (done && topology.bounded(?sp.grid)) { done = step_seams(?rd, stop); }
+    if (!done)                              { mem.copy[u32](sp.census, sp.before, sp.hi * space.CENSUS); }
+    ret done;
 }
 
 # the second half of a step: the back cells compute wrote become the front, and
