@@ -1,0 +1,197 @@
+# the interface's host: a blit context run over boom
+#
+# boom's half of blit (boom.graphics.blitui) gives the context its text, a
+# TrueType face rasterised at whatever interface scale the context asks for,
+# draws its frame in the overlay pass over the world, and frames its input
+# from the window's events. each frame the window's events are folded in as
+# they arrived, then the frame begins, the interface is built, and it ends.
+#
+# cellar keeps the keyboard for its own bindings: the pointer, its buttons and
+# the wheel always reach the interface, but keys, typed text and composition
+# reach it only while one of its fields holds the keyboard. a key binding is
+# never also a press of a control, and tab is cellar's, not blit's keyboard
+# navigation. cellar draws every frame, so the frame never asks to sleep.
+
+use blit;
+use bctx: blit.context;
+use binp: blit.input;
+use boom.context.Context;
+use boom.context.Wake;
+use boom.context.context_wake;
+use boom.event.Event;
+use gfx: boom.graphics;
+use cellar.look;
+use allo: std.allocator;
+use std.allocator.page;
+use std.chrono.duration.SECOND;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+# the interface face, a DejaVu Sans subset (res/fonts/LICENSE-DejaVu)
+#[embed("../res/fonts/DejaVuSans-subset.ttf")]
+val FONT: [_]u8;
+
+# how far init got, so dnit releases exactly what it made
+val MADE_NONE:     u8 = 0;
+val MADE_TYPEFACE: u8 = 1;
+val MADE_GLYPHS:   u8 = 2;
+val MADE_CONTEXT:  u8 = 3;
+val MADE_ALL:      u8 = 4;
+
+# the interface and what hosts it; it holds pointers into itself, so it stays
+# where init made it
+# ---
+# ui:       the blit context the interface is built in
+# typeface: the embedded face
+# glyphs:   the face as the context's glyph source
+# renderer: draws the context's frame in a boom pass
+# input:    the context's frame input, kept from the window's events
+# look:     the text style and class cellar's look added
+# made:     how far init got, a MADE_*
+pub rec Gui {
+    ui:       bctx.Context;
+    typeface: gfx.Typeface;
+    glyphs:   gfx.BlitGlyphs;
+    renderer: gfx.BlitRenderer;
+    input:    gfx.BlitInput;
+    look:     look.Look;
+    made:     u8;
+}
+
+# set the interface up over a window, in cellar's look
+# ---
+# g:   the host, made in place
+# a:   allocator behind the context, the face and the input; outlives the host
+# d:   the device the frame is drawn with
+# ctx: the context whose window the interface takes input from
+# ret: whether everything was made; on false, dnit releases what was
+pub fun init(g: *Gui, a: *allo.Allocator, d: *gfx.Device, ctx: *Context) bool {
+    g.made = MADE_NONE;
+    val tf: res[gfx.Typeface, gfx.Error] = gfx.typeface_from_static(a, ?FONT[0], $length_of(FONT));
+    if (sel tf.err) { ret false; }
+    g.typeface = tf.ok;
+    g.made     = MADE_TYPEFACE;
+    val gs: res[gfx.BlitGlyphs, gfx.Error] = gfx.blit_glyphs(a, ?g.typeface, look.BODY_PX, gfx.FontSizeMode.line_height{},
+        gfx.FontRaster.smooth{});
+    if (sel gs.err) { ret false; }
+    g.glyphs = gs.ok;
+    g.made   = MADE_GLYPHS;
+    val made: err[allo.Error] = bctx.init(?g.ui, a);
+    if (sel made.err) { ret false; }
+    g.made = MADE_CONTEXT;
+    bctx.set_glyph_source(?g.ui, gfx.blit_glyphs_source(?g.glyphs));
+    val l: opt[look.Look] = look.apply(?g.ui);
+    if (sel l.none) { ret false; }
+    g.look = l.some;
+    val br: res[gfx.BlitRenderer, gfx.Error] = gfx.blit_renderer(d, ?g.ui);
+    if (sel br.err) { ret false; }
+    g.renderer = br.ok;
+    g.input    = gfx.blit_input(a, ctx);
+    g.made     = MADE_ALL;
+    ret true;
+}
+
+# release what init made, renderer first; before the boom renderer goes
+pub fun dnit(g: *Gui) {
+    if (g.made >= MADE_ALL) {
+        gfx.blit_renderer_delete(?g.renderer);
+        gfx.blit_input_delete(?g.input);
+    }
+    if (g.made >= MADE_CONTEXT)  { bctx.free(?g.ui); }
+    if (g.made >= MADE_GLYPHS)   { gfx.blit_glyphs_delete(?g.glyphs); }
+    if (g.made >= MADE_TYPEFACE) { gfx.typeface_delete(?g.typeface); }
+    g.made = MADE_NONE;
+}
+
+# whether a field holds the keyboard, so cellar's key bindings stay quiet
+pub fun typing(g: *Gui) bool {
+    ret bctx.typing(?g.ui);
+}
+
+# start the frame's input on the context's clock
+# ---
+# g:   the host
+# ctx: the context whose clock the frame is timed by
+pub fun open(g: *Gui, ctx: *Context) {
+    gfx.blit_input_begin(?g.input, ctx.clock.elapsed::f64 / SECOND::f64);
+}
+
+# fold one of the window's events into the frame's input, in arrival order
+pub fun fold(g: *Gui, e: Event) {
+    gfx.blit_input_event(?g.input, e);
+}
+
+# keep only the pointer's button events, so the keyboard stays cellar's
+fun pointer_only(in: *binp.Input) {
+    var kept: usize = 0;
+    var i:    usize = 0;
+    for (i < in.events.len) {
+        val e: binp.Event = in.events.data[i];
+        if (sel e.down || sel e.up) {
+            in.events.data[kept] = e;
+            kept                 = kept + 1;
+        }
+        i = i + 1;
+    }
+    in.events.len = kept;
+    in.paste      = nil;
+}
+
+# begin the interface's frame over a screen of sw by sh pixels at an interface scale
+# ---
+# g:     the host, its frame's events folded
+# sw:    screen width in framebuffer pixels
+# sh:    screen height in framebuffer pixels
+# scale: the interface scale, 1 for 100%
+pub fun begin(g: *Gui, sw: f32, sh: f32, scale: f32) {
+    if (!bctx.typing(?g.ui)) { pointer_only(?g.input.input); }
+    bctx.set_scale(?g.ui, scale);
+    bctx.begin(?g.ui, g.input.input, sw, sh);
+}
+
+# end the frame and answer what it asks of the window: the clipboard, the
+# pointer's shape and the input method; the next frame starts at once
+# ---
+# g:   the host
+# ctx: the context whose window it serves
+pub fun end(g: *Gui, ctx: *Context) {
+    bctx.end(?g.ui);
+    val served: err[allo.Error] = gfx.blit_input_serve(?g.input, ?g.ui, ctx);
+    context_wake(ctx, Wake.now{});
+}
+
+# draw the frame over whatever the pass holds
+# ---
+# g:   the host, its frame ended
+# p:   the open overlay pass
+# ret: ok, or the atlas upload that failed
+pub fun draw(g: *Gui, p: *gfx.Pass) err[gfx.Error] {
+    ret gfx.blit_draw(?g.renderer, p);
+}
+
+# the small text style, for headings, notes and readouts
+pub fun small(g: *Gui) u32 {
+    ret g.look.small;
+}
+
+test pointer_only__keeps_the_buttons_and_drops_the_keyboard {
+    var a:    allo.Allocator;
+    val made: err[allo.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var in: binp.Input;
+    binp.init(?in, ?a);
+    binp.type_text(?in, 'q');
+    binp.press_button(?in, binp.BUTTON_LEFT, 1.0, 2.0);
+    binp.press_key(?in, binp.KEY_TAB, 0);
+    binp.release_button(?in, binp.BUTTON_LEFT, 1.0, 2.0);
+    pointer_only(?in);
+    if (in.events.len != 2)                                       { ret 2; }
+    if (!sel in.events.data[0].down || !sel in.events.data[1].up) { ret 3; }
+    binp.free(?in);
+    ret 0;
+}

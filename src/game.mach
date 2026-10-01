@@ -42,6 +42,7 @@ use cellar.config;
 use cellar.exec;
 use cellar.format;
 use cellar.gpu;
+use cellar.gui;
 use cellar.hud;
 use cellar.paint;
 use cellar.panel;
@@ -107,6 +108,8 @@ val SMALL_PX: f32 = 14.0;
 #              completed generation it saw
 # renderer:    boom's renderer on the window
 # ui:          the interface
+# gui:         the interface's blit host
+# gui_ok:      gui is set up
 # paths:       the data directory
 # body:        the label face
 # small:       the heading and readout face
@@ -144,6 +147,8 @@ pub rec Game {
     shown:       world.Shown;
     renderer:    gfx.Renderer;
     ui:          ui.Ui;
+    gui:         gui.Gui;
+    gui_ok:      bool;
     paths:       paths.Paths;
     body:        gfx.Font;
     small:       gfx.Font;
@@ -199,6 +204,7 @@ pub fun on_init(ctx: *Context) {
     val g: *Game = game_of(ctx);
     g.sim_ok      = false;
     g.renderer_ok = false;
+    g.gui_ok      = false;
     g.faces_at    = 0.0;
     val paged: err[allo.Error] = page.make(?g.a);
     if (sel paged.err) {
@@ -252,6 +258,11 @@ pub fun on_init(ctx: *Context) {
     sketch.init(?g.sketches, ?g.a, gfx.renderer_device(?g.renderer));
     if (!faces(g)) {
         give_up(ctx, "could not load the interface font");
+        ret;
+    }
+    g.gui_ok = gui.init(?g.gui, ?g.a, gfx.renderer_device(?g.renderer), ctx);
+    if (!g.gui_ok) {
+        give_up(ctx, "could not set up the interface");
         ret;
     }
 
@@ -452,15 +463,17 @@ fun paste(ctx: *Context, a: *app.App, rule: bool) {
 }
 
 # hand the window's queued events, typed text among them, to the interface in
-# order, so none waits for a later tick or is dropped when the queue fills, and
-# open a file dropped on the window. a drop's paths live until the next poll,
-# so the command takes its own copy here
-fun events(q: *EventQueue, u: *ui.Ui, a: *app.App) {
+# order, and open a file dropped on the window. a drop's paths live until the
+# next poll, so the command takes its own copy here
+fun events(q: *EventQueue, u: *ui.Ui, h: *gui.Gui, a: *app.App) {
     for {
         val e: opt[Event] = queue_pop(q);
         if (sel e.none)      { brk; }
         if (sel e.some.drop) { app.drop(a, e.some.drop.paths, e.some.drop.count); }
-        or                   { ui.feed(u, e.some); }
+        or {
+            ui.feed(u, e.some);
+            gui.fold(h, e.some);
+        }
     }
 }
 
@@ -473,8 +486,7 @@ fun tick(ctx: *Context) {
 
     # while a field has the keyboard the key bindings stay quiet, including on
     # the tick whose enter or escape gives it back
-    val typing: bool = ui.typing(u);
-    events(?ctx.events, u, a);
+    val typing: bool = ui.typing(u) || gui.typing(?g.gui);
     if (!typing)       { keys(ctx, g); }
     if (a.toast_t > 0) { a.toast_t = a.toast_t - 1; }
     if (g.gpu_ok)      { gpu.display(?g.gpu, win.window_refresh_hz(?ctx.window)); }
@@ -494,7 +506,7 @@ fun tick(ctx: *Context) {
     # the pan is the view centre in cells, moved by pixels at the current zoom
     val ppc:  f32 = render.BASE_PPC * a.zoom;
     val step: f32 = ui.px(u, PAN_STEP) / ppc;
-    if (!typing && !ui.typing(u)) {
+    if (!typing) {
         if (inp.key_down(in, inp.KEY_LEFT))  { a.pan_x = a.pan_x - step::f64; }
         if (inp.key_down(in, inp.KEY_RIGHT)) { a.pan_x = a.pan_x + step::f64; }
         if (inp.key_down(in, inp.KEY_UP))    { a.pan_y = a.pan_y - step::f64; }
@@ -709,7 +721,7 @@ fun shown(p0: f32, c: f32, n: usize, end: f32) Shown {
 # ctx: the running context
 pub fun on_draw(ctx: *Context) {
     val g: *Game = game_of(ctx);
-    if (!g.renderer_ok || !g.gpu_ok || g.faces_at == 0.0) { ret; }
+    if (!g.renderer_ok || !g.gpu_ok || !g.gui_ok || g.faces_at == 0.0) { ret; }
     if (!faces(g)) {
         give_up(ctx, "could not load the interface font");
         ret;
@@ -728,6 +740,8 @@ pub fun on_draw(ctx: *Context) {
     val sh: f32      = gfx.renderer_height(?g.renderer)::f32;
     val u:  *ui.Ui   = ?g.ui;
     val a:  *app.App = ?g.app;
+    gui.open(?g.gui, ctx);
+    events(?ctx.events, u, ?g.gui, a);
 
     # the frame holds the world only when the thread is not stepping it, or
     # between steps when commands wait, and releases it before drawing
@@ -829,6 +843,10 @@ pub fun on_draw(ctx: *Context) {
         edit_world(g, pt, cam);
     }
     ui.end(u);
+    gui.begin(?g.gui, sw, sh, app.scale(a.scale_idx));
+    gui.end(?g.gui, ctx);
+    val drew: err[gfx.Error] = gui.draw(?g.gui, ?pass);
+    if (sel drew.err) { print.eprintlnf("could not draw the interface: {}", gfx.error_message(drew.err)); }
 
     gfx.pass_end(?pass);
     val take: bool = want_shot(g);
@@ -902,6 +920,7 @@ pub fun on_dnit(ctx: *Context) {
         gfx.renderer_wait_idle(?g.renderer);
         if (g.gpu_ok) { gpu.dnit(?g.gpu); }
         sketch.dnit(?g.sketches);
+        if (g.gui_ok) { gui.dnit(?g.gui); }
         faces_dnit(g);
         val down: err[gfx.Error] = gfx.renderer_dnit(?g.renderer);
         if (sel down.err) {
@@ -1065,7 +1084,8 @@ test events__open_the_first_dropped_file_and_say_the_rest_were_ignored {
     val pushed: err[QueueError] = queue_push(?q, Event.drop{got.ok});
     if (sel pushed.err) { ret 1; }
     var u: ui.Ui;
-    events(?q, ?u, ?ap);
+    var h: gui.Gui;
+    events(?q, ?u, ?h, ?ap);
     queue_clear(?q);
     if (ap.queue.items.len != 1) { ret 2; }
 
