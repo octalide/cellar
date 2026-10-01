@@ -375,7 +375,7 @@ fun follow(a: *app.App, dx: i64, dy: i64) {
 
 # put the world on a grid, translated so the box drawn for it is where the
 # grid's notation puts it, the view moving with it, saying what was dropped and
-# when the world left HashLife for it
+# which the caller tells when the world left HashLife for it
 fun bounds(a: *app.App, s: *sim.Sim, c: *command.Bounds) Change {
     var want: rule.Rule = s.rule;
     want.grid = c.grid;
@@ -423,7 +423,6 @@ fun bounds(a: *app.App, s: *sim.Sim, c: *command.Bounds) Change {
         why[o] = 0;
         app.say_also(a, ?why[0]);
     }
-    if (tree && !sim.on_tree(s)) { app.say_also(a, "HashLife runs only the unbounded plane, so the world moved to the chunk engine"); }
     ret Change.fresh{};
 }
 
@@ -535,6 +534,20 @@ fun apply(c: *command.Command, a: *app.App, s: *sim.Sim, d: *Deps) {
     if (journal.dropped(?a.log)) { app.say(a, "that change is too large to undo, so the history was cleared"); }
 }
 
+# say why the world left HashLife when a command moved it to the chunk engine,
+# which every route to a rule it cannot run passes through. choosing the engine
+# is not a rule change and says nothing of its own
+fun left(a: *app.App, s: *sim.Sim, c: *command.Command, was: bool, told: u32) {
+    if (!was || sim.on_tree(s) || sel c.engine) { ret; }
+    var m: [160]u8;
+    var o: usize = text.buf_str(?m[0], 0, "HashLife cannot run ");
+    o    = text.buf_str(?m[0], o, rule.hashlife_cause(?s.rule));
+    o    = text.buf_str(?m[0], o, ", so the world moved to the chunk engine");
+    m[o] = 0;
+    if (a.told != told) { app.say_also(a, ?m[0]); }
+    or                  { app.say(a, ?m[0]); }
+}
+
 # apply every waiting command in order and empty the queue
 # ---
 # a: application state, which owns the queue
@@ -544,7 +557,10 @@ pub fun run(a: *app.App, s: *sim.Sim, d: *Deps) {
     journal.bind(?a.log, s);
     var i: usize = 0;
     for (i < a.queue.items.len) {
+        val was:  bool = sim.on_tree(s);
+        val told: u32  = a.told;
         apply(?a.queue.items.data[i], a, s, d);
+        left(a, s, ?a.queue.items.data[i], was, told);
         i = i + 1;
     }
     command.clear(?a.queue);
@@ -1082,6 +1098,49 @@ test run__refuses_a_kernel_widened_past_a_small_torus {
     if (!rule.same(?s.rule, ?small))                                   { ret 5; }
     if (!string.str_starts_with(ap.toast, "the rule was not applied")) { ret 6; }
     if (sim.set_rule(?s, wide) || !rule.same(?s.rule, ?small))         { ret 7; }
+    app.dnit(?ap);
+    sim.dnit(?s);
+    ret 0;
+}
+
+test run__a_rule_change_off_hashlife_says_why_whichever_way_it_came {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    var ap: app.App;
+    app.init(?ap);
+    val shown: err[format.Error] = app.attach(?ap, ?a);
+    if (sel shown.err) { ret 1; }
+    var d:  Deps;
+    val b0: res[rule.Rule, str] = rule.parse("B0123478/S34678");
+    if (sel b0.err) { ret 2; }
+    var strobe: rule.Rule = b0.ok;
+    var life:   rule.Rule = rule.preset_rule(0);
+
+    # a rule typed while HashLife holds the world
+    if (!sim.use_hashlife(?s, true)) { ret 3; }
+    app.submit(?ap, command.Command.rule{strobe});
+    run(?ap, ?s, ?d);
+    if (sim.on_tree(?s) || !string.str_equals(ap.toast, "HashLife cannot run a B0 rule, so the world moved to the chunk engine")) { ret 4; }
+
+    # choosing the pool is the user's own move and says nothing
+    app.submit(?ap, command.Command.rule{life});
+    run(?ap, ?s, ?d);
+    if (!sim.use_hashlife(?s, true)) { ret 5; }
+    ap.toast_t = 0;
+    app.submit(?ap, command.Command.engine{false});
+    run(?ap, ?s, ?d);
+    if (sim.on_tree(?s) || ap.toast_t != 0) { ret 6; }
+
+    # undo back to the rule it left
+    app.submit(?ap, command.Command.engine{true});
+    run(?ap, ?s, ?d);
+    app.submit(?ap, command.Command.undo{});
+    run(?ap, ?s, ?d);
+    if (rule.same(?s.rule, ?life))                                                                    { ret 7; }
+    if (sim.on_tree(?s) || !string.str_ends_with(ap.toast, "so the world moved to the chunk engine")) { ret 8; }
     app.dnit(?ap);
     sim.dnit(?s);
     ret 0;
