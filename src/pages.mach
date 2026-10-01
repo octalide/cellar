@@ -6,17 +6,19 @@
 # only through commands.
 
 use blit;
-use bctx: blit.context;
-use binp: blit.input;
-use bint: blit.interact;
-use blay: blit.layout;
-use bth:  blit.theme;
-use bw:   blit.widget;
+use bctx:  blit.context;
+use binp:  blit.input;
+use bint:  blit.interact;
+use blay:  blit.layout;
+use blist: blit.list;
+use bst:   blit.state;
+use bw:    blit.widget;
 use cellar.app;
 use cellar.arrange;
 use cellar.bounds;
 use cellar.ceiling;
 use cellar.command;
+use cellar.format;
 use cellar.history;
 use cellar.identify.worker;
 use cellar.look;
@@ -29,17 +31,23 @@ use cellar.space;
 use cellar.text;
 use cellar.theme;
 use cellar.world;
+use allo: std.allocator;
+use std.allocator.page;
+use std.collections.vector;
 use fs: std.filesystem;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
 use std.types.option.opt;
+use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 
 # unscaled height of the population graph
 val GRAPH: f32 = 48.0;
+# unscaled height of a file's row
+val ROW_H: f32 = 24.0;
 # the version the settings show
 val VERSION: str = $mach.project.version;
 
@@ -125,8 +133,7 @@ pub fun view_page(ui: *bctx.Context, l: look.Look, a: *app.App, s: *world.Shown)
 }
 
 # the population over the recent samples, each held until the generation of
-# the next, and scaled so the largest fills the height, with the peak in its
-# corner
+# the next, and scaled so the largest fills the height, with the peak below it
 fun graph(ui: *bctx.Context, l: look.Look, s: *world.Shown) {
     val h:  *history.History = world.recent(s);
     val gh: f32              = bctx.px(ui, GRAPH);
@@ -155,9 +162,7 @@ fun graph(ui: *bctx.Context, l: look.Look, s: *world.Shown) {
     var o:  usize = text.buf_str(?rd[0], 0, "population, peak ");
     o     = text.buf_grouped(?rd[0], o, peak);
     rd[o] = 0;
-    bctx.push_style(ui, l.small);
-    bctx.text_at(ui, ?rd[0], r.x0 + pad * 2.0, r.y0 + pad, look.colour(theme.TEXT, 1.0));
-    bctx.pop_style(ui);
+    look.line(ui, l.small, ?rd[0], theme.TEXT_DIM);
 }
 
 # the stats as label and value pairs, cols to a row, in the small face
@@ -347,24 +352,31 @@ fun kind_name(e: *saves.Entry) str {
     ret "pattern";
 }
 
-# a listed file as a row, its name cut from the front to fit and its kind at
-# the right; ret whether it was clicked
-fun entry(ui: *bctx.Context, l: look.Look, e: *saves.Entry) bool {
-    val rh:   f32        = bctx.px(ui, 24.0);
-    val r:    bctx.Area  = bw.place(ui, blay.fill(1.0), blay.fixed(rh), 0.0, rh);
-    val h:    bint.Hit   = bint.hit(ui, bctx.id_of(ui, "file"), r.x0, r.y0, r.x1, r.y1, binp.BUTTON_LEFT);
-    val st:   u8         = bth.pick(h.hot, h.active, false, false);
-    val ink:  *bth.Paint = bctx.paint_of(ui, bth.LIST_ITEM, st);
-    val pad:  f32        = bctx.px(ui, 8.0);
-    val kind: str        = kind_name(e);
-    bctx.box(ui, bth.LIST_ITEM, st, r.x0, r.y0, r.x1, r.y1);
-    bctx.push_style(ui, l.small);
+# what the file rows draw from, and the row clicked this frame
+# ---
+# l:       cellar's look
+# items:   the listed files
+# clicked: the clicked row's file, or the count of files for none
+rec Files {
+    l:       look.Look;
+    items:   *saves.Entry;
+    clicked: usize;
+}
+
+# a listed file's row: its name cut from the front to fit and its kind at
+# the right in the small face
+fun file_row(ui: *bctx.Context, user: ptr, row: blist.Row) {
+    val f:    *Files       = user::*Files;
+    val e:    *saves.Entry = ?f.items[row.index];
+    val pad:  f32          = bctx.px(ui, 8.0);
+    val kind: str          = kind_name(e);
+    if (row.hit.clicked) { f.clicked = row.index; }
+    bctx.push_style(ui, f.l.small);
     val kw: f32 = bctx.text_width(ui, kind);
-    look.text_mid(ui, kind, r.x1 - pad - kw, r.y0, r.y1, ink.mark);
+    look.text_mid(ui, kind, row.x1 - pad - kw, row.y0, row.y1, row.dim);
     bctx.pop_style(ui);
-    val ty: f32 = r.y0 + (rh - bctx.line_height(ui)) / 2.0;
-    blit.text.fit_at(ui, e.name, r.x0 + pad, ty, r.x1 - r.x0 - kw - pad * 3.0, blit.text.CUT_START, ink.text);
-    ret h.clicked;
+    val ty: f32 = row.y0 + (row.y1 - row.y0 - bctx.line_height(ui)) / 2.0;
+    blit.text.fit_at(ui, e.name, row.x0 + pad, ty, row.x1 - row.x0 - kw - pad * 3.0, blit.text.CUT_START, row.ink);
 }
 
 # the end of a path that fits across the column, in the small face
@@ -410,12 +422,85 @@ pub fun files_page(ui: *bctx.Context, l: look.Look, a: *app.App, p: *paths.Paths
         ret;
     }
     look.note(ui, l, "Click a world to load it, a pattern to edit it, a rule to run it");
+    # the list is as tall as its rows, each with the gap after it, or as what
+    # it measured of them last frame, so it has nothing to scroll and the
+    # wheel over it scrolls the panel. a click loads, and selects nothing
+    val n:  usize       = a.saves.items.len;
+    val st: *blist.List = bst.get[blist.List](ui, bctx.id_of(ui, "files"));
+    var f:  Files       = Files{l: l, items: a.saves.items.data, clicked: n};
+    var r:  blist.Rows  = blist.rows(nil, n);
+    r.draw  = file_row;
+    r.user  = (?f)::ptr;
+    r.row_h = bctx.px(ui, ROW_H);
+    var h: f32 = (r.row_h + bw.row_gap(ui)) * n::f32;
+    if (st.scroll.content > h) { h = st.scroll.content; }
+    st.selected = n;
+    blist.show(ui, "files", st, r, h);
+    if (f.clicked < n) { load(a, p, ?a.saves.items.data[f.clicked]); }
+}
+
+# the files page in a scrolling panel shorter than its rows
+#[testing]
+rec FilesProbe {
+    a:  *app.App;
+    p:  paths.Paths;
+    l:  look.Look;
+    sc: bw.Scroll;
+}
+
+#[testing]
+fun files_ui(ui: *bctx.Context, user: ptr) {
+    val fp:   *FilesProbe   = user::*FilesProbe;
+    val body: bw.ScrollArea = bw.begin_scroll(ui, "panel", ?fp.sc, 200.0);
+    files_page(ui, fp.l, fp.a, ?fp.p);
+    bw.end_scroll(ui, ?fp.sc, body);
+}
+
+test files_page__the_panel_scrolls_under_the_rows {
+    var al:   allo.Allocator;
+    val made: err[allo.Error] = page.make(?al);
+    if (sel made.err) { ret 1; }
+    var a: app.App;
+    app.init(?a);
+    val at: err[format.Error] = app.attach(?a, ?al);
+    if (sel at.err) { ret 1; }
+    a.files_seen  = true;
+    a.saves.stale = false;
     var i: usize = 0;
-    for (i < a.saves.items.len) {
-        bctx.push_id_int(ui, i::u64);
-        val clicked: bool = entry(ui, l, ?a.saves.items.data[i]);
-        bctx.pop_id(ui);
-        if (clicked) { load(a, p, ?a.saves.items.data[i]); }
+    for (i < 20) {
+        val pushed: res[usize, allo.Error] = vector.push[saves.Entry](?a.saves.items, saves.Entry{name: "glider.rle", kind: saves.KIND_PATTERN});
+        if (sel pushed.err) { ret 1; }
         i = i + 1;
     }
+    var fp: FilesProbe;
+    fp.a         = ?a;
+    fp.p.ok      = true;
+    fp.p.dir[0]  = 0;
+    fp.sc.offset = 0.0;
+    var d:  blit.driver.Driver;
+    val di: err[allo.Error] = blit.driver.init(?d, ?al, 300.0, 300.0, files_ui, (?fp)::ptr);
+    if (sel di.err) { ret 1; }
+    val l: opt[look.Look] = look.apply(?d.ctx);
+    if (sel l.none) { ret 2; }
+    fp.l = l.some;
+    blit.driver.steps(?d, 2);
+
+    # the wheel over a row scrolls the panel, the list having nothing to scroll
+    val row: u64 = blit.driver.at(?d, 100.0, 190.0);
+    if (row == 0)                                 { ret 3; }
+    if (!blit.driver.scroll(?d, row, 0.0, -60.0)) { ret 4; }
+    blit.driver.settle(?d);
+    if (fp.sc.offset <= 0.0) { ret 5; }
+
+    # a click on a row loads its file and selects nothing
+    val second: u64 = blit.id.child_int(blit.driver.find(?d, "panel/files"), 1);
+    if (!blit.driver.click(?d, second))                                    { ret 6; }
+    if (a.queue.items.len != 1 || !sel a.queue.items.data[0].load_pattern) { ret 7; }
+
+    # the entries' names are not the list's to free
+    a.saves.items.len = 0;
+    val freed: err[allo.Error] = blit.driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    app.dnit(?a);
+    ret 0;
 }

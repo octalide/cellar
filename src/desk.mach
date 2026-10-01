@@ -52,6 +52,35 @@ fun probe_ui(ui: *bctx.Context, user: ptr) {
     pr.pt = draw(ui, ?pr.sc);
 }
 
+# drop the central node from a kept layout of n bytes in place; ret its new
+# length
+#[testing]
+fun uncentred(doc: *u8, n: usize) usize {
+    val key: str   = "central = ";
+    var o:   usize = 0;
+    var i:   usize = 0;
+    for (i < n) {
+        var j: usize = 0;
+        for (key[j] != 0 && i + j < n && doc[i + j] == key[j]) { j = j + 1; }
+        if (key[j] == 0) {
+            for (i < n && doc[i] != '\n') { i = i + 1; }
+            i = i + 1;
+            cnt;
+        }
+        for (i < n && doc[i] != '\n') {
+            doc[o] = doc[i];
+            o      = o + 1;
+            i      = i + 1;
+        }
+        if (i < n) {
+            doc[o] = '\n';
+            o      = o + 1;
+            i      = i + 1;
+        }
+    }
+    ret o;
+}
+
 test draw__every_panel_draws_and_its_controls_act {
     var al:   allo.Allocator;
     val made: err[allo.Error] = page.make(?al);
@@ -82,8 +111,8 @@ test draw__every_panel_draws_and_its_controls_act {
     val pe: err[blit.state.Error] = panel.persist(?d.ctx);
     if (sel pe.err) { ret 2; }
 
-    # the default layout: the docks at the sides below the toolbar, every
-    # panel keyed apart from the rest
+    # the default layout: the panels at the sides of the world below the
+    # toolbar, every panel keyed apart from the rest
     blit.driver.steps(?d, 3);
     if (bctx.collisions(?d.ctx) != 0)                                { ret 3; }
     if (pr.pt.x0 <= 0.0 || pr.pt.y0 <= 0.0)                          { ret 4; }
@@ -126,12 +155,27 @@ test draw__every_panel_draws_and_its_controls_act {
     blit.driver.steps(?d, 2);
     if (pr.pt.x0 <= 0.0 || panel.shown(?d.ctx, panel.SETTINGS) || !panel.shown(?d.ctx, panel.RULE)) { ret 14; }
 
-    # the layout the settings keep comes back in a new interface, the rule
-    # panel closed as it was left
+    # the left side widens by its splitter, the world giving way
+    val x0: f32 = pr.pt.x0;
+    val my: f32 = pr.pt.y0 + pr.pt.h / 2.0;
+    if (!blit.driver.drag(?d, blit.driver.at(?d, x0 - 2.0, my), x0 + 100.0, my)) { ret 20; }
+    blit.driver.steps(?d, 2);
+    val wide: f32 = pr.pt.x0;
+    if (wide < x0 + 90.0) { ret 21; }
+
+    # the layout the settings keep comes back in a new interface, its sizes
+    # with it and the rule panel closed as it was left
     panel.show(?d.ctx, ?a, panel.RULE, false);
     blit.driver.step(?d);
     panel.keep(?d.ctx, ?a);
-    if (a.layout.len == 0) { ret 15; }
+    if (a.layout.len == 0 || a.layout.len > 8192) { ret 15; }
+    var kept:   [8192]u8;
+    val kept_n: usize = a.layout.len - 1;
+    var k:      usize = 0;
+    for (k < kept_n) {
+        kept[k] = a.layout.data[k];
+        k       = k + 1;
+    }
     val freed: err[allo.Error] = blit.driver.free(?d);
     if (sel freed.err) { ret 1; }
     var e:  blit.driver.Driver;
@@ -143,7 +187,7 @@ test draw__every_panel_draws_and_its_controls_act {
     panel.restore(?e.ctx, ?a);
     if (a.relayout) { ret 17; }
     blit.driver.steps(?e, 3);
-    if (panel.shown(?e.ctx, panel.RULE) || !panel.shown(?e.ctx, panel.STATS) || pr.pt.x0 <= 0.0) { ret 18; }
+    if (panel.shown(?e.ctx, panel.RULE) || !panel.shown(?e.ctx, panel.STATS) || pr.pt.x0 != wide) { ret 18; }
     # a layout that does not read gives the default one
     val bad: str = "[dock.1]\nroot = \"x\n";
     app.keep_layout(?a, bad::*u8, string.str_len(bad));
@@ -151,6 +195,21 @@ test draw__every_panel_draws_and_its_controls_act {
     if (!a.relayout) { ret 19; }
     val freed2: err[allo.Error] = blit.driver.free(?e);
     if (sel freed2.err) { ret 1; }
+
+    # and so does one whose space has no central node for the world
+    app.keep_layout(?a, ?kept[0], uncentred(?kept[0], kept_n));
+    var f:  blit.driver.Driver;
+    val fi: err[allo.Error] = blit.driver.init(?f, ?al, 1280.0, 800.0, probe_ui, (?pr)::ptr);
+    if (sel fi.err) { ret 1; }
+    look.apply(?f.ctx);
+    val pe3: err[blit.state.Error] = panel.persist(?f.ctx);
+    if (sel pe3.err) { ret 22; }
+    panel.restore(?f.ctx, ?a);
+    if (!a.relayout) { ret 23; }
+    blit.driver.steps(?f, 3);
+    if (pr.pt.x0 <= 0.0 || pr.pt.x0 + pr.pt.w >= 1280.0 || !panel.shown(?f.ctx, panel.RULE)) { ret 24; }
+    val freed3: err[allo.Error] = blit.driver.free(?f);
+    if (sel freed3.err) { ret 1; }
     app.dnit(?a);
     sim.dnit(?s);
     ret 0;
