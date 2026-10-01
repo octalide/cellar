@@ -1,0 +1,157 @@
+# the interface around the world: the toolbar across the top, the docks at the
+# sides and the panels in them, and what they leave of the window for the world
+
+use blit;
+use bctx: blit.context;
+use binp: blit.input;
+use cellar.app;
+use cellar.format;
+use cellar.look;
+use cellar.panel;
+use cellar.paths;
+use cellar.render;
+use cellar.sim;
+use cellar.sketch;
+use cellar.toolbar;
+use cellar.world;
+use allo: std.allocator;
+use std.allocator.page;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.size.usize;
+use std.types.string;
+use std.types.string.str;
+
+# draw the toolbar, the docks and the panels, and apply their controls; call
+# at the interface's root, first in the frame
+# ---
+# ui:  the interface, its frame begun
+# sc:  what the panels draw from
+# ret: the world's port, what the toolbar and the docks leave of the window
+pub fun draw(ui: *bctx.Context, sc: *panel.Scene) render.Port {
+    toolbar.draw(ui, sc.l, sc.a, sc.s);
+    val pt: render.Port = panel.docks(ui, sc.a);
+    panel.draw(ui, sc);
+    ret pt;
+}
+
+# what the desk test draws
+#[testing]
+rec Probe {
+    sc: panel.Scene;
+    p:  paths.Paths;
+    sk: sketch.Sketches;
+    pt: render.Port;
+}
+
+#[testing]
+fun probe_ui(ui: *bctx.Context, user: ptr) {
+    val pr: *Probe = user::*Probe;
+    pr.pt = draw(ui, ?pr.sc);
+}
+
+test draw__every_panel_draws_and_its_controls_act {
+    var al:   allo.Allocator;
+    val made: err[allo.Error] = page.make(?al);
+    if (sel made.err) { ret 1; }
+    var s:  sim.Sim;
+    val sm: err[allo.Error] = sim.init(?s, ?al);
+    if (sel sm.err) { ret 1; }
+    var a: app.App;
+    app.init(?a);
+    val at: err[format.Error] = app.attach(?a, ?al);
+    if (sel at.err) { ret 1; }
+    var shown: world.Shown;
+    world.observe(?s, ?shown);
+
+    var pr: Probe;
+    pr.p.ok  = false;
+    pr.sc.a  = ?a;
+    pr.sc.s  = ?shown;
+    pr.sc.p  = ?pr.p;
+    pr.sc.sk = ?pr.sk;
+    sketch.init(?pr.sk, ?al, nil);
+    var d:  blit.driver.Driver;
+    val di: err[allo.Error] = blit.driver.init(?d, ?al, 1280.0, 800.0, probe_ui, (?pr)::ptr);
+    if (sel di.err) { ret 1; }
+    val l: opt[look.Look] = look.apply(?d.ctx);
+    if (sel l.none) { ret 2; }
+    pr.sc.l = l.some;
+    val pe: err[blit.state.Error] = panel.persist(?d.ctx);
+    if (sel pe.err) { ret 2; }
+
+    # the default layout: the docks at the sides below the toolbar, every
+    # panel keyed apart from the rest
+    blit.driver.steps(?d, 3);
+    if (bctx.collisions(?d.ctx) != 0)                                { ret 3; }
+    if (pr.pt.x0 <= 0.0 || pr.pt.y0 <= 0.0)                          { ret 4; }
+    if (pr.pt.x0 + pr.pt.w >= 1280.0 || pr.pt.y0 + pr.pt.h != 800.0) { ret 5; }
+    if (panel.shown(?d.ctx, panel.SETTINGS))                         { ret 6; }
+
+    if (!blit.driver.click(?d, blit.driver.find(?d, "toolbar/Step"))) { ret 7; }
+    if (a.queue.items.len != 1)                                       { ret 8; }
+    if (!sel a.queue.items.data[0].step)                              { ret 9; }
+
+    # a rule string no family reads keeps the keyboard, to be put right
+    val field: u64 = blit.driver.find(?d, "Rule/rule string");
+    if (!blit.driver.click(?d, field)) { ret 10; }
+    blit.driver.type_text(?d, "x");
+    blit.driver.key(?d, binp.KEY_ENTER, 0);
+    blit.driver.step(?d);
+    if (!blit.driver.focused(?d, field) || a.rule_text.error == nil) { ret 11; }
+    bctx.unfocus(?d.ctx);
+
+    # every panel draws, floating, the settings too
+    var i: usize = 0;
+    for (i < panel.COUNT) {
+        blit.dock.remove(?d.ctx, panel.id(i));
+        panel.show(?d.ctx, ?a, i, true);
+        i = i + 1;
+    }
+    blit.driver.steps(?d, 2);
+    if (bctx.collisions(?d.ctx) != 0) { ret 12; }
+
+    # closing every panel gives the world the window below the toolbar, and a
+    # reset brings the default layout back
+    i = 0;
+    for (i < panel.COUNT) {
+        panel.show(?d.ctx, ?a, i, false);
+        i = i + 1;
+    }
+    blit.driver.steps(?d, 2);
+    if (pr.pt.x0 != 0.0 || pr.pt.w != 1280.0) { ret 13; }
+    a.relayout = true;
+    blit.driver.steps(?d, 2);
+    if (pr.pt.x0 <= 0.0 || panel.shown(?d.ctx, panel.SETTINGS) || !panel.shown(?d.ctx, panel.RULE)) { ret 14; }
+
+    # the layout the settings keep comes back in a new interface, the rule
+    # panel closed as it was left
+    panel.show(?d.ctx, ?a, panel.RULE, false);
+    blit.driver.step(?d);
+    panel.keep(?d.ctx, ?a);
+    if (a.layout.len == 0) { ret 15; }
+    val freed: err[allo.Error] = blit.driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    var e:  blit.driver.Driver;
+    val ei: err[allo.Error] = blit.driver.init(?e, ?al, 1280.0, 800.0, probe_ui, (?pr)::ptr);
+    if (sel ei.err) { ret 1; }
+    look.apply(?e.ctx);
+    val pe2: err[blit.state.Error] = panel.persist(?e.ctx);
+    if (sel pe2.err) { ret 16; }
+    panel.restore(?e.ctx, ?a);
+    if (a.relayout) { ret 17; }
+    blit.driver.steps(?e, 3);
+    if (panel.shown(?e.ctx, panel.RULE) || !panel.shown(?e.ctx, panel.STATS) || pr.pt.x0 <= 0.0) { ret 18; }
+    # a layout that does not read gives the default one
+    val bad: str = "[dock.1]\nroot = \"x\n";
+    app.keep_layout(?a, bad::*u8, string.str_len(bad));
+    panel.restore(?e.ctx, ?a);
+    if (!a.relayout) { ret 19; }
+    val freed2: err[allo.Error] = blit.driver.free(?e);
+    if (sel freed2.err) { ret 1; }
+    app.dnit(?a);
+    sim.dnit(?s);
+    ret 0;
+}
