@@ -1305,14 +1305,36 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool) err[gfx.Error] {
     ret err[gfx.Error].ok{};
 }
 
+# the chunks a look can see, a chunk beyond each side: columns and rows x0, y0,
+# x1, y1, inclusive
+# ---
+# look: the camera
+# out:  receives the four
+pub fun view_chunks(look: *Look, out: *i64) {
+    val bx: i64 = look.base_cx::i64 - space.BIAS;
+    val by: i64 = look.base_cy::i64 - space.BIAS;
+    val hw: f32 = look.half_w / look.ppc;
+    val hh: f32 = look.half_h / look.ppc;
+    out[0] = bx + ((look.frac_x - hw) / 64.0 - 1.0)::i64;
+    out[1] = by + ((look.frac_y - hh) / 64.0 - 1.0)::i64;
+    out[2] = bx + ((look.frac_x + hw) / 64.0 + 1.0)::i64;
+    out[3] = by + ((look.frac_y + hh) / 64.0 + 1.0)::i64;
+}
+
+# whether a look draws from the coverage pyramids rather than the cells: at
+# half a pixel per cell or less (see cells_frag)
+pub fun reads_pyramids(look: *Look) bool {
+    ret look.ppc > 0.0 && look.ppc <= 0.5;
+}
+
 # while the CPU steps, upload the chunks the view can see that changed since
 # they were last sent, for as long as VIEW_SHARE of the refresh interval
 # allows, going on from where the last frame stopped so every chunk takes its
 # turn. what does not fit is sent by the frames after, so the view may lag the
 # world a generation but the frame never waits on it. the pyramids come built
 # from the step (space.pyramid), and only a chunk changed some other way has its
-# own built here. below half a pixel per cell the draw reads only the
-# pyramids, so the cells wait until the view comes closer
+# own built here. the draw reads either the cells or, at half a pixel per cell
+# or less, the pyramids, so only the one it reads is sent
 fun upload_view(g: *Gpu, sp: *space.Space, look: *Look) err[gfx.Error] {
     # a pyramid reads its cells through the rule's sense
     if (!mem.equal[u8]((?g.drawn)::*u8, (?sp.sense)::*u8, $size_of(layout.Sense))) {
@@ -1320,18 +1342,10 @@ fun upload_view(g: *Gpu, sp: *space.Space, look: *Look) err[gfx.Error] {
         g.drawn = sp.sense;
     }
     if (look.ppc <= 0.0 || sp.hi == 0) { ret err[gfx.Error].ok{}; }
-    val bx:   i64 = look.base_cx::i64 - space.BIAS;
-    val by:   i64 = look.base_cy::i64 - space.BIAS;
-    val cx:   f32 = look.frac_x;
-    val cy:   f32 = look.frac_y;
-    val hw:   f32 = look.half_w / look.ppc;
-    val hh:   f32 = look.half_h / look.ppc;
-    val x0:   i64 = bx + ((cx - hw) / 64.0 - 1.0)::i64;
-    val x1:   i64 = bx + ((cx + hw) / 64.0 + 1.0)::i64;
-    val y0:   i64 = by + ((cy - hh) / 64.0 - 1.0)::i64;
-    val y1:   i64 = by + ((cy + hh) / 64.0 + 1.0)::i64;
-    var want: u8  = SENT_MIP;
-    if (look.ppc > 0.5) { want = SENT_MIP | SENT_CELLS; }
+    var box: [4]i64;
+    view_chunks(look, ?box[0]);
+    var want: u8 = SENT_CELLS;
+    if (reads_pyramids(look)) { want = SENT_MIP; }
     val t0: time.InstantClock = time.instant();
     if (sel t0.err) { ret err[gfx.Error].ok{}; }
     val budget: u64   = g.pace_us.quick_us * 1000 / VIEW_SHARE;
@@ -1343,16 +1357,16 @@ fun upload_view(g: *Gpu, sp: *space.Space, look: *Look) err[gfx.Error] {
         if (space.used(sp, s) && (h & want) != want) {
             val x: i64 = space.slot_x(sp, s);
             val y: i64 = space.slot_y(sp, s);
-            if (x >= x0 && x <= x1 && y >= y0 && y <= y1) {
+            if (x >= box[0] && x <= box[2] && y >= box[1] && y <= box[3]) {
                 val now: time.InstantClock = time.instant();
                 if (sel now.ok) {
                     if (time.instant_sub(now.ok, t0.ok)::u64 > budget) { brk; }
                 }
-                if ((want & SENT_CELLS) != 0 && (h & SENT_CELLS) == 0) {
+                if (want == SENT_CELLS) {
                     val e: err[gfx.Error] = upload_cells(g, sp, s, 1, false);
                     if (sel e.err) { ret e; }
                 }
-                if ((h & SENT_MIP) == 0) {
+                or {
                     var m: *u32 = ?g.built[0];
                     if ((h & BUILT) != 0) { m = ?sp.mips[s * MIP]; }
                     or                    { space.pyramid(?sp.cells[s * space.CELLS], sp.sense, m); }
