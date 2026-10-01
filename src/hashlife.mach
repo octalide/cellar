@@ -30,13 +30,14 @@
 #
 # the table holds at most max nodes. collect frees every node the root and the
 # empty squares do not reach, and forgets the results that named one. tidy
-# collects as the nodes in use near a budget, the max unless a ceiling on the
-# tree's memory sets a lower one (set_budget). a node
+# collects as the nodes in use near what the table can reach under a budget,
+# the max unless a ceiling on the tree's memory sets a lower one (set_budget). a node
 # the table cannot make is NONE, which every function passes up, so a step or
 # an edit that fills the table stops whole and says so rather than going wrong.
 #
-# a step can also be cancelled part way, through the same NONE: when it would
-# take a node past the budget, when it runs past a deadline (set_deadline), or
+# a step can also be cancelled part way, through the same NONE: when growing
+# the table would pass the budget, counting the old table beside the new one
+# unless the allocator resizes it in place, when it runs past a deadline (set_deadline), or
 # when another thread asks (ask_cancel). the root is left as it was, the
 # results worked out so far stay as the valid cache entries they are, and
 # cancelled says why, for the caller to collect, pause or carry on. only a step
@@ -156,7 +157,9 @@ rec Cache {
 # a:        allocator behind the table and the cache
 # made:     the table is allocated
 # max:      the most nodes the table may hold
-# budget:   nodes tidy collects as the table nears, at most max
+# budget:   nodes the table, and any copy a growth makes, may take while a step
+#           is under way, which tidy collects ahead of; at most max
+# in_place: a growth resizes the table where it lies (set_in_place)
 # nodes:    the table
 # cap:      nodes allocated
 # hi:       ids in use lie below this
@@ -188,6 +191,7 @@ pub rec Tree {
     made:     bool;
     max:      usize;
     budget:   usize;
+    in_place: bool;
     nodes:    *Node;
     cap:      usize;
     hi:       usize;
@@ -221,18 +225,19 @@ pub rec Tree {
 # a:   allocator for the table
 # max: the most nodes, at least a few thousand
 pub fun init(t: *Tree, a: *allo.Allocator, max: usize) {
-    t.a      = a;
-    t.made   = false;
-    t.max    = max;
-    t.budget = max;
-    t.cap    = 0;
-    t.k      = 0;
-    t.full   = false;
-    t.armed  = false;
-    t.cancel = CANCEL_NONE;
-    t.timed  = false;
-    t.asked  = 0;
-    t.polls  = 0;
+    t.a        = a;
+    t.made     = false;
+    t.max      = max;
+    t.budget   = max;
+    t.in_place = $mach.build.os == $mach.os.linux;
+    t.cap      = 0;
+    t.k        = 0;
+    t.full     = false;
+    t.armed    = false;
+    t.cancel   = CANCEL_NONE;
+    t.timed    = false;
+    t.asked    = 0;
+    t.polls    = 0;
     # until a rule is set, every state but 0 shows as a live cell at full heat
     var i: usize = 0;
     for (i < MAX_STATES::usize) {
@@ -291,6 +296,32 @@ fun rehash(t: *Tree) {
         }
         i = i + 1;
     }
+}
+
+# the nodes a full table grows to: double, at most max, and while a step is
+# under way no more than the budget holds with the table it grows from, unless
+# the allocator resizes it in place
+fun next_cap(t: *Tree) usize {
+    var cap: usize = t.cap * 2;
+    if (cap > t.max) { cap = t.max; }
+    if (t.armed && t.budget < t.max) {
+        var room: usize = t.budget;
+        if (!t.in_place) {
+            room = 0;
+            if (t.budget > t.cap) { room = t.budget - t.cap; }
+        }
+        if (cap > room) { cap = room; }
+    }
+    ret cap;
+}
+
+# the most nodes the table reaches under the budget: all of it when the table
+# is resized in place, and half when a growth holds the old table beside the new
+fun attainable(t: *Tree) usize {
+    var b: usize = t.budget;
+    if (b > t.max)   { b = t.max; }
+    if (!t.in_place) { b = b / 2; }
+    ret b;
 }
 
 # the table at cap nodes, the old one carried over
@@ -454,11 +485,6 @@ pub fun node(t: *Tree, nw: u32, ne: u32, sw: u32, se: u32) u32 {
         if (d.kids[0] == nw && d.kids[1] == ne && d.kids[2] == sw && d.kids[3] == se) { ret i; }
         i = t.nodes[i::usize].next;
     }
-    # a step stops before it takes a node past the budget
-    if (t.armed && t.budget < t.max && t.used >= t.budget) {
-        t.cancel = CANCEL_BUDGET;
-        ret NONE;
-    }
     var id: u32 = t.free;
     if (id != NONE) { t.free = t.nodes[id::usize].next; }
     or {
@@ -467,10 +493,12 @@ pub fun node(t: *Tree, nw: u32, ne: u32, sw: u32, se: u32) u32 {
             ret NONE;
         }
         if (t.hi == t.cap) {
-            var cap: usize = t.cap * 2;
-            if (cap > t.max) { cap = t.max; }
-            # the table grows no further than the budget until something passes it
-            if (cap > t.budget && t.hi < t.budget) { cap = t.budget; }
+            val cap: usize = next_cap(t);
+            # a step stops rather than grow the table past the budget
+            if (cap <= t.cap) {
+                t.cancel = CANCEL_BUDGET;
+                ret NONE;
+            }
             if (!grow(t, cap)) {
                 t.full = true;
                 ret NONE;
@@ -802,11 +830,16 @@ pub fun collect(t: *Tree, extra: u32) {
     t.full = false;
 }
 
-# collect when the nodes in use reach three quarters of the budget or the table
+# collect when the nodes in use reach three quarters of what the table can reach
 pub fun tidy(t: *Tree, extra: u32) {
-    var b: usize = t.budget;
-    if (b > t.max)           { b = t.max; }
+    val b: usize = attainable(t);
     if (t.used >= b - b / 4) { collect(t, extra); }
+}
+
+# say whether the allocator resizes the table where it lies, so a growth never
+# holds a second copy. the page allocator does on linux (mremap)
+pub fun set_in_place(t: *Tree, on: bool) {
+    t.in_place = on;
 }
 
 # set the nodes tidy keeps the table within, the table's max for none

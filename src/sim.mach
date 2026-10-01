@@ -629,11 +629,16 @@ pub fun set_exponent(s: *Sim, k: u32) {
 #
 # the step is cancelled part way as it would pass the memory ceiling's budget
 # or the step ceiling's time, leaving the world as it was, and the run pauses
-# at that ceiling. a step cancelled by an ask is left to whoever asked.
+# at that ceiling. with descend a step cancelled for memory is taken as two
+# of half the generations instead, down to single generations, as Golly does
+# for a run aiming at a generation. a step cancelled by an ask is left to
+# whoever asked.
 # ---
-# ret: false when the table filled, the step was cancelled or it crossed a
-#      ceiling
-fun tree_step(s: *Sim) bool {
+# s:       simulation on the tree
+# descend: halve a step the memory ceiling cancels
+# ret:     false when the table filled, the step was cancelled or it crossed a
+#          ceiling
+fun tree_step(s: *Sim, descend: bool) bool {
     val t:  *hashlife.Tree    = ?s.tree;
     val t0: opt[time.Instant] = clock(s);
     val k:  usize             = ceiling.STEP;
@@ -642,9 +647,10 @@ fun tree_step(s: *Sim) bool {
         if (!s.past[k]) { at = opt[time.Instant].some{hashlife.deadline_after(t0.some, s.ceil.limit[k])}; }
     }
     hashlife.set_deadline(t, at);
-    var ok:  bool = hashlife.step(t);
-    val why: u8   = hashlife.cancelled(t);
-    if (!ok && why != hashlife.CANCEL_TIME && why != hashlife.CANCEL_ASKED) {
+    var ok:    bool = hashlife.step(t);
+    val why:   u8   = hashlife.cancelled(t);
+    val halve: bool = descend && t.k > 0 && why == hashlife.CANCEL_BUDGET;
+    if (!ok && !halve && why != hashlife.CANCEL_TIME && why != hashlife.CANCEL_ASKED) {
         # what earlier steps left behind may be what filled it
         hashlife.collect(t, hashlife.NONE);
         ok = hashlife.step(t);
@@ -654,6 +660,13 @@ fun tree_step(s: *Sim) bool {
         if (again == hashlife.CANCEL_BUDGET) {
             # what the cancelled step made is garbage
             hashlife.collect(t, hashlife.NONE);
+            if (descend && t.k > 0) {
+                val k: u32 = t.k;
+                hashlife.set_exponent(t, k - 1);
+                val done: bool = tree_step(s, true) && tree_step(s, true);
+                hashlife.set_exponent(t, k);
+                ret done;
+            }
             trip(s, ceiling.MEMORY);
         }
         or (again == hashlife.CANCEL_TIME) { trip(s, ceiling.STEP); }
@@ -675,7 +688,7 @@ fun tree_step(s: *Sim) bool {
 pub fun step(s: *Sim) {
     if (s.full || s.tripped != ceiling.COUNT) { ret; }
     if (on_tree(s)) {
-        tree_step(s);
+        tree_step(s, false);
         ret;
     }
     if (on_gpu(s)) {
@@ -808,7 +821,8 @@ fun disarm(s: *Sim) {
 }
 
 # advance the tree to a generation, by the powers of two its distance from
-# this one is made of, largest first, keeping the step exponent
+# this one is made of, largest first, keeping the step exponent. a step the
+# memory ceiling cancels is taken in halves (tree_step)
 # ---
 # s:   simulation on the tree
 # gen: the generation, not before this one and less than 2^(MAX_EXPONENT + 1)
@@ -828,7 +842,7 @@ pub fun jump(s: *Sim, gen: u64) bool {
         b = b - 1;
         if (((d >> b::u64) & 1) != 0) {
             hashlife.set_exponent(?s.tree, b);
-            ok = tree_step(s);
+            ok = tree_step(s, true);
         }
     }
     hashlife.set_exponent(?s.tree, k0);
@@ -2315,6 +2329,75 @@ test ceiling__hashlife_collects_before_its_memory_ceiling_pauses_it {
     if (!same_live(?t, ?r))                                                       { ret 16; }
     snapshot.dnit(?was);
     dnit(?r);
+    dnit(?t);
+    ret 0;
+}
+
+test ceiling__hashlife_growth_counts_the_copy_it_makes_against_the_budget {
+    var a: allo.Allocator;
+    page.make(?a);
+    var mode: usize = 0;
+    for (mode < 2) {
+        var t:    Sim;
+        val made: err[allo.Error] = init(?t, ?a);
+        if (sel made.err) { ret 1; }
+        randomize(?t, 0.4, 512);
+        if (!use_hashlife(?t, true)) { ret 2; }
+        val tr: *hashlife.Tree = ?t.tree;
+        hashlife.set_exponent(tr, 10);
+        # a copying allocator holds the old table beside the new as it grows
+        hashlife.set_in_place(tr, mode == 1);
+        hashlife.collect(tr, hashlife.NONE);
+        val c0:     usize = tr.cap;
+        val budget: usize = c0 * 5 / 2;
+        val pop:    u64   = hashlife.population(tr);
+        hashlife.set_budget(tr, budget);
+        if (hashlife.step(tr) || hashlife.cancelled(tr) != hashlife.CANCEL_BUDGET) { ret 3 + mode::i32 * 10; }
+        if (hashlife.population(tr) != pop)                                        { ret 4 + mode::i32 * 10; }
+        # copying, c0 grows to 1.5 c0 beside it, and no further; in place, to the budget
+        if (mode == 0 && tr.cap != c0 * 3 / 2) { ret 5; }
+        if (mode == 1 && tr.cap != budget)     { ret 15; }
+        dnit(?t);
+        mode = mode + 1;
+    }
+    ret 0;
+}
+
+test ceiling__a_run_to_a_generation_takes_smaller_steps_where_memory_runs_short {
+    var a: allo.Allocator;
+    page.make(?a);
+    var c: ceiling.Ceilings = ceiling.defaults();
+    c.limit[ceiling.MEMORY] = 1;
+    # a plain step of 2^9 generations needs more than the ceiling
+    var u:  Sim;
+    val m0: err[allo.Error] = init(?u, ?a);
+    if (sel m0.err) { ret 1; }
+    seed_world(?u);
+    if (!use_hashlife(?u, true)) { ret 2; }
+    set_ceilings(?u, c);
+    set_exponent(?u, 9);
+    step(?u);
+    if (u.tripped != ceiling.MEMORY || u.generation != 0) { ret 3; }
+    dnit(?u);
+    # going to a generation halves such steps and gets there as the CPU does
+    var p:  Sim;
+    var t:  Sim;
+    val m1: err[allo.Error] = init(?p, ?a);
+    if (sel m1.err) { ret 4; }
+    val m2: err[allo.Error] = init(?t, ?a);
+    if (sel m2.err) { ret 5; }
+    seed_world(?p);
+    seed_world(?t);
+    if (!use_hashlife(?t, true)) { ret 6; }
+    set_ceilings(?t, c);
+    var g: usize = 0;
+    for (g < 1000) {
+        step(?p);
+        g = g + 1;
+    }
+    if (!jump(?t, 1000) || t.generation != 1000 || t.tripped != ceiling.COUNT) { ret 7; }
+    if (!same_as_tree(?p, ?t))                                                 { ret 8; }
+    dnit(?p);
     dnit(?t);
     ret 0;
 }
