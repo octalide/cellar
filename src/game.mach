@@ -132,6 +132,9 @@ val SMALL_PX: f32 = 14.0;
 # started:     when the measurement began
 # frames:      frames drawn since it began
 # gen0:        the generation it began at
+# pausing:     a measured pause was asked for and has not applied
+# pauses:      measured pauses applied
+# worst:       the longest a measured pause took to apply, in nanoseconds
 pub rec Game {
     a:           allo.Allocator;
     app:         app.App;
@@ -164,10 +167,15 @@ pub rec Game {
     started:     Instant;
     frames:      u64;
     gen0:        u64;
+    pausing:     bool;
+    pauses:      u64;
+    worst:       i64;
 }
 
 # frames a measurement lets pass before it starts the clock
 val WARMUP: u64 = 30;
+# pauses the pause measurement times
+val PAUSES: u64 = 10;
 
 fun game_of(ctx: *Context) *Game {
     ret context_user(ctx)::*Game;
@@ -915,7 +923,14 @@ fun bench_world(g: *Game) {
         weighted.set_radius(?k, g.bench_r);
         sim.set_rule(s, rule.of(rule.Kind.weighted{k}));
     }
-    if (g.bench == args.BENCH_DENSE) {
+    if (g.bench == args.BENCH_PAUSE) {
+        val seeds: res[rule.Rule, str] = rule.parse("B2/S");
+        if (sel seeds.ok) { sim.set_rule(s, seeds.ok); }
+        sim.randomize(s, sim.DEFAULT_DENSITY, 512);
+        if (g.engine == args.ENGINE_HASHLIFE) { sim.use_hashlife(s, true); }
+        g.app.zoom = 900.0 / 512.0 / render.BASE_PPC;
+    }
+    or (g.bench == args.BENCH_DENSE) {
         sim.randomize(s, sim.DEFAULT_DENSITY, 512);
         g.app.zoom = 900.0 / 512.0 / render.BASE_PPC;
     }
@@ -946,9 +961,15 @@ fun bench_world(g: *Game) {
     }
     g.app.panel = 0;
     g.app.refit = false;
-    s.running   = 1;
+    # the pauses are timed on a run played as a person plays it, so the
+    # journal holds the world from where the run began, not from the first pause
+    if (g.bench == args.BENCH_PAUSE) { app.submit(?g.app, command.Command.toggle{}); }
+    or                               { s.running = 1; }
     g.frames    = 0;
     g.gen0      = 0;
+    g.pausing   = false;
+    g.pauses    = 0;
+    g.worst     = 0;
 }
 
 # count a measured frame, and report and stop once the time is up
@@ -962,6 +983,10 @@ fun bench_frame(ctx: *Context, g: *Game) {
         g.started = now.ok;
         g.gen0    = g.shown.generation;
     }
+    if (g.bench == args.BENCH_PAUSE) {
+        bench_pause(ctx, g, now.ok);
+        ret;
+    }
     val secs: f64 = time.instant_sub(now.ok, g.started)::f64 / SECOND::f64;
     if (secs < g.bench_secs) { ret; }
     val gens:   f64 = (g.shown.generation - g.gen0)::f64;
@@ -972,6 +997,46 @@ fun bench_frame(ctx: *Context, g: *Game) {
     print.printlnf("bench {} radius {} chunks {} population {} gens/s {} frame us {}", engine, rule.radius(?g.shown.rule)::u64,
         g.shown.chunks::u64, g.shown.population::u64, (gens / secs)::u64, frame::u64);
     context_stop(ctx);
+}
+
+# pause the run once it has run the measurement's seconds, time how long the
+# pause takes to reach the world, and resume it, until PAUSES are timed or the
+# world stops on its own, full or at a ceiling
+fun bench_pause(ctx: *Context, g: *Game, now: Instant) {
+    var engine: str = "gpu";
+    if (!g.gpu.stepping)          { engine = "cpu"; }
+    if (world.hashlife(?g.shown)) { engine = "hashlife"; }
+    # a pause or a resume asked for waits in the queue until a frame applies it
+    if (g.app.queue.items.len != 0) { ret; }
+    if (g.pausing) {
+        if (g.shown.running) { ret; }
+        val took: i64 = time.instant_sub(now, g.started);
+        if (took > g.worst) { g.worst = took; }
+        g.pauses  = g.pauses + 1;
+        g.pausing = false;
+        val gens: u64 = g.shown.generation - g.gen0;
+        print.printlnf("pause {} {} generation {} chunks {} population {} gens since resume {} pause ms {}", engine, g.pauses,
+            g.shown.generation, g.shown.chunks::u64, g.shown.population::u64, gens, took::f64 / 1000000.0);
+        if (g.pauses == PAUSES) {
+            print.printlnf("pause {} worst ms {}", engine, g.worst::f64 / 1000000.0);
+            context_stop(ctx);
+            ret;
+        }
+        app.submit(?g.app, command.Command.toggle{});
+        g.started = now;
+        g.gen0    = g.shown.generation;
+        ret;
+    }
+    if (!g.shown.running) {
+        print.printlnf("pause {} stopped on its own at generation {}: full {} ceiling {}; worst ms {}", engine, g.shown.generation,
+            g.shown.full, sim.tripped(?g.sim)::u64, g.worst::f64 / 1000000.0);
+        context_stop(ctx);
+        ret;
+    }
+    if (time.instant_sub(now, g.started)::f64 / SECOND::f64 < g.bench_secs) { ret; }
+    app.submit(?g.app, command.Command.toggle{});
+    g.pausing = true;
+    g.started = now;
 }
 
 test events__open_the_first_dropped_file_and_say_the_rest_were_ignored {
