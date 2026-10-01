@@ -37,6 +37,7 @@ use cellar.sim;
 use cellar.snapshot;
 use cellar.space;
 use cellar.text;
+use cellar.topology;
 use cellar.world;
 use allo: std.allocator;
 use std.allocator.page;
@@ -357,9 +358,73 @@ fun recorded(c: *command.Command) u8 {
         if (c.area.op == command.AREA_SHRINK || c.area.op == command.AREA_IDENTIFY) { ret UNRECORDED; }
         ret journal.KIND_EDIT;
     }
-    if (sel c.clear || sel c.randomize || sel c.stamp || sel c.rule || sel c.reset)        { ret journal.KIND_EDIT; }
-    if (sel c.load_world || sel c.load_pattern || sel c.open || sel c.paste || sel c.drop) { ret journal.KIND_EDIT; }
+    if (sel c.clear || sel c.randomize || sel c.stamp || sel c.rule || sel c.bounds || sel c.reset) { ret journal.KIND_EDIT; }
+    if (sel c.load_world || sel c.load_pattern || sel c.open || sel c.paste || sel c.drop)          { ret journal.KIND_EDIT; }
     ret UNRECORDED;
+}
+
+# move the view and the selection with the world, so neither moves on screen
+fun follow(a: *app.App, dx: i64, dy: i64) {
+    a.pan_x   = a.pan_x + dx::f64;
+    a.pan_y   = a.pan_y + dy::f64;
+    a.area.x0 = a.area.x0 + dx;
+    a.area.x1 = a.area.x1 + dx;
+    a.area.y0 = a.area.y0 + dy;
+    a.area.y1 = a.area.y1 + dy;
+}
+
+# put the world on a grid, translated so the box drawn for it is where the
+# grid's notation puts it, the view moving with it, saying what was dropped and
+# when the world left HashLife for it
+fun bounds(a: *app.App, s: *sim.Sim, c: *command.Bounds) Change {
+    var want: rule.Rule = s.rule;
+    want.grid = c.grid;
+    val why: opt[str] = rule.refusal(?want);
+    if (sel why.some) {
+        app.say_why(a, "the bounds were not set", why.some);
+        ret Change.none{};
+    }
+    val here: str = sim.refusal(s, ?want);
+    if (here != nil) {
+        app.say_why(a, "the bounds were not set", here);
+        ret Change.none{};
+    }
+    var g:  topology.Grid = c.grid;
+    var dx: i64           = 0;
+    var dy: i64           = 0;
+    if (topology.bounded(?g) && g.w != 0)                { dx = topology.left(?g) - c.x0; }
+    if (topology.bounded(?g) && g.h != 0)                { dy = topology.top(?g) - c.y0; }
+    if (rule.same(?s.rule, ?want) && dx == 0 && dy == 0) { ret Change.none{}; }
+    val tree: bool       = sim.on_tree(s);
+    val p:    sim.Placed = sim.place(s, g, dx, dy);
+    if (!p.ok && tree && sim.on_tree(s)) {
+        app.say(a, "HashLife cannot run a bounded grid, and the world is too large for the chunk pool");
+        ret Change.none{};
+    }
+    # a full pool took the world part way, which the frame reports
+    if (!p.ok && !s.full) {
+        app.say(a, "the bounds were not set: the GPU's cells could not be read");
+        ret Change.none{};
+    }
+    journal.moved(?a.log, dx, dy);
+    follow(a, dx, dy);
+    if (topology.bounded(?g)) {
+        # the suffix without its colon, as Golly writes it after the rule
+        var suffix: [topology.FORMAT_MAX + 1]u8;
+        topology.format(?g, ?suffix[0], 0);
+        app.say_why(a, "bounds set", ?suffix[1]);
+    }
+    or { app.say(a, "bounds removed"); }
+    if (p.dropped > 0) {
+        var why: [96]u8;
+        var o:   usize = text.buf_grouped(?why[0], 0, p.dropped);
+        if (p.dropped == 1) { o = text.buf_str(?why[0], o, " cell outside them was dropped"); }
+        or                  { o = text.buf_str(?why[0], o, " cells outside them were dropped"); }
+        why[o] = 0;
+        app.say_also(a, ?why[0]);
+    }
+    if (tree && !sim.on_tree(s)) { app.say_also(a, "HashLife runs only the unbounded plane, so the world moved to the chunk engine"); }
+    ret Change.fresh{};
 }
 
 # undo or redo, leaving the world paused as it now stands, which becomes the start
@@ -372,6 +437,7 @@ fun back(a: *app.App, s: *sim.Sim, undo: bool) {
         or        { app.say(a, "nothing to redo"); }
         ret;
     }
+    if (sel went.done)           { follow(a, a.log.shift_x, a.log.shift_y); }
     if (sel went.lost)           { app.say(a, "the world could not be put back, so the history was cleared"); }
     or (journal.dropped(?a.log)) { app.say(a, "the history outgrew its limit and was cleared"); }
     snapshot.drop(?a.start);
@@ -446,6 +512,7 @@ fun apply(c: *command.Command, a: *app.App, s: *sim.Sim, d: *Deps) {
     if (sel c.jump)                               { jump(a, s, c.jump); }
     if (sel c.ceilings)                           { sim.set_ceilings(s, c.ceilings); }
     if (sel c.area)                               { area(?c.area, a, s, d); }
+    if (sel c.bounds)                             { change = bounds(a, s, ?c.bounds); }
     if (sel c.reset)                              { reset(a, s); }
     if (sel c.save_world)                         { save_world(a, s, d, command.path(?c.save_world)); }
     if (sel c.load_world)                         { change = load_world(a, s, d, command.path(?c.load_world)); }
@@ -1049,6 +1116,78 @@ test run__undo_takes_a_world_back_off_a_bounded_grid_with_the_cells_it_dropped {
     app.submit(?ap, command.Command.redo{});
     run(?ap, ?s, ?d);
     if (!rule.same(?s.rule, ?small) || sim.alive(?s, 200, 200)) { ret 5; }
+    app.dnit(?ap);
+    sim.dnit(?s);
+    ret 0;
+}
+
+test run__bounds_move_the_world_and_the_view_drop_what_falls_off_and_undo_puts_both_back {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    var ap: app.App;
+    app.init(?ap);
+    val shown: err[format.Error] = app.attach(?ap, ?a);
+    if (sel shown.err) { ret 1; }
+    var d:    Deps;
+    var life: rule.Rule = rule.preset_rule(0);
+    world.paint(?s, 0, 0, 1);
+    world.paint(?s, 17, 8, 1);
+    world.paint(?s, 100, 100, 1);
+    world.paint(?s, 101, 100, 1);
+    ap.pan_x = 7.0;
+    ap.pan_y = 3.0;
+
+    # a 20 by 10 plane drawn from (-2, -1) is centred, the world and the view
+    # moving 8 left and 4 up with it, and the two cells off it dropped
+    val plane: topology.Grid = topology.Grid{shape: topology.PLANE, w: 20, h: 10, twist_w: false};
+    app.submit(?ap, command.Command.bounds{command.Bounds{grid: plane, x0: -2, y0: -1}});
+    run(?ap, ?s, ?d);
+    var on: topology.Grid = s.rule.grid;
+    if (!topology.same(?on, ?plane) || sim.population(?s) != 2)                                { ret 2; }
+    if (!sim.alive(?s, -8, -4) || !sim.alive(?s, 9, 4) || sim.alive(?s, 0, 0))                 { ret 3; }
+    if (ap.pan_x != -1.0 || ap.pan_y != -1.0)                                                  { ret 4; }
+    if (!string.str_equals(ap.toast, "bounds set: P20,10; 2 cells outside them were dropped")) { ret 5; }
+
+    # undo puts back the plane, the cells and the view, and redo makes the change again
+    app.submit(?ap, command.Command.undo{});
+    run(?ap, ?s, ?d);
+    if (!rule.same(?s.rule, ?life) || sim.population(?s) != 4 || !sim.alive(?s, 101, 100)) { ret 6; }
+    if (!sim.alive(?s, 0, 0) || ap.pan_x != 7.0 || ap.pan_y != 3.0)                        { ret 7; }
+    app.submit(?ap, command.Command.redo{});
+    run(?ap, ?s, ?d);
+    if (sim.population(?s) != 2 || !sim.alive(?s, -8, -4) || ap.pan_x != -1.0) { ret 8; }
+
+    # a shrunk box drops more, each shape is taken where the grid is, and the
+    # bounds come off without moving anything
+    val small: topology.Grid = topology.Grid{shape: topology.PLANE, w: 10, h: 10, twist_w: false};
+    app.submit(?ap, command.Command.bounds{command.Bounds{grid: small, x0: -10, y0: -5}});
+    run(?ap, ?s, ?d);
+    if (sim.population(?s) != 1 || !sim.alive(?s, -3, -4) || ap.pan_x != 4.0) { ret 9; }
+    if (!string.str_ends_with(ap.toast, "1 cell outside them was dropped"))   { ret 10; }
+    val shapes: [4]u8 = [4]u8{topology.TORUS, topology.KLEIN, topology.KLEIN, topology.CROSS};
+    var k:      usize = 0;
+    for (k < 4) {
+        val g: topology.Grid = topology.Grid{shape: shapes[k], w: 10, h: 10, twist_w: k == 1};
+        app.submit(?ap, command.Command.bounds{command.Bounds{grid: g, x0: -5, y0: -5}});
+        run(?ap, ?s, ?d);
+        on = s.rule.grid;
+        if (!topology.same(?on, ?g) || !sim.alive(?s, -3, -4) || ap.pan_x != 4.0) { ret 11 + k::i32; }
+        k = k + 1;
+    }
+    app.submit(?ap, command.Command.bounds{command.Bounds{grid: topology.open(), x0: 0, y0: 0}});
+    run(?ap, ?s, ?d);
+    if (!rule.same(?s.rule, ?life) || !sim.alive(?s, -3, -4) || ap.pan_x != 4.0) { ret 15; }
+    if (!string.str_equals(ap.toast, "bounds removed"))                          { ret 16; }
+
+    # HashLife cannot run a bounded grid, so the world moves to the chunk engine
+    if (!sim.use_hashlife(?s, true)) { ret 17; }
+    app.submit(?ap, command.Command.bounds{command.Bounds{grid: small, x0: -5, y0: -5}});
+    run(?ap, ?s, ?d);
+    if (sim.on_tree(?s) || !sim.alive(?s, -3, -4))                    { ret 18; }
+    if (!string.str_ends_with(ap.toast, "moved to the chunk engine")) { ret 19; }
     app.dnit(?ap);
     sim.dnit(?s);
     ret 0;

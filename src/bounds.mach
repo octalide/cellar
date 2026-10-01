@@ -1,0 +1,370 @@
+# the world's bounds: the tool that drags them out and the controls that set
+# them by value
+#
+# a box dragged in the world, or a grid's edges dragged to new places, becomes
+# the grid the world runs on, a plane unless another shape is chosen. the box
+# stays where it was drawn on screen: the command it makes translates the world
+# so the box is where the grid's notation centres it (cellar.exec). the shapes
+# are the grids cellar.topology runs, a Klein bottle twisted either way.
+
+use blit;
+use bctx: blit.context;
+use blay: blit.layout;
+use bov:  blit.overlay;
+use bw:   blit.widget;
+use cellar.app;
+use cellar.command;
+use cellar.look;
+use cellar.paint;
+use cellar.render;
+use cellar.space;
+use cellar.text;
+use cellar.theme;
+use cellar.topology;
+use cellar.world;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+
+# a plane of dead edges
+pub val SHAPE_PLANE: usize = 0;
+# a torus
+pub val SHAPE_TORUS: usize = 1;
+# a cross-surface
+pub val SHAPE_CROSS: usize = 2;
+# a Klein bottle, its top and bottom edges twisted (Golly's w*)
+pub val SHAPE_KLEIN_W: usize = 3;
+# a Klein bottle, its left and right edges twisted (Golly's h*)
+pub val SHAPE_KLEIN_H: usize = 4;
+# number of shapes
+pub val SHAPE_COUNT: usize = 5;
+
+# the grid's left edge, dragged
+pub val EDGE_LEFT: u8 = 1;
+# its right edge
+pub val EDGE_RIGHT: u8 = 2;
+# its top edge
+pub val EDGE_TOP: u8 = 4;
+# its bottom edge
+pub val EDGE_BOTTOM: u8 = 8;
+
+# unscaled pixels from a grid's edge that a press grabs it within
+val GRAB: f32 = 6.0;
+
+# the grid of a shape, w by h
+pub fun grid_of(shape: usize, w: i64, h: i64) topology.Grid {
+    var g: topology.Grid = topology.Grid{shape: topology.PLANE, w: w, h: h, twist_w: false};
+    if (shape == SHAPE_TORUS) { g.shape = topology.TORUS; }
+    if (shape == SHAPE_CROSS) { g.shape = topology.CROSS; }
+    if (shape == SHAPE_KLEIN_W || shape == SHAPE_KLEIN_H) {
+        g.shape   = topology.KLEIN;
+        g.twist_w = shape == SHAPE_KLEIN_W;
+    }
+    ret g;
+}
+
+# the shape of a bounded grid
+pub fun shape_of(g: *topology.Grid) usize {
+    if (g.shape == topology.TORUS) { ret SHAPE_TORUS; }
+    if (g.shape == topology.CROSS) { ret SHAPE_CROSS; }
+    if (g.shape == topology.KLEIN) {
+        if (g.twist_w) { ret SHAPE_KLEIN_W; }
+        ret SHAPE_KLEIN_H;
+    }
+    ret SHAPE_PLANE;
+}
+
+# the cells of a bounded grid, half-open, an unbounded axis left empty
+fun box_of(g: *topology.Grid) space.Box {
+    var b: space.Box = space.Box{x0: 0, y0: 0, x1: 0, y1: 0};
+    if (g.w != 0) {
+        b.x0 = topology.left(g);
+        b.x1 = b.x0 + g.w;
+    }
+    if (g.h != 0) {
+        b.y0 = topology.top(g);
+        b.y1 = b.y0 + g.h;
+    }
+    ret b;
+}
+
+# ask to put the world on a grid, the grid's box drawn with its top-left cell
+# at (x0, y0) in the world as it stands
+pub fun ask(a: *app.App, g: topology.Grid, x0: i64, y0: i64) {
+    app.submit(a, command.Command.bounds{command.Bounds{grid: g, x0: x0, y0: y0}});
+}
+
+# ask to put the world on a grid where its notation puts it, moving nothing
+pub fun ask_centred(a: *app.App, g: topology.Grid) {
+    var c: topology.Grid = g;
+    ask(a, g, topology.left(?c), topology.top(?c));
+}
+
+# ask to take the bounds away
+pub fun remove(a: *app.App) {
+    ask(a, topology.open(), 0, 0);
+}
+
+# the edges of the grid a press at screen (mx, my) grabs, 0 for none
+fun grabbed(g: *topology.Grid, cam: render.Camera, mx: f32, my: f32, m: f32) u8 {
+    if (!topology.bounded(g)) { ret 0; }
+    val b:  space.Box   = box_of(g);
+    val r:  render.Span = render.span(cam, b);
+    var x0: f32         = r.x0 - m;
+    var x1: f32         = r.x1 + m;
+    var y0: f32         = r.y0 - m;
+    var y1: f32         = r.y1 + m;
+    if (g.w == 0) {
+        x0 = mx;
+        x1 = mx;
+    }
+    if (g.h == 0) {
+        y0 = my;
+        y1 = my;
+    }
+    if (mx < x0 || mx > x1 || my < y0 || my > y1) { ret 0; }
+    var e: u8 = 0;
+    if (g.w != 0) {
+        val dl: f32 = abs(mx - r.x0);
+        val dr: f32 = abs(mx - r.x1);
+        if (dl <= m && dl <= dr) { e = e | EDGE_LEFT; }
+        or (dr <= m)             { e = e | EDGE_RIGHT; }
+    }
+    if (g.h != 0) {
+        val dt: f32 = abs(my - r.y0);
+        val db: f32 = abs(my - r.y1);
+        if (dt <= m && dt <= db) { e = e | EDGE_TOP; }
+        or (db <= m)             { e = e | EDGE_BOTTOM; }
+    }
+    ret e;
+}
+
+fun abs(v: f32) f32 {
+    if (v < 0.0) { ret 0.0 - v; }
+    ret v;
+}
+
+# the box dragged so far, from the press's cell to (cx, cy) or the grabbed
+# edges moved to it, at least a cell across
+fun dragged(a: *app.App, cx: i64, cy: i64) {
+    if (a.edges == 0) {
+        a.sized = space.Box{x0: min(a.anchor_x, cx), y0: min(a.anchor_y, cy), x1: max(a.anchor_x, cx) + 1, y1: max(a.anchor_y, cy) + 1};
+        ret;
+    }
+    val b: *space.Box = ?a.sized;
+    if ((a.edges & EDGE_LEFT) != 0)   { b.x0 = min(cx, b.x1 - 1); }
+    if ((a.edges & EDGE_RIGHT) != 0)  { b.x1 = max(cx + 1, b.x0 + 1); }
+    if ((a.edges & EDGE_TOP) != 0)    { b.y0 = min(cy, b.y1 - 1); }
+    if ((a.edges & EDGE_BOTTOM) != 0) { b.y1 = max(cy + 1, b.y0 + 1); }
+}
+
+fun min(a: i64, b: i64) i64 {
+    if (a < b) { ret a; }
+    ret b;
+}
+
+fun max(a: i64, b: i64) i64 {
+    if (a > b) { ret a; }
+    ret b;
+}
+
+# use the tool: a press grabs the grid's edges near it or starts a new box,
+# a drag moves them, and the release asks for the bounds
+# ---
+# a:       application state
+# g:       the grid the world is on
+# cam:     the camera
+# scale:   the interface scale
+# mx:      the pointer's column on screen
+# my:      the pointer's row on screen
+# pressed: a press began on the world this frame
+# held:    the button is held
+pub fun tool(a: *app.App, g: *topology.Grid, cam: render.Camera, scale: f32, mx: f32, my: f32, pressed: bool, held: bool) {
+    var cx: i64 = 0;
+    var cy: i64 = 0;
+    render.cell_at(cam, mx, my, ?cx, ?cy);
+    if (pressed) {
+        a.sizing   = true;
+        a.edges    = grabbed(g, cam, mx, my, GRAB * scale);
+        a.anchor_x = cx;
+        a.anchor_y = cy;
+        a.sized    = box_of(g);
+        if (a.edges == 0) { a.sized = space.Box{x0: cx, y0: cy, x1: cx + 1, y1: cy + 1}; }
+    }
+    if (!a.sizing) { ret; }
+    if (held) {
+        dragged(a, cx, cy);
+        ret;
+    }
+    a.sizing = false;
+    val b: space.Box = a.sized;
+    # a click with nothing dragged is no box
+    if (a.edges == 0 && cx == a.anchor_x && cy == a.anchor_y) { ret; }
+    if (a.edges == 0) {
+        ask(a, grid_of(a.grid_shape, b.x1 - b.x0, b.y1 - b.y0), b.x0, b.y0);
+        ret;
+    }
+    # an unbounded axis stays so
+    var w: i64 = 0;
+    var h: i64 = 0;
+    if (g.w != 0) { w = b.x1 - b.x0; }
+    if (g.h != 0) { h = b.y1 - b.y0; }
+    ask(a, grid_of(shape_of(g), w, h), b.x0, b.y0);
+}
+
+# stop dragging the bounds, asking for nothing
+pub fun cancel(a: *app.App) {
+    a.sizing = false;
+}
+
+# the bounds being dragged, over the world, an unbounded axis across the screen
+pub fun overlay(d: *paint.Paint, a: *app.App, cam: render.Camera) {
+    if (!a.sizing) { ret; }
+    val r:  render.Span = render.span(cam, a.sized);
+    var x0: f32         = r.x0;
+    var x1: f32         = r.x1;
+    var y0: f32         = r.y0;
+    var y1: f32         = r.y1;
+    if (a.sized.x1 <= a.sized.x0) {
+        x0 = cam.x0 - 2.0;
+        x1 = cam.x0 + cam.sw + 2.0;
+    }
+    if (a.sized.y1 <= a.sized.y0) {
+        y0 = cam.y0 - 2.0;
+        y1 = cam.y0 + cam.sh + 2.0;
+    }
+    paint.frame(d, x0 - 2.0, y0 - 2.0, x1 + 2.0, y1 + 2.0, 2.0, theme.ACCENT, 0.9);
+}
+
+# write a size, an unbounded one as such
+fun size(buf: *u8, off: usize, v: i64) usize {
+    if (v == 0) { ret text.buf_str(buf, off, "unbounded"); }
+    ret text.buf_u64(buf, off, v::u64);
+}
+
+# the size of the bounds being dragged, over their top-left corner
+pub fun label(ui: *bctx.Context, l: look.Look, a: *app.App, cam: render.Camera) {
+    if (!a.sizing) { ret; }
+    val r: render.Span = render.span(cam, a.sized);
+    var b: [64]u8;
+    var o: usize       = size(?b[0], 0, a.sized.x1 - a.sized.x0);
+    o    = text.buf_str(?b[0], o, " x ");
+    o    = size(?b[0], o, a.sized.y1 - a.sized.y0);
+    b[o] = 0;
+    var ov: bov.Overlay = bov.on_rect(bctx.Area{x0: r.x0, y0: r.y0, x1: r.x1, y1: r.y1}, bov.TOP_LEFT, bov.BOTTOM_LEFT);
+    ov.dy = 0.0 - bctx.px(ui, 6.0);
+    val shown: bov.Shown = bov.begin(ui, "bounds", ov);
+    bctx.push_alpha(ui, 0.9);
+    look.line(ui, l.small, ?b[0], theme.ACCENT);
+    bctx.pop_alpha(ui);
+    bov.end(ui, shown);
+}
+
+# the shape's name, as the section says what the world is on
+fun shape_name(shape: usize) str {
+    if (shape == SHAPE_TORUS)   { ret "Torus"; }
+    if (shape == SHAPE_CROSS)   { ret "Cross-surface"; }
+    if (shape == SHAPE_KLEIN_W) { ret "Klein bottle, top and bottom twisted"; }
+    if (shape == SHAPE_KLEIN_H) { ret "Klein bottle, sides twisted"; }
+    ret "Plane";
+}
+
+# a size field's value, or -1 when it is empty or past the largest size
+fun typed(f: *blit.field.Field) i64 {
+    val t: str   = blit.field.text(f);
+    var v: i64   = 0;
+    var i: usize = 0;
+    for (t[i] != 0) {
+        v = v * 10 + (t[i] - '0')::i64;
+        if (v > topology.SIZE_MAX) { ret -1; }
+        i = i + 1;
+    }
+    if (i == 0) { ret -1; }
+    ret v;
+}
+
+# set the bounds to the typed size and the chosen shape, centred where they are
+fun set_typed(a: *app.App) {
+    val w: i64 = typed(?a.size_w);
+    val h: i64 = typed(?a.size_h);
+    if (w < 0 || h < 0) {
+        app.say(a, "type a width and a height, each at most 2,000,000,000");
+        ret;
+    }
+    val k: usize = a.grid_shape;
+    if ((w == 0 || h == 0) && k != SHAPE_PLANE && k != SHAPE_TORUS) {
+        app.say(a, "only a plane or a torus may be unbounded along an axis");
+        ret;
+    }
+    ask_centred(a, grid_of(k, w, h));
+}
+
+# show the grid's size in the size fields
+fun show_size(a: *app.App, g: *topology.Grid) {
+    var b: [24]u8;
+    var o: usize = text.buf_u64(?b[0], 0, g.w::u64);
+    b[o] = 0;
+    blit.field.set(?a.size_w, ?b[0]);
+    o    = text.buf_u64(?b[0], 0, g.h::u64);
+    b[o] = 0;
+    blit.field.set(?a.size_h, ?b[0]);
+}
+
+# the bounds section: what the world is on, the shape, the size by value, and
+# taking the bounds away
+# ---
+# ui: the interface
+# l:  cellar's look
+# a:  application state
+# s:  the world as shown, whose rule gives the grid
+pub fun section(ui: *bctx.Context, l: look.Look, a: *app.App, s: *world.Shown) {
+    look.heading(ui, l, "Bounds");
+    var g:  topology.Grid = s.rule.grid;
+    val on: bool          = topology.bounded(?g);
+    # the fields and the shape follow the grid each time it changes
+    if (!topology.same(?g, ?a.sized_grid)) {
+        a.sized_grid = g;
+        if (on) {
+            a.grid_shape = shape_of(?g);
+            show_size(a, ?g);
+        }
+    }
+    if (on) {
+        var d: [96]u8;
+        var o: usize = text.buf_str(?d[0], 0, shape_name(a.grid_shape));
+        o    = text.buf_str(?d[0], o, ", ");
+        o    = size(?d[0], o, g.w);
+        o    = text.buf_str(?d[0], o, " x ");
+        o    = size(?d[0], o, g.h);
+        d[o] = 0;
+        look.note(ui, l, ?d[0]);
+    }
+    or { look.note(ui, l, "Unbounded: the world runs on without edges"); }
+
+    var shapes: [5]str;
+    shapes[0] = "Plane";
+    shapes[1] = "Torus";
+    shapes[2] = "Cross";
+    shapes[3] = "Klein w*";
+    shapes[4] = "Klein h*";
+    val hit: usize = bw.button_grid(ui, ?shapes[0], SHAPE_COUNT, 3, a.grid_shape);
+    if (hit < SHAPE_COUNT && hit != a.grid_shape) {
+        a.grid_shape = hit;
+        # a bounded world takes the shape at once, where it is
+        if (on) { ask_centred(a, grid_of(hit, g.w, g.h)); }
+    }
+
+    val ew:   u8 = bw.text_field(ui, "width", ?a.size_w, "Width in cells");
+    val eh:   u8 = bw.text_field(ui, "height", ?a.size_h, "Height in cells");
+    var acts: [2]str;
+    acts[0] = "Set bounds";
+    acts[1] = "Remove";
+    var n: usize = 1;
+    if (on) { n = 2; }
+    val act: usize = bw.buttons(ui, ?acts[0], n);
+    if (act == 0 || ((ew | eh) & blit.field.ENTERED) != 0) { set_typed(a); }
+    if (act == 1 && on)                                    { remove(a); }
+    look.note(ui, l, "The Bounds tool drags a box in the world, or the grid's edges");
+}
