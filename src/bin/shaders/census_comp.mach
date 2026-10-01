@@ -4,19 +4,20 @@
 # live chunk is always warm, so only those are counted.
 #
 # an invocation is one slot. it counts the chunk's live cells, notes whether
-# any cell is still warm, and sets a bit for each neighbour a live cell lies
-# near enough to reach within the reach the host budgets, records the columns
-# and rows the live cells span, and copies the slot's incarnation so the host
-# can tell a report about a slot it has since freed and reused. every invocation
-# also writes the census id the host set, the same value from each, so the host
-# knows which census a readback carries.
+# any cell is still warm, both as the rule family's sense in the meta head reads
+# a cell, records the columns and rows the live cells span and the quadrants
+# they lie in, from which the host works out the halo they need
+# (cellar.space.halo), and copies the slot's
+# incarnation so the host can tell a report about a slot it has since freed and
+# reused. every invocation also writes the census id the host set, the same
+# value from each, so the host knows which census a readback carries.
 
-# the census id, then three words per slot: live cells in bits 0 to 12, warm in
-# bit 13 and the low 18 bits of the incarnation above, then the neighbour mask,
-# then the live cells' extent (cellar.layout.extent)
+# the census id, then two words per slot: live cells in bits 0 to 12, warm in
+# bit 13 and the low 18 bits of the incarnation above, then the live cells'
+# extent (cellar.layout.extent) and the quadrants they lie in
 rec Status {
     head: [4]u32;
-    v:    [layout.MAX_SLOTS * 3]u32;
+    v:    [layout.MAX_SLOTS * 2]u32;
 }
 
 use cellar.layout;
@@ -42,14 +43,14 @@ fun comp_main() {
     val slot: u32 = gid[0];
     status.head[0] = meta.census;
     if (slot >= meta.hi) { ret; }
-    val inc:  u32 = meta.table[slot * layout.ENTRY + (layout.ENTRY - 1)];
-    var live: u32 = 0;
-    var warm: u32 = 0;
-    var mask: u32 = 0;
-    var x0:   u32 = 63;
-    var y0:   u32 = 63;
-    var x1:   u32 = 0;
-    var y1:   u32 = 0;
+    val inc:   u32 = meta.table[slot * layout.ENTRY + layout.INCARNATION_AT];
+    var live:  u32 = 0;
+    var warm:  u32 = 0;
+    var quads: u32 = 0;
+    var x0:    u32 = 63;
+    var y0:    u32 = 63;
+    var x1:    u32 = 0;
+    var y1:    u32 = 0;
     # a chunk no step or upload has stamped with the current serial is cold
     # and empty, and needs no count
     val f: u32 = flags.v[slot * 2 + 1];
@@ -57,33 +58,22 @@ fun comp_main() {
         var i: u32 = 0;
         for (i < layout.CELLS) {
             val c: u32 = cells.v[slot * layout.CELLS + i];
-            if (c >= layout.LIVE) {
+            if (layout.live(c, meta.live_mask, meta.live_lo, meta.live_hi) != 0) {
                 live = live + 1;
-                val x:  u32 = i & (layout.SIDE - 1);
-                val y:  u32 = i / layout.SIDE;
-                var wl: u32 = 0;
-                var er: u32 = 0;
-                var nt: u32 = 0;
-                var sb: u32 = 0;
-                if (x < 32)  { wl = 1; }
-                if (x >= 32) { er = 1; }
-                if (y < 32)  { nt = 1; }
-                if (y >= 32) { sb = 1; }
-                if (x < x0)  { x0 = x; }
-                if (y < y0)  { y0 = y; }
-                if (x > x1)  { x1 = x; }
-                if (y > y1)  { y1 = y; }
-                # the bits are the page-table entry's neighbour words
-                mask = mask | (wl << 3) | (er << 5) | (nt << 1) | (sb << 7);
-                mask = mask | (wl * nt) | ((er * nt) << 2) | ((wl * sb) << 6) | ((er * sb) << 8);
+                val x: u32 = i & (layout.SIDE - 1);
+                val y: u32 = i / layout.SIDE;
+                quads = quads | layout.quadrant(x, y);
+                if (x < x0) { x0 = x; }
+                if (y < y0) { y0 = y; }
+                if (x > x1) { x1 = x; }
+                if (y > y1) { y1 = y; }
             }
-            if ((c & layout.HEAT_MASK) != 0) { warm = 1; }
+            if ((c & meta.warm_mask) != 0) { warm = 1; }
             i = i + 1;
         }
     }
     var ext: u32 = 0;
-    if (live != 0) { ext = layout.extent(x0, y0, x1, y1); }
-    status.v[slot * 3]     = live | (warm << 13) | ((inc & 0x3ffff) << 14);
-    status.v[slot * 3 + 1] = mask;
-    status.v[slot * 3 + 2] = ext;
+    if (live != 0) { ext = layout.extent(x0, y0, x1, y1) | (quads << layout.EXTENT_QUADS); }
+    status.v[slot * 2]     = live | (warm << 13) | ((inc & 0x3ffff) << 14);
+    status.v[slot * 2 + 1] = ext;
 }

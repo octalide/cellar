@@ -1,0 +1,1395 @@
+# the world as a hash-consed quadtree, stepped by Gosper's HashLife
+#
+# a node of level l is a 2^l square of cells, made of four nodes of level l - 1
+# (nw, ne, sw, se). a node of level 0 is one cell, and its id is its state, so
+# ids below MAX_STATES are the cells and never freed. every other node lives
+# once in the table, found by its four children through a chained hash, so
+# equal squares anywhere in the world, and at any generation, are one node.
+#
+# a node of level l >= 2 has a result: its centre 2^(l-1) square some
+# generations on. with the step exponent k, that is 2^(l-2) generations when
+# l - 2 <= k, which does not depend on k and is kept in full, and 2^k otherwise,
+# kept in slow with the k it was worked out for. a result is found from the
+# results of the nine overlapping squares one level down, then of the four
+# squares they make, so a pattern that repeats in space or time is stepped once.
+# the base case, level 2, steps its centre 2 by 2 cells one generation through
+# the rule family's next, over a table of every 3 by 3 block for a two-state
+# rule, so a family of more states slots in by giving next.
+#
+# a node also keeps what the rule shows of it: the cells in a state its sense
+# counts live, and the most heat any of its cells' words carries, so a dying
+# state is kept, stepped and blocks births like any other but is counted and
+# drawn as the pool counts and draws it. both follow from each state's word,
+# so a rule that words its states otherwise works them out afresh (relight).
+#
+# the root is centred on the origin: a root of level L holds the cells in
+# [-2^(L-1), 2^(L-1)) on both axes, and every node below it is aligned to its
+# own size. a step pads the root with empty squares until the pattern lies in
+# its centre quarter and the root is deep enough for 2^k generations, and takes
+# the root's result as the new root.
+#
+# the table holds at most max nodes. collect frees every node the root and the
+# empty squares do not reach, and forgets the results that named one. a node
+# the table cannot make is NONE, which every function passes up, so a step or
+# an edit that fills the table stops whole and says so rather than going wrong.
+#
+# edits and reads go through a cache of 64 by 64 chunks of states over the
+# tree: a chunk is copied out of the tree the first time an edit or a read
+# touches it, written in place, and grafted back as one node when the cache is
+# flushed or fills, so an edit costs what its chunks do, however far apart. a
+# square already made of nodes, such as a file's, is laid over the world whole
+# instead (lay), costing its nodes rather than its chunks.
+
+use cellar.layout;
+use cellar.rule;
+use allo: std.allocator;
+use std.allocator.page;
+use std.collections.map;
+use std.collections.map.Map;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use mem: std.memory;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+# a node that could not be made
+pub val NONE: u32 = 0xffffffff;
+# ids of level 0, one per state a cell can be in
+pub val MAX_STATES: u32 = 256;
+# the deepest root, so every coordinate below it fits an i64 with room to spare
+pub val MAX_LEVEL: u32 = 60;
+# the largest step exponent, which leaves the root room to be padded for it
+pub val MAX_EXPONENT: u32 = 48;
+# nodes a table may hold unless told otherwise, 48 bytes each
+pub val DEFAULT_MAX: usize = 4194304;
+# the level of a chunk, 64 cells on a side
+pub val CHUNK: u32 = 6;
+# the shallowest root, so every chunk is a node below it
+val MIN_LEVEL: u32 = 7;
+# nodes the table starts with room for
+val FIRST: usize = 65536;
+# chunks the edit cache holds before it is flushed
+pub val CACHE_MAX: usize = 4096;
+# cells in a chunk
+val CELLS: usize = 4096;
+
+# one node of the table
+# ---
+# kids:  nw, ne, sw, se
+# full:  the result 2^(level-2) generations on, NONE until worked out
+# slow:  the result 2^sk generations on, NONE until worked out
+# next:  the next node in its hash chain, or in the free list
+# level: its level
+# sk:    the exponent slow was worked out for
+# flags: USED while it holds a node, MARK while a walk has reached it
+# heat:  the most heat the rule's word for any of its cells carries
+# pop:   cells in a state other than 0, held at the u64 ceiling
+# live:  cells in a state the rule counts live, held at the u64 ceiling
+rec Node {
+    kids:  [4]u32;
+    full:  u32;
+    slow:  u32;
+    next:  u32;
+    level: u8;
+    sk:    u8;
+    flags: u8;
+    heat:  u8;
+    pop:   u64;
+    live:  u64;
+}
+
+# Node.flags
+val USED: u8 = 1;
+val MARK: u8 = 2;
+
+# the chunks an edit or a read has taken out of the tree
+# ---
+# at:    each chunk's column and row, 2 a chunk
+# cells: each chunk's states, CELLS a chunk, row-major
+# dirty: each chunk was written since it was taken out
+# n:     chunks held
+# hash:  entry per bucket, NONE when empty, linear probing
+# hcap:  buckets
+rec Cache {
+    at:    *i64;
+    cells: *u8;
+    dirty: *u8;
+    n:     usize;
+    hash:  *u32;
+    hcap:  usize;
+}
+
+# the tree
+# ---
+# a:      allocator behind the table and the cache
+# made:   the table is allocated
+# max:    the most nodes the table may hold
+# nodes:  the table
+# cap:    nodes allocated
+# hi:     ids in use lie below this
+# used:   nodes in use, the cells included
+# free:   the first free id below hi, NONE when none
+# heads:  first node per hash bucket
+# hcap:   buckets, a power of two
+# empty:  the empty node of each level, NONE until made
+# r:      the rule
+# states: states a cell of the rule can be in
+# lit:    each state is one the rule's sense counts live
+# hue:    the heat the rule's word for each state carries
+# table:  next state of every 3 by 3 block of a two-state rule, bit i of the
+#         index the block's cell i
+# tabled: table holds the rule's
+# k:      the step exponent
+# root:   the world
+# level:  the root's level
+# full:   the table could not make a node
+# cache:  the chunks taken out for editing
+pub rec Tree {
+    a:      *allo.Allocator;
+    made:   bool;
+    max:    usize;
+    nodes:  *Node;
+    cap:    usize;
+    hi:     usize;
+    used:   usize;
+    free:   u32;
+    heads:  *u32;
+    hcap:   usize;
+    empty:  [61]u32;
+    r:      rule.Rule;
+    states: u32;
+    lit:    [256]u8;
+    hue:    [256]u8;
+    table:  [512]u8;
+    tabled: bool;
+    k:      u32;
+    root:   u32;
+    level:  u32;
+    full:   bool;
+    cache:  Cache;
+}
+
+# a tree with nothing allocated, to hold at most max nodes once it is made
+# ---
+# t:   the tree
+# a:   allocator for the table
+# max: the most nodes, at least a few thousand
+pub fun init(t: *Tree, a: *allo.Allocator, max: usize) {
+    t.a    = a;
+    t.made = false;
+    t.max  = max;
+    t.cap  = 0;
+    t.k    = 0;
+    t.full = false;
+    # until a rule is set, every state but 0 shows as a live cell at full heat
+    var i: usize = 0;
+    for (i < MAX_STATES::usize) {
+        t.lit[i] = 0;
+        t.hue[i] = 0;
+        if (i != 0) {
+            t.lit[i] = 1;
+            t.hue[i] = 255;
+        }
+        i = i + 1;
+    }
+}
+
+# release the table and the cache
+pub fun dnit(t: *Tree) {
+    if (!t.made) { ret; }
+    allo.deallocate[Node](t.a, t.nodes, t.cap);
+    allo.deallocate[u32](t.a, t.heads, t.hcap);
+    allo.deallocate[i64](t.a, t.cache.at, CACHE_MAX * 2);
+    allo.deallocate[u8](t.a, t.cache.cells, CACHE_MAX * CELLS);
+    allo.deallocate[u8](t.a, t.cache.dirty, CACHE_MAX);
+    allo.deallocate[u32](t.a, t.cache.hash, t.cache.hcap);
+    t.made = false;
+    t.cap  = 0;
+}
+
+# buckets for n nodes: a power of two, at least one a node
+fun buckets(n: usize) usize {
+    var b: usize = 1;
+    for (b < n) { b = b * 2; }
+    ret b;
+}
+
+fun hash4(a: u32, b: u32, c: u32, d: u32) u64 {
+    var h: u64 = a::u64 * 0x9e3779b97f4a7c15;
+    h = (h ^ (h >> 29)) + b::u64 * 0xc2b2ae3d27d4eb4f;
+    h = (h ^ (h >> 31)) + c::u64 * 0x165667b19e3779f9;
+    h = (h ^ (h >> 27)) + d::u64 * 0x27d4eb2f165667c5;
+    ret h ^ (h >> 33);
+}
+
+fun bucket(t: *Tree, n: u32) usize {
+    val d: *Node = ?t.nodes[n::usize];
+    ret (hash4(d.kids[0], d.kids[1], d.kids[2], d.kids[3])::usize) & (t.hcap - 1);
+}
+
+# chain every node in use into the buckets afresh
+fun rehash(t: *Tree) {
+    mem.fill[u32](t.heads, NONE, t.hcap);
+    var i: usize = MAX_STATES::usize;
+    for (i < t.hi) {
+        if ((t.nodes[i].flags & USED) != 0) {
+            val b: usize = bucket(t, i::u32);
+            t.nodes[i].next = t.heads[b];
+            t.heads[b]      = i::u32;
+        }
+        i = i + 1;
+    }
+}
+
+# the table at cap nodes, the old one carried over
+fun grow(t: *Tree, cap: usize) bool {
+    val rn: res[*Node, allo.Error] = allo.zallocate[Node](t.a, cap);
+    if (sel rn.err) { ret false; }
+    val hcap: usize                 = buckets(cap);
+    val rh:   res[*u32, allo.Error] = allo.allocate[u32](t.a, hcap);
+    if (sel rh.err) {
+        allo.deallocate[Node](t.a, rn.ok, cap);
+        ret false;
+    }
+    if (t.cap != 0) {
+        mem.copy[Node](rn.ok, t.nodes, t.hi);
+        allo.deallocate[Node](t.a, t.nodes, t.cap);
+        allo.deallocate[u32](t.a, t.heads, t.hcap);
+    }
+    t.nodes = rn.ok;
+    t.cap   = cap;
+    t.heads = rh.ok;
+    t.hcap  = hcap;
+    # the free list runs through next, which rehash rewrites for nodes in use only
+    rehash(t);
+    ret true;
+}
+
+# allocate the table and the cache, once
+# ---
+# ret: false when the allocator refused them
+pub fun make(t: *Tree) bool {
+    if (t.made) { ret true; }
+    var first: usize = FIRST;
+    if (first > t.max)                 { first = t.max; }
+    if (first < MAX_STATES::usize * 2) { first = MAX_STATES::usize * 2; }
+    t.cap = 0;
+    t.hi  = 0;
+    if (!grow(t, first)) { ret false; }
+    var at:    *i64                  = nil;
+    var cells: *u8                   = nil;
+    var dirty: *u8                   = nil;
+    var hash:  *u32                  = nil;
+    val hc:    usize                 = buckets(CACHE_MAX * 2);
+    val ra:    res[*i64, allo.Error] = allo.allocate[i64](t.a, CACHE_MAX * 2);
+    if (sel ra.ok) { at = ra.ok; }
+    val rc: res[*u8, allo.Error] = allo.allocate[u8](t.a, CACHE_MAX * CELLS);
+    if (sel rc.ok) { cells = rc.ok; }
+    val rd: res[*u8, allo.Error] = allo.allocate[u8](t.a, CACHE_MAX);
+    if (sel rd.ok) { dirty = rd.ok; }
+    val rh: res[*u32, allo.Error] = allo.allocate[u32](t.a, hc);
+    if (sel rh.ok) { hash = rh.ok; }
+    if (at == nil || cells == nil || dirty == nil || hash == nil) {
+        if (at != nil)    { allo.deallocate[i64](t.a, at, CACHE_MAX * 2); }
+        if (cells != nil) { allo.deallocate[u8](t.a, cells, CACHE_MAX * CELLS); }
+        if (dirty != nil) { allo.deallocate[u8](t.a, dirty, CACHE_MAX); }
+        if (hash != nil)  { allo.deallocate[u32](t.a, hash, hc); }
+        allo.deallocate[Node](t.a, t.nodes, t.cap);
+        allo.deallocate[u32](t.a, t.heads, t.hcap);
+        t.cap = 0;
+        ret false;
+    }
+    t.cache.at    = at;
+    t.cache.cells = cells;
+    t.cache.dirty = dirty;
+    t.cache.hash  = hash;
+    t.cache.hcap  = hc;
+    t.cache.n     = 0;
+    mem.fill[u32](t.cache.hash, NONE, hc);
+    t.made = true;
+    clear(t);
+    ret true;
+}
+
+# empty the world, keeping the rule, the exponent and the table's size
+pub fun clear(t: *Tree) {
+    if (!t.made) { ret; }
+    mem.zero[Node](t.nodes, t.hi);
+    var i: u32 = 0;
+    for (i < MAX_STATES) {
+        val n: *Node = ?t.nodes[i::usize];
+        n.flags = USED;
+        n.full  = NONE;
+        n.slow  = NONE;
+        n.live  = t.lit[i::usize]::u64;
+        n.heat  = t.hue[i::usize];
+        if (i != 0) { n.pop = 1; }
+        i = i + 1;
+    }
+    t.hi   = MAX_STATES::usize;
+    t.used = t.hi;
+    t.free = NONE;
+    mem.fill[u32](t.heads, NONE, t.hcap);
+    var l: usize = 0;
+    for (l < 61) {
+        t.empty[l] = NONE;
+        l          = l + 1;
+    }
+    t.empty[0] = 0;
+    t.full     = false;
+    t.cache.n  = 0;
+    mem.fill[u32](t.cache.hash, NONE, t.cache.hcap);
+    t.level = MIN_LEVEL;
+    t.root  = empty(t, MIN_LEVEL);
+}
+
+# the level of a node
+pub fun level_of(t: *Tree, n: u32) u32 {
+    ret t.nodes[n::usize].level::u32;
+}
+
+# the cells of a node in a state other than 0
+pub fun pop(t: *Tree, n: u32) u64 {
+    if (n == NONE) { ret 0; }
+    ret t.nodes[n::usize].pop;
+}
+
+# the cells of a node in a state the rule counts live
+pub fun live(t: *Tree, n: u32) u64 {
+    if (n == NONE) { ret 0; }
+    ret t.nodes[n::usize].live;
+}
+
+# the most heat the rule's word for any cell of a node carries
+pub fun heat(t: *Tree, n: u32) u32 {
+    if (n == NONE) { ret 0; }
+    ret t.nodes[n::usize].heat::u32;
+}
+
+# child q of a node, nw 0, ne 1, sw 2, se 3, or NONE for NONE
+pub fun kid(t: *Tree, n: u32, q: usize) u32 {
+    if (n == NONE) { ret NONE; }
+    ret t.nodes[n::usize].kids[q];
+}
+
+fun add_pop(a: u64, b: u64) u64 {
+    val s: u64 = a + b;
+    if (s < a) { ret 0xffffffffffffffff; }
+    ret s;
+}
+
+# the node of four children of one level, found or made
+# ---
+# ret: the node, or NONE when a child is NONE or the table is full
+pub fun node(t: *Tree, nw: u32, ne: u32, sw: u32, se: u32) u32 {
+    if (nw == NONE || ne == NONE || sw == NONE || se == NONE) { ret NONE; }
+    val b: usize = (hash4(nw, ne, sw, se)::usize) & (t.hcap - 1);
+    var i: u32   = t.heads[b];
+    for (i != NONE) {
+        val d: *Node = ?t.nodes[i::usize];
+        if (d.kids[0] == nw && d.kids[1] == ne && d.kids[2] == sw && d.kids[3] == se) { ret i; }
+        i = t.nodes[i::usize].next;
+    }
+    var id: u32 = t.free;
+    if (id != NONE) { t.free = t.nodes[id::usize].next; }
+    or {
+        if (t.hi >= t.max) {
+            t.full = true;
+            ret NONE;
+        }
+        if (t.hi == t.cap) {
+            var cap: usize = t.cap * 2;
+            if (cap > t.max) { cap = t.max; }
+            if (!grow(t, cap)) {
+                t.full = true;
+                ret NONE;
+            }
+        }
+        id   = t.hi::u32;
+        t.hi = t.hi + 1;
+    }
+    val bb: usize = (hash4(nw, ne, sw, se)::usize) & (t.hcap - 1);
+    val n:  *Node = ?t.nodes[id::usize];
+    n.kids[0]   = nw;
+    n.kids[1]   = ne;
+    n.kids[2]   = sw;
+    n.kids[3]   = se;
+    n.full      = NONE;
+    n.slow      = NONE;
+    n.sk        = 0;
+    n.flags     = USED;
+    n.level     = (t.nodes[nw::usize].level + 1)::u8;
+    n.pop       = add_pop(add_pop(t.nodes[nw::usize].pop, t.nodes[ne::usize].pop), add_pop(t.nodes[sw::usize].pop, t.nodes[se::usize].pop));
+    n.next      = t.heads[bb];
+    t.heads[bb] = id;
+    t.used      = t.used + 1;
+    light(t, id);
+    ret id;
+}
+
+# work out a node's live cells and heat from its children's
+fun light(t: *Tree, n: u32) {
+    val d:    *Node = ?t.nodes[n::usize];
+    var live: u64   = 0;
+    var heat: u8    = 0;
+    var q:    usize = 0;
+    for (q < 4) {
+        val k: *Node = ?t.nodes[d.kids[q]::usize];
+        live = add_pop(live, k.live);
+        if (k.heat > heat) { heat = k.heat; }
+        q = q + 1;
+    }
+    d.live = live;
+    d.heat = heat;
+}
+
+# light a node once its children are, each node once, marking those done
+fun relight_from(t: *Tree, n: u32) {
+    val d: *Node = ?t.nodes[n::usize];
+    d.flags = d.flags | MARK;
+    var q: usize = 0;
+    for (q < 4) {
+        val k: u32 = d.kids[q];
+        if (k >= MAX_STATES && (t.nodes[k::usize].flags & MARK) == 0) { relight_from(t, k); }
+        q = q + 1;
+    }
+    light(t, n);
+}
+
+# work out every node's live cells and heat afresh, for a rule that words the
+# states otherwise
+fun relight(t: *Tree) {
+    var i: usize = 0;
+    for (i < MAX_STATES::usize) {
+        t.nodes[i].live = t.lit[i]::u64;
+        t.nodes[i].heat = t.hue[i];
+        i               = i + 1;
+    }
+    i = MAX_STATES::usize;
+    for (i < t.hi) {
+        val f: u8 = t.nodes[i].flags;
+        if ((f & USED) != 0 && (f & MARK) == 0) { relight_from(t, i::u32); }
+        i = i + 1;
+    }
+    i = MAX_STATES::usize;
+    for (i < t.hi) {
+        t.nodes[i].flags = t.nodes[i].flags & USED;
+        i                = i + 1;
+    }
+}
+
+# the empty node of a level
+pub fun empty(t: *Tree, level: u32) u32 {
+    if (t.empty[level::usize] != NONE) { ret t.empty[level::usize]; }
+    val e: u32 = empty(t, level - 1);
+    val n: u32 = node(t, e, e, e, e);
+    t.empty[level::usize] = n;
+    ret n;
+}
+
+# the centre half of a node, one level down, no time passing
+fun centre(t: *Tree, n: u32) u32 {
+    ret node(t, kid(t, kid(t, n, 0), 3), kid(t, kid(t, n, 1), 2), kid(t, kid(t, n, 2), 1), kid(t, kid(t, n, 3), 0));
+}
+
+# the square of a node's level straddling the border of two side by side
+fun across(t: *Tree, w: u32, e: u32) u32 {
+    ret node(t, kid(t, w, 1), kid(t, e, 0), kid(t, w, 3), kid(t, e, 2));
+}
+
+# the square of a node's level straddling the border of two stacked
+fun down(t: *Tree, n: u32, s: u32) u32 {
+    ret node(t, kid(t, n, 2), kid(t, n, 3), kid(t, s, 0), kid(t, s, 1));
+}
+
+# a node one level up with n at its centre and empty around it
+fun expand(t: *Tree, n: u32) u32 {
+    if (n == NONE) { ret NONE; }
+    val e: u32 = empty(t, level_of(t, n) - 1);
+    ret node(t, node(t, e, e, e, kid(t, n, 0)), node(t, e, e, kid(t, n, 1), e), node(t, e, kid(t, n, 2), e, e), node(t, kid(t, n, 3), e, e, e));
+}
+
+# the state of the cell at (x, y) of a 4 by 4 node's cells, rows then columns
+fun cell4(t: *Tree, n: u32, x: usize, y: usize) u32 {
+    ret kid(t, kid(t, n, (y / 2) * 2 + x / 2), (y % 2) * 2 + x % 2);
+}
+
+# the next state of the cell at (x, y) of a 4 by 4 node, x and y in 1..2
+fun next4(t: *Tree, n: u32, x: usize, y: usize) u32 {
+    var nb: [9]u32;
+    var i:  usize = 0;
+    for (i < 9) {
+        nb[i] = cell4(t, n, x + i % 3 - 1, y + i / 3 - 1);
+        i     = i + 1;
+    }
+    if (t.tabled) {
+        var idx: usize = 0;
+        i = 0;
+        for (i < 9) {
+            if (nb[i] != 0) { idx = idx | ((1::usize) << i::u64); }
+            i = i + 1;
+        }
+        ret t.table[idx]::u32;
+    }
+    ret rule.next(?t.r, ?nb[0]);
+}
+
+# the base case: a 4 by 4 node's centre 2 by 2 one generation on
+fun base(t: *Tree, n: u32) u32 {
+    ret node(t, next4(t, n, 1, 1), next4(t, n, 2, 1), next4(t, n, 1, 2), next4(t, n, 2, 2));
+}
+
+# a node's centre half, 2^min(k, level - 2) generations on
+# ---
+# t:   the tree
+# n:   a node of level 2 or more, or NONE
+# ret: the result, or NONE when the table filled
+fun result(t: *Tree, n: u32) u32 {
+    if (n == NONE) { ret NONE; }
+    val l:    u32  = level_of(t, n);
+    val fast: bool = l - 2 <= t.k;
+    if (t.nodes[n::usize].pop == 0)                                                  { ret empty(t, l - 1); }
+    if (fast && t.nodes[n::usize].full != NONE)                                      { ret t.nodes[n::usize].full; }
+    if (!fast && t.nodes[n::usize].slow != NONE && t.nodes[n::usize].sk::u32 == t.k) { ret t.nodes[n::usize].slow; }
+    var r: u32 = NONE;
+    if (l == 2) { r = base(t, n); }
+    or {
+        val nw: u32 = kid(t, n, 0);
+        val ne: u32 = kid(t, n, 1);
+        val sw: u32 = kid(t, n, 2);
+        val se: u32 = kid(t, n, 3);
+        var s:  [9]u32;
+        s[0] = nw;
+        s[1] = across(t, nw, ne);
+        s[2] = ne;
+        s[3] = down(t, nw, sw);
+        s[4] = centre(t, n);
+        s[5] = down(t, ne, se);
+        s[6] = sw;
+        s[7] = across(t, sw, se);
+        s[8] = se;
+        var c: [9]u32;
+        var i: usize = 0;
+        for (i < 9) {
+            # at full speed the first half of the time passes here, and on the slow
+            # path none does
+            if (fast) { c[i] = result(t, s[i]); }
+            or        { c[i] = centre(t, s[i]); }
+            i = i + 1;
+        }
+        r = node(t, result(t, node(t, c[0], c[1], c[3], c[4])), result(t, node(t, c[1], c[2], c[4], c[5])),
+            result(t, node(t, c[3], c[4], c[6], c[7])), result(t, node(t, c[4], c[5], c[7], c[8])));
+    }
+    if (r == NONE) { ret NONE; }
+    if (fast)      { t.nodes[n::usize].full = r; }
+    or {
+        t.nodes[n::usize].slow = r;
+        t.nodes[n::usize].sk   = t.k::u8;
+    }
+    ret r;
+}
+
+# take the rule a tree runs, forgetting every result worked out under another
+# ---
+# t: the tree, made or not
+# r: a rule caps says a quadtree engine can run, of at most MAX_STATES states
+pub fun set_rule(t: *Tree, r: rule.Rule) {
+    t.r      = r;
+    t.states = rule.states(?t.r);
+    t.tabled = t.states == 2;
+    val sn:    layout.Sense = rule.sense(?t.r);
+    var shown: bool         = false;
+    var st:    u32          = 0;
+    for (st < MAX_STATES) {
+        # a state past the rule's is read as the rule words it, as the pool would hold it
+        val w:   u32 = rule.word(?t.r, st);
+        val lit: u8  = layout.live(w, sn.live_mask, sn.live_lo, sn.live_hi)::u8;
+        val hue: u8  = layout.texel_heat(w, sn.heat_shift, sn.heat_mask)::u8;
+        if (lit != t.lit[st::usize] || hue != t.hue[st::usize]) { shown = true; }
+        t.lit[st::usize] = lit;
+        t.hue[st::usize] = hue;
+        st               = st + 1;
+    }
+    if (shown && t.made) { relight(t); }
+    if (t.tabled) {
+        var nb:  [9]u32;
+        var idx: usize = 0;
+        for (idx < 512) {
+            var i: usize = 0;
+            for (i < 9) {
+                nb[i] = ((idx >> i::u64) & 1)::u32;
+                i     = i + 1;
+            }
+            t.table[idx] = rule.next(?t.r, ?nb[0])::u8;
+            idx          = idx + 1;
+        }
+    }
+    forget(t);
+}
+
+# forget every result, which a new rule makes wrong
+fun forget(t: *Tree) {
+    if (!t.made) { ret; }
+    var i: usize = 0;
+    for (i < t.hi) {
+        t.nodes[i].full = NONE;
+        t.nodes[i].slow = NONE;
+        i               = i + 1;
+    }
+}
+
+fun clip(t: *Tree, n: u32, states: u32, map: *u32) u32 {
+    if (n == NONE) { ret NONE; }
+    if (n < MAX_STATES) {
+        if (n >= states) { ret 0; }
+        ret n;
+    }
+    if (map[n::usize] != NONE) { ret map[n::usize]; }
+    val r: u32 = node(t, clip(t, kid(t, n, 0), states, map), clip(t, kid(t, n, 1), states, map),
+        clip(t, kid(t, n, 2), states, map), clip(t, kid(t, n, 3), states, map));
+    map[n::usize] = r;
+    ret r;
+}
+
+# make every cell of a state a rule of fewer states lacks the quiescent 0
+# ---
+# t:      the tree
+# states: the states the rule has
+# ret:    false when the scratch map or a node could not be made, leaving the
+#         world as it was
+pub fun limit_states(t: *Tree, states: u32) bool {
+    if (!t.made) { ret true; }
+    val hi: usize                 = t.hi;
+    val rm: res[*u32, allo.Error] = allo.allocate[u32](t.a, hi);
+    if (sel rm.err) { ret false; }
+    mem.fill[u32](rm.ok, NONE, hi);
+    val n: u32 = clip(t, t.root, states, rm.ok);
+    allo.deallocate[u32](t.a, rm.ok, hi);
+    if (n == NONE) { ret false; }
+    t.root = n;
+    ret true;
+}
+
+# set the step exponent, so a step advances 2^k generations
+pub fun set_exponent(t: *Tree, k: u32) {
+    t.k = k;
+    if (t.k > MAX_EXPONENT) { t.k = MAX_EXPONENT; }
+}
+
+fun mark(t: *Tree, n: u32) {
+    if (n == NONE || n < MAX_STATES) { ret; }
+    val nd: *Node = ?t.nodes[n::usize];
+    if ((nd.flags & MARK) != 0) { ret; }
+    nd.flags = nd.flags | MARK;
+    var q: usize = 0;
+    for (q < 4) {
+        mark(t, t.nodes[n::usize].kids[q]);
+        q = q + 1;
+    }
+}
+
+# free every node the root and the empty squares do not reach, and forget the
+# results that named one
+# ---
+# t:     the tree
+# extra: another node to keep, or NONE
+pub fun collect(t: *Tree, extra: u32) {
+    if (!t.made) { ret; }
+    mark(t, t.root);
+    mark(t, extra);
+    var l: usize = 0;
+    for (l < 61) {
+        mark(t, t.empty[l]);
+        l = l + 1;
+    }
+    t.free = NONE;
+    var i: usize = t.hi;
+    for (i > MAX_STATES::usize) {
+        i = i - 1;
+        val n: *Node = ?t.nodes[i];
+        if (n.flags == USED) {
+            n.flags = 0;
+            t.used  = t.used - 1;
+        }
+        if (n.flags == 0) {
+            n.next = t.free;
+            t.free = i::u32;
+        }
+    }
+    i = MAX_STATES::usize;
+    for (i < t.hi) {
+        val n: *Node = ?t.nodes[i];
+        if (n.flags != 0) {
+            n.flags = USED;
+            if (n.full != NONE && n.full >= MAX_STATES && t.nodes[n.full::usize].flags == 0) { n.full = NONE; }
+            if (n.slow != NONE && n.slow >= MAX_STATES && t.nodes[n.slow::usize].flags == 0) { n.slow = NONE; }
+        }
+        i = i + 1;
+    }
+    rehash(t);
+    t.full = false;
+}
+
+# collect when the table is three quarters full
+pub fun tidy(t: *Tree, extra: u32) {
+    if (t.used >= t.max - t.max / 4) { collect(t, extra); }
+}
+
+# whether the root's live cells all lie in its centre quarter
+fun centred(t: *Tree) bool {
+    val r:     u32 = t.root;
+    val inner: u64 = add_pop(add_pop(pop(t, kid(t, kid(t, kid(t, r, 0), 3), 3)), pop(t, kid(t, kid(t, kid(t, r, 1), 2), 2))),
+        add_pop(pop(t, kid(t, kid(t, kid(t, r, 2), 1), 1)), pop(t, kid(t, kid(t, kid(t, r, 3), 0), 0))));
+    ret inner == pop(t, r);
+}
+
+# pad the root with empty squares, centred, up to a level
+fun pad_to(t: *Tree, level: u32) bool {
+    for (t.level < level) {
+        val n: u32 = expand(t, t.root);
+        if (n == NONE) { ret false; }
+        t.root  = n;
+        t.level = t.level + 1;
+    }
+    ret true;
+}
+
+# advance the world 2^k generations
+#
+# a failure leaves the world as it was, and collect then retry may succeed.
+# ---
+# t:   the tree, made
+# ret: false when the table filled or the root would pass MAX_LEVEL
+pub fun step(t: *Tree) bool {
+    tidy(t, NONE);
+    if (!pad_to(t, t.k + 3)) { ret false; }
+    for (!centred(t)) {
+        if (t.level >= MAX_LEVEL) {
+            t.full = true;
+            ret false;
+        }
+        if (!pad_to(t, t.level + 1)) { ret false; }
+    }
+    val r: u32 = result(t, t.root);
+    if (r == NONE) { ret false; }
+    t.root  = r;
+    t.level = t.level - 1;
+    ret pad_to(t, MIN_LEVEL);
+}
+
+# half the side of the root, the reach of its cells either side of the origin
+fun half(t: *Tree) i64 {
+    ret (1::i64) << (t.level - 1)::i64;
+}
+
+# the state of the cell at (x, y)
+pub fun get(t: *Tree, x: i64, y: i64) u32 {
+    if (!t.made) { ret 0; }
+    val h: i64 = half(t);
+    if (x < 0 - h || y < 0 - h || x >= h || y >= h) { ret 0; }
+    var n:  u32 = t.root;
+    var l:  u32 = t.level;
+    var ox: i64 = 0 - h;
+    var oy: i64 = 0 - h;
+    for (l > 0) {
+        if (t.nodes[n::usize].pop == 0) { ret 0; }
+        val s: i64   = (1::i64) << (l - 1)::i64;
+        var q: usize = 0;
+        if (x >= ox + s) {
+            q  = 1;
+            ox = ox + s;
+        }
+        if (y >= oy + s) {
+            q  = q + 2;
+            oy = oy + s;
+        }
+        n = kid(t, n, q);
+        l = l - 1;
+    }
+    ret n;
+}
+
+# pad the root until it holds the square of side cells with its corner at (x, y)
+fun reach(t: *Tree, x: i64, y: i64, side: i64) bool {
+    for {
+        val h: i64 = half(t);
+        if (x >= 0 - h && y >= 0 - h && x + side <= h && y + side <= h) { ret true; }
+        if (t.level >= MAX_LEVEL) {
+            t.full = true;
+            ret false;
+        }
+        if (!pad_to(t, t.level + 1)) { ret false; }
+    }
+    ret true;
+}
+
+# pad the root until it holds the chunk at (cx, cy)
+fun reach_chunk(t: *Tree, cx: i64, cy: i64) bool {
+    ret reach(t, cx * 64, cy * 64, 64);
+}
+
+# the node of the chunk at (cx, cy)
+fun chunk_node(t: *Tree, cx: i64, cy: i64) u32 {
+    val h: i64 = half(t);
+    if (cx * 64 < 0 - h || cy * 64 < 0 - h || cx * 64 + 64 > h || cy * 64 + 64 > h) { ret empty(t, CHUNK); }
+    var n:  u32 = t.root;
+    var l:  u32 = t.level;
+    var ox: i64 = 0 - h;
+    var oy: i64 = 0 - h;
+    for (l > CHUNK) {
+        if (t.nodes[n::usize].pop == 0) { ret empty(t, CHUNK); }
+        val s: i64   = (1::i64) << (l - 1)::i64;
+        var q: usize = 0;
+        if (cx * 64 >= ox + s) {
+            q  = 1;
+            ox = ox + s;
+        }
+        if (cy * 64 >= oy + s) {
+            q  = q + 2;
+            oy = oy + s;
+        }
+        n = kid(t, n, q);
+        l = l - 1;
+    }
+    ret n;
+}
+
+# a copy of n, of level l with its corner at (ox, oy), with the chunk node c at (cx, cy)
+fun put(t: *Tree, n: u32, l: u32, ox: i64, oy: i64, cx: i64, cy: i64, c: u32) u32 {
+    if (l == CHUNK) { ret c; }
+    val s: i64   = (1::i64) << (l - 1)::i64;
+    var q: usize = 0;
+    var x: i64   = ox;
+    var y: i64   = oy;
+    if (cx * 64 >= ox + s) {
+        q = 1;
+        x = ox + s;
+    }
+    if (cy * 64 >= oy + s) {
+        q = q + 2;
+        y = oy + s;
+    }
+    var k: [4]u32;
+    var i: usize = 0;
+    for (i < 4) {
+        k[i] = kid(t, n, i);
+        i    = i + 1;
+    }
+    k[q] = put(t, k[q], l - 1, x, y, cx, cy, c);
+    ret node(t, k[0], k[1], k[2], k[3]);
+}
+
+# replace the chunk at (cx, cy) with the chunk node c
+# ---
+# ret: false when the table filled or the chunk lies past MAX_LEVEL
+fun graft(t: *Tree, cx: i64, cy: i64, c: u32) bool {
+    if (c == NONE)               { ret false; }
+    if (!reach_chunk(t, cx, cy)) { ret false; }
+    val h: i64 = half(t);
+    val n: u32 = put(t, t.root, t.level, 0 - h, 0 - h, cx, cy, c);
+    if (n == NONE) { ret false; }
+    t.root = n;
+    ret true;
+}
+
+# write a node's cells into out, a row-major grid stride cells wide, from its corner at (x, y)
+fun spill(t: *Tree, n: u32, l: u32, x: usize, y: usize, out: *u8, stride: usize) {
+    if (t.nodes[n::usize].pop == 0) { ret; }
+    if (l == 0) {
+        out[y * stride + x] = n::u8;
+        ret;
+    }
+    val s: usize = (1::usize) << (l - 1)::u64;
+    spill(t, kid(t, n, 0), l - 1, x, y, out, stride);
+    spill(t, kid(t, n, 1), l - 1, x + s, y, out, stride);
+    spill(t, kid(t, n, 2), l - 1, x, y + s, out, stride);
+    spill(t, kid(t, n, 3), l - 1, x + s, y + s, out, stride);
+}
+
+# the node of level l of a row-major grid of states stride cells wide, from its corner at (x, y)
+fun build(t: *Tree, cells: *u8, l: u32, x: usize, y: usize, stride: usize) u32 {
+    if (l == 0) { ret cells[y * stride + x]::u32; }
+    val s: usize = (1::usize) << (l - 1)::u64;
+    ret node(t, build(t, cells, l - 1, x, y, stride), build(t, cells, l - 1, x + s, y, stride),
+        build(t, cells, l - 1, x, y + s, stride), build(t, cells, l - 1, x + s, y + s, stride));
+}
+
+# the chunk node of CELLS states
+fun chunk_of(t: *Tree, cells: *u8) u32 {
+    var i: usize = 0;
+    for (i < CELLS && cells[i] == 0) { i = i + 1; }
+    if (i == CELLS) { ret empty(t, CHUNK); }
+    ret build(t, cells, CHUNK, 0, 0, 64);
+}
+
+# a chunk's CELLS states, copied out of the tree
+# ---
+# t:   the tree, made
+# cx:  chunk column
+# cy:  chunk row
+# out: receives CELLS states, row-major
+pub fun chunk_cells(t: *Tree, cx: i64, cy: i64, out: *u8) {
+    mem.zero[u8](out, CELLS);
+    spill(t, chunk_node(t, cx, cy), CHUNK, 0, 0, out, 64);
+}
+
+# replace a chunk with CELLS states
+# ---
+# ret: false when the table filled
+pub fun set_chunk(t: *Tree, cx: i64, cy: i64, cells: *u8) bool {
+    ret graft(t, cx, cy, chunk_of(t, cells));
+}
+
+fun cache_bucket(c: *Cache, cx: i64, cy: i64) usize {
+    val h: u64 = (cx::u64 * 0x9e3779b97f4a7c15) ^ (cy::u64 * 0xc2b2ae3d27d4eb4f);
+    ret ((h ^ (h >> 29))::usize) & (c.hcap - 1);
+}
+
+# the entry of the chunk at (cx, cy) in the cache, or NONE
+fun cache_find(c: *Cache, cx: i64, cy: i64) u32 {
+    var b: usize = cache_bucket(c, cx, cy);
+    for (c.hash[b] != NONE) {
+        val e: usize = c.hash[b]::usize;
+        if (c.at[e * 2] == cx && c.at[e * 2 + 1] == cy) { ret e::u32; }
+        b = (b + 1) & (c.hcap - 1);
+    }
+    ret NONE;
+}
+
+# graft every written chunk of the cache back into the tree and empty it
+# ---
+# ret: false when the table filled, leaving the chunks not yet grafted lost
+pub fun flush(t: *Tree) bool {
+    if (!t.made) { ret true; }
+    val c:  *Cache = ?t.cache;
+    var ok: bool   = true;
+    var e:  usize  = 0;
+    for (e < c.n && ok) {
+        if (c.dirty[e] != 0) {
+            tidy(t, NONE);
+            ok = set_chunk(t, c.at[e * 2], c.at[e * 2 + 1], ?c.cells[e * CELLS]);
+            if (!ok) {
+                # one chance after a full collection, which the chunks cannot lose
+                collect(t, NONE);
+                ok = set_chunk(t, c.at[e * 2], c.at[e * 2 + 1], ?c.cells[e * CELLS]);
+            }
+        }
+        e = e + 1;
+    }
+    c.n = 0;
+    mem.fill[u32](c.hash, NONE, c.hcap);
+    ret ok;
+}
+
+# the states of the chunk at (cx, cy) to read or write in place, taken out of
+# the tree when the cache does not hold it yet
+#
+# a pointer given out lasts until the next call, which may flush the cache.
+# ---
+# t:    the tree, made
+# cx:   chunk column
+# cy:   chunk row
+# make: take the chunk out even when it holds nothing, to write live cells to
+# ret:  CELLS states, or nil when the chunk is empty and make is false, or the
+#       cache could not be flushed to make room
+pub fun chunk(t: *Tree, cx: i64, cy: i64, make: bool) *u8 {
+    val c: *Cache = ?t.cache;
+    val e: u32    = cache_find(c, cx, cy);
+    if (e != NONE)                                   { ret ?c.cells[e::usize * CELLS]; }
+    if (!make && pop(t, chunk_node(t, cx, cy)) == 0) { ret nil; }
+    if (c.n == CACHE_MAX && !flush(t))               { ret nil; }
+    val n: usize = c.n;
+    c.n             = c.n + 1;
+    c.at[n * 2]     = cx;
+    c.at[n * 2 + 1] = cy;
+    c.dirty[n]      = 0;
+    chunk_cells(t, cx, cy, ?c.cells[n * CELLS]);
+    var b: usize = cache_bucket(c, cx, cy);
+    for (c.hash[b] != NONE) { b = (b + 1) & (c.hcap - 1); }
+    c.hash[b] = n::u32;
+    ret ?c.cells[n * CELLS];
+}
+
+# note that the chunk at (cx, cy), which chunk gave out, was written
+pub fun wrote(t: *Tree, cx: i64, cy: i64) {
+    val e: u32 = cache_find(?t.cache, cx, cy);
+    if (e != NONE) { t.cache.dirty[e::usize] = 1; }
+}
+
+# cells in the world in a state the rule counts live
+pub fun population(t: *Tree) u64 {
+    if (!t.made) { ret 0; }
+    ret live(t, t.root);
+}
+
+# one edge of the live cells in a node: the leftmost column, or with rows the
+# top row, or with far the column or row just past the last
+#
+# best is the edge found so far and any whether there is one. a square that
+# cannot beat it is not searched, and once the half of a square nearer the edge
+# holds a cell the farther half cannot beat that.
+fun edge(t: *Tree, n: u32, l: u32, ox: i64, oy: i64, rows: bool, far: bool, best: i64, any: *bool) i64 {
+    if (t.nodes[n::usize].live == 0) { ret best; }
+    val side: i64 = (1::i64) << l::i64;
+    var o:    i64 = ox;
+    if (rows)                            { o = oy; }
+    if (@any && !far && o >= best)       { ret best; }
+    if (@any && far && o + side <= best) { ret best; }
+    if (l == 0) {
+        @any = true;
+        if (far) { ret o + 1; }
+        ret o;
+    }
+    val s: i64 = side / 2;
+    # the quadrants in order: the nearer half's two, then the farther half's
+    var qs: [4]usize;
+    qs[0] = 0;
+    qs[1] = 2;
+    qs[2] = 1;
+    qs[3] = 3;
+    if (rows) {
+        qs[1] = 1;
+        qs[2] = 2;
+    }
+    if (far) {
+        val a: usize = qs[0];
+        val b: usize = qs[1];
+        qs[0] = qs[2];
+        qs[1] = qs[3];
+        qs[2] = a;
+        qs[3] = b;
+    }
+    val had: bool  = @any;
+    var got: i64   = best;
+    var i:   usize = 0;
+    for (i < 4) {
+        if (i == 2 && ((!had && @any) || got != best)) { ret got; }
+        val q: usize = qs[i];
+        var x: i64   = ox;
+        var y: i64   = oy;
+        if (q == 1 || q == 3) { x = ox + s; }
+        if (q >= 2)           { y = oy + s; }
+        got = edge(t, kid(t, n, q), l - 1, x, y, rows, far, got, any);
+        i   = i + 1;
+    }
+    ret got;
+}
+
+# the smallest box holding every live cell, as x0, y0, x1, y1 half-open
+# ---
+# t:   the tree
+# out: receives four coordinates
+# ret: false when nothing is alive
+pub fun bounds(t: *Tree, out: *i64) bool {
+    if (population(t) == 0) { ret false; }
+    val h: i64   = half(t);
+    var i: usize = 0;
+    for (i < 4) {
+        var any: bool = false;
+        out[i] = edge(t, t.root, t.level, 0 - h, 0 - h, i % 2 == 1, i >= 2, 0, ?any);
+        i      = i + 1;
+    }
+    ret true;
+}
+
+# a node with every cell outside [x0, x1) by [y0, y1) made dead
+fun crop(t: *Tree, n: u32, l: u32, ox: i64, oy: i64, b: *i64) u32 {
+    if (n == NONE || t.nodes[n::usize].pop == 0) { ret n; }
+    val side: i64 = (1::i64) << l::i64;
+    if (ox >= b[0] && oy >= b[1] && ox + side <= b[2] && oy + side <= b[3]) { ret n; }
+    if (ox >= b[2] || oy >= b[3] || ox + side <= b[0] || oy + side <= b[1]) { ret empty(t, l); }
+    val s: i64 = side / 2;
+    ret node(t, crop(t, kid(t, n, 0), l - 1, ox, oy, b), crop(t, kid(t, n, 1), l - 1, ox + s, oy, b),
+        crop(t, kid(t, n, 2), l - 1, ox, oy + s, b), crop(t, kid(t, n, 3), l - 1, ox + s, oy + s, b));
+}
+
+# kill every cell outside [x0, x1) by [y0, y1)
+# ---
+# ret: false when the table filled, leaving the world as it was
+pub fun keep_inside(t: *Tree, x0: i64, y0: i64, x1: i64, y1: i64) bool {
+    if (!t.made) { ret true; }
+    var b: [4]i64;
+    b[0] = x0;
+    b[1] = y0;
+    b[2] = x1;
+    b[3] = y1;
+    tidy(t, NONE);
+    val h: i64 = half(t);
+    val n: u32 = crop(t, t.root, t.level, 0 - h, 0 - h, ?b[0]);
+    if (n == NONE) { ret false; }
+    t.root = n;
+    ret true;
+}
+
+# two nodes of one level being laid one over the other
+rec Pair {
+    under: u32;
+    over:  u32;
+}
+
+# the node of over's live cells laid on under, over's dead cells leaving
+# under's, each pair worked out once
+fun overlay(t: *Tree, under: u32, over: u32, memo: *Map[Pair, u32]) u32 {
+    if (under == NONE || over == NONE) { ret NONE; }
+    if (pop(t, over) == 0)             { ret under; }
+    if (pop(t, under) == 0)            { ret over; }
+    if (level_of(t, over) == 0)        { ret over; }
+    var key:  Pair      = Pair{under: under, over: over};
+    val have: opt[*u32] = map.get[Pair, u32](memo, ?key);
+    if (sel have.some) { ret @have.some; }
+    var k: [4]u32;
+    var i: usize = 0;
+    for (i < 4) {
+        k[i] = overlay(t, kid(t, under, i), kid(t, over, i), memo);
+        i    = i + 1;
+    }
+    val n: u32 = node(t, k[0], k[1], k[2], k[3]);
+    if (n == NONE) { ret NONE; }
+    val put: res[bool, allo.Error] = map.insert[Pair, u32](memo, key, n);
+    if (sel put.err) {
+        t.full = true;
+        ret NONE;
+    }
+    ret n;
+}
+
+# a copy of n, of level l with its corner at (ox, oy), with the node c of
+# level cl laid over the square at (x, y)
+fun paste(t: *Tree, n: u32, l: u32, ox: i64, oy: i64, c: u32, cl: u32, x: i64, y: i64, memo: *Map[Pair, u32]) u32 {
+    if (l == cl) { ret overlay(t, n, c, memo); }
+    val s:  i64   = (1::i64) << (l - 1)::i64;
+    var q:  usize = 0;
+    var qx: i64   = ox;
+    var qy: i64   = oy;
+    if (x >= ox + s) {
+        q  = 1;
+        qx = ox + s;
+    }
+    if (y >= oy + s) {
+        q  = q + 2;
+        qy = oy + s;
+    }
+    var k: [4]u32;
+    var i: usize = 0;
+    for (i < 4) {
+        k[i] = kid(t, n, i);
+        i    = i + 1;
+    }
+    k[q] = paste(t, k[q], l - 1, qx, qy, c, cl, x, y, memo);
+    ret node(t, k[0], k[1], k[2], k[3]);
+}
+
+# lay a node over the world, its live cells replacing the world's and its dead
+# ones leaving them, the cache flushed first
+#
+# the cost follows the distinct pairs of the node's squares and the world's
+# it lands on, not the cells either holds.
+# ---
+# t:   the tree, made
+# n:   a node of the table
+# l:   its level
+# x:   its leftmost column, a multiple of 2^l
+# y:   its top row, a multiple of 2^l
+# ret: false when the table filled or the square lies past MAX_LEVEL, leaving
+#      the world as it was but for the cache's chunks, grafted back
+pub fun lay(t: *Tree, n: u32, l: u32, x: i64, y: i64) bool {
+    if (n == NONE || !flush(t))              { ret false; }
+    if (pop(t, n) == 0)                      { ret true; }
+    if (!reach(t, x, y, (1::i64) << l::i64)) { ret false; }
+    val h:    i64            = half(t);
+    var memo: Map[Pair, u32] = map.init[Pair, u32](t.a);
+    val r:    u32            = paste(t, t.root, t.level, 0 - h, 0 - h, n, l, x, y, ?memo);
+    map.dnit[Pair, u32](?memo);
+    if (r == NONE) { ret false; }
+    t.root = r;
+    ret true;
+}
+
+# what a walk over the tree's chunks hands each live one: its column and row
+# and its CELLS states, row-major
+pub def Visit: fun(*u8, i64, i64, *u8);
+
+fun walk(t: *Tree, n: u32, l: u32, ox: i64, oy: i64, f: Visit, ctx: *u8, buf: *u8) {
+    if (t.nodes[n::usize].pop == 0) { ret; }
+    if (l == CHUNK) {
+        mem.zero[u8](buf, CELLS);
+        spill(t, n, CHUNK, 0, 0, buf, 64);
+        f(ctx, ox >> 6, oy >> 6, buf);
+        ret;
+    }
+    val s: i64 = (1::i64) << (l - 1)::i64;
+    walk(t, kid(t, n, 0), l - 1, ox, oy, f, ctx, buf);
+    walk(t, kid(t, n, 1), l - 1, ox + s, oy, f, ctx, buf);
+    walk(t, kid(t, n, 2), l - 1, ox, oy + s, f, ctx, buf);
+    walk(t, kid(t, n, 3), l - 1, ox + s, oy + s, f, ctx, buf);
+}
+
+fun walk_within(t: *Tree, n: u32, l: u32, ox: i64, oy: i64, b: *i64, f: Visit, ctx: *u8, buf: *u8) {
+    if (t.nodes[n::usize].pop == 0) { ret; }
+    val side: i64 = (1::i64) << l::i64;
+    if (ox >= b[2] || oy >= b[3] || ox + side <= b[0] || oy + side <= b[1]) { ret; }
+    if (l == CHUNK) {
+        mem.zero[u8](buf, CELLS);
+        spill(t, n, CHUNK, 0, 0, buf, 64);
+        f(ctx, ox >> 6, oy >> 6, buf);
+        ret;
+    }
+    val s: i64 = side / 2;
+    walk_within(t, kid(t, n, 0), l - 1, ox, oy, b, f, ctx, buf);
+    walk_within(t, kid(t, n, 1), l - 1, ox + s, oy, b, f, ctx, buf);
+    walk_within(t, kid(t, n, 2), l - 1, ox, oy + s, b, f, ctx, buf);
+    walk_within(t, kid(t, n, 3), l - 1, ox + s, oy + s, b, f, ctx, buf);
+}
+
+# hand f every chunk holding a live cell that meets [x0, x1) by [y0, y1), the
+# box aligned to chunks
+# ---
+# t:   the tree
+# b:   x0, y0, x1, y1
+# f:   the visit
+# ctx: passed back to f
+# buf: CELLS bytes the states are written to
+pub fun chunks_within(t: *Tree, b: *i64, f: Visit, ctx: *u8, buf: *u8) {
+    if (!t.made) { ret; }
+    val h: i64 = half(t);
+    walk_within(t, t.root, t.level, 0 - h, 0 - h, b, f, ctx, buf);
+}
+
+# hand every chunk holding a live cell to f, west to east within north to south
+# quadrants
+# ---
+# t:   the tree
+# f:   the visit
+# ctx: passed back to f
+# buf: CELLS bytes the states are written to
+pub fun chunks(t: *Tree, f: Visit, ctx: *u8, buf: *u8) {
+    if (!t.made) { ret; }
+    val h: i64 = half(t);
+    walk(t, t.root, t.level, 0 - h, 0 - h, f, ctx, buf);
+}
+
+# what a draw of the tree hands each square it shows: its column and row in
+# squares, and its node, whose live cells and heat say how it is drawn and
+# which at level 0 is its one cell's state
+pub def Show: fun(*u8, i64, i64, u32);
+
+fun show_walk(t: *Tree, n: u32, l: u32, ox: i64, oy: i64, s: u32, b: *i64, f: Show, ctx: *u8) {
+    if (t.nodes[n::usize].pop == 0) { ret; }
+    val side: i64 = (1::i64) << l::i64;
+    if (ox >= b[2] || oy >= b[3] || ox + side <= b[0] || oy + side <= b[1]) { ret; }
+    if (l <= s) {
+        f(ctx, ox >> s::i64, oy >> s::i64, n);
+        ret;
+    }
+    val h: i64 = side / 2;
+    show_walk(t, kid(t, n, 0), l - 1, ox, oy, s, b, f, ctx);
+    show_walk(t, kid(t, n, 1), l - 1, ox + h, oy, s, b, f, ctx);
+    show_walk(t, kid(t, n, 2), l - 1, ox, oy + h, s, b, f, ctx);
+    show_walk(t, kid(t, n, 3), l - 1, ox + h, oy + h, s, b, f, ctx);
+}
+
+# hand f every square 2^s cells on a side, aligned to its size, that holds a
+# cell in a state other than 0 and meets [x0, x1) by [y0, y1), with its node
+#
+# a square smaller than 2^s, when the whole root is, is handed as the square it
+# lies in, so one square may be handed more than once and what it shows adds.
+# ---
+# t:   the tree
+# s:   the squares' level
+# b:   x0, y0, x1, y1
+# f:   the visit
+# ctx: passed back to f
+pub fun squares(t: *Tree, s: u32, b: *i64, f: Show, ctx: *u8) {
+    if (!t.made) { ret; }
+    # the root is centred, so it is its quarters that are aligned to their size
+    val h: i64 = half(t);
+    val l: u32 = t.level - 1;
+    show_walk(t, kid(t, t.root, 0), l, 0 - h, 0 - h, s, b, f, ctx);
+    show_walk(t, kid(t, t.root, 1), l, 0, 0 - h, s, b, f, ctx);
+    show_walk(t, kid(t, t.root, 2), l, 0 - h, 0, s, b, f, ctx);
+    show_walk(t, kid(t, t.root, 3), l, 0, 0, s, b, f, ctx);
+}
+
+fun emit(t: *Tree, n: u32, map: *u32, out: *Vector[u32]) u32 {
+    if (map[n::usize] != NONE) { ret map[n::usize]; }
+    val l: u32   = level_of(t, n);
+    var k: [4]u32;
+    var i: usize = 0;
+    for (i < 4) {
+        k[i] = kid(t, n, i);
+        if (l > 1) {
+            k[i] = emit(t, k[i], map, out);
+            if (k[i] == NONE) { ret NONE; }
+        }
+        i = i + 1;
+    }
+    val at: u32                    = (out.len / 5)::u32;
+    val p0: res[usize, allo.Error] = vector.push[u32](out, l);
+    if (sel p0.err) { ret NONE; }
+    i = 0;
+    for (i < 4) {
+        val p: res[usize, allo.Error] = vector.push[u32](out, k[i]);
+        if (sel p.err) { ret NONE; }
+        i = i + 1;
+    }
+    map[n::usize] = at;
+    ret at;
+}
+
+# write the distinct nodes the root reaches into out, children before parents,
+# five words each: the level, then the four children, as states at level 1 and
+# as indices of earlier entries above it, the root last
+# ---
+# t:   the tree, made
+# out: the words, emptied first
+# ret: false when out or the scratch map could not grow
+pub fun export(t: *Tree, out: *Vector[u32]) bool {
+    vector.clear[u32](out);
+    val rm: res[*u32, allo.Error] = allo.allocate[u32](t.a, t.hi);
+    if (sel rm.err) { ret false; }
+    mem.fill[u32](rm.ok, NONE, t.hi);
+    val at: u32 = emit(t, t.root, rm.ok, out);
+    allo.deallocate[u32](t.a, rm.ok, t.hi);
+    ret at != NONE;
+}
+
+# replace the world with nodes export wrote
+# ---
+# t:     the tree, made
+# words: the entries, five words each
+# n:     entries
+# ret:   false when the table filled, leaving the world empty
+pub fun import(t: *Tree, words: *u32, n: usize) bool {
+    clear(t);
+    if (n == 0) { ret true; }
+    val rm: res[*u32, allo.Error] = allo.allocate[u32](t.a, n);
+    if (sel rm.err) { ret false; }
+    val ids: *u32  = rm.ok;
+    var i:   usize = 0;
+    for (i < n) {
+        val w: *u32 = ?words[i * 5];
+        if (w[0] == 1) { ids[i] = node(t, w[1], w[2], w[3], w[4]); }
+        or             { ids[i] = node(t, ids[w[1]::usize], ids[w[2]::usize], ids[w[3]::usize], ids[w[4]::usize]); }
+        if (ids[i] == NONE) {
+            allo.deallocate[u32](t.a, ids, n);
+            clear(t);
+            t.full = true;
+            ret false;
+        }
+        # the nodes made so far are held by later entries only, so nothing is collected here
+        i = i + 1;
+    }
+    t.root  = ids[n - 1];
+    t.level = words[(n - 1) * 5];
+    allo.deallocate[u32](t.a, ids, n);
+    if (!pad_to(t, MIN_LEVEL)) {
+        clear(t);
+        t.full = true;
+        ret false;
+    }
+    ret true;
+}

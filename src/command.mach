@@ -7,11 +7,13 @@
 # would wait a frame on the GPU anyway. a command owns everything it needs, so
 # a queue of them is also a history that can be replayed or undone.
 
-use cellar.kernel;
 use cellar.pattern;
+use cellar.rule;
+use cellar.space;
 use allo: std.allocator;
 use std.collections.vector;
 use std.collections.vector.Vector;
+use std.types.bool.bool;
 use std.types.error.err;
 use std.types.result.res;
 use std.types.size.usize;
@@ -19,18 +21,18 @@ use std.types.string;
 use std.types.string.OwnedString;
 use std.types.string.str;
 
-# a cell set live or dead
+# a cell set to a state
 # ---
 # x: column
 # y: row
-# v: 1 live, 0 dead
+# v: the state, 0 dead
 pub rec Paint {
     x: i64;
     y: i64;
     v: u8;
 }
 
-# every cell on the line from (x0, y0) to (x1, y1) set live or dead
+# every cell on the line from (x0, y0) to (x1, y1) set to a state
 pub rec Line {
     x0: i64;
     y0: i64;
@@ -46,11 +48,57 @@ pub rec Stamp {
     y: i64;
 }
 
+# copy the rectangle into the custom pattern and make it the stamp
+pub val AREA_COPY: u8 = 0;
+# copy the rectangle, then kill its cells
+pub val AREA_CUT: u8 = 1;
+# kill the rectangle's cells
+pub val AREA_CLEAR: u8 = 2;
+# kill every cell outside the rectangle
+pub val AREA_CLEAR_OUTSIDE: u8 = 3;
+# replace the rectangle with a random soup
+pub val AREA_FILL: u8 = 4;
+# flip every cell in the rectangle
+pub val AREA_INVERT: u8 = 5;
+# shrink the selection to the box its live cells span
+pub val AREA_SHRINK: u8 = 6;
+# say what the rectangle's pattern is: a still life, oscillator or spaceship
+pub val AREA_IDENTIFY: u8 = 7;
+# number of area operations
+pub val AREA_COUNT: u8 = 8;
+
+# an operation on a rectangle of the world, the selection it was asked on
+# ---
+# op:  what to do (AREA_*)
+# box: the rectangle, half-open
+pub rec Area {
+    op:  u8;
+    box: space.Box;
+}
+
 # a file a command reads or writes
 # ---
 # path: the file's path, owned by the command
 pub rec File {
     path: OwnedString;
+}
+
+# text pasted from the clipboard, read as a pattern to stamp
+# ---
+# text: the clipboard's text, owned by the command
+# rule: also take the pattern's rule, when it names one cellar can run
+pub rec Paste {
+    text: OwnedString;
+    rule: bool;
+}
+
+# files dropped on the window, the first of which is opened
+# ---
+# file:    the first file, opened as open opens one
+# ignored: how many more were dropped with it and left alone
+pub rec Drop {
+    file:    File;
+    ignored: usize;
 }
 
 # one change to the world or to its files
@@ -63,26 +111,44 @@ pub rec File {
 # line:         set the cells along a line
 # stamp:        overlay a pattern
 # rule:         replace the rule
+# area:         operate on a rectangle
+# reset:        return to the world as it was when play last started
 # save_world:   write the world and the view to a file
 # load_world:   replace the world with a world file's
 # save_pattern: write the custom pattern to a file
 # load_pattern: replace the custom pattern with a pattern file's
 # open:         load a world file as the world, or stamp a pattern file of any
 #               format centred on the origin, taking its rule
+# undo:         put back what the newest change replaced (cellar.journal)
+# redo:         make the change undone last again
+# paste:        read clipboard text as a pattern and make it the stamp
+# drop:         open the first of the files dropped on the window
+# engine:       hold the world in the quadtree (true) or the pool (false)
+# exponent:     step the quadtree 2^this generations at a time
+# jump:         advance the quadtree to this generation
 pub tag Command: u8 {
     toggle;
     step;
     clear;
-    randomize:    usize;
-    paint:        Paint;
-    line:         Line;
-    stamp:        Stamp;
-    rule:         kernel.Kernel;
+    randomize: usize;
+    paint:     Paint;
+    line:      Line;
+    stamp:     Stamp;
+    rule:      rule.Rule;
+    area:      Area;
+    reset;
     save_world:   File;
     load_world:   File;
     save_pattern: File;
     load_pattern: File;
     open:         File;
+    undo;
+    redo;
+    paste:    Paste;
+    drop:     Drop;
+    engine:   bool;
+    exponent: u32;
+    jump:     u64;
 }
 
 # commands waiting for the frame, oldest first
@@ -127,6 +193,8 @@ pub fun release(c: *Command) {
     if (sel c.save_pattern) { string.owned_release(?c.save_pattern.path); }
     if (sel c.load_pattern) { string.owned_release(?c.load_pattern.path); }
     if (sel c.open)         { string.owned_release(?c.open.path); }
+    if (sel c.paste)        { string.owned_release(?c.paste.text); }
+    if (sel c.drop)         { string.owned_release(?c.drop.file.path); }
 }
 
 # add a command to the end, which then owns it

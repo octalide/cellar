@@ -1,0 +1,409 @@
+# the generations family: Life-like births and survivals over the eight
+# neighbours, with cells that die by passing through dying states
+#
+# a rule has n states. a dead cell (0) is born when its live neighbour count is
+# in the birth set, and a live cell (1) stays alive when its count is in the
+# survive set. every other cell moves one state on: a live cell that does not
+# survive starts dying at state 2, and a dying cell passes up to state n-1 and
+# then back to 0. only live cells count as neighbours, so dying cells block
+# births without causing any.
+#
+# its rule string is B/S/C notation, "B2/S/C3" for Brian's Brain, or the older
+# survive/birth/states form Golly also reads, "/2/3". its cell word is
+# cellar.rules.generations.word's, and its step stage is generations_comp.
+
+use cellar.layout;
+use cellar.rules.generations.word;
+use cellar.space;
+use cellar.text;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+#[embed("{artifact.stage-generations_comp.out}")]
+val STAGE: [_]u8;
+
+# what the family's capabilities come to for one rule
+# ---
+# b0:        a dead cell with no live neighbour is born, which parse refuses
+# isotropic: every rotation and reflection of a pattern steps alike
+# hashlife:  a quadtree engine can run it: every rule, whose reach is the
+#            eight neighbours and which never births on 0
+# bounded:   it can run on a bounded grid
+# life_like: it has two states, and so is the Life-like rule of its masks
+pub rec Caps {
+    b0:        bool;
+    isotropic: bool;
+    hashlife:  bool;
+    bounded:   bool;
+    life_like: bool;
+}
+
+# a generations rule
+# ---
+# birth:   bit n set => a dead cell with n live neighbours is born
+# survive: bit n set => a live cell with n live neighbours stays alive
+# states:  how many states a cell can be in, 2 to word.STATES_MAX
+pub rec Rule {
+    birth:   u32;
+    survive: u32;
+    states:  u32;
+}
+
+# lowercase an ASCII letter
+fun lower(c: u8) u8 {
+    if (c >= 'A' && c <= 'Z') { ret c + 32; }
+    ret c;
+}
+
+# read a count list, digits 0 to 8 with commas and blanks between, into a mask
+# ---
+# s:   the text
+# i:   read position, left after the list
+# out: receives the mask
+# ret: false when a digit is beyond the eight neighbours
+fun count_list(s: str, i: *usize, out: *u32) bool {
+    var m: u32 = 0;
+    for (s[@i] != 0 && s[@i] != '/') {
+        val c: u8 = s[@i];
+        if (c >= '0' && c <= '8')              { m = m | (1::u32 << (c - '0')::u32); }
+        or (c != ',' && c != ' ' && c != '\t') { ret false; }
+        @i = @i + 1;
+    }
+    @out = m;
+    ret true;
+}
+
+# read the state count at s[@i] to the end of the text
+fun state_count(s: str, i: *usize, out: *u32) bool {
+    if (s[@i] < '0' || s[@i] > '9') { ret false; }
+    var v: u32 = 0;
+    for (s[@i] >= '0' && s[@i] <= '9') {
+        v  = v * 10 + (s[@i] - '0')::u32;
+        @i = @i + 1;
+        if (v > word.STATES_MAX) { ret false; }
+    }
+    @out = v;
+    ret v >= 2;
+}
+
+# whether a rule string is plausibly this family's, so that a string every
+# family refuses reports the error of the family it meant: one with two slashes,
+# the form's three parts, that starts as either form does, with B, a count or
+# a slash, so a MAP string's base64 slashes are not taken for its parts (see
+# cellar.rules.weighted.claims)
+# ---
+# s: NUL-terminated rule text
+pub fun claims(s: str) bool {
+    var slashes: usize = 0;
+    var i:       usize = 0;
+    for (s[i] == ' ') { i = i + 1; }
+    val c: u8 = lower(s[i]);
+    if (c != 'b' && c != '/' && (c < '0' || c > '9')) { ret false; }
+    for (s[i] != 0) {
+        if (s[i] == '/') { slashes = slashes + 1; }
+        i = i + 1;
+    }
+    ret slashes == 2;
+}
+
+# read the family's rule string: "B2/S/C3" or "/2/3" (survive, birth, states),
+# in any case
+# ---
+# s:   NUL-terminated rule text
+# ret: the rule, or what is wrong with s
+pub fun parse(s: str) res[Rule, str] {
+    var i: usize = 0;
+    var r: Rule;
+    for (s[i] == ' ') { i = i + 1; }
+    val range:  str = "a neighbour count is beyond 8";
+    val shape:  str = "not a B/S/C rule";
+    val states: str = "the state count is not 2 to 256";
+    if (lower(s[i]) == 'b') {
+        i = i + 1;
+        if (!count_list(s, ?i, ?r.birth)) { ret res[Rule, str].err{range}; }
+        if (s[i] != '/')                  { ret res[Rule, str].err{shape}; }
+        i = i + 1;
+        if (lower(s[i]) != 's') { ret res[Rule, str].err{shape}; }
+        i = i + 1;
+        if (!count_list(s, ?i, ?r.survive)) { ret res[Rule, str].err{range}; }
+        if (s[i] != '/')                    { ret res[Rule, str].err{shape}; }
+        i = i + 1;
+        if (lower(s[i]) == 'c') { i = i + 1; }
+    }
+    or {
+        if (!count_list(s, ?i, ?r.survive)) { ret res[Rule, str].err{shape}; }
+        if (s[i] != '/')                    { ret res[Rule, str].err{shape}; }
+        i = i + 1;
+        if (!count_list(s, ?i, ?r.birth)) { ret res[Rule, str].err{range}; }
+        if (s[i] != '/')                  { ret res[Rule, str].err{shape}; }
+        i = i + 1;
+    }
+    if (!state_count(s, ?i, ?r.states)) { ret res[Rule, str].err{states}; }
+    if (s[i] != 0)                      { ret res[Rule, str].err{"text follows the rule"}; }
+    if ((r.birth & 1) != 0)             { ret res[Rule, str].err{"a generations rule cannot birth on 0"}; }
+    ret res[Rule, str].ok{r};
+}
+
+# the longest rule string format writes, less its NUL: "B12345678/S012345678/C256"
+pub val FORMAT_MAX: usize = 25;
+
+# append a mask's counts
+fun buf_mask(buf: *u8, off: usize, mask: u32) usize {
+    var o: usize = off;
+    var n: u32   = 0;
+    for (n < 9) {
+        if (((mask >> n) & 1) != 0) {
+            buf[o] = '0' + n::u8;
+            o      = o + 1;
+        }
+        n = n + 1;
+    }
+    ret o;
+}
+
+# write the family's rule string in B/S/C notation
+# ---
+# r:   the rule
+# buf: at least FORMAT_MAX + 1 bytes
+# ret: buf, which parse reads back as r
+pub fun format(r: *Rule, buf: *u8) str {
+    var o: usize = text.buf_str(buf, 0, "B");
+    o      = buf_mask(buf, o, r.birth);
+    o      = text.buf_str(buf, o, "/S");
+    o      = buf_mask(buf, o, r.survive);
+    o      = text.buf_str(buf, o, "/C");
+    o      = text.buf_u64(buf, o, r.states::u64);
+    buf[o] = 0;
+    ret buf;
+}
+
+# write a rule's short form for the readout, its whole rule string
+# ---
+# r:   the rule
+# buf: at least FORMAT_MAX + 1 bytes
+# ret: buf
+pub fun display(r: *Rule, buf: *u8) str {
+    ret format(r, buf);
+}
+
+# whether two rules step alike
+pub fun same_rule(a: *Rule, b: *Rule) bool {
+    ret a.birth == b.birth && a.survive == b.survive && a.states == b.states;
+}
+
+# how many states a cell of the rule can be in
+pub fun states(r: *Rule) u32 {
+    ret r.states;
+}
+
+# the word a fresh cell of a state is written as
+pub fun word_of(r: *Rule, state: u32) u32 {
+    ret word.word(state, r.states);
+}
+
+# the state a word holds, its heat aside
+pub fun state_of(c: u32) u32 {
+    ret c & word.STATE_MASK;
+}
+
+# how shared code reads the family's cell word
+pub fun sense() layout.Sense {
+    ret word.sense();
+}
+
+# how far one generation reaches: the eight neighbours
+pub fun radius(r: *Rule) usize {
+    ret 1;
+}
+
+# the capabilities the family has for a rule
+pub fun caps(r: *Rule) Caps {
+    ret Caps{b0: false, isotropic: true, hashlife: true, bounded: true, life_like: r.states == 2};
+}
+
+# the next word of a cell given its word and its live neighbour count
+pub fun next(r: *Rule, c: u32, count: u32) u32 {
+    val st:   u32 = c & word.STATE_MASK;
+    var mask: u32 = r.birth;
+    if (st == word.LIVE) { mask = r.survive; }
+    ret word.word(word.next(st, r.states, (mask >> count) & 1), r.states);
+}
+
+# the state a cell becomes from the states of the 3 by 3 block around it
+# ---
+# r:   the rule
+# nb:  the nine states, row-major with the cell at 4
+# ret: its next state
+pub fun next_of(r: *Rule, nb: *u32) u32 {
+    var count: u32   = 0;
+    var i:     usize = 0;
+    for (i < 9) {
+        if (i != 4 && nb[i] == word.LIVE) { count = count + 1; }
+        i = i + 1;
+    }
+    var mask: u32 = r.birth;
+    if (nb[4] == word.LIVE) { mask = r.survive; }
+    ret word.next(nb[4], r.states, (mask >> count) & 1);
+}
+
+# step one chunk on the CPU, the rule the family's stage applies word for word
+#
+# a chunk with no live cell nearby has no births or survivals, so its dying
+# cells only move on. a cell near an edge reads its neighbours from the block,
+# where a chunk that does not exist reads as dead.
+# ---
+# r: the rule
+# b: the chunk's block and back cells
+# t: the tally of the cells written
+pub fun step_chunk(r: *Rule, b: *space.Block, t: *space.Tally) {
+    val own: *u32 = b.nb[4];
+    val out: *u32 = b.out;
+    var ly:  i64  = 0;
+    for (ly < 64) {
+        var lx: i64 = 0;
+        for (lx < 64) {
+            val i:     usize = (ly * 64 + lx)::usize;
+            var count: u32   = 0;
+            if (b.busy) {
+                var dy: i64 = -1;
+                for (dy <= 1) {
+                    var dx: i64 = -1;
+                    for (dx <= 1) {
+                        if (dx != 0 || dy != 0) {
+                            val x: i64 = lx + dx;
+                            val y: i64 = ly + dy;
+                            var c: u32 = 0;
+                            if (x >= 0 && x < 64 && y >= 0 && y < 64) { c = own[(y * 64 + x)::usize]; }
+                            or                                        { c = space.block_cell(b, x, y); }
+                            if ((c & word.STATE_MASK) == word.LIVE)   { count = count + 1; }
+                        }
+                        dx = dx + 1;
+                    }
+                    dy = dy + 1;
+                }
+            }
+            val v: u32 = next(r, own[i], count);
+            out[i] = v;
+            space.note(t, v, lx::u32, ly::u32);
+            lx = lx + 1;
+        }
+        ly = ly + 1;
+    }
+}
+
+# pack a rule into the family's window of the meta head, as its stage reads it
+# ---
+# r: the rule
+# w: layout.RULE words
+pub fun pack(r: *Rule, w: *u32) {
+    var i: usize = 0;
+    for (i < layout.RULE::usize) {
+        w[i] = 0;
+        i    = i + 1;
+    }
+    w[word.BIRTH_AT]   = r.birth;
+    w[word.SURVIVE_AT] = r.survive;
+    w[word.STATES_AT]  = r.states;
+}
+
+# the family's stage binds no rule buffer: a rule fits its window
+pub val TABLE: bool = false;
+
+# the words of the rule buffer a rule needs, none
+pub fun table_words(r: *Rule) usize {
+    ret 0;
+}
+
+# pack a rule into the rule buffer it has none of
+pub fun pack_table(r: *Rule, w: *u32) {}
+
+# the colour a live cell is drawn in: the view's solid colour, the family
+# having no palette of its own
+pub fun colour(r: *Rule, state: u32) opt[u32] {
+    ret opt[u32].none{};
+}
+
+# the family's step stage, as SPIR-V
+# ---
+# len: receives its length in bytes
+# ret: its first byte
+pub fun stage(len: *usize) *u8 {
+    @len = $length_of(STAGE);
+    ret ?STAGE[0];
+}
+
+# rule strings that exercise the family, for the tests that run every family:
+# Brian's Brain, then Star Wars in the survive/birth/states form
+pub val SAMPLE_COUNT: usize = 2;
+
+# the sample rule string i
+pub fun sample(i: usize) str {
+    if (i == 1) { ret "345/2/4"; }
+    ret "B2/S/C3";
+}
+
+test parse__reads_both_notations_and_refuses_the_rest {
+    val bb: res[Rule, str] = parse("b2/s/c3");
+    if (!sel bb.ok)                                                  { ret 1; }
+    if (bb.ok.birth != 4 || bb.ok.survive != 0 || bb.ok.states != 3) { ret 1; }
+    val sw: res[Rule, str] = parse("345/2/4");
+    if (!sel sw.ok)                                                     { ret 2; }
+    if (sw.ok.birth != 4 || sw.ok.survive != 0x38 || sw.ok.states != 4) { ret 2; }
+    val old: res[Rule, str] = parse("/2/3");
+    if (!sel old.ok)                 { ret 3; }
+    if (!same_rule(?old.ok, ?bb.ok)) { ret 3; }
+    val bare: res[Rule, str] = parse("B2/S/3");
+    if (!sel bare.ok)                 { ret 4; }
+    if (!same_rule(?bare.ok, ?bb.ok)) { ret 4; }
+    val a: res[Rule, str] = parse("B3/S23");
+    val b: res[Rule, str] = parse("23/3");
+    val c: res[Rule, str] = parse("B2/S/C1");
+    val d: res[Rule, str] = parse("B2/S/C257");
+    val e: res[Rule, str] = parse("B02/S/C3");
+    val f: res[Rule, str] = parse("B2/S9/C3");
+    val g: res[Rule, str] = parse("B2/S/C3x");
+    if (sel a.ok || sel b.ok || sel c.ok || sel d.ok || sel e.ok || sel f.ok || sel g.ok) { ret 5; }
+    ret 0;
+}
+
+test format__round_trips_through_parse {
+    var buf:  [26]u8;
+    val wide: res[Rule, str] = parse("B12345678/S012345678/C256");
+    if (!sel wide.ok) { ret 1; }
+    format(?wide.ok, ?buf[0]);
+    if (buf[FORMAT_MAX] != 0) { ret 2; }
+    var i: usize = 0;
+    for (i < SAMPLE_COUNT) {
+        val r: res[Rule, str] = parse(sample(i));
+        if (!sel r.ok) { ret 3; }
+        val again: res[Rule, str] = parse(format(?r.ok, ?buf[0]));
+        if (!sel again.ok)                { ret 4; }
+        if (!same_rule(?again.ok, ?r.ok)) { ret 5; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test word__gives_every_state_its_own_heat {
+    var n: u32 = 2;
+    for (n <= word.STATES_MAX) {
+        var st:   u32 = 0;
+        var last: u32 = 256;
+        for (st < n) {
+            val c: u32 = word.word(st, n);
+            if ((c & word.STATE_MASK) != st) { ret 1; }
+            val h: u32 = c >> word.HEAT_SHIFT;
+            if (st != 0 && (h == 0 || h >= last))            { ret 2; }
+            if (layout.live(c, 255, 1, 1) != (st == 1)::u32) { ret 3; }
+            if (st != 0)                                     { last = h; }
+            st = st + 1;
+        }
+        n = n + 1;
+    }
+    ret 0;
+}

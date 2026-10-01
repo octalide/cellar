@@ -6,6 +6,46 @@ All notable changes to cellar are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-30
+
+### Added
+
+- A HashLife engine beside the GPU and CPU engines, with a step exponent and go to generation. Patterns spanning billions of cells run in real time (#52).
+- Generations rules, such as Brian's Brain and Star Wars, on every engine including HashLife (#47, #105).
+- Rule tables. Golly's `.rule` files with `@TABLE`, `@TREE` and `@COLORS` load by name from the data directory or by opening the file, and WireWorld and Langton's Loops are built in (#48).
+- Isotropic non-totalistic rules in Hensel notation and Golly's MAP rules, with tlife and Just Friends as presets (#22).
+- Bounded grids: planes, tori, Klein bottles and cross-surfaces, with Golly's `:P`, `:T`, `:K` and `:C` suffixes. B0 rules run on them as well (#53, #114).
+- Wider weighted kernels up to radius 16 with negative weights, a rule editor that scales to them, and Golly's NW weighted notation (#46, #116, #99).
+- Type a rule string, and a mistyped one reports the error of the family it meant (#44, #133).
+- Undo and redo for every edit, file action and rule change (#40).
+- Reset to the starting generation (#41).
+- A selection tool, and copy and paste as RLE through the clipboard. Dropping a file on the window opens it (#39, #36).
+- A bundled pattern library with search (#42).
+- Macrocell read and write. A Macrocell file loads into HashLife straight from its nodes, and a HashLife world saves the same way, so 2^30-sized patterns open and save in milliseconds (#37, #128, #113).
+- Oscillator and spaceship identification (#55).
+- `cellar run`, a headless batch mode that steps a pattern a number of generations and writes the result (#57).
+- A state picker for multi-state rules. Q and Shift+Q step through the states (#132).
+- The engine and step exponent are kept in settings (#106).
+
+### Changed
+
+- B0 rules run as Golly runs them, strobing or as their complement (#45).
+- Rule families sit behind one contract, and presets come from a data table (#43).
+- Large patterns draw from a texture, and only small ones are edited cell by cell (#91).
+- CPU stepping has fast paths for common rules (#50).
+- The GPU widens its halo while uncapped stepping is bound by reach (#51).
+- Frame-time pacing follows the display's refresh rate instead of assuming 60 Hz (#103).
+- Built on boom 0.39 and std 9.4.1. blit 0.9 comes in through boom.
+
+### Fixed
+
+- Zoomed out, cells draw by coverage instead of dropping out (#56).
+- A Generations world exports every nonzero state (#101).
+- The readout and toast draw on an opaque background (#107).
+- Nothing is drawn under the pointer while it is outside the window (#115).
+- On odd generations of a strobing B0 rule on a bounded grid, population, reads and saves report the cells the view shows (#138).
+- Opening a pattern sets its rule before writing its cells, so states the old rule lacked are kept.
+
 ## [0.4.0] - 2026-09-30
 
 ### Added

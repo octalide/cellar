@@ -6,21 +6,41 @@
 # so a format that cannot hold its pattern in memory, such as a Macrocell
 # quadtree larger than the chunk pool, is as easy to write as a dense one.
 #
-# decoding runs twice, see cellar.formats.load. the first pass has no sink and
-# only validates the input and gathers its Info, the second streams into the
-# sink once the input is known to be good. so a decoder must be a pure function
+# decoding runs more than once, see cellar.formats.load: a validating pass with
+# no sink that gathers the Info, a fitting pass that offers the runs to a sink
+# that measures them, and a writing pass that streams them into the sink once
+# the input is known to be good and to fit. so a decoder must be a pure function
 # of its bytes: same input, same runs, and no effect outside its Emit. it emits
 # only live cells, as runs of one nonzero state in any order that does not
 # overlap, with absolute coordinates, so a sink may rely on each cell arriving
 # at most once. dead cells are implicit.
 #
+# the validating pass has no sink to feed, so a decoder may fill the Info with
+# gather rather than emit its runs there, as long as the Info comes out as the
+# runs would have made it. a format whose runs can far outnumber its bytes, as
+# a quadtree's can, must, so validating a file costs no more than reading it.
+# on the other passes a decoder stops as soon as emit is refused, and a sink
+# that fits refuses once a pattern is past what it can hold, so no pass does
+# more than its sink can take.
+#
 # coordinates are i64 and a run's length a usize, so a format may describe
 # patterns far larger than memory. every number a decoder reads from its input
 # is bounded by LIMIT before it is used in arithmetic.
 #
+# a sink that holds its cells as a quadtree offers the tree to build as well
+# (TreeSink), and a decoder that is one may build it instead, making the
+# file's squares as the sink's nodes and never emitting a run, so a load pays
+# for the file's distinct nodes rather than its cells. the loader asks for this
+# only of a format that builds (Format.builds), and the decoder must build
+# whenever it is asked.
+#
 # an encoder reads its Source row by row, top to bottom and left to right within
 # a row, and may rewind it to read again, so a format that needs two passes over
-# the cells (a quadtree builder, a sizing pass) is expressible too.
+# the cells (a quadtree builder, a sizing pass) is expressible too. a source
+# whose cells are held as a quadtree offers the tree as well (Quadtree), and an
+# encoder that is one may read it instead, paying for the tree's distinct nodes
+# rather than its runs. it must accept the runs all the same, since the tree is
+# optional.
 
 use allo: std.allocator;
 use std.collections.vector.Vector;
@@ -181,7 +201,7 @@ pub fun cover(i: *Info, x0: i64, y0: i64, x1: i64, y1: i64) {
     if (y1 > i.y1) { i.y1 = y1; }
 }
 
-# set NOTE_* flags from what the decode gathered. the rule is not judged here, see cellar.kernel.parse
+# set NOTE_* flags from what the decode gathered. the rule is not judged here, see cellar.rule.parse
 pub fun settle(i: *Info) {
     i.notes = 0;
     if (i.states > 2) { i.notes = i.notes | NOTE_STATES; }
@@ -194,27 +214,81 @@ fun lower(c: u8) u8 {
 
 # a place cells are written to, one run at a time
 #
-# the two-pass decode calls open once with the validated Info, then run for
-# every live run, then close, whatever happened in between.
+# a load asks the sink in order: plan with the validated Info, fit for every
+# live run when the sink fits, open, run for every live run, and close. a
+# format that builds is given the tree instead when the sink offers one: plan,
+# the tree's open, its join and put, and close, with nothing to fit, since a
+# tree has no room to measure. plan and fit only judge, and leave the
+# destination as it was, so a pattern they refuse costs nothing. open is the
+# first step that changes the destination.
+# close is called once for every load plan accepted, whatever happened after,
+# and releases what plan and open took.
 # ---
 # ctx:   the sink's own state, passed back to each callback
-# open:  the pattern is valid and lies inside info's box; false refuses it
+# tree:  the destination as a quadtree, which a decoder that builds fills in
+#        place of fit, open and run, or nil when the sink takes runs only
+# plan:  the pattern is valid and lies inside info's box; false refuses it as
+#        one the sink cannot hold. nil when the box alone refuses nothing
+# fit:   n cells of state v from (x, y) rightward are coming; false refuses the
+#        pattern. nil when the sink needs only the box
+# open:  begin writing the pattern plan accepted; false when the destination
+#        cannot be written
 # run:   n cells of state v from (x, y) rightward; false when they cannot be kept
-# close: the stream ended; false when the destination lost anything
+# close: the load ended; false when the destination lost anything
 pub rec Sink {
     ctx:   *u8;
+    tree:  *TreeSink;
+    plan:  fun(*u8, *Info) bool;
+    fit:   fun(*u8, i64, i64, usize, u8) bool;
     open:  fun(*u8, *Info) bool;
     run:   fun(*u8, i64, i64, usize, u8) bool;
     close: fun(*u8) bool;
+}
+
+# a node a TreeSink could not make
+pub val NO_NODE: u32 = 0xffffffff;
+
+# a quadtree a sink builds a pattern into, for a decoder that is one
+#
+# a node of level l is a 2^l square split into four of level l - 1, nw, ne, sw
+# and se, and a node of level 0 is one cell, its id its state, as in Quadtree.
+# the decoder makes the pattern's squares bottom up with join and lays each
+# finished one with put, the squares it lays not overlapping. the destination's
+# squares are aligned to their size: a square of level l is laid with its
+# corner a multiple of 2^l from (x0, y0) on both axes. so a decoder whose own
+# squares lie otherwise, as Macrocell's lie a row off HashLife's, makes each
+# square of the destination from those of its own that it overlaps.
+# ---
+# ctx:  the destination's own state, passed back to each callback
+# x0:   a corner of the destination's grid in the file's coordinates, set by
+#       the time open is called
+# y0:   its row
+# open: begin writing the pattern plan accepted, in place of Sink.open
+# join: the node of four nodes of one level, or NO_NODE when it could not be made
+# put:  lay a node of a level with its corner at (x, y) in the file's
+#       coordinates, its live cells replacing the destination's and its dead
+#       ones leaving them; false when it could not be laid
+pub rec TreeSink {
+    ctx:  *u8;
+    x0:   i64;
+    y0:   i64;
+    open: fun(*u8, *Info) bool;
+    join: fun(*u8, u32, u32, u32, u32) u32;
+    put:  fun(*u8, u32, u32, i64, i64) bool;
 }
 
 # the decoder's view of where its cells go
 # ---
 # sink: the destination, nil on the validating pass
 # info: what the decode gathers: metadata, bounds, counts
+# fits: the runs go to the sink's fit rather than its run
+# tree: the sink's tree to build the pattern into instead of emitting its runs,
+#       set on the writing pass of a format that builds when the sink offers one
 pub rec Emit {
     sink: *Sink;
     info: *Info;
+    fits: bool;
+    tree: *TreeSink;
 }
 
 # report n live cells of state v from (x, y) rightward
@@ -229,11 +303,27 @@ pub rec Emit {
 # ret: false when the sink refused the run
 pub fun emit(e: *Emit, x: i64, y: i64, n: usize, v: u8) bool {
     if (n == 0 || v == 0) { ret true; }
-    cover(e.info, x, y, x + n::i64, y + 1);
-    if (v::u32 >= e.info.states) { e.info.states = v::u32 + 1; }
-    e.info.live = e.info.live + n::u64;
+    gather(e.info, x, y, x + n::i64, y + 1, n::u64, v);
     if (e.sink == nil) { ret true; }
+    if (e.fits)        { ret e.sink.fit(e.sink.ctx, x, y, n, v); }
     ret e.sink.run(e.sink.ctx, x, y, n, v);
+}
+
+# fold live cells into an Info as emitting them would, for a decoder that
+# knows their extent, count and highest state without listing them
+# ---
+# i:    the Info
+# x0:   leftmost live column, inclusive
+# y0:   top live row, inclusive
+# x1:   right edge, exclusive
+# y1:   bottom edge, exclusive
+# live: how many
+# top:  the highest state among them, nonzero
+pub fun gather(i: *Info, x0: i64, y0: i64, x1: i64, y1: i64, live: u64, top: u8) {
+    if (live == 0) { ret; }
+    cover(i, x0, y0, x1, y1);
+    if (top::u32 >= i.states) { i.states = top::u32 + 1; }
+    i.live = i.live + live;
 }
 
 # one run of live cells read from a Source
@@ -249,10 +339,38 @@ pub rec Run {
     v: u8;
 }
 
+# the cells of a Source as a quadtree
+#
+# a node of level l is a 2^l square split into four of level l - 1, nw, ne, sw
+# and se, and a node of level 0 is one cell, its id its state. an id names one
+# square wherever it appears, so an encoder may write a node once however often
+# it is reached. a tree that hash-conses its nodes, as HashLife's does, also
+# gives equal squares one id, so each distinct square is written once. every
+# cell outside the root is dead. the tree must not change while in use.
+# ---
+# ctx:   the tree's own state, passed back to each callback
+# root:  the root node
+# level: the root's level, 1 to 62
+# x0:    the root's leftmost column
+# y0:    the root's top row
+# kid:   child q of a node above level 0, nw 0, ne 1, sw 2, se 3
+# live:  whether a node holds a cell in a state but 0
+pub rec Quadtree {
+    ctx:   *u8;
+    root:  u32;
+    level: u32;
+    x0:    i64;
+    y0:    i64;
+    kid:   fun(*u8, u32, usize) u32;
+    live:  fun(*u8, u32) bool;
+}
+
 # the cells an encoder writes out
 #
 # runs come row by row from the top and left to right within a row, live cells
-# only, never overlapping, and rewind starts them again from the top.
+# only, never overlapping, and rewind starts them again from the top. a source
+# may put off gathering its runs until the first rewind, which says when it
+# could not.
 # ---
 # ctx:    the source's own state, passed back to each callback
 # x0:     left edge of the extent to write, inclusive
@@ -260,7 +378,9 @@ pub rec Run {
 # x1:     right edge, exclusive
 # y1:     bottom edge, exclusive
 # states: how many states the cells use, at least 2
-# rewind: start over at the first run
+# tree:   the same cells as a quadtree, every live one inside the extent, or
+#         nil when the source has only runs
+# rewind: start over at the first run; an error when the runs cannot be read
 # next:   the next run, false when none remain
 pub rec Source {
     ctx:    *u8;
@@ -269,7 +389,8 @@ pub rec Source {
     x1:     i64;
     y1:     i64;
     states: u32;
-    rewind: fun(*u8);
+    tree:   *Quadtree;
+    rewind: fun(*u8) err[Error];
     next:   fun(*u8, *Run) bool;
 }
 
@@ -280,6 +401,7 @@ pub rec Source {
 # sniff:  how likely the bytes are this format, 0 when certainly not, up to 100
 # decode: stream the file's live cells through an Emit, filling its Info. it
 #         allocates from the allocator it is given and frees it all before it returns
+# builds: decode builds a sink's tree (Emit.tree) when it is given one
 # encode: write the source's cells to out, describing them with the Info's text.
 #         nil when the format is read only
 pub rec Format {
@@ -287,6 +409,7 @@ pub rec Format {
     exts:   str;
     sniff:  fun(*u8, usize) u32;
     decode: fun(*allo.Allocator, *u8, usize, *Emit) err[Error];
+    builds: bool;
     encode: fun(*allo.Allocator, *Source, *Info, *Vector[u8]) err[Error];
 }
 

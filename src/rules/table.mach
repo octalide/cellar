@@ -1,0 +1,244 @@
+# the table family: rules given as a transition table or tree, Golly's
+# RuleLoader .rule files
+#
+# a rule is a table of up to 256 states over the von Neumann, Moore or
+# hexagonal neighbourhood, read by cellar.rules.table.load into a decision tree
+# and kept by cellar.rules.table.store, so the rule itself is the id of a kept
+# table. its rule string is the table's name, as Golly writes one, and a name
+# is looked up as the store says. every state but 0 is live, a neighbourhood
+# the table gives no transition for keeps the cell, and a table whose empty
+# neighbourhood gives a live cell is refused, so no rule of the family births
+# on 0. its cell word is cellar.rules.table.word's, its step stage table_comp,
+# which walks the tree the rule buffer holds, and its palette the table's
+# @COLORS, or Golly's gradient from red to yellow without them.
+
+use cellar.layout;
+use cellar.rules.table.load;
+use cellar.rules.table.store;
+use cellar.rules.table.word;
+use cellar.space;
+use mem: std.memory;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string;
+use std.types.string.str;
+
+#[embed("{artifact.stage-table_comp.out}")]
+val STAGE: [_]u8;
+
+# what the family's capabilities come to for one rule
+# ---
+# b0:        a dead cell with no live neighbour is born, which the loader refuses
+# isotropic: the table's symmetries take in every rotation and reflection
+# hashlife:  a quadtree engine can run it
+# bounded:   it can run on a bounded grid
+# life_like: it is a Life-like rule, which no table is taken as
+pub rec Caps {
+    b0:        bool;
+    isotropic: bool;
+    hashlife:  bool;
+    bounded:   bool;
+    life_like: bool;
+}
+
+# a rule table
+# ---
+# id: the kept table (cellar.rules.table.store)
+pub rec Rule {
+    id: u32;
+}
+
+# read the family's rule string: the name of a rule table
+# ---
+# s:   NUL-terminated rule text
+# ret: the rule, or what is wrong with s
+pub fun parse(s: str) res[Rule, str] {
+    var i: usize = 0;
+    for (s[i] == ' ') { i = i + 1; }
+    val got: res[u32, str] = store.resolve(?s[i]);
+    if (sel got.err) { ret res[Rule, str].err{got.err}; }
+    ret res[Rule, str].ok{Rule{id: got.ok}};
+}
+
+# whether a rule string is plausibly this family's, so that a string every
+# family refuses reports the error of the family it meant: a bare name, one
+# that does not start with a digit, as the other families' forms do
+# ---
+# s: NUL-terminated rule text
+pub fun claims(s: str) bool {
+    var i: usize = 0;
+    for (s[i] == ' ') { i = i + 1; }
+    ret !(s[i] >= '0' && s[i] <= '9') && load.name_ok(?s[i]);
+}
+
+# the longest rule string format writes, less its NUL: a table's name
+pub val FORMAT_MAX: usize = load.NAME_MAX;
+
+# write the family's rule string, the table's name
+# ---
+# r:   the rule
+# buf: at least FORMAT_MAX + 1 bytes
+# ret: buf, which parse reads back as r while the name resolves to the table
+pub fun format(r: *Rule, buf: *u8) str {
+    val name: str = store.name(r.id);
+    mem.copy[u8](buf, name, string.str_len(name) + 1);
+    ret buf;
+}
+
+# write a rule's short form for the readout, its name
+pub fun display(r: *Rule, buf: *u8) str {
+    ret format(r, buf);
+}
+
+# whether two rules step alike: they hold the same kept table
+pub fun same_rule(a: *Rule, b: *Rule) bool {
+    ret a.id == b.id;
+}
+
+# how many states a cell of the rule can be in
+pub fun states(r: *Rule) u32 {
+    ret store.get(r.id).states;
+}
+
+# the word a fresh cell of a state is written as
+pub fun word_of(r: *Rule, state: u32) u32 {
+    ret word.word(state, states(r));
+}
+
+# the state a word holds, its heat aside
+pub fun state_of(c: u32) u32 {
+    ret c & word.STATE_MASK;
+}
+
+# how shared code reads the family's cell word
+pub fun sense() layout.Sense {
+    ret word.sense();
+}
+
+# how far one generation reaches: every neighbourhood is within a cell
+pub fun radius(r: *Rule) usize {
+    ret 1;
+}
+
+# the capabilities the family has for a rule
+pub fun caps(r: *Rule) Caps {
+    ret Caps{b0: false, isotropic: store.get(r.id).iso, hashlife: false, bounded: true, life_like: false};
+}
+
+# the state a cell becomes from the states of the 3 by 3 block around it
+# ---
+# r:   the rule
+# nb:  the nine states, row-major with the cell at 4
+# ret: its next state
+pub fun next_of(r: *Rule, nb: *u32) u32 {
+    ret load.next(store.get(r.id), nb);
+}
+
+# step one chunk on the CPU, walking the tree for every cell as the family's
+# stage does
+#
+# a chunk with no live cell in its block holds only zeros, and the empty
+# neighbourhood steps to 0, so it stays empty.
+# ---
+# r: the rule
+# b: the chunk's block and back cells
+# t: the tally of the cells written
+pub fun step_chunk(r: *Rule, b: *space.Block, t: *space.Tally) {
+    val out: *u32 = b.out;
+    if (!b.busy) {
+        mem.zero[u32](out, space.CELLS);
+        ret;
+    }
+    val tb:   *load.Table = store.get(r.id);
+    val n:    u32         = tb.states;
+    val tree: *u32        = tb.tree.data;
+    var dx:   [9]i64;
+    var dy:   [9]i64;
+    var q:    usize       = 0;
+    for (q < tb.inputs::usize) {
+        dx[q] = (tb.at[q] % 3)::i64 - 1;
+        dy[q] = (tb.at[q] / 3)::i64 - 1;
+        q     = q + 1;
+    }
+    var ly: i64 = 0;
+    for (ly < 64) {
+        var lx: i64 = 0;
+        for (lx < 64) {
+            var p: u32 = tb.root;
+            q = 0;
+            for (q < tb.inputs::usize) {
+                val c: u32 = space.block_cell(b, lx + dx[q], ly + dy[q]) & word.STATE_MASK;
+                p = tree[(p + c)::usize];
+                q = q + 1;
+            }
+            val v: u32 = word.word(p, n);
+            out[(ly * 64 + lx)::usize] = v;
+            space.note(t, v, lx::u32, ly::u32);
+            lx = lx + 1;
+        }
+        ly = ly + 1;
+    }
+}
+
+# pack a rule into the family's window of the meta head, as its stage reads it
+# ---
+# r: the rule
+# w: layout.RULE words
+pub fun pack(r: *Rule, w: *u32) {
+    mem.zero[u32](w, layout.RULE::usize);
+    val tb: *load.Table = store.get(r.id);
+    w[word.STATES_AT] = tb.states;
+    w[word.INPUTS_AT] = tb.inputs;
+    w[word.ROOT_AT]   = tb.root;
+    var i: u32 = 0;
+    for (i < tb.inputs) {
+        w[word.AT_AT + i] = tb.at[i::usize];
+        i                 = i + 1;
+    }
+}
+
+# the family's stage binds a rule buffer: the tree
+pub val TABLE: bool = true;
+
+# the words of the rule buffer a rule needs, its tree's
+pub fun table_words(r: *Rule) usize {
+    ret store.get(r.id).tree.len;
+}
+
+# pack a rule's tree into the rule buffer
+# ---
+# r: the rule
+# w: table_words(r) words
+pub fun pack_table(r: *Rule, w: *u32) {
+    val tb: *load.Table = store.get(r.id);
+    mem.copy[u32](w, tb.tree.data, tb.tree.len);
+}
+
+# the colour a state is drawn in, 0xrrggbb, the table's own
+pub fun colour(r: *Rule, state: u32) opt[u32] {
+    ret opt[u32].some{store.get(r.id).colours[state::usize]};
+}
+
+# the family's step stage, as SPIR-V
+# ---
+# len: receives its length in bytes
+# ret: its first byte
+pub fun stage(len: *usize) *u8 {
+    @len = $length_of(STAGE);
+    ret ?STAGE[0];
+}
+
+# rule strings that exercise the family, for the tests that run every family:
+# the built-in WireWorld, Moore with its states' own transitions, and Langton's
+# Loops, von Neumann with rotations
+pub val SAMPLE_COUNT: usize = 2;
+
+# the sample rule string i
+pub fun sample(i: usize) str {
+    if (i == 1) { ret "Langtons-Loops"; }
+    ret "WireWorld";
+}

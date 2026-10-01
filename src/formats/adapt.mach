@@ -4,17 +4,29 @@
 # points back at it, so it lives on the caller's stack and must not move while
 # in use.
 
+use gfx: boom.graphics;
 use cellar.format;
+use cellar.hashlife;
 use cellar.pattern;
+use cellar.rule;
 use cellar.sim;
+use cellar.space;
 use allo: std.allocator;
+use std.collections.sort;
+use std.collections.vector;
+use std.collections.vector.Vector;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
 use std.types.size.usize;
 
 # a sink that fills a heap pattern, sized to the file's box
+#
+# a pattern is dense, so it plans by the box: one past pattern.holds, whatever
+# its population, is refused before anything is allocated.
 # ---
 # p:    the pattern to fill; on open it is resized and takes the file's rule and
 #       comments, and its name when the file has one
@@ -24,15 +36,28 @@ pub rec PatternSink {
     sink: format.Sink;
 }
 
+# the width and height of an Info's box, 0 by 0 when it has none
+fun box_size(info: *format.Info, w: *i64, h: *i64) {
+    @w = 0;
+    @h = 0;
+    if (info.bounded) {
+        @w = info.x1 - info.x0;
+        @h = info.y1 - info.y0;
+    }
+}
+
+fun pattern_plan(ctx: *u8, info: *format.Info) bool {
+    var w: i64 = 0;
+    var h: i64 = 0;
+    box_size(info, ?w, ?h);
+    ret pattern.holds(w::u64, h::u64);
+}
+
 fun pattern_open(ctx: *u8, info: *format.Info) bool {
     val s: *PatternSink = ctx::*PatternSink;
     var w: i64          = 0;
     var h: i64          = 0;
-    if (info.bounded) {
-        w = info.x1 - info.x0;
-        h = info.y1 - info.y0;
-    }
-    if (w > pattern.MAX_SIDE::i64 || h > pattern.MAX_SIDE::i64) { ret false; }
+    box_size(info, ?w, ?h);
     val r: err[allo.Error] = pattern.resize(s.p, w::usize, h::usize);
     if (sel r.err) { ret false; }
     s.p.x = info.x0;
@@ -69,6 +94,9 @@ fun pattern_close(ctx: *u8) bool {
 pub fun pattern_sink(s: *PatternSink, p: *pattern.Pattern) *format.Sink {
     s.p          = p;
     s.sink.ctx   = s::*u8;
+    s.sink.tree  = nil;
+    s.sink.plan  = pattern_plan;
+    s.sink.fit   = nil;
     s.sink.open  = pattern_open;
     s.sink.run   = pattern_run;
     s.sink.close = pattern_close;
@@ -76,30 +104,79 @@ pub fun pattern_sink(s: *PatternSink, p: *pattern.Pattern) *format.Sink {
 }
 
 # a sink that overlays the cells onto the world, offset, in one bulk edit
+#
+# it plans and fits without touching the world: a box past the world's reach is
+# refused, and the engine holding the world judges the rest. the pool's counts
+# the chunks the runs would add, so a pattern the pool cannot hold is refused
+# whole while one far larger than the pool in extent but sparse enough loads.
+# the quadtree has no pool, so a pattern of any extent loads straight into it,
+# its runs counted up to sim.LOAD_CELLS live cells as they fit. while it holds
+# the world the sink offers it as a tree too, so a format that builds lays its
+# squares straight into it (sim.merge_begin), of any size, and the watch keeps
+# the world whole rather than the box. only open begins the edit, and a rule
+# the sink was given to take is set there, once the pattern is known to fit and
+# before any cell is written, so the cells are written as that rule's states.
 # ---
-# s:      simulation to write onto
-# dx:     columns to shift every cell by
-# dy:     rows to shift every cell by
-# centre: on open, shift instead so the file's box is centred on the origin,
-#         as pattern.stamp centres a pattern
-# opened: whether the edit is open
-# sink:   the sink to hand to formats.load
+# s:       simulation to write onto
+# dx:      columns to shift every cell by
+# dy:      rows to shift every cell by
+# centre:  on plan, shift instead so the file's box is centred on the origin,
+#          as pattern.stamp centres a pattern
+# planned: need holds a measure
+# opened:  whether the edit is open
+# need:    what the pattern adds to the pool, from plan to close
+# take:    rule holds a rule to set as the sink opens
+# rule:    the rule to take
+# refused: the simulation refused the rule, so the world kept its own
+# tree:    the tree the sink offers while the quadtree holds the world
+# sink:    the sink to hand to formats.load
 pub rec WorldSink {
-    s:      *sim.Sim;
-    dx:     i64;
-    dy:     i64;
-    centre: bool;
-    opened: bool;
-    sink:   format.Sink;
+    s:       *sim.Sim;
+    dx:      i64;
+    dy:      i64;
+    centre:  bool;
+    planned: bool;
+    opened:  bool;
+    need:    sim.Need;
+    take:    bool;
+    rule:    rule.Rule;
+    refused: bool;
+    tree:    format.TreeSink;
+    sink:    format.Sink;
 }
 
-fun world_open(ctx: *u8, info: *format.Info) bool {
+fun world_plan(ctx: *u8, info: *format.Info) bool {
     val w: *WorldSink = ctx::*WorldSink;
     if (!info.bounded) { ret true; }
     if (w.centre) {
         w.dx = pattern.corner(0, (info.x1 - info.x0)::usize) - info.x0;
         w.dy = pattern.corner(0, (info.y1 - info.y0)::usize) - info.y0;
     }
+    # the tree's grid is the world's, whose origin lies at (-dx, -dy) in the file
+    w.tree.x0 = 0 - w.dx;
+    w.tree.y0 = 0 - w.dy;
+    if (!sim.reaches(info.x0 + w.dx, info.y0 + w.dy, info.x1 + w.dx, info.y1 + w.dy)) { ret false; }
+    sim.need_init(?w.need, w.s);
+    w.planned = true;
+    ret true;
+}
+
+fun world_fit(ctx: *u8, x: i64, y: i64, n: usize, v: u8) bool {
+    val w: *WorldSink = ctx::*WorldSink;
+    ret sim.need_run(?w.need, x + w.dx, y + w.dy, n);
+}
+
+# set the rule the sink was given to take, once
+fun take_rule(w: *WorldSink) {
+    if (!w.take) { ret; }
+    w.take    = false;
+    w.refused = !sim.set_rule(w.s, w.rule);
+}
+
+fun world_open(ctx: *u8, info: *format.Info) bool {
+    val w: *WorldSink = ctx::*WorldSink;
+    take_rule(w);
+    if (!info.bounded) { ret true; }
     w.opened = sim.edit_begin(w.s, info.x0 + w.dx, info.y0 + w.dy, info.x1 + w.dx, info.y1 + w.dy);
     ret w.opened;
 }
@@ -109,26 +186,61 @@ fun world_run(ctx: *u8, x: i64, y: i64, n: usize, v: u8) bool {
     ret sim.edit_run(w.s, x + w.dx, y + w.dy, n, v);
 }
 
+fun world_tree_open(ctx: *u8, info: *format.Info) bool {
+    val w: *WorldSink = ctx::*WorldSink;
+    take_rule(w);
+    if (!info.bounded) { ret true; }
+    w.opened = sim.merge_begin(w.s, info.x0 + w.dx, info.y0 + w.dy, info.x1 + w.dx, info.y1 + w.dy);
+    ret w.opened;
+}
+
+fun world_join(ctx: *u8, nw: u32, ne: u32, sw: u32, se: u32) u32 {
+    val w: *WorldSink = ctx::*WorldSink;
+    val n: u32        = sim.merge_node(w.s, nw, ne, sw, se);
+    if (n == hashlife.NONE) { ret format.NO_NODE; }
+    ret n;
+}
+
+fun world_put(ctx: *u8, n: u32, l: u32, x: i64, y: i64) bool {
+    val w: *WorldSink = ctx::*WorldSink;
+    ret sim.edit_square(w.s, n, l, x + w.dx, y + w.dy);
+}
+
 fun world_close(ctx: *u8) bool {
     val w: *WorldSink = ctx::*WorldSink;
+    if (w.planned) { sim.need_dnit(?w.need); }
+    w.planned = false;
     if (!w.opened) { ret true; }
     w.opened = false;
     ret sim.edit_end(w.s);
 }
 
-# point a WorldSink at a simulation
+# point a WorldSink at a simulation, offering the tree while it holds the world
 # ---
 # w:  sink record
 # s:  simulation
 # dx: columns to shift every cell by
 # dy: rows to shift every cell by
 pub fun world_sink(w: *WorldSink, s: *sim.Sim, dx: i64, dy: i64) *format.Sink {
-    w.s          = s;
-    w.dx         = dx;
-    w.dy         = dy;
-    w.centre     = false;
-    w.opened     = false;
-    w.sink.ctx   = w::*u8;
+    w.s         = s;
+    w.dx        = dx;
+    w.dy        = dy;
+    w.centre    = false;
+    w.planned   = false;
+    w.opened    = false;
+    w.take      = false;
+    w.refused   = false;
+    w.tree.ctx  = w::*u8;
+    w.tree.x0   = 0 - dx;
+    w.tree.y0   = 0 - dy;
+    w.tree.open = world_tree_open;
+    w.tree.join = world_join;
+    w.tree.put  = world_put;
+    w.sink.ctx  = w::*u8;
+    w.sink.tree = nil;
+    if (sim.on_tree(s)) { w.sink.tree = ?w.tree; }
+    w.sink.plan  = world_plan;
+    w.sink.fit   = world_fit;
     w.sink.open  = world_open;
     w.sink.run   = world_run;
     w.sink.close = world_close;
@@ -145,6 +257,15 @@ pub fun centred_sink(w: *WorldSink, s: *sim.Sim) *format.Sink {
     ret k;
 }
 
+# have a WorldSink set a rule as it opens, before it writes a cell. a rule the
+# quadtree cannot run moves the world off it as it is set, so the sink then
+# offers no tree and the cells go in as runs
+pub fun sink_rule(w: *WorldSink, r: rule.Rule) {
+    w.take = true;
+    w.rule = r;
+    if (!rule.caps(?w.rule).hashlife) { w.sink.tree = nil; }
+}
+
 # a source that reads a heap pattern, its live cells in rows
 # ---
 # p:      pattern to read
@@ -158,10 +279,11 @@ pub rec PatternSource {
     source: format.Source;
 }
 
-fun pattern_rewind(ctx: *u8) {
+fun pattern_rewind(ctx: *u8) err[format.Error] {
     val s: *PatternSource = ctx::*PatternSource;
     s.x = 0;
     s.y = 0;
+    ret err[format.Error].ok{};
 }
 
 fun pattern_next(ctx: *u8, r: *format.Run) bool {
@@ -205,7 +327,246 @@ pub fun pattern_source(s: *PatternSource, p: *pattern.Pattern) *format.Source {
         if (p.cells[i]::u32 >= s.source.states) { s.source.states = p.cells[i]::u32 + 1; }
         i = i + 1;
     }
+    s.source.tree   = nil;
     s.source.rewind = pattern_rewind;
     s.source.next   = pattern_next;
     ret ?s.source;
+}
+
+# a chunk holding a state but 0, where a WorldSource reads it
+# ---
+# cx: chunk column
+# cy: chunk row
+rec Held {
+    cx: i64;
+    cy: i64;
+}
+
+# a source that reads the world's cells in a state but 0, dying ones included,
+# sparse
+#
+# it keeps the chunks holding such a state ordered by row and then column, so a
+# row of the world is read from its chunks alone, and a run reaching a chunk's
+# edge goes on into the next chunk of the row when that one lies beside it. the
+# cells of one chunk row at a time are read through the simulation, whichever
+# engine holds the world. the cost is the held chunks', not the extent's, and
+# the chunks are listed on the first rewind, so an encoder that reads the
+# quadtree instead, when HashLife holds the world, never lists them. that
+# rewind also makes room for the cells of the widest chunk row, so a save
+# without the memory fails there rather than writing the runs short. the world
+# must not change while the source is in use.
+# ---
+# s:      simulation to read
+# listed: held holds the chunks
+# held:   the chunks holding a state, ordered
+# cells:  the states of the chunks of the row being read, in order
+# band:   the first chunk of the chunk row being read
+# end:    the chunk after that row's last
+# ly:     the row within the chunk row
+# k:      the chunk the cursor is in
+# lx:     the column within it
+# quad:   the world's quadtree, when HashLife holds it
+# source: the source to hand to formats.save
+pub rec WorldSource {
+    s:      *sim.Sim;
+    listed: bool;
+    held:   Vector[Held];
+    cells:  Vector[u8];
+    band:   usize;
+    end:    usize;
+    ly:     i64;
+    k:      usize;
+    lx:     i64;
+    quad:   format.Quadtree;
+    source: format.Source;
+}
+
+fun held_order(a: *Held, b: *Held) i64 {
+    if (a.cy != b.cy) {
+        if (a.cy < b.cy) { ret -1; }
+        ret 1;
+    }
+    if (a.cx < b.cx) { ret -1; }
+    if (a.cx > b.cx) { ret 1; }
+    ret 0;
+}
+
+# the chunk after the chunk row starting at from, whose chunks' cells are read
+# into cells, which rewind made room for
+fun band_end(w: *WorldSource, from: usize) usize {
+    var e: usize = from;
+    for (e < w.held.len && w.held.data[e].cy == w.held.data[from].cy) { e = e + 1; }
+    var k: usize = from;
+    for (k < e) {
+        sim.world_chunk_cells(w.s, w.held.data[k].cx, w.held.data[k].cy, ?w.cells.data[(k - from) * space.CELLS]);
+        k = k + 1;
+    }
+    w.cells.len = (e - from) * space.CELLS;
+    ret e;
+}
+
+# the chunks a WorldSource is listing
+# ---
+# held: the list
+# ok:   every chunk was kept
+rec Listed {
+    held: *Vector[Held];
+    ok:   bool;
+}
+
+fun list_chunk(ctx: *u8, cx: i64, cy: i64, cells: *u8) {
+    val at:  *Listed                = ctx::*Listed;
+    val put: res[usize, allo.Error] = vector.push[Held](at.held, Held{cx: cx, cy: cy});
+    if (sel put.err) { at.ok = false; }
+}
+
+fun world_rewind(ctx: *u8) err[format.Error] {
+    val w: *WorldSource = ctx::*WorldSource;
+    if (!w.listed) {
+        var at: Listed = Listed{held: ?w.held, ok: true};
+        sim.world_chunks(w.s, list_chunk, (?at)::*u8);
+        if (!at.ok) { ret err[format.Error].err{format.Error.alloc{allo.Error.exhausted{}}}; }
+        sort.sort_by[Held](w.held.data, w.held.len, held_order);
+        # room for the widest chunk row, so reading the runs never allocates
+        var widest: usize = 0;
+        var from:   usize = 0;
+        for (from < w.held.len) {
+            var e: usize = from;
+            for (e < w.held.len && w.held.data[e].cy == w.held.data[from].cy) { e = e + 1; }
+            if (e - from > widest) { widest = e - from; }
+            from = e;
+        }
+        val room: res[usize, allo.Error] = vector.reserve[u8](?w.cells, widest * space.CELLS);
+        if (sel room.err) { ret err[format.Error].err{format.Error.alloc{room.err}}; }
+        w.listed = true;
+    }
+    w.band = 0;
+    w.end  = band_end(w, 0);
+    w.ly   = 0;
+    w.k    = 0;
+    w.lx   = 0;
+    ret err[format.Error].ok{};
+}
+
+# the state of a cell of chunk k of the row being read
+fun state_at(w: *WorldSource, k: usize, lx: i64, ly: i64) u8 {
+    ret w.cells.data[(k - w.band) * space.CELLS + (ly * space.SIDE + lx)::usize];
+}
+
+# how many cells of state v run from column lx of a chunk's row, to its edge at most
+fun run_of(w: *WorldSource, k: usize, lx: i64, ly: i64, v: u8) i64 {
+    var x: i64 = lx;
+    for (x < space.SIDE && state_at(w, k, x, ly) == v) { x = x + 1; }
+    ret x - lx;
+}
+
+fun world_next(ctx: *u8, r: *format.Run) bool {
+    val w: *WorldSource = ctx::*WorldSource;
+    for (w.band < w.held.len) {
+        for (w.k < w.end) {
+            val c: *Held = ?w.held.data[w.k];
+            for (w.lx < space.SIDE && state_at(w, w.k, w.lx, w.ly) == 0) { w.lx = w.lx + 1; }
+            if (w.lx == space.SIDE) {
+                w.k  = w.k + 1;
+                w.lx = 0;
+                cnt;
+            }
+            val v: u8  = state_at(w, w.k, w.lx, w.ly);
+            val m: i64 = run_of(w, w.k, w.lx, w.ly, v);
+            r.x  = c.cx * space.SIDE + w.lx;
+            r.y  = c.cy * space.SIDE + w.ly;
+            r.v  = v;
+            w.lx = w.lx + m;
+            var n: i64 = m;
+            # a run reaching the edge goes on into the chunk beside it
+            for (w.lx == space.SIDE && w.k + 1 < w.end && w.held.data[w.k + 1].cx == w.held.data[w.k].cx + 1) {
+                w.k = w.k + 1;
+                val more: i64 = run_of(w, w.k, 0, w.ly, v);
+                n    = n + more;
+                w.lx = more;
+            }
+            r.n = n::usize;
+            ret true;
+        }
+        w.ly = w.ly + 1;
+        w.k  = w.band;
+        w.lx = 0;
+        if (w.ly == space.SIDE) {
+            w.band = w.end;
+            w.end  = band_end(w, w.band);
+            w.ly   = 0;
+            w.k    = w.band;
+        }
+    }
+    ret false;
+}
+
+fun quad_kid(ctx: *u8, n: u32, q: usize) u32 {
+    ret hashlife.kid(ctx::*hashlife.Tree, n, q);
+}
+
+fun quad_live(ctx: *u8, n: u32) bool {
+    ret hashlife.pop(ctx::*hashlife.Tree, n) != 0;
+}
+
+# point a Quadtree at a HashLife tree, whose root is centred on the origin
+# ---
+# q:   quadtree record
+# t:   the tree, made, left as it is while the quadtree is read
+# ret: q
+pub fun quadtree(q: *format.Quadtree, t: *hashlife.Tree) *format.Quadtree {
+    q.ctx   = t::*u8;
+    q.root  = t.root;
+    q.level = t.level;
+    q.x0    = 0 - ((1::i64) << (t.level - 1)::i64);
+    q.y0    = q.x0;
+    q.kid   = quad_kid;
+    q.live  = quad_live;
+    ret q;
+}
+
+# point a WorldSource at a simulation, its extent the box of its cells in a
+# state but 0
+#
+# the cells are brought from the GPU first when it steps, and the tree is
+# offered as well when HashLife holds the world.
+# ---
+# w:   source record; world_source_dnit releases it, whether this succeeded or not
+# s:   simulation to write out, left as it is
+# a:   allocator for the chunk list
+# ret: the source, or why the cells could not be read
+pub fun world_source(w: *WorldSource, s: *sim.Sim, a: *allo.Allocator) res[*format.Source, format.Error] {
+    w.s      = s;
+    w.listed = false;
+    w.held   = vector.init[Held](a);
+    w.cells  = vector.init[u8](a);
+    val synced: err[gfx.Error] = sim.sync(s);
+    if (sel synced.err) { ret res[*format.Source, format.Error].err{format.Error.sink{}}; }
+    val box: opt[space.Box] = sim.state_bounds(s);
+    w.source.ctx  = w::*u8;
+    w.source.x0   = 0;
+    w.source.y0   = 0;
+    w.source.x1   = 0;
+    w.source.y1   = 0;
+    w.source.tree = nil;
+    if (sel box.some) {
+        w.source.x0 = box.some.x0;
+        w.source.y0 = box.some.y0;
+        w.source.x1 = box.some.x1;
+        w.source.y1 = box.some.y1;
+    }
+    val t: *hashlife.Tree = sim.quadtree(s);
+    if (t != nil) { w.source.tree = quadtree(?w.quad, t); }
+    w.source.states = rule.states(?s.rule);
+    w.source.rewind = world_rewind;
+    w.source.next   = world_next;
+    w.band          = 0;
+    w.end           = 0;
+    ret res[*format.Source, format.Error].ok{?w.source};
+}
+
+# release a WorldSource's chunk list and cells
+pub fun world_source_dnit(w: *WorldSource) {
+    vector.dnit[Held](?w.held);
+    vector.dnit[u8](?w.cells);
 }

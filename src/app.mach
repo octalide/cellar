@@ -3,15 +3,27 @@
 # the simulation owns the cells and the rule. this owns the camera, the tool,
 # the colours, the panel and what it shows, and the messages it flashes.
 
+use cellar.brush;
 use cellar.command;
+use cellar.format;
+use cellar.identify;
+use cellar.identify.worker;
+use cellar.journal;
+use cellar.library;
 use cellar.pattern;
 use cellar.render;
+use cellar.rule;
+use cellar.ruletext;
 use cellar.saves;
+use cellar.snapshot;
 use cellar.space;
+use cellar.sumlist;
 use cellar.text;
 use cellar.theme;
 use cellar.ui;
 use allo: std.allocator;
+use std.collections.vector;
+use std.collections.vector.Vector;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -19,6 +31,7 @@ use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
+use std.types.string;
 use std.types.string.str;
 
 # number of colour modes (kept in step with render.MODE_*)
@@ -28,12 +41,21 @@ pub val BOUNDS_COUNT: usize = 8;
 # bounds-table index used at startup (128)
 pub val DEFAULT_BOUNDS: usize = 2;
 
+# the pattern_sel that selects the custom pattern rather than a library one
+pub val CUSTOM: usize = 0xffffffffffffffff;
+# the library pattern selected at startup
+val DEFAULT_PATTERN: str = "Glider";
+
 # paint live cells
 pub val TOOL_DRAW: usize = 0;
 # paint dead cells
 pub val TOOL_ERASE: usize = 1;
 # stamp the selected pattern
 pub val TOOL_STAMP: usize = 2;
+# drag out a rectangle to operate on
+pub val TOOL_SELECT: usize = 3;
+# number of tools
+pub val TOOL_COUNT: usize = 4;
 
 # number of interface scales offered
 pub val SCALE_COUNT: usize = 4;
@@ -41,91 +63,150 @@ pub val SCALE_COUNT: usize = 4;
 # ticks a message stays up
 pub val TOAST_TICKS: i32 = 150;
 
-# clamp on the user zoom multiplier, from a whole large world to a few cells
+# clamp on the user zoom multiplier, from a whole large world to a few cells.
+# at the least a pixel stays well under a chunk wide, which the coverage draw
+# needs (cellar.gpu)
 pub val ZOOM_MIN: f32 = 0.005;
 pub val ZOOM_MAX: f32 = 16.0;
+# the least zoom while HashLife holds the world, which draws a square of cells
+# a pixel however far out, so a pixel may stand for 2^37 cells
+pub val ZOOM_TREE_MIN: f32 = 0.000000000001;
 
 # all interactive state not owned by the simulation
 # ---
-# speed:       generations per second when not uncapped
-# mode:        colour mode (render.MODE_*)
-# gutter:      1 to draw grid lines when zoomed in
-# uncapped:    1 to step as fast as the machine allows
-# tool:        what a left press does to the world (TOOL_*)
-# bounds_idx:  index into the power-of-two randomize-area table
-# pattern_sel: selected pattern; pattern.BUILTIN_COUNT selects the custom one
-# custom:      the user-drawn custom pattern
-# orient:      how the stamp is laid down (pattern.ORIENT_*)
-# solid:       live-cell colour in solid mode, sRGB hex
-# zoom:        zoom multiplier, render.BASE_PPC pixels per cell at 1
-# pan_x:       world column at the view's centre
-# pan_y:       world row at the view's centre
-# refit:       frame fit, or the randomize area, on the next frame
-# fit:         the cells to frame, none for the randomize area
-# panel:       1 while the side panel is shown
-# open_run:    the run section is expanded
-# open_draw:   the draw section is expanded
-# open_rule:   the rule section is expanded
-# open_view:   the view section is expanded
-# open_files:  the files section is expanded
-# scale_idx:   index into the interface scales
-# scroll:      how far the panel's content is scrolled up, in pixels
-# content:     the panel content's height last frame
-# side_x0:     the panel's left edge last frame, or the window width when hidden
-# help:        1 while the key reference is shown
-# full_said:   the full pool was reported, until the world is cleared
-# toast:       the message being flashed
-# toast_t:     ticks it has left
-# said:        the text of a message built at run time
-# name:        the name the files section saves under
-# saves:       the worlds and patterns in the data directory
-# stroke:      a paint stroke is under way
-# last_x:      the cell the stroke last painted
-# last_y:      the cell the stroke last painted
-# shot:        a screenshot of the next frame is wanted
-# alloc:       allocator behind the patterns and the queue, once attach has run
-# queue:       edits to the world, applied at the start of the next frame
+# speed:        generations per second when not uncapped
+# mode:         colour mode (render.MODE_*)
+# gutter:       1 to draw grid lines when zoomed in
+# uncapped:     1 to step as fast as the machine allows
+# tool:         what a left press does to the world (TOOL_*)
+# ink:          the state the draw tool paints, below the rule's states
+# bounds_idx:   index into the power-of-two randomize-area table
+# pattern_sel:  the selected library pattern's index, or CUSTOM
+# library:      the bundled patterns, once attach has run
+# picked:       the selected library pattern, decoded
+# picked_at:    the library index picked holds, or CUSTOM for none
+# custom:       the user-drawn custom pattern
+# search:       the draw section's pattern search
+# browse:       the library category listed while the search is empty
+# page:         the page of the pattern list shown
+# orient:       how the stamp is laid down (pattern.ORIENT_*)
+# solid:        live-cell colour in solid mode, sRGB hex
+# zoom:         zoom multiplier, render.BASE_PPC pixels per cell at 1
+# zoom_min:     the least zoom the engine holding the world draws
+# pan_x:        world column at the view's centre
+# pan_y:        world row at the view's centre
+# refit:        frame fit, or the randomize area, on the next frame
+# fit:          the cells to frame, none for the randomize area
+# panel:        1 while the side panel is shown
+# open_run:     the run section is expanded
+# open_draw:    the draw section is expanded
+# open_rule:    the rule section is expanded
+# rule_text:    the rule section's rule string field
+# birth_list:   the wide kernel editor's birth sums
+# survive_list: the wide kernel editor's survive sums
+# brush:        the wide kernel editor's brush and view
+# open_view:    the view section is expanded
+# open_files:   the files section is expanded
+# scale_idx:    index into the interface scales
+# engine_tree:  the chosen engine is HashLife, which the settings keep
+# engine_cpu:   the chosen pool engine is the CPU rather than the GPU
+# scroll:       how far the panel's content is scrolled up, in pixels
+# content:      the panel content's height last frame
+# side_x0:      the panel's left edge last frame, or the window width when hidden
+# help:         1 while the key reference is shown
+# full_said:    the full pool was reported, until the world is cleared
+# toast:        the message being flashed
+# toast_t:      ticks it has left
+# said:         the text of a message built at run time
+# go_to:        the generation the run section goes to on HashLife
+# name:         the name the files section saves under
+# saves:        the worlds and patterns in the data directory
+# stroke:       a paint stroke is under way
+# last_x:       the cell the stroke last painted
+# last_y:       the cell the stroke last painted
+# shot:         a screenshot of the next frame is wanted
+# selected:     a rectangle of the world is selected
+# area:         the selection, half-open
+# dragging:     the selection is being dragged out
+# anchor_x:     the cell the drag started on
+# anchor_y:     the cell the drag started on
+# alloc:        allocator behind the patterns and the queue, once attach has run
+# queue:        edits to the world, applied at the start of the next frame
+# start:        the world reset returns to, once attach has run
+# log:          the changes undo and redo walk, once attach has run
+# clip:         text the frame is to put on the clipboard, once attach has run
+# clip_ready:   clip holds text not yet put on the clipboard
+# identifier:   classifies a selection off the frame
+# id_limits:    the limits a selection is classified under
 pub rec App {
-    speed:       f32;
-    mode:        usize;
-    gutter:      u8;
-    uncapped:    u8;
-    tool:        usize;
-    bounds_idx:  usize;
-    pattern_sel: usize;
-    library:     [7]pattern.Pattern;
-    custom:      pattern.Pattern;
-    orient:      u8;
-    solid:       u32;
-    zoom:        f32;
-    pan_x:       f64;
-    pan_y:       f64;
-    refit:       bool;
-    fit:         opt[space.Box];
-    panel:       u8;
-    open_run:    u8;
-    open_draw:   u8;
-    open_rule:   u8;
-    open_view:   u8;
-    open_files:  u8;
-    scale_idx:   usize;
-    scroll:      f32;
-    content:     f32;
-    side_x0:     f32;
-    help:        u8;
-    full_said:   bool;
-    toast:       str;
-    toast_t:     i32;
-    said:        [256]u8;
-    name:        ui.Field;
-    saves:       saves.Saves;
-    stroke:      bool;
-    last_x:      i64;
-    last_y:      i64;
-    shot:        bool;
-    alloc:       *allo.Allocator;
-    queue:       command.Queue;
+    speed:        f32;
+    mode:         usize;
+    gutter:       u8;
+    uncapped:     u8;
+    tool:         usize;
+    ink:          u8;
+    bounds_idx:   usize;
+    pattern_sel:  usize;
+    library:      library.Library;
+    picked:       pattern.Pattern;
+    picked_at:    usize;
+    custom:       pattern.Pattern;
+    search:       ui.Field;
+    browse:       usize;
+    page:         usize;
+    orient:       u8;
+    solid:        u32;
+    zoom:         f32;
+    zoom_min:     f32;
+    pan_x:        f64;
+    pan_y:        f64;
+    refit:        bool;
+    fit:          opt[space.Box];
+    panel:        u8;
+    open_run:     u8;
+    open_draw:    u8;
+    open_rule:    u8;
+    rule_text:    ruletext.RuleText;
+    birth_list:   sumlist.SumList;
+    survive_list: sumlist.SumList;
+    brush:        brush.Brush;
+    open_view:    u8;
+    open_files:   u8;
+    scale_idx:    usize;
+    engine_tree:  bool;
+    engine_cpu:   bool;
+    scroll:       f32;
+    content:      f32;
+    side_x0:      f32;
+    help:         u8;
+    full_said:    bool;
+    toast:        str;
+    toast_t:      i32;
+    said:         [256]u8;
+    go_to:        ui.Field;
+    name:         ui.Field;
+    saves:        saves.Saves;
+    stroke:       bool;
+    last_x:       i64;
+    last_y:       i64;
+    shot:         bool;
+    selected:     bool;
+    area:         space.Box;
+    dragging:     bool;
+    anchor_x:     i64;
+    anchor_y:     i64;
+    alloc:        *allo.Allocator;
+    queue:        command.Queue;
+    start:        snapshot.Snapshot;
+    log:          journal.Journal;
+    clip:         Vector[u8];
+    clip_ready:   bool;
+    identifier:   worker.Worker;
+    id_limits:    identify.Limits;
 }
+
+# the message shown while a selection is being identified
+pub val IDENTIFYING: str = "identifying...";
 
 # the randomize area's side length (cells) for a bounds-table index
 # ---
@@ -144,11 +225,19 @@ pub fun scale(i: usize) f32 {
     ret 1.0;
 }
 
-# a zoom multiplier brought within ZOOM_MIN and ZOOM_MAX
-pub fun clamp_zoom(z: f32) f32 {
-    if (z < ZOOM_MIN) { ret ZOOM_MIN; }
-    if (z > ZOOM_MAX) { ret ZOOM_MAX; }
+# a zoom multiplier brought within the least the engine draws and ZOOM_MAX
+pub fun clamp_zoom(a: *App, z: f32) f32 {
+    if (z < a.zoom_min) { ret a.zoom_min; }
+    if (z > ZOOM_MAX)   { ret ZOOM_MAX; }
     ret z;
+}
+
+# take the least zoom of the engine holding the world, HashLife's with tree,
+# bringing the zoom within it
+pub fun fit_engine(a: *App, tree: bool) {
+    a.zoom_min = ZOOM_MIN;
+    if (tree) { a.zoom_min = ZOOM_TREE_MIN; }
+    a.zoom = clamp_zoom(a, a.zoom);
 }
 
 # frame the randomize area on the next frame
@@ -201,45 +290,118 @@ pub fun say_why(a: *App, what: str, why: str) {
     say(a, ?a.said[0]);
 }
 
-# flash the full pool once per fill, and rearm when the world is cleared
-pub fun note_full(a: *App, full: bool) {
+# add to the message being flashed, as "message; more"
+pub fun say_also(a: *App, more: str) {
+    var was: [256]u8;
+    var o:   usize = 0;
+    for (a.toast[o] != 0 && o < 255) {
+        was[o] = a.toast[o];
+        o      = o + 1;
+    }
+    was[o] = 0;
+    o      = 0;
+    for (was[o] != 0 && o < 200) {
+        a.said[o] = was[o];
+        o         = o + 1;
+    }
+    o = text.buf_str(?a.said[0], o, "; ");
+    var i: usize = 0;
+    for (more[i] != 0 && o < 254) {
+        a.said[o] = more[i];
+        o         = o + 1;
+        i         = i + 1;
+    }
+    a.said[o] = 0;
+    say(a, ?a.said[0]);
+}
+
+# flash the full world once per fill, and rearm when the world is cleared
+# ---
+# a:    application state
+# full: the world is full
+# why:  what that means, for the message
+pub fun note_full(a: *App, full: bool, why: str) {
     if (!full) {
         a.full_said = false;
         ret;
     }
     if (a.full_said) { ret; }
     a.full_said = true;
-    say(a, "the world outgrew its pool of chunks; clear it to run again");
+    say(a, why);
 }
 
-# make the patterns the interface offers, once the allocator is up
+# make the patterns the interface offers, once the allocator is up, selecting
+# the default one
 # ---
 # a:     application state
 # alloc: allocator backing the patterns, outliving the application
-# ret:   ok, or the allocator's refusal
-pub fun attach(a: *App, alloc: *allo.Allocator) err[allo.Error] {
+# ret:   ok, or why the library or a pattern could not be made
+pub fun attach(a: *App, alloc: *allo.Allocator) err[format.Error] {
     a.alloc = alloc;
     command.init(?a.queue, alloc);
     saves.init(?a.saves, alloc);
-    var i: usize = 0;
-    for (i < pattern.BUILTIN_COUNT) {
-        val e: err[allo.Error] = pattern.builtin(?a.library[i], alloc, i);
-        if (sel e.err) { ret e; }
-        i = i + 1;
-    }
-    ret pattern.init(?a.custom, alloc, 16, 16, "custom");
+    snapshot.init(?a.start, alloc);
+    journal.init(?a.log, alloc);
+    a.clip       = vector.init[u8](alloc);
+    a.clip_ready = false;
+    val l: err[format.Error] = library.init(?a.library, alloc);
+    if (sel l.err) { ret l; }
+    val p: err[allo.Error] = pattern.init(?a.picked, alloc, 0, 0, "");
+    if (sel p.err) { ret err[format.Error].err{format.Error.alloc{p.err}}; }
+    val c: err[allo.Error] = pattern.init(?a.custom, alloc, 16, 16, "custom");
+    if (sel c.err) { ret err[format.Error].err{format.Error.alloc{c.err}}; }
+    choose_default(a);
+    ret err[format.Error].ok{};
 }
 
 # release the patterns attach made
 pub fun dnit(a: *App) {
-    var i: usize = 0;
-    for (i < pattern.BUILTIN_COUNT) {
-        pattern.dnit(?a.library[i]);
-        i = i + 1;
-    }
+    library.dnit(?a.library);
+    pattern.dnit(?a.picked);
     pattern.dnit(?a.custom);
     command.dnit(?a.queue);
     saves.dnit(?a.saves);
+    snapshot.dnit(?a.start);
+    journal.dnit(?a.log);
+    vector.dnit[u8](?a.clip);
+    worker.cancel(?a.identifier);
+}
+
+# choose a library pattern to stamp and browse its category, or the custom pattern
+# ---
+# a: application state
+# i: a library index or CUSTOM; anything else selects the default pattern
+pub fun choose(a: *App, i: usize) {
+    val n: usize = library.count(?a.library);
+    var s: usize = i;
+    if (s != CUSTOM && s >= n) { s = library.find(?a.library, DEFAULT_PATTERN); }
+    if (s != CUSTOM && s >= n) { s = 0; }
+    a.pattern_sel = s;
+    if (s < n) { a.browse = library.category_of(?a.library, s); }
+}
+
+# choose the library pattern with a name, or the default when the library has none by it
+pub fun choose_named(a: *App, name: str) {
+    choose(a, library.find(?a.library, name));
+}
+
+# choose the default library pattern
+pub fun choose_default(a: *App) {
+    choose(a, library.count(?a.library));
+}
+
+# the selected pattern, the custom one or the library one, decoded on first use
+pub fun chosen(a: *App) *pattern.Pattern {
+    if (a.pattern_sel == CUSTOM || a.pattern_sel >= library.count(?a.library)) { ret ?a.custom; }
+    if (a.picked_at != a.pattern_sel) {
+        val r: err[format.Error] = library.load(?a.library, a.pattern_sel, ?a.picked);
+        if (sel r.err) {
+            say(a, format.error_message(r.err));
+            pattern.resize(?a.picked, 0, 0);
+        }
+        a.picked_at = a.pattern_sel;
+    }
+    ret ?a.picked;
 }
 
 # ask for a change to the world, applied at the start of the next frame
@@ -279,6 +441,97 @@ pub fun stamp(a: *App, p: *pattern.Pattern, o: u8, x: i64, y: i64) {
     submit(a, command.Command.stamp{s});
 }
 
+# ask to paste clipboard text as the stamp
+# ---
+# a:    application state
+# text: the clipboard's text, a copy from a.alloc that this takes ownership of
+# rule: also take the pattern's rule
+pub fun paste(a: *App, text: str, rule: bool) {
+    val n: usize              = string.str_len(text);
+    var o: string.OwnedString = string.owned_adopt(a.alloc, text, n, n + 1);
+    if (n == 0) {
+        string.owned_release(?o);
+        say(a, "the clipboard holds no text");
+        ret;
+    }
+    submit(a, command.Command.paste{command.Paste{text: o, rule: rule}});
+}
+
+# ask to open the first of the files dropped on the window
+# ---
+# a:     application state
+# paths: the dropped paths, borrowed for the call
+# count: how many
+pub fun drop(a: *App, paths: *str, count: usize) {
+    if (count == 0) { ret; }
+    val f: opt[command.File] = file(a, paths[0]);
+    if (sel f.some) { submit(a, command.Command.drop{command.Drop{file: f.some, ignored: count - 1}}); }
+}
+
+# select the rectangle with corner cells (x0, y0) and (x1, y1), both inside it
+pub fun select(a: *App, x0: i64, y0: i64, x1: i64, y1: i64) {
+    a.selected = true;
+    a.area.x0  = x0;
+    a.area.x1  = x1 + 1;
+    a.area.y0  = y0;
+    a.area.y1  = y1 + 1;
+    if (x1 < x0) {
+        a.area.x0 = x1;
+        a.area.x1 = x0 + 1;
+    }
+    if (y1 < y0) {
+        a.area.y0 = y1;
+        a.area.y1 = y0 + 1;
+    }
+}
+
+# drop the selection
+pub fun deselect(a: *App) {
+    a.selected = false;
+    a.dragging = false;
+}
+
+# ask for an operation on the selection, when there is one
+# ---
+# a:  application state
+# op: the operation (command.AREA_*)
+pub fun area(a: *App, op: u8) {
+    if (!a.selected) {
+        say(a, "nothing is selected");
+        ret;
+    }
+    submit(a, command.Command.area{command.Area{op: op, box: a.area}});
+}
+
+# whether a character may be typed into a generation
+fun digit(c: u32) bool {
+    ret c >= '0' && c <= '9';
+}
+
+# the state a press of the tool paints: dead for erase, the ink otherwise
+pub fun pen(a: *App) u8 {
+    if (a.tool == TOOL_ERASE) { ret 0; }
+    ret a.ink;
+}
+
+# bring the ink within a rule of n states, which has live states 1 to n - 1
+pub fun fit_ink(a: *App, n: u32) {
+    if (a.ink == 0)      { a.ink = 1; }
+    if (a.ink::u32 >= n) { a.ink = (n - 1)::u8; }
+}
+
+# step the ink to the next live state of a rule of n states, or with back the
+# one before, wrapping round, and arm the draw tool
+pub fun step_ink(a: *App, n: u32, back: bool) {
+    fit_ink(a, n);
+    val live: u32 = n - 1;
+    var i:    u32 = a.ink::u32 - 1;
+    if (back) { i = i + live - 1; }
+    or        { i = i + 1; }
+    a.ink  = (i % live + 1)::u8;
+    a.tool = TOOL_DRAW;
+}
+
 # seed the application state
 pub fun init(a: *App) {
     a.speed       = 12.0;
@@ -286,33 +539,115 @@ pub fun init(a: *App) {
     a.gutter      = 0;
     a.uncapped    = 0;
     a.tool        = TOOL_DRAW;
+    a.ink         = 1;
     a.bounds_idx  = DEFAULT_BOUNDS;
     a.pattern_sel = 0;
-    a.orient      = 0;
-    a.solid       = theme.swatch(0);
-    a.zoom        = 1.0;
-    a.pan_x       = 0.0;
-    a.pan_y       = 0.0;
+    library.empty(?a.library);
+    a.picked_at = CUSTOM;
+    ui.field_init(?a.search, ui.FIELD_CAP, nil);
+    a.browse   = 0;
+    a.page     = 0;
+    a.orient   = 0;
+    a.solid    = theme.swatch(0);
+    a.zoom     = 1.0;
+    a.zoom_min = ZOOM_MIN;
+    a.pan_x    = 0.0;
+    a.pan_y    = 0.0;
     frame_area(a);
-    a.panel      = 1;
-    a.open_run   = 1;
-    a.open_draw  = 1;
-    a.open_rule  = 0;
-    a.open_view  = 1;
-    a.open_files = 0;
-    a.scale_idx  = 0;
-    a.scroll     = 0.0;
-    a.content    = 0.0;
-    a.side_x0    = 0.0;
-    a.help       = 0;
-    a.full_said  = false;
-    a.toast      = "";
-    a.toast_t    = 0;
-    a.said[0]    = 0;
+    a.panel     = 1;
+    a.open_run  = 1;
+    a.open_draw = 1;
+    a.open_rule = 0;
+    ruletext.init(?a.rule_text);
+    sumlist.init(?a.birth_list);
+    sumlist.init(?a.survive_list);
+    brush.init(?a.brush);
+    a.open_view   = 1;
+    a.open_files  = 0;
+    a.scale_idx   = 0;
+    a.engine_tree = false;
+    a.engine_cpu  = false;
+    a.scroll      = 0.0;
+    a.content     = 0.0;
+    a.side_x0     = 0.0;
+    a.help        = 0;
+    a.full_said   = false;
+    a.toast       = "";
+    a.toast_t     = 0;
+    a.said[0]     = 0;
     ui.field_init(?a.name, saves.NAME_MAX, saves.name_char);
-    a.stroke = false;
-    a.last_x = 0;
-    a.last_y = 0;
-    a.shot   = false;
-    a.alloc  = nil;
+    ui.field_init(?a.go_to, 19, digit);
+    a.stroke   = false;
+    a.last_x   = 0;
+    a.last_y   = 0;
+    a.shot     = false;
+    a.selected = false;
+    a.dragging = false;
+    a.alloc    = nil;
+    worker.init(?a.identifier);
+    a.id_limits = identify.limits();
+}
+
+# classify a pattern off the frame under a rule, replacing a classification
+# still running, and say so while it runs
+# ---
+# a: application state
+# r: the rule
+# p: the pattern, which the worker copies, so the caller keeps it
+pub fun identify_start(a: *App, r: rule.Rule, p: *pattern.Pattern) {
+    if (!worker.start(?a.identifier, r, p, a.id_limits)) {
+        say(a, "the selection could not be identified: out of memory or threads");
+        ret;
+    }
+    say(a, IDENTIFYING);
+}
+
+# flash a finished classification, keeping the running message up until then;
+# the frame calls this once a frame
+pub fun identify_poll(a: *App) {
+    val c: worker.Collected = worker.collect(?a.identifier);
+    if (sel c.idle) {
+        if (worker.running(?a.identifier) && a.toast == IDENTIFYING) { a.toast_t = TOAST_TICKS; }
+        ret;
+    }
+    if (sel c.failed) {
+        say(a, "out of memory");
+        ret;
+    }
+    if (sel c.ready) {
+        var r:    identify.Result = c.ready;
+        var line: [641]u8;
+        say_why(a, "selection", identify.describe(?r, ?line[0]));
+    }
+}
+
+test zoom_min__keeps_a_pixel_within_a_chunks_neighbours {
+    # a pixel the draw colours lies at most a pixel outside its chunk, and its
+    # footprint reaches half a pixel further, which must stay in the next chunk
+    val cells: f32 = 1.0 / (render.BASE_PPC * ZOOM_MIN);
+    if (cells * 1.5 >= 64.0) { ret 1; }
+    ret 0;
+}
+
+test step_ink__cycles_the_live_states_and_fit_ink_clamps_them {
+    var a: App;
+    a.tool = TOOL_ERASE;
+    a.ink  = 1;
+    if (pen(?a) != 0) { ret 1; }
+    step_ink(?a, 4, false);
+    if (a.ink != 2 || a.tool != TOOL_DRAW || pen(?a) != 2) { ret 2; }
+    step_ink(?a, 4, false);
+    step_ink(?a, 4, false);
+    if (a.ink != 1) { ret 3; }
+    step_ink(?a, 4, true);
+    if (a.ink != 3) { ret 4; }
+    # a rule of fewer states brings the ink within them, and two states hold it at 1
+    fit_ink(?a, 3);
+    if (a.ink != 2) { ret 5; }
+    step_ink(?a, 2, true);
+    if (a.ink != 1) { ret 6; }
+    a.ink = 255;
+    fit_ink(?a, 256);
+    if (a.ink != 255) { ret 7; }
+    ret 0;
 }

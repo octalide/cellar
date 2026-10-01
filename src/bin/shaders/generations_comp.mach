@@ -1,0 +1,170 @@
+# one generation of every allocated chunk in the pool, under the generations
+# family (cellar.rules.generations)
+#
+# an invocation is a run of 8 cells in a row, and 8 workgroups of 64 cover a
+# chunk; workgroup y names the chunk's slot. the neighbourhood is read straight
+# from the source pool through the chunk's page-table entry, so a chunk that
+# does not exist reads as dead. a cell is heat << 8 | state, and only state 1
+# counts as a neighbour.
+#
+# each step stamps, per slot, the step's serial into an alive and a warm word
+# when the chunk's result holds a live cell or any cell not dead, as the
+# weighted family's stage does. a chunk with no live cell in its 3 by 3 block
+# has no births or survivals, so its dying cells only move on, and one with no
+# cell but dead ones, cold the step before too, already holds zeros in both
+# pools and is skipped.
+
+use cellar.layout;
+use cellar.layout.Cells;
+use cellar.layout.Flags;
+use cellar.layout.Meta;
+use cellar.rules.generations.word;
+
+#[storage(1, 0, "readonly")]
+var src:   Cells;
+#[storage(1, 1)]
+var dst:   Cells;
+#[storage(1, 2, "readonly")]
+var meta:  Meta;
+#[storage(1, 3)]
+var flags: Flags;
+
+#[builtin("global_invocation")]
+var gid: u32x3;
+
+# the index in the source pool of the cell at (x, y) of a slot's frame, taken
+# through the links where it lies outside the window (cellar.layout), or NONE
+# where no chunk holds it
+fun reach(slot: u32, x: i32, y: i32) u32 {
+    var sl: u32 = slot;
+    var px: i32 = x;
+    var py: i32 = y;
+    var at: u32 = layout.NONE;
+    var h:  u32 = 0;
+    for (h <= layout.HOPS) {
+        val b: u32 = sl * layout.ENTRY;
+        val k: u32 = layout.edge_side(meta.table[b + layout.EDGE_AT], px, py);
+        val n: u32 = meta.table[b + k];
+        if (k == 4) {
+            at = sl * layout.CELLS + (py * layout.SIDE::i32 + px)::u32;
+            h  = layout.HOPS;
+        }
+        or (n == layout.NONE) { h = layout.HOPS; }
+        or {
+            val t:  u32 = meta.table[b + layout.LINK_AT + k];
+            val nx: i32 = layout.hop_x(t, px, py);
+            py = layout.hop_y(t, px, py);
+            px = nx;
+            sl = n;
+        }
+        h = h + 1;
+    }
+    ret at;
+}
+
+#[stage("compute")]
+#[workgroup(64, 1, 1)]
+fun comp_main() {
+    val slot: u32 = gid[1];
+    val ly:   i32 = (gid[0] / 8)::i32;
+    val x0:   u32 = (gid[0] % 8) * 8;
+    val base: u32 = slot * layout.ENTRY;
+    val row:  u32 = slot * layout.CELLS + (ly * layout.SIDE::i32)::u32;
+    if (meta.table[base + layout.INCARNATION_AT] == 0) { ret; }
+    # a seamed chunk reads its block through its links, and holds its cells
+    # off the grid at zero
+    val edge:   u32 = meta.table[base + layout.EDGE_AT];
+    val seamed: u32 = layout.seamed(edge);
+
+    # the serial that produced the source, or this step's where a stamp this
+    # step already wrote replaced it
+    val last:    u32 = meta.serial - 1;
+    val now:     u32 = meta.serial;
+    val n:       u32 = meta.rule[word.STATES_AT];
+    val birth:   u32 = meta.rule[word.BIRTH_AT];
+    val survive: u32 = meta.rule[word.SURVIVE_AT];
+    var busy:    u32 = 0;
+    var k:       u32 = 0;
+    for (k < 9) {
+        val nb: u32 = meta.table[base + k];
+        if (nb != layout.NONE) {
+            val f: u32 = flags.v[nb * 2];
+            if (f == last || f == now) { busy = 1; }
+        }
+        k = k + 1;
+    }
+    if (seamed != 0) { busy = 1; }
+    var x: u32 = x0;
+    if (busy == 0) {
+        val warm: u32 = flags.v[slot * 2 + 1];
+        if (warm != last && warm != now) {
+            # all dead at the source; if it was a step earlier too, the
+            # destination already holds zeros
+            if (warm != last - 1) { ret; }
+            for (x < x0 + 8) {
+                dst.v[row + x] = 0;
+                x              = x + 1;
+            }
+            ret;
+        }
+    }
+
+    var live: u32 = 0;
+    var warm: u32 = 0;
+    for (x < x0 + 8) {
+        val cur:   u32 = src.v[row + x];
+        val st:    u32 = cur & word.STATE_MASK;
+        var count: u32 = 0;
+        if (busy != 0) {
+            var dy: i32 = -1;
+            for (dy <= 1) {
+                var y:  i32 = ly + dy;
+                var cy: u32 = 1;
+                if (y < 0) {
+                    y  = y + layout.SIDE::i32;
+                    cy = 0;
+                }
+                or (y >= layout.SIDE::i32) {
+                    y  = y - layout.SIDE::i32;
+                    cy = 2;
+                }
+                var dx: i32 = -1;
+                for (dx <= 1) {
+                    if (dx != 0 || dy != 0) {
+                        var xx: i32 = x::i32 + dx;
+                        var cx: u32 = 1;
+                        if (xx < 0) {
+                            xx = xx + layout.SIDE::i32;
+                            cx = 0;
+                        }
+                        or (xx >= layout.SIDE::i32) {
+                            xx = xx - layout.SIDE::i32;
+                            cx = 2;
+                        }
+                        var at: u32 = layout.NONE;
+                        if (seamed != 0) { at = reach(slot, x::i32 + dx, ly + dy); }
+                        or {
+                            val nb: u32 = meta.table[base + cy * 3 + cx];
+                            if (nb != layout.NONE) { at = nb * layout.CELLS + (y * layout.SIDE::i32 + xx)::u32; }
+                        }
+                        if (at != layout.NONE) {
+                            if ((src.v[at] & word.STATE_MASK) == word.LIVE) { count = count + 1; }
+                        }
+                    }
+                    dx = dx + 1;
+                }
+                dy = dy + 1;
+            }
+        }
+        var mask: u32 = birth;
+        if (st == word.LIVE) { mask = survive; }
+        var next: u32 = word.next(st, n, (mask >> count) & 1);
+        if (seamed != 0 && layout.edge_side(edge, x::i32, ly) != 4) { next = 0; }
+        if (next == word.LIVE)                                      { live = 1; }
+        warm           = warm | next;
+        dst.v[row + x] = word.word(next, n);
+        x              = x + 1;
+    }
+    if (live != 0) { flags.v[slot * 2] = now; }
+    if (warm != 0) { flags.v[slot * 2 + 1] = now; }
+}

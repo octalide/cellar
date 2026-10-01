@@ -1,0 +1,1545 @@
+# Golly's RuleLoader .rule files, read into the decision tree the table family
+# steps
+#
+# a .rule file is sections, each begun by a line starting with '@': @RULE names
+# the rule, @TABLE or @TREE gives its transitions, the first of the two found
+# being the one taken as Golly takes it, and @COLORS its palette. every other
+# section (@NAMES, @ICONS) and the prose between them is skipped.
+#
+# a @TABLE is read as Golly's RuleTable algorithm reads one: n_states (2 to
+# 256), neighborhood (vonNeumann, Moore or hexagonal, the last being Golly's
+# emulation on the square grid, whose six neighbours leave out north-east and
+# south-west) and symmetries, before any variable or transition. a variable
+# names a set of states, and one named more than once in a transition is bound,
+# taking each of its states in turn at every place it appears. a transition
+# lists the inputs in Golly's order, the cell first, then its next state, and
+# with at most ten states and no variables it may be written without commas.
+# each transition stands for every image of itself under the symmetries, the
+# first transition any image of which matches a neighbourhood gives the next
+# state, and a neighbourhood no transition matches keeps the cell.
+#
+# a @TREE is Golly's rule tree: num_states, num_neighbors (4 or 8) and
+# num_nodes, then node lines, a node's depth and its children, which at depth 1
+# are next states and above it node numbers one depth down.
+#
+# either becomes one form: a decision tree whose node holds one word per state
+# of the input it reads, a child's offset or, at the last input, the next
+# state. a lookup starts at the root and takes the child for each input's
+# state in turn, so the step is one read per input whatever the rule. a table
+# is compiled to it by walking the inputs, the cell last, keeping the
+# transitions that can still match, and sharing every node and every set of
+# transitions met twice. a @TREE already is one.
+#
+# a rule whose empty neighbourhood gives a live cell is refused: it would flip
+# the unbounded background (cellar.rule).
+
+use cellar.layout;
+use cellar.rules.table.word;
+use allo: std.allocator;
+use std.allocator.page;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use mem: std.memory;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string;
+use std.types.string.str;
+
+# the longest rule name
+pub val NAME_MAX: usize = 64;
+# the most inputs a lookup reads: the eight neighbours and the cell
+pub val INPUTS_MAX: usize = 9;
+# the longest line read
+val LINE_MAX: usize = 4096;
+# the most tokens of a line kept
+val TOKENS_MAX: usize = 512;
+# the longest variable name
+val VAR_MAX: usize = 64;
+# the most transition images a table may expand to
+val IMAGES_MAX: usize = 8388608;
+# the most words the compiler's memo may hold before the table is refused
+val MEMO_MAX: usize = 67108864;
+
+# neighbourhoods
+pub val VON_NEUMANN: u8 = 0;
+pub val MOORE:       u8 = 1;
+pub val HEXAGONAL:   u8 = 2;
+
+# a compiled rule
+# ---
+# name:    the rule's name, as @RULE gives it, NUL-terminated
+# states:  how many states a cell can be in
+# inputs:  the inputs a lookup reads
+# at:      per input, the position it reads in the 3 by 3 block around the
+#          cell, row-major with the cell at 4, in the order the tree reads them
+# root:    the root node's offset in tree
+# tree:    the nodes, states words each
+# colours: per state its colour, 0xrrggbb
+# iso:     every rotation and reflection of the square steps alike
+pub rec Table {
+    name:    [65]u8;
+    states:  u32;
+    inputs:  u32;
+    at:      [9]u32;
+    root:    u32;
+    tree:    Vector[u32];
+    colours: [256]u32;
+    iso:     bool;
+}
+
+# why a file could not be read
+# ---
+# why:  what is wrong
+# line: the line it was found on, from 1
+pub rec Fault {
+    why:  str;
+    line: usize;
+}
+
+# release a table's tree
+pub fun dnit(t: *Table) {
+    vector.dnit[u32](?t.tree);
+}
+
+# the next state of a cell under a table
+# ---
+# t:   the table
+# nb:  the states of the 3 by 3 block around the cell, row-major with it at 4
+# ret: its next state
+pub fun next(t: *Table, nb: *u32) u32 {
+    var p: u32 = t.root;
+    var i: u32 = 0;
+    for (i < t.inputs) {
+        p = t.tree.data[(p + nb[t.at[i]])::usize];
+        i = i + 1;
+    }
+    ret p;
+}
+
+rec Cursor {
+    p:  *u8;
+    n:  usize;
+    at: usize;
+    no: usize;
+}
+
+# read the next line into buf, its end and any carriage return dropped
+# ---
+# c:    the cursor
+# buf:  at least LINE_MAX + 1 bytes
+# long: receives whether the line was cut short
+# ret:  false at the end of the text
+fun next_line(c: *Cursor, buf: *u8, long: *bool) bool {
+    if (c.at >= c.n) { ret false; }
+    var k: usize = 0;
+    @long = false;
+    for (c.at < c.n && c.p[c.at] != '\n') {
+        if (k < LINE_MAX) {
+            buf[k] = c.p[c.at];
+            k      = k + 1;
+        }
+        or { @long = true; }
+        c.at = c.at + 1;
+    }
+    if (c.at < c.n)                  { c.at = c.at + 1; }
+    if (k > 0 && buf[k - 1] == '\r') { k = k - 1; }
+    buf[k] = 0;
+    c.no   = c.no + 1;
+    ret true;
+}
+
+fun fault(why: str, line: usize) opt[Fault] {
+    ret opt[Fault].some{Fault{why: why, line: line}};
+}
+
+fun blank(c: u8) bool {
+    ret c == ' ' || c == '\t';
+}
+
+fun digit(c: u8) bool {
+    ret c >= '0' && c <= '9';
+}
+
+fun lower(c: u8) u8 {
+    if (c >= 'A' && c <= 'Z') { ret c + 32; }
+    ret c;
+}
+
+# whether s starts with key, ignoring case
+fun starts(s: *u8, key: str) bool {
+    var i: usize = 0;
+    for (key[i] != 0) {
+        if (lower(s[i]) != lower(key[i])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# cut a line at a '#' and trim blanks from both ends
+# ---
+# s:   the line, NUL-terminated, cut in place
+# ret: its first byte that is not blank
+fun trimmed(s: *u8, comment: bool) *u8 {
+    var n: usize = 0;
+    for (s[n] != 0) {
+        if (comment && s[n] == '#') { s[n] = 0; }
+        or                          { n = n + 1; }
+    }
+    for (n > 0 && blank(s[n - 1])) { n = n - 1; }
+    s[n] = 0;
+    var b: usize = 0;
+    for (blank(s[b])) { b = b + 1; }
+    ret ?s[b];
+}
+
+# the leading digits of s as a number, or none without one
+fun number(s: *u8) opt[u32] {
+    if (!digit(s[0])) { ret opt[u32].none{}; }
+    var v: u64   = 0;
+    var i: usize = 0;
+    for (digit(s[i])) {
+        if (v < 0x100000000) { v = v * 10 + (s[i] - '0')::u64; }
+        i = i + 1;
+    }
+    if (v > 0xffffffff) { v = 0xffffffff; }
+    ret opt[u32].some{v::u32};
+}
+
+# whether a byte separates tokens under delims
+fun delim(c: u8, delims: str) bool {
+    var i: usize = 0;
+    for (delims[i] != 0) {
+        if (c == delims[i]) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# split a line in place into tokens at any byte of delims
+# ---
+# s:      the line, NUL-terminated, whose delimiters become NULs
+# delims: the bytes that separate tokens
+# tok:    receives up to TOKENS_MAX tokens
+# ret:    how many there are, counting those past TOKENS_MAX
+fun tokens(s: *u8, delims: str, tok: **u8) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    for (s[i] != 0) {
+        for (s[i] != 0 && delim(s[i], delims)) {
+            s[i] = 0;
+            i    = i + 1;
+        }
+        if (s[i] == 0)      { brk; }
+        if (n < TOKENS_MAX) { tok[n] = ?s[i]; }
+        n = n + 1;
+        for (s[i] != 0 && !delim(s[i], delims)) { i = i + 1; }
+    }
+    ret n;
+}
+
+# a table's variable
+# ---
+# name: NUL-terminated
+# at:   its states' first place in the pool of variables' states
+# len:  how many states it lists, repeats included
+# id:   the id of the set of states it holds (see Reading)
+rec Var {
+    name: [65]u8;
+    at:   u32;
+    len:  u32;
+    id:   u16;
+}
+
+# a set of states a variable holds, a bit each, and whether it holds every
+# state of the rule
+rec Set {
+    bits: [8]u32;
+    full: bool;
+}
+
+# a table as it is read: its header, its variables, the sets they hold and the
+# images of its transitions, each inputs ids and a next state. an id below 256
+# is that state alone, and 256 + i the set sets holds at i. every set is held
+# once and a set of one state is that state's id, so two inputs hold the same
+# states exactly when their ids are equal, which permute's arrangements count on
+rec Reading {
+    n:      u32;
+    ni:     usize;
+    hood:   u8;
+    sym:    u8;
+    rows:   *u32;
+    nrows:  usize;
+    vars:   Vector[Var];
+    vals:   Vector[u8];
+    sets:   Vector[Set];
+    images: Vector[u16];
+    outs:   Vector[u8];
+}
+
+val SYM_NONE:    u8 = 0;
+val SYM_PERMUTE: u8 = 1;
+val SYM_REMAP:   u8 = 2;
+
+# Golly's symmetry images, per image the input each place takes, in the
+# table's input order: the cell, then the neighbours clockwise from north
+val VN_ROTATE4:        [20]u32 = [20]u32{0, 1, 2, 3, 4, 0, 2, 3, 4, 1, 0, 3, 4, 1, 2, 0, 4, 1, 2, 3};
+val VN_ROTATE4REFLECT: [40]u32 = [40]u32{
+    0, 1, 2, 3, 4, 0, 2, 3, 4, 1, 0, 3, 4, 1, 2, 0, 4, 1, 2, 3,
+    0, 4, 3, 2, 1, 0, 3, 2, 1, 4, 0, 2, 1, 4, 3, 0, 1, 4, 3, 2,
+};
+val VN_REFLECT:    [10]u32 = [10]u32{0, 1, 2, 3, 4, 0, 1, 4, 3, 2};
+val MOORE_ROTATE4: [36]u32 = [36]u32{
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 0, 3, 4, 5, 6, 7, 8, 1, 2,
+    0, 5, 6, 7, 8, 1, 2, 3, 4, 0, 7, 8, 1, 2, 3, 4, 5, 6,
+};
+val MOORE_ROTATE8: [72]u32 = [72]u32{
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 0, 2, 3, 4, 5, 6, 7, 8, 1,
+    0, 3, 4, 5, 6, 7, 8, 1, 2, 0, 4, 5, 6, 7, 8, 1, 2, 3,
+    0, 5, 6, 7, 8, 1, 2, 3, 4, 0, 6, 7, 8, 1, 2, 3, 4, 5,
+    0, 7, 8, 1, 2, 3, 4, 5, 6, 0, 8, 1, 2, 3, 4, 5, 6, 7,
+};
+val MOORE_ROTATE4REFLECT: [72]u32 = [72]u32{
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 0, 3, 4, 5, 6, 7, 8, 1, 2,
+    0, 5, 6, 7, 8, 1, 2, 3, 4, 0, 7, 8, 1, 2, 3, 4, 5, 6,
+    0, 1, 8, 7, 6, 5, 4, 3, 2, 0, 7, 6, 5, 4, 3, 2, 1, 8,
+    0, 5, 4, 3, 2, 1, 8, 7, 6, 0, 3, 2, 1, 8, 7, 6, 5, 4,
+};
+val MOORE_ROTATE8REFLECT: [144]u32 = [144]u32{
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 0, 2, 3, 4, 5, 6, 7, 8, 1,
+    0, 3, 4, 5, 6, 7, 8, 1, 2, 0, 4, 5, 6, 7, 8, 1, 2, 3,
+    0, 5, 6, 7, 8, 1, 2, 3, 4, 0, 6, 7, 8, 1, 2, 3, 4, 5,
+    0, 7, 8, 1, 2, 3, 4, 5, 6, 0, 8, 1, 2, 3, 4, 5, 6, 7,
+    0, 8, 7, 6, 5, 4, 3, 2, 1, 0, 7, 6, 5, 4, 3, 2, 1, 8,
+    0, 6, 5, 4, 3, 2, 1, 8, 7, 0, 5, 4, 3, 2, 1, 8, 7, 6,
+    0, 4, 3, 2, 1, 8, 7, 6, 5, 0, 3, 2, 1, 8, 7, 6, 5, 4,
+    0, 2, 1, 8, 7, 6, 5, 4, 3, 0, 1, 8, 7, 6, 5, 4, 3, 2,
+};
+val MOORE_REFLECT: [18]u32 = [18]u32{0, 1, 2, 3, 4, 5, 6, 7, 8, 0, 1, 8, 7, 6, 5, 4, 3, 2};
+val HEX_ROTATE2:   [14]u32 = [14]u32{0, 1, 2, 3, 4, 5, 6, 0, 4, 5, 6, 1, 2, 3};
+val HEX_ROTATE3:   [21]u32 = [21]u32{0, 1, 2, 3, 4, 5, 6, 0, 3, 4, 5, 6, 1, 2, 0, 5, 6, 1, 2, 3, 4};
+val HEX_ROTATE6:   [42]u32 = [42]u32{
+    0, 1, 2, 3, 4, 5, 6, 0, 2, 3, 4, 5, 6, 1, 0, 3, 4, 5, 6, 1, 2,
+    0, 4, 5, 6, 1, 2, 3, 0, 5, 6, 1, 2, 3, 4, 0, 6, 1, 2, 3, 4, 5,
+};
+val HEX_ROTATE6REFLECT: [84]u32 = [84]u32{
+    0, 1, 2, 3, 4, 5, 6, 0, 2, 3, 4, 5, 6, 1, 0, 3, 4, 5, 6, 1, 2,
+    0, 4, 5, 6, 1, 2, 3, 0, 5, 6, 1, 2, 3, 4, 0, 6, 1, 2, 3, 4, 5,
+    0, 6, 5, 4, 3, 2, 1, 0, 5, 4, 3, 2, 1, 6, 0, 4, 3, 2, 1, 6, 5,
+    0, 3, 2, 1, 6, 5, 4, 0, 2, 1, 6, 5, 4, 3, 0, 1, 6, 5, 4, 3, 2,
+};
+
+# per tree input, the table input it reads, and the tree input's place in the
+# 3 by 3 block. a tree reads the cell last, so a lookup that finds no
+# transition knows the cell to keep; for Moore and von Neumann the order is
+# the one Golly's @TREE fixes
+val VN_ORDER:    [5]u32 = [5]u32{1, 4, 2, 3, 0};
+val VN_AT:       [5]u32 = [5]u32{1, 3, 5, 7, 4};
+val MOORE_ORDER: [9]u32 = [9]u32{8, 2, 6, 4, 1, 7, 3, 5, 0};
+val MOORE_AT:    [9]u32 = [9]u32{0, 2, 6, 8, 1, 3, 5, 7, 4};
+val HEX_ORDER:   [7]u32 = [7]u32{6, 1, 2, 5, 3, 4, 0};
+val HEX_AT:      [7]u32 = [7]u32{0, 1, 5, 3, 8, 7, 4};
+
+# choose the symmetry a table names for its neighbourhood
+# ---
+# r:    the reading, its neighbourhood set
+# name: the symmetry's name
+# iso:  receives whether it takes in every rotation and reflection of the square
+# ret:  false when the neighbourhood has no such symmetry
+fun symmetry(r: *Reading, name: *u8, iso: *bool) bool {
+    r.sym   = SYM_REMAP;
+    r.nrows = 0;
+    @iso    = false;
+    if (string.str_equals(name, "none")) {
+        r.sym = SYM_NONE;
+        ret true;
+    }
+    if (string.str_equals(name, "permute")) {
+        r.sym = SYM_PERMUTE;
+        @iso  = r.hood != HEXAGONAL;
+        ret true;
+    }
+    if (r.hood == VON_NEUMANN) {
+        if (string.str_equals(name, "rotate4")) {
+            r.rows  = ?VN_ROTATE4[0];
+            r.nrows = 4;
+        }
+        or (string.str_equals(name, "rotate4reflect")) {
+            r.rows  = ?VN_ROTATE4REFLECT[0];
+            r.nrows = 8;
+            @iso    = true;
+        }
+        or (string.str_equals(name, "reflect_horizontal")) {
+            r.rows  = ?VN_REFLECT[0];
+            r.nrows = 2;
+        }
+    }
+    or (r.hood == MOORE) {
+        if (string.str_equals(name, "rotate4")) {
+            r.rows  = ?MOORE_ROTATE4[0];
+            r.nrows = 4;
+        }
+        or (string.str_equals(name, "rotate8")) {
+            r.rows  = ?MOORE_ROTATE8[0];
+            r.nrows = 8;
+        }
+        or (string.str_equals(name, "rotate4reflect")) {
+            r.rows  = ?MOORE_ROTATE4REFLECT[0];
+            r.nrows = 8;
+            @iso    = true;
+        }
+        or (string.str_equals(name, "rotate8reflect")) {
+            r.rows  = ?MOORE_ROTATE8REFLECT[0];
+            r.nrows = 16;
+            @iso    = true;
+        }
+        or (string.str_equals(name, "reflect_horizontal")) {
+            r.rows  = ?MOORE_REFLECT[0];
+            r.nrows = 2;
+        }
+    }
+    or {
+        if (string.str_equals(name, "rotate2")) {
+            r.rows  = ?HEX_ROTATE2[0];
+            r.nrows = 2;
+        }
+        or (string.str_equals(name, "rotate3")) {
+            r.rows  = ?HEX_ROTATE3[0];
+            r.nrows = 3;
+        }
+        or (string.str_equals(name, "rotate6")) {
+            r.rows  = ?HEX_ROTATE6[0];
+            r.nrows = 6;
+        }
+        or (string.str_equals(name, "rotate6reflect")) {
+            r.rows  = ?HEX_ROTATE6REFLECT[0];
+            r.nrows = 12;
+        }
+    }
+    ret r.nrows != 0;
+}
+
+# whether the set an id names holds a state
+fun member(r: *Reading, id: u16, s: u32) bool {
+    if (id < 256) { ret id::u32 == s; }
+    val v: *Set = ?r.sets.data[(id - 256)::usize];
+    ret ((v.bits[(s / 32)::usize] >> (s % 32)) & 1) != 0;
+}
+
+# whether the set an id names holds every state
+fun full(r: *Reading, id: u16) bool {
+    if (id < 256) { ret r.n == 1; }
+    ret r.sets.data[(id - 256)::usize].full;
+}
+
+# add an image of a transition
+fun image(r: *Reading, ids: *u16, out: u8) bool {
+    if (r.outs.len >= IMAGES_MAX) { ret false; }
+    var i: usize = 0;
+    for (i < r.ni) {
+        val pi: res[usize, allo.Error] = vector.push[u16](?r.images, ids[i]);
+        if (sel pi.err) { ret false; }
+        i = i + 1;
+    }
+    val po: res[usize, allo.Error] = vector.push[u8](?r.outs, out);
+    ret sel po.ok;
+}
+
+# rearrange a run of ids into the next greater arrangement, as C++'s
+# next_permutation does, so equal ids are never swapped for one another
+# ---
+# ret: false once the run is back to its least arrangement
+fun next_arrangement(p: *u16, n: usize) bool {
+    if (n < 2) { ret false; }
+    var i: usize = n - 1;
+    for (i > 0 && p[i - 1] >= p[i]) { i = i - 1; }
+    if (i == 0) {
+        reverse(p, 0, n);
+        ret false;
+    }
+    var j: usize = n - 1;
+    for (p[j] <= p[i - 1]) { j = j - 1; }
+    val t: u16 = p[i - 1];
+    p[i - 1] = p[j];
+    p[j]     = t;
+    reverse(p, i, n);
+    ret true;
+}
+
+fun reverse(p: *u16, from: usize, to: usize) {
+    var a: usize = from;
+    var b: usize = to;
+    for (a + 1 < b) {
+        b = b - 1;
+        val t: u16 = p[a];
+        p[a] = p[b];
+        p[b] = t;
+        a    = a + 1;
+    }
+}
+
+# add every image of a transition under the table's symmetries
+# ---
+# ret: false when the images outgrow IMAGES_MAX or memory
+fun transition(r: *Reading, ids: *u16, out: u8) bool {
+    if (r.sym == SYM_NONE) { ret image(r, ids, out); }
+    var img: [9]u16;
+    if (r.sym == SYM_PERMUTE) {
+        img[0] = ids[0];
+        var i: usize = 1;
+        for (i < r.ni) {
+            img[i] = ids[i];
+            i      = i + 1;
+        }
+        # sorted first, so every distinct arrangement is met once
+        i = 1;
+        for (i < r.ni) {
+            var j: usize = i;
+            for (j > 1 && img[j - 1] > img[j]) {
+                val t: u16 = img[j - 1];
+                img[j - 1] = img[j];
+                img[j]     = t;
+                j          = j - 1;
+            }
+            i = i + 1;
+        }
+        for {
+            if (!image(r, ?img[0], out))              { ret false; }
+            if (!next_arrangement(?img[1], r.ni - 1)) { brk; }
+        }
+        ret true;
+    }
+    var k: usize = 0;
+    for (k < r.nrows) {
+        var i: usize = 0;
+        for (i < r.ni) {
+            img[i] = ids[r.rows[k * r.ni + i]::usize];
+            i      = i + 1;
+        }
+        if (!image(r, ?img[0], out)) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# the variable a token names, if any
+fun var_named(r: *Reading, s: *u8) opt[usize] {
+    var i: usize = 0;
+    for (i < r.vars.len) {
+        if (string.str_equals(?r.vars.data[i].name[0], s)) { ret opt[usize].some{i}; }
+        i = i + 1;
+    }
+    ret opt[usize].none{};
+}
+
+# read a variable line
+fun variable(r: *Reading, line: *u8, no: usize) opt[Fault] {
+    var tok: [512]*u8;
+    var cut: [4097]u8;
+    mem.copy[u8](?cut[0], line, string.str_len(line) + 1);
+    # the name is what follows "var" up to a blank or '='
+    val nn: usize = tokens(?cut[0], "= \t", ?tok[0]);
+    if (nn < 2) { ret fault("a variable has no name", no); }
+    var name: [65]u8;
+    val len:  usize = string.str_len(tok[1]);
+    if (len > VAR_MAX) { ret fault("a variable's name is too long", no); }
+    mem.copy[u8](?name[0], tok[1], len + 1);
+    val n: usize = tokens(line, "= {,}\t", ?tok[0]);
+    if (n < 2 || !string.str_equals(tok[1], ?name[0])) { ret fault("a variable's name holds a delimiter", no); }
+    if (n < 3)                                         { ret fault("a variable lists no states", no); }
+    if (n > TOKENS_MAX)                                { ret fault("a variable lists too many states", no); }
+    var v: Var;
+    mem.copy[u8](?v.name[0], ?name[0], len + 1);
+    v.at  = r.vals.len::u32;
+    v.len = 0;
+    var i: usize = 2;
+    for (i < n) {
+        val other: opt[usize] = var_named(r, tok[i]);
+        if (sel other.some) {
+            # a variable named inside a later one stands for its states
+            val o:  Var   = r.vars.data[other.some];
+            var sj: usize = 0;
+            for (sj < o.len::usize) {
+                val pv: res[usize, allo.Error] = vector.push[u8](?r.vals, r.vals.data[o.at::usize + sj]);
+                if (sel pv.err) { ret fault("out of memory", no); }
+                v.len = v.len + 1;
+                sj    = sj + 1;
+            }
+        }
+        or {
+            val s: opt[u32] = number(tok[i]);
+            if (sel s.none)    { ret fault("a variable lists something that is not a state", no); }
+            if (s.some >= r.n) { ret fault("a variable lists a state beyond n_states", no); }
+            val pv: res[usize, allo.Error] = vector.push[u8](?r.vals, s.some::u8);
+            if (sel pv.err) { ret fault("out of memory", no); }
+            v.len = v.len + 1;
+        }
+        i = i + 1;
+    }
+    var st:  Set;
+    var one: u32 = 0;
+    var k:   u32 = 0;
+    for (k < v.len) {
+        val s: u32 = r.vals.data[(v.at + k)::usize]::u32;
+        st.bits[(s / 32)::usize] = st.bits[(s / 32)::usize] | (1::u32 << (s % 32));
+        one                      = s;
+        k                        = k + 1;
+    }
+    st.full = true;
+    var held: u32 = 0;
+    var s:    u32 = 0;
+    for (s < r.n) {
+        if (((st.bits[(s / 32)::usize] >> (s % 32)) & 1) == 0) { st.full = false; }
+        or                                                     { held = held + 1; }
+        s = s + 1;
+    }
+    if (held == 1) { v.id = one::u16; }
+    or {
+        var i: usize = 0;
+        for (i < r.sets.len && !mem.equal[u32](?r.sets.data[i].bits[0], ?st.bits[0], 8)) { i = i + 1; }
+        if (i == r.sets.len) {
+            if (i >= 65536 - 256) { ret fault("too many variables", no); }
+            val ps: res[usize, allo.Error] = vector.push[Set](?r.sets, st);
+            if (sel ps.err) { ret fault("out of memory", no); }
+        }
+        v.id = (256 + i)::u16;
+    }
+    # a later definition of the same name replaces the earlier
+    val was: opt[usize] = var_named(r, ?v.name[0]);
+    if (sel was.some) {
+        r.vars.data[was.some] = v;
+        ret opt[Fault].none{};
+    }
+    val pushed: res[usize, allo.Error] = vector.push[Var](?r.vars, v);
+    if (sel pushed.err) { ret fault("out of memory", no); }
+    ret opt[Fault].none{};
+}
+
+# read a transition line and add every transition it stands for
+fun transition_line(r: *Reading, line: *u8, no: usize) opt[Fault] {
+    var ids: [9]u16;
+    if (r.n <= 10 && r.vars.len == 0 && !string.str_contains_char(line, ',')) {
+        # single digits, the inputs then the next state
+        if (string.str_len(line) < r.ni + 1) { ret fault("a transition has too few entries", no); }
+        var i: usize = 0;
+        for (i <= r.ni) {
+            if (!digit(line[i])) { ret fault("a transition holds something that is not a state", no); }
+            val s: u32 = (line[i] - '0')::u32;
+            if (s >= r.n) { ret fault("a transition names a state beyond n_states", no); }
+            if (i < r.ni) { ids[i] = s::u16; }
+            i = i + 1;
+        }
+        if (!transition(r, ?ids[0], (line[r.ni] - '0')::u8)) { ret fault("the table expands to too many transitions", no); }
+        ret opt[Fault].none{};
+    }
+    var tok: [512]*u8;
+    val n:   usize = tokens(line, ", #\t", ?tok[0]);
+    if (n < r.ni + 1) { ret fault("a transition has too few entries", no); }
+    # a variable named more than once among the inputs and the next state is
+    # bound, taking the same state at every place
+    var bound: [10]usize;
+    var nb:    usize = 0;
+    var vof:   [10]i64;
+    var i:     usize = 0;
+    for (i <= r.ni) {
+        vof[i] = -1;
+        val v: opt[usize] = var_named(r, tok[i]);
+        if (sel v.some) { vof[i] = v.some::i64; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i <= r.ni) {
+        if (vof[i] >= 0) {
+            var times: usize = 0;
+            var seen:  bool  = false;
+            var j:     usize = 0;
+            for (j <= r.ni) {
+                if (vof[j] == vof[i]) {
+                    times = times + 1;
+                    if (j < i) { seen = true; }
+                }
+                j = j + 1;
+            }
+            if (times > 1 && !seen) {
+                bound[nb] = vof[i]::usize;
+                nb        = nb + 1;
+            }
+        }
+        i = i + 1;
+    }
+    var pick: [10]u32;
+    var k:    usize = 0;
+    for (k < nb) {
+        pick[k] = 0;
+        k       = k + 1;
+    }
+    for {
+        i = 0;
+        for (i <= r.ni) {
+            var id: u32 = 0;
+            if (vof[i] >= 0) {
+                val v:  usize = vof[i]::usize;
+                var bk: usize = nb;
+                k = 0;
+                for (k < nb) {
+                    if (bound[k] == v) { bk = k; }
+                    k = k + 1;
+                }
+                val vv: *Var = ?r.vars.data[v];
+                if (bk < nb)     { id = r.vals.data[(vv.at + pick[bk])::usize]::u32; }
+                or (i < r.ni)    { id = vv.id::u32; }
+                or (vv.len == 1) { id = r.vals.data[vv.at::usize]::u32; }
+                or               { ret fault("a transition's next state must be a state, a single-state variable or a bound variable", no); }
+            }
+            or {
+                val s: opt[u32] = number(tok[i]);
+                if (sel s.none) { ret fault("a transition holds something that is neither a state nor a variable", no); }
+                id = s.some;
+                if (id >= r.n) { ret fault("a transition names a state beyond n_states", no); }
+            }
+            if (i < r.ni) { ids[i] = id::u16; }
+            or {
+                if (!transition(r, ?ids[0], id::u8)) { ret fault("the table expands to too many transitions", no); }
+            }
+            i = i + 1;
+        }
+        # the next choice of the bound variables' states, the first fastest
+        var c: usize = 0;
+        for (c < nb) {
+            if (pick[c] + 1 < r.vars.data[bound[c]].len) {
+                pick[c] = pick[c] + 1;
+                brk;
+            }
+            pick[c] = 0;
+            c       = c + 1;
+        }
+        if (c >= nb) { brk; }
+    }
+    ret opt[Fault].none{};
+}
+
+# read a @TABLE section into a reading, leaving the cursor on the line that
+# begins the next section
+fun read_table(r: *Reading, c: *Cursor, iso: *bool) opt[Fault] {
+    var buf:    [4097]u8;
+    var long:   bool = false;
+    var states: bool = false;
+    var hood:   bool = false;
+    var sym:    bool = false;
+    r.n    = 8;
+    r.hood = VON_NEUMANN;
+    r.ni   = 5;
+    for {
+        val at: usize = c.at;
+        val no: usize = c.no;
+        if (!next_line(c, ?buf[0], ?long)) { brk; }
+        if (buf[0] == '@') {
+            c.at = at;
+            c.no = no;
+            brk;
+        }
+        if (long) { ret fault("a line is longer than 4096 bytes", c.no); }
+        val line: *u8 = trimmed(?buf[0], true);
+        if (line[0] == 0) { cnt; }
+        if (starts(line, "n_states:")) {
+            val v: opt[u32] = number(trimmed(?line[9], false));
+            if (sel v.none)                 { ret fault("n_states is not a number", c.no); }
+            if (v.some < 2 || v.some > 256) { ret fault("n_states is not 2 to 256", c.no); }
+            r.n    = v.some;
+            states = true;
+        }
+        or (starts(line, "neighborhood:")) {
+            val name: *u8 = trimmed(?line[13], false);
+            if (string.str_equals(name, "vonNeumann")) {
+                r.hood = VON_NEUMANN;
+                r.ni   = 5;
+            }
+            or (string.str_equals(name, "Moore")) {
+                r.hood = MOORE;
+                r.ni   = 9;
+            }
+            or (string.str_equals(name, "hexagonal")) {
+                r.hood = HEXAGONAL;
+                r.ni   = 7;
+            }
+            or (string.str_equals(name, "oneDimensional")) { ret fault("the oneDimensional neighbourhood is not supported", c.no); }
+            or                                             { ret fault("an unknown neighbourhood", c.no); }
+            hood = true;
+        }
+        or (starts(line, "symmetries:")) {
+            if (!hood)                                        { ret fault("neighborhood must come before symmetries", c.no); }
+            if (!symmetry(r, trimmed(?line[11], false), iso)) { ret fault("the neighbourhood has no such symmetries", c.no); }
+            sym = true;
+        }
+        or (starts(line, "var ")) {
+            if (!states || !hood || !sym) { ret fault("n_states, neighborhood and symmetries must come before the first variable", c.no); }
+            val f: opt[Fault] = variable(r, line, c.no);
+            if (sel f.some) { ret f; }
+        }
+        or {
+            if (!states || !hood || !sym) { ret fault("n_states, neighborhood and symmetries must come before the first transition", c.no); }
+            val f: opt[Fault] = transition_line(r, line, c.no);
+            if (sel f.some) { ret f; }
+        }
+    }
+    if (!states || !hood || !sym) { ret fault("the table lacks n_states, neighborhood or symmetries", c.no); }
+    ret opt[Fault].none{};
+}
+
+# sequences of words, each kept once with a value, found by content
+# ---
+# pool:  per sequence its length, its value and its words
+# slots: per slot a sequence's place in pool plus one, 0 while empty
+# used:  slots in use
+rec Seqs {
+    pool:  Vector[u32];
+    slots: Vector[u32];
+    used:  usize;
+}
+
+fun seqs_init(s: *Seqs, a: *allo.Allocator) bool {
+    s.pool  = vector.init[u32](a);
+    s.slots = vector.init[u32](a);
+    s.used  = 0;
+    val room: res[usize, allo.Error] = vector.ensure[u32](?s.slots, 1024);
+    if (sel room.err) { ret false; }
+    mem.zero[u32](s.slots.data, 1024);
+    s.slots.len = 1024;
+    ret true;
+}
+
+fun seqs_dnit(s: *Seqs) {
+    vector.dnit[u32](?s.pool);
+    vector.dnit[u32](?s.slots);
+}
+
+fun seqs_hash(w: *u32, n: usize) u64 {
+    var h: u64   = 0xcbf29ce484222325;
+    var i: usize = 0;
+    for (i < n) {
+        h = (h ^ w[i]::u64) * 0x100000001b3;
+        i = i + 1;
+    }
+    h = (h ^ n::u64) * 0x100000001b3;
+    ret h ^ (h >> 29);
+}
+
+# the slot a sequence is held in, or the empty slot it would take
+fun seqs_slot(s: *Seqs, w: *u32, n: usize) usize {
+    val mask: usize = s.slots.len - 1;
+    var i:    usize = seqs_hash(w, n)::usize & mask;
+    for {
+        val at: u32 = s.slots.data[i];
+        if (at == 0) { ret i; }
+        val p: *u32 = ?s.pool.data[(at - 1)::usize];
+        if (p[0]::usize == n && mem.equal[u32](?p[2], w, n)) { ret i; }
+        i = (i + 1) & mask;
+    }
+    ret 0;
+}
+
+# the value held for a sequence, if any
+fun seqs_get(s: *Seqs, w: *u32, n: usize) opt[u32] {
+    val at: u32 = s.slots.data[seqs_slot(s, w, n)];
+    if (at == 0) { ret opt[u32].none{}; }
+    ret opt[u32].some{s.pool.data[at::usize]};
+}
+
+# hold a sequence not yet held with a value
+fun seqs_put(s: *Seqs, w: *u32, n: usize, v: u32) bool {
+    if ((s.used + 1) * 2 > s.slots.len) {
+        # twice the slots, every sequence placed again
+        val old: usize                  = s.slots.len;
+        val gr:  res[usize, allo.Error] = vector.ensure[u32](?s.slots, old * 2);
+        if (sel gr.err) { ret false; }
+        s.slots.len = old * 2;
+        mem.zero[u32](s.slots.data, old * 2);
+        var p: usize = 0;
+        for (p < s.pool.len) {
+            val len: usize = s.pool.data[p]::usize;
+            s.slots.data[seqs_slot(s, ?s.pool.data[p + 2], len)] = (p + 1)::u32;
+            p                                                    = p + 2 + len;
+        }
+    }
+    if (s.pool.len + n + 2 >= MEMO_MAX) { ret false; }
+    val at: usize                  = s.pool.len;
+    val gp: res[usize, allo.Error] = vector.ensure[u32](?s.pool, at + n + 2);
+    if (sel gp.err) { ret false; }
+    s.pool.data[at]     = n::u32;
+    s.pool.data[at + 1] = v;
+    mem.copy[u32](?s.pool.data[at + 2], w, n);
+    s.pool.len                       = at + n + 2;
+    s.slots.data[seqs_slot(s, w, n)] = (at + 1)::u32;
+    s.used                           = s.used + 1;
+    ret true;
+}
+
+# the table compiler's state
+# ---
+# r:     the reading, its images in table input order
+# order: per tree input the table input it reads
+# k:     tree inputs
+# last:  per image, the first tree input from which on every input holds
+#        every state, so a lookup that reaches it with the image still
+#        matching takes its next state
+# lists: per tree input the transitions still matching a node of it, being built
+# memo:  per tree input and list of images still matching, its node
+# nodes: per tree input and children, the node, so equal nodes are one
+# key:   scratch for a key
+# tree:  the tree being built
+rec Compiler {
+    r:     *Reading;
+    order: [9]u32;
+    k:     usize;
+    last:  Vector[u8];
+    lists: [10]Vector[u32];
+    memo:  Seqs;
+    nodes: Seqs;
+    key:   Vector[u32];
+    tree:  *Vector[u32];
+}
+
+# the node for tree input j over images still matching, built once
+# ---
+# cp:  the compiler
+# j:   the tree input the node reads
+# s:   the images still matching, in the table's order
+# n:   how many
+# ret: the node's offset, or why the tree could not be built
+fun build(cp: *Compiler, j: usize, s: *u32, n: usize) res[u32, str] {
+    val big: str      = "the table is too large to compile";
+    val r:   *Reading = cp.r;
+    # the key: the input, then the images
+    vector.clear[u32](?cp.key);
+    val gk: res[usize, allo.Error] = vector.ensure[u32](?cp.key, n + 1);
+    if (sel gk.err) { ret res[u32, str].err{big}; }
+    cp.key.data[0] = j::u32;
+    mem.copy[u32](?cp.key.data[1], s, n);
+    val hit: opt[u32] = seqs_get(?cp.memo, cp.key.data, n + 1);
+    if (sel hit.some) { ret res[u32, str].ok{hit.some}; }
+
+    var kids: [257]u32;
+    kids[0] = j::u32;
+    val in: usize = cp.order[j]::usize;
+    var st: u32   = 0;
+    if (j + 1 == cp.k) {
+        # the cell, read last: the first image still matching gives the next
+        # state, and none keeps the cell
+        for (st < r.n) {
+            var out: u32   = st;
+            var t:   usize = 0;
+            for (t < n) {
+                val im: usize = s[t]::usize;
+                if (member(r, r.images.data[im * r.ni + in], st)) {
+                    out = r.outs.data[im]::u32;
+                    brk;
+                }
+                t = t + 1;
+            }
+            kids[(st + 1)::usize] = out;
+            st                    = st + 1;
+        }
+    }
+    or {
+        val list: *Vector[u32] = ?cp.lists[j + 1];
+        for (st < r.n) {
+            vector.clear[u32](list);
+            val gl: res[usize, allo.Error] = vector.ensure[u32](list, n + 1);
+            if (sel gl.err) { ret res[u32, str].err{big}; }
+            var m: usize = 0;
+            var t: usize = 0;
+            for (t < n) {
+                val im: usize = s[t]::usize;
+                if (member(r, r.images.data[im * r.ni + in], st)) {
+                    list.data[m] = im::u32;
+                    m            = m + 1;
+                    # an image that matches whatever the rest hold hides every later one
+                    if (cp.last.data[im]::usize <= j + 1) { brk; }
+                }
+                t = t + 1;
+            }
+            list.len = m;
+            val child: res[u32, str] = build(cp, j + 1, list.data, m);
+            if (sel child.err) { ret child; }
+            kids[(st + 1)::usize] = child.ok;
+            st                    = st + 1;
+        }
+    }
+    var off: u32      = 0;
+    val had: opt[u32] = seqs_get(?cp.nodes, ?kids[0], r.n::usize + 1);
+    if (sel had.some) { off = had.some; }
+    or {
+        if (cp.tree.len + r.n::usize > layout.TABLE_MAX::usize) { ret res[u32, str].err{big}; }
+        off = cp.tree.len::u32;
+        val gt: res[usize, allo.Error] = vector.ensure[u32](cp.tree, cp.tree.len + r.n::usize);
+        if (sel gt.err) { ret res[u32, str].err{big}; }
+        mem.copy[u32](?cp.tree.data[cp.tree.len], ?kids[1], r.n::usize);
+        cp.tree.len = cp.tree.len + r.n::usize;
+        if (!seqs_put(?cp.nodes, ?kids[0], r.n::usize + 1, off)) { ret res[u32, str].err{big}; }
+    }
+    # the key again, since building the children used the scratch
+    vector.clear[u32](?cp.key);
+    val gk2: res[usize, allo.Error] = vector.ensure[u32](?cp.key, n + 1);
+    if (sel gk2.err) { ret res[u32, str].err{big}; }
+    cp.key.data[0] = j::u32;
+    mem.copy[u32](?cp.key.data[1], s, n);
+    if (!seqs_put(?cp.memo, cp.key.data, n + 1, off)) { ret res[u32, str].err{big}; }
+    ret res[u32, str].ok{off};
+}
+
+# compile a reading's images into the tree of a table
+fun compile(a: *allo.Allocator, r: *Reading, t: *Table) opt[str] {
+    val big:    str  = "the table is too large to compile";
+    var cp:     Compiler;
+    var orderp: *u32 = ?VN_ORDER[0];
+    var atp:    *u32 = ?VN_AT[0];
+    if (r.hood == MOORE) {
+        orderp = ?MOORE_ORDER[0];
+        atp    = ?MOORE_AT[0];
+    }
+    or (r.hood == HEXAGONAL) {
+        orderp = ?HEX_ORDER[0];
+        atp    = ?HEX_AT[0];
+    }
+    cp.r    = r;
+    cp.k    = r.ni;
+    cp.tree = ?t.tree;
+    var i: usize = 0;
+    for (i < r.ni) {
+        cp.order[i] = orderp[i];
+        t.at[i]     = atp[i];
+        i           = i + 1;
+    }
+    t.inputs = r.ni::u32;
+    t.states = r.n;
+    cp.last  = vector.init[u8](a);
+    cp.key   = vector.init[u32](a);
+    i        = 0;
+    for (i < 10) {
+        cp.lists[i] = vector.init[u32](a);
+        i           = i + 1;
+    }
+    var why: str = nil;
+    if (!seqs_init(?cp.memo, a) || !seqs_init(?cp.nodes, a)) { why = big; }
+    val count: usize = r.outs.len;
+    if (why == nil) {
+        val gl: res[usize, allo.Error] = vector.ensure[u8](?cp.last, count + 1);
+        val g0: res[usize, allo.Error] = vector.ensure[u32](?cp.lists[0], count + 1);
+        if (sel gl.err || sel g0.err) { why = big; }
+    }
+    if (why == nil) {
+        var im: usize = 0;
+        for (im < count) {
+            var from: usize = cp.k;
+            for (from > 0 && full(r, r.images.data[im * r.ni + cp.order[from - 1]::usize])) { from = from - 1; }
+            cp.last.data[im]     = from::u8;
+            cp.lists[0].data[im] = im::u32;
+            im                   = im + 1;
+        }
+        cp.lists[0].len = count;
+        val root: res[u32, str] = build(?cp, 0, cp.lists[0].data, count);
+        if (sel root.err) { why = root.err; }
+        if (sel root.ok)  { t.root = root.ok; }
+    }
+    vector.dnit[u8](?cp.last);
+    vector.dnit[u32](?cp.key);
+    i = 0;
+    for (i < 10) {
+        vector.dnit[u32](?cp.lists[i]);
+        i = i + 1;
+    }
+    seqs_dnit(?cp.memo);
+    seqs_dnit(?cp.nodes);
+    if (why != nil) { ret opt[str].some{why}; }
+    ret opt[str].none{};
+}
+
+# a @TREE's variable ": value" line, as Golly's " name = %d" reads it
+fun tree_value(line: *u8, name: str, out: *i64) bool {
+    var i: usize = 0;
+    for (blank(line[i])) { i = i + 1; }
+    val n: usize = string.str_len(name);
+    if (!string.str_region_equals(line, i, n, name)) { ret false; }
+    i = i + n;
+    for (blank(line[i])) { i = i + 1; }
+    if (line[i] != '=') { ret false; }
+    i = i + 1;
+    for (blank(line[i])) { i = i + 1; }
+    var neg: bool = false;
+    if (line[i] == '-') {
+        neg = true;
+        i   = i + 1;
+    }
+    val v: opt[u32] = number(?line[i]);
+    if (sel v.none) { ret false; }
+    @out = v.some::i64;
+    if (neg) { @out = 0 - v.some::i64; }
+    ret true;
+}
+
+# read a @TREE section into a table, leaving the cursor on the line that begins
+# the next section
+fun read_tree(a: *allo.Allocator, c: *Cursor, t: *Table) opt[Fault] {
+    var buf:    [4097]u8;
+    var long:   bool       = false;
+    var states: i64        = -1;
+    var nbrs:   i64        = -1;
+    var nodes:  i64        = -1;
+    var level:  Vector[u8] = vector.init[u8](a);
+    fin { vector.dnit[u8](?level); }
+    var lev: u32 = 0;
+    for {
+        val at: usize = c.at;
+        val no: usize = c.no;
+        if (!next_line(c, ?buf[0], ?long)) { brk; }
+        if (buf[0] == '@') {
+            c.at = at;
+            c.no = no;
+            brk;
+        }
+        if (long)                                        { ret fault("a line is longer than 4096 bytes", c.no); }
+        if (buf[0] == '#' || buf[0] == 0)                { cnt; }
+        if (tree_value(?buf[0], "num_states", ?states))  { cnt; }
+        if (tree_value(?buf[0], "num_neighbors", ?nbrs)) { cnt; }
+        if (tree_value(?buf[0], "num_nodes", ?nodes))    { cnt; }
+        if (states < 2 || states > 256 || (nbrs != 4 && nbrs != 8) || nodes < nbrs || nodes > 100000000) {
+            ret fault("num_states, num_neighbors or num_nodes is missing or out of range", c.no);
+        }
+        if (buf[0] < '1' || buf[0]::i64 > '0'::i64 + 1 + nbrs) { ret fault("a node's depth is out of range", c.no); }
+        lev = (buf[0] - '0')::u32;
+        val n:   usize = states::usize;
+        val off: usize = t.tree.len;
+        if (off + n > layout.TABLE_MAX::usize) { ret fault("the tree is too large", c.no); }
+        val gt: res[usize, allo.Error] = vector.ensure[u32](?t.tree, off + n);
+        if (sel gt.err) { ret fault("out of memory", c.no); }
+        val pl: res[usize, allo.Error] = vector.push[u8](?level, lev::u8);
+        if (sel pl.err) { ret fault("out of memory", c.no); }
+        var got: usize = 0;
+        var i:   usize = 1;
+        for (buf[i] != 0) {
+            for (buf[i] != 0 && buf[i] <= ' ') { i = i + 1; }
+            if (buf[i] == 0) { brk; }
+            val nv: opt[u32] = number(?buf[i]);
+            if (sel nv.none) { ret fault("a node holds something that is not a number", c.no); }
+            val v: u32 = nv.some;
+            for (buf[i] > ' ') {
+                if (!digit(buf[i])) { ret fault("a node holds something that is not a number", c.no); }
+                i = i + 1;
+            }
+            if (got >= n) { ret fault("a node holds more values than num_states", c.no); }
+            if (lev == 1) {
+                if (v::i64 >= states) { ret fault("a node holds a state beyond num_states", c.no); }
+                t.tree.data[off + got] = v;
+            }
+            or {
+                if (v::usize >= level.len - 1)            { ret fault("a node names a node not yet defined", c.no); }
+                if (level.data[v::usize]::u32 != lev - 1) { ret fault("a node names a node not one depth down", c.no); }
+                t.tree.data[off + got] = v * n::u32;
+            }
+            got = got + 1;
+        }
+        if (got != n) { ret fault("a node holds fewer values than num_states", c.no); }
+        t.tree.len = off + n;
+    }
+    if (level.len::i64 != nodes || nodes < 0) { ret fault("num_nodes does not match the nodes given", c.no); }
+    if (lev::i64 != nbrs + 1)                 { ret fault("the last node is not the root", c.no); }
+    t.states = states::u32;
+    t.inputs = (nbrs + 1)::u32;
+    t.root   = ((level.len - 1) * states::usize)::u32;
+    var i: usize = 0;
+    for (i < t.inputs::usize) {
+        if (nbrs == 4) { t.at[i] = VN_AT[i]; }
+        or             { t.at[i] = MOORE_AT[i]; }
+        i = i + 1;
+    }
+    ret opt[Fault].none{};
+}
+
+# Golly's gradient over the live states, from one colour to another
+fun gradient(t: *Table, from: u32, to: u32) {
+    var s: u32 = 1;
+    for (s < t.states) {
+        var c:  u32 = 0;
+        var sh: u32 = 0;
+        for (sh < 24) {
+            val a: i64 = ((from >> sh) & 255)::i64;
+            val b: i64 = ((to >> sh) & 255)::i64;
+            var v: i64 = a;
+            if (t.states > 2) { v = a + (b - a) * (s - 1)::i64 / (t.states - 2)::i64; }
+            c  = c | (v::u32 << sh);
+            sh = sh + 8;
+        }
+        t.colours[s::usize] = c;
+        s                   = s + 1;
+    }
+}
+
+# read the @COLORS section at the cursor: a state and its red, green and blue
+# on a line, or two colours on a line for a gradient over the live states
+fun read_colours(c: *Cursor, t: *Table) {
+    var buf:  [4097]u8;
+    var long: bool = false;
+    for {
+        if (!next_line(c, ?buf[0], ?long)) { brk; }
+        if (buf[0] == '@')                 { brk; }
+        if (long)                          { cnt; }
+        var v: [6]u32;
+        var n: usize = 0;
+        var i: usize = 0;
+        for (n < 6) {
+            for (blank(buf[i])) { i = i + 1; }
+            val got: opt[u32] = number(?buf[i]);
+            if (sel got.none) { brk; }
+            v[n] = got.some;
+            n    = n + 1;
+            for (digit(buf[i])) { i = i + 1; }
+            if (buf[i] != 0 && !blank(buf[i])) { brk; }
+        }
+        var ok: bool  = true;
+        var k:  usize = 0;
+        for (k < n) {
+            if (k > 0 || n == 6) {
+                if (v[k] > 255) { ok = false; }
+            }
+            k = k + 1;
+        }
+        if (!ok)                       { cnt; }
+        if (n == 6)                    { gradient(t, (v[0] << 16) | (v[1] << 8) | v[2], (v[3] << 16) | (v[4] << 8) | v[5]); }
+        or (n >= 4 && v[0] < t.states) { t.colours[v[0]::usize] = (v[1] << 16) | (v[2] << 8) | v[3]; }
+    }
+}
+
+# read a .rule file into a table
+# ---
+# a:   allocator behind the table's tree and the reading
+# p:   the file's bytes
+# n:   how many
+# out: receives the table, whose tree the caller releases with dnit, also on
+#      a fault
+# ret: none, or why the file is not a rule cellar can run
+pub fun read(a: *allo.Allocator, p: *u8, n: usize, out: *Table) opt[Fault] {
+    mem.zero[u8](out::*u8, $size_of(Table));
+    out.tree = vector.init[u32](a);
+    var c:     Cursor = Cursor{p: p, n: n, at: 0, no: 0};
+    var buf:   [4097]u8;
+    var long:  bool   = false;
+    var named: bool   = false;
+    var ruled: bool   = false;
+    var hue:   bool   = false;
+    var huec:  Cursor;
+    var r:     Reading;
+    r.vars   = vector.init[Var](a);
+    r.vals   = vector.init[u8](a);
+    r.images = vector.init[u16](a);
+    r.outs   = vector.init[u8](a);
+    r.sets   = vector.init[Set](a);
+    fin {
+        vector.dnit[Set](?r.sets);
+        vector.dnit[Var](?r.vars);
+        vector.dnit[u8](?r.vals);
+        vector.dnit[u16](?r.images);
+        vector.dnit[u8](?r.outs);
+    }
+    for (next_line(?c, ?buf[0], ?long)) {
+        if (buf[0] != '@') { cnt; }
+        val line: *u8 = trimmed(?buf[0], false);
+        if (starts(line, "@RULE") && (line[5] == 0 || blank(line[5]))) {
+            if (named) { cnt; }
+            val name: *u8   = trimmed(?line[5], false);
+            val len:  usize = string.str_len(name);
+            if (len == 0)       { ret fault("the @RULE line names no rule", c.no); }
+            if (len > NAME_MAX) { ret fault("the rule's name is too long", c.no); }
+            if (!name_ok(name)) { ret fault("the rule's name holds a character a rule name cannot", c.no); }
+            mem.copy[u8](?out.name[0], name, len + 1);
+            named = true;
+        }
+        or (string.str_equals(line, "@TABLE")) {
+            if (ruled) { cnt; }
+            var iso: bool       = false;
+            val f:   opt[Fault] = read_table(?r, ?c, ?iso);
+            if (sel f.some) { ret f; }
+            val why: opt[str] = compile(a, ?r, out);
+            if (sel why.some) { ret fault(why.some, c.no); }
+            out.iso = iso;
+            ruled   = true;
+        }
+        or (string.str_equals(line, "@TREE")) {
+            if (ruled) { cnt; }
+            val f: opt[Fault] = read_tree(a, ?c, out);
+            if (sel f.some) { ret f; }
+            ruled = true;
+        }
+        or (string.str_equals(line, "@COLORS")) {
+            huec = c;
+            hue  = true;
+        }
+    }
+    if (!named) { ret fault("no @RULE line names the rule", 1); }
+    if (!ruled) { ret fault("no @TABLE or @TREE section gives the rule", 1); }
+    # Golly's default colours, a gradient from red to yellow, then the file's own
+    out.colours[0] = 0x303030;
+    gradient(out, 0xff0000, 0xffff00);
+    if (hue) { read_colours(?huec, out); }
+    var zero: [9]u32;
+    if (next(out, ?zero[0]) != 0) { ret fault("the rule gives an empty neighbourhood a live cell, which an unbounded world cannot run", 1); }
+    ret opt[Fault].none{};
+}
+
+# whether a rule name can be written in a rule string and a file name: printable
+# ASCII other than a colon, which begins a grid, and the path separators
+pub fun name_ok(s: *u8) bool {
+    var i: usize = 0;
+    for (s[i] != 0) {
+        val c: u8 = s[i];
+        if (c < 0x20 || c >= 0x7f || c == ':' || c == '/' || c == '\\') { ret false; }
+        i = i + 1;
+    }
+    ret i > 0 && s[0] != ' ' && s[i - 1] != ' ';
+}
+
+# read rule text into a table, for the tests
+#[testing]
+fun read_str(a: *allo.Allocator, s: str, t: *Table) opt[Fault] {
+    ret read(a, s, string.str_len(s), t);
+}
+
+# the next state of the cell at the centre of a 3 by 3 block written as nine
+# digits, row-major
+#[testing]
+fun probe(t: *Table, block: str) u32 {
+    var nb: [9]u32;
+    var i:  usize = 0;
+    for (i < 9) {
+        nb[i] = (block[i] - '0')::u32;
+        i     = i + 1;
+    }
+    ret next(t, ?nb[0]);
+}
+
+# a symmetry case: a table of one transition, and blocks with the next state
+# each must step to
+#[testing]
+rec Case {
+    hood:  str;
+    sym:   str;
+    line:  str;
+    tests: str;
+}
+
+test read__expands_every_symmetry_of_every_neighbourhood_as_golly_does {
+    var a: allo.Allocator;
+    page.make(?a);
+    # a probe is nine digits of a block, row-major, then the state it steps to;
+    # a block no image of the transition matches keeps its cell
+    val cases: [14]Case = [14]Case{
+        Case{hood: "vonNeumann", sym: "none", line: "0,1,0,0,0,1", tests: "0100000001 0000010000"},
+        Case{hood: "vonNeumann", sym: "rotate4", line: "0,1,0,0,0,1", tests: "0100000001 0000010001 0000000101 0001000001 0010000000"},
+        Case{hood: "vonNeumann", sym: "reflect_horizontal", line: "0,1,2,0,0,1", tests: "0100020001 0102000001 0000010200"},
+        Case{hood: "vonNeumann", sym: "rotate4reflect", line: "0,1,2,0,0,1", tests: "0100020001 0102000001 0000010201 0000000000"},
+        Case{hood: "Moore", sym: "rotate4", line: "0,1,0,0,0,0,0,0,0,1", tests: "0100000001 0000010001 0010000000"},
+        Case{hood: "Moore", sym: "rotate8", line: "0,1,0,0,0,0,0,0,0,1", tests: "0010000001 0000000011 1000000001"},
+        Case{hood: "Moore", sym: "rotate4reflect", line: "0,1,2,0,0,0,0,0,0,1", tests: "0120000001 2100000001 0010020000"},
+        Case{hood: "Moore", sym: "rotate8reflect", line: "0,1,2,0,0,0,0,0,0,1", tests: "0010020001 2100000001 0020010001"},
+        Case{hood: "Moore", sym: "reflect_horizontal", line: "0,1,2,0,0,0,0,0,0,1", tests: "0120000001 2100000001 0000010020"},
+        Case{hood: "Moore", sym: "permute", line: "0,1,1,0,0,0,0,0,0,1", tests: "1000000011 0001010001 1110000000"},
+        Case{hood: "hexagonal", sym: "rotate2", line: "0,1,0,0,0,0,0,1", tests: "0100000001 0000000101 0000010000"},
+        Case{hood: "hexagonal", sym: "rotate3", line: "0,1,0,0,0,0,0,1", tests: "0001000001 0000000011 0000000100"},
+        Case{hood: "hexagonal", sym: "rotate6", line: "0,1,2,0,0,0,0,1", tests: "0000010021 1002000000 0010000000"},
+        Case{hood: "hexagonal", sym: "rotate6reflect", line: "0,1,2,0,0,0,0,1", tests: "0000010021 1002000001 0000000100"},
+    };
+    var k: usize = 0;
+    for (k < 14) {
+        var text: [512]u8;
+        var o:    usize = 0;
+        o       = text_put(?text[0], o, "@RULE Case\n@TABLE\nn_states:3\nneighborhood:");
+        o       = text_put(?text[0], o, cases[k].hood);
+        o       = text_put(?text[0], o, "\nsymmetries:");
+        o       = text_put(?text[0], o, cases[k].sym);
+        o       = text_put(?text[0], o, "\n");
+        o       = text_put(?text[0], o, cases[k].line);
+        o       = text_put(?text[0], o, "\n");
+        text[o] = 0;
+        var t: Table;
+        val f: opt[Fault] = read_str(?a, ?text[0], ?t);
+        if (sel f.some) { ret 1; }
+        val tests: str   = cases[k].tests;
+        var i:     usize = 0;
+        for (tests[i] != 0) {
+            if (probe(?t, ?tests[i]) != (tests[i + 9] - '0')::u32) { ret (10 + k)::i32; }
+            i = i + 10;
+            if (tests[i] == ' ') { i = i + 1; }
+        }
+        dnit(?t);
+        k = k + 1;
+    }
+    ret 0;
+}
+
+#[testing]
+fun text_put(buf: *u8, off: usize, s: str) usize {
+    var o: usize = off;
+    var i: usize = 0;
+    for (s[i] != 0) {
+        buf[o] = s[i];
+        o      = o + 1;
+        i      = i + 1;
+    }
+    ret o;
+}
+
+test read__binds_repeated_variables_and_takes_the_first_transition_that_matches {
+    var a: allo.Allocator;
+    page.make(?a);
+    var t: Table;
+    # a is bound where named twice, b free where named once; the second line
+    # is hidden where the first matches
+    val f: opt[Fault] = read_str(?a, "@RULE Bound\n@TABLE\nn_states:4\nneighborhood:Moore\nsymmetries:none\nvar a={1,2}\nvar b={1,2,3}\nvar c=b\n0,a,a,0,0,0,0,0,0,a  # bound\n0,b,c,0,0,0,0,0,0,3\n3 1 0 0 0 0 0 0 0 0\n", ?t);
+    if (sel f.some)                  { ret 1; }
+    if (probe(?t, "011000000") != 1) { ret 2; }
+    if (probe(?t, "022000000") != 2) { ret 3; }
+    if (probe(?t, "012000000") != 3) { ret 4; }
+    if (probe(?t, "033000000") != 3) { ret 5; }
+    # a transition written with blanks for commas
+    if (probe(?t, "010030000") != 0) { ret 6; }
+    if (t.states != 4 || t.iso)      { ret 8; }
+    dnit(?t);
+    ret 0;
+}
+
+test read__refuses_what_golly_refuses_and_a_rule_that_births_on_0 {
+    var a: allo.Allocator;
+    page.make(?a);
+    val bad: [7]str = [7]str{
+        "@RULE B0\n@TABLE\nn_states:2\nneighborhood:vonNeumann\nsymmetries:none\n0,0,0,0,0,1\n",
+        "@RULE Odd\n@TABLE\nn_states:2\nneighborhood:triangular\nsymmetries:none\n",
+        "@RULE Late\n@TABLE\nn_states:2\nsymmetries:none\nneighborhood:Moore\n",
+        "@RULE Far\n@TABLE\nn_states:2\nneighborhood:vonNeumann\nsymmetries:none\n0,1,0,0,0,2\n",
+        "@RULE Few\n@TABLE\nn_states:3\nneighborhood:vonNeumann\nsymmetries:rotate8\n",
+        "@TABLE\nn_states:2\nneighborhood:vonNeumann\nsymmetries:none\n",
+        "@RULE Empty\nno table at all\n",
+    };
+    var k: usize = 0;
+    for (k < 7) {
+        var t: Table;
+        val f: opt[Fault] = read_str(?a, bad[k], ?t);
+        dnit(?t);
+        if (sel f.none) { ret (1 + k)::i32; }
+        k = k + 1;
+    }
+    ret 0;
+}
+
+# a parity tree over n inputs, the cell among them last: the next state is the
+# parity of the inputs taken, which are all but the cell when skip_cell
+#[testing]
+fun parity_tree(buf: *u8, nbrs: usize) usize {
+    var o: usize = text_put(buf, 0, "@RULE Parity\n@TREE\nnum_states=2\nnum_neighbors=");
+    buf[o] = '0' + nbrs::u8;
+    o      = o + 1;
+    o      = text_put(buf, o, "\nnum_nodes=");
+    val nodes: usize = 2 * nbrs + 1;
+    if (nodes >= 10) {
+        buf[o] = '0' + (nodes / 10)::u8;
+        o      = o + 1;
+    }
+    buf[o] = '0' + (nodes % 10)::u8;
+    o      = o + 1;
+    # depth 1, the cell ignored: nodes 0 and 1 give parity 0 and 1
+    o = text_put(buf, o, "\n1 0 0\n1 1 1\n");
+    # each depth above has a node for parity 0 so far and one for 1
+    var d: usize = 2;
+    for (d <= nbrs) {
+        val lo: usize = (d - 2) * 2;
+        buf[o]     = '0' + d::u8;
+        buf[o + 1] = ' ';
+        o          = o + 2;
+        o          = put_num(buf, o, lo);
+        buf[o]     = ' ';
+        o          = put_num(buf, o + 1, lo + 1);
+        buf[o]     = '\n';
+        buf[o + 1] = '0' + d::u8;
+        buf[o + 2] = ' ';
+        o          = o + 3;
+        o          = put_num(buf, o, lo + 1);
+        buf[o]     = ' ';
+        o          = put_num(buf, o + 1, lo);
+        buf[o]     = '\n';
+        o          = o + 1;
+        d          = d + 1;
+    }
+    # the root takes the first input
+    val top: usize = (nbrs - 1) * 2;
+    buf[o]     = '0' + (nbrs + 1)::u8;
+    buf[o + 1] = ' ';
+    o          = put_num(buf, o + 2, top);
+    buf[o]     = ' ';
+    o          = put_num(buf, o + 1, top + 1);
+    buf[o]     = '\n';
+    buf[o + 1] = 0;
+    ret o + 1;
+}
+
+#[testing]
+fun put_num(buf: *u8, off: usize, v: usize) usize {
+    if (v >= 10) {
+        buf[off]     = '0' + (v / 10)::u8;
+        buf[off + 1] = '0' + (v % 10)::u8;
+        ret off + 2;
+    }
+    buf[off] = '0' + v::u8;
+    ret off + 1;
+}
+
+test read__walks_a_tree_as_golly_orders_its_inputs {
+    var a: allo.Allocator;
+    page.make(?a);
+    var nbrs: usize = 4;
+    for (nbrs <= 8) {
+        var text: [1024]u8;
+        parity_tree(?text[0], nbrs);
+        var t: Table;
+        val f: opt[Fault] = read_str(?a, ?text[0], ?t);
+        if (sel f.some) { ret 1; }
+        # every block steps to the parity of the neighbours the tree reads,
+        # the four orthogonal ones for four and all eight for eight
+        var b: u32 = 0;
+        for (b < 512) {
+            var nb:  [9]u32;
+            var par: u32   = 0;
+            var i:   usize = 0;
+            for (i < 9) {
+                nb[i] = (b >> i::u32) & 1;
+                val read: bool = i != 4 && (nbrs == 8 || i % 2 == 1);
+                if (read) { par = par ^ nb[i]; }
+                i = i + 1;
+            }
+            if (next(?t, ?nb[0]) != par) { ret (10 + nbrs)::i32; }
+            b = b + 1;
+        }
+        # Golly's default colours without a @COLORS section
+        if (t.colours[1] != 0xff0000) { ret 2; }
+        dnit(?t);
+        nbrs = nbrs + 4;
+    }
+    # a node pointing past the nodes before it is refused
+    var t: Table;
+    val f: opt[Fault] = read_str(?a, "@RULE Bad\n@TREE\nnum_states=2\nnum_neighbors=4\nnum_nodes=5\n1 0 1\n2 0 5\n", ?t);
+    dnit(?t);
+    if (sel f.none) { ret 3; }
+    ret 0;
+}
+
+test read__takes_colours_and_gradients_from_the_colours_section {
+    var a: allo.Allocator;
+    page.make(?a);
+    var t: Table;
+    val f: opt[Fault] = read_str(?a, "@RULE Hue\n@COLORS\n0 0 255 0 255 0  gradient\n2 10 20 30 named\n9 1 1 1 past the states\n@TABLE\nn_states:4\nneighborhood:vonNeumann\nsymmetries:none\n", ?t);
+    if (sel f.some)                                           { ret 1; }
+    if (t.colours[1] != 0x0000ff || t.colours[3] != 0x00ff00) { ret 2; }
+    if (t.colours[2] != 0x0a141e)                             { ret 3; }
+    dnit(?t);
+    ret 0;
+}

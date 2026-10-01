@@ -1,18 +1,24 @@
 # text serialization of a world or a pattern to disk
 #
-# a world file is sparse. its first line is "cellar 3", then a header of
+# a world file is sparse. its first line is "cellar 4", then a header of
 # "<key> <value>" lines ended by a blank line, then for every chunk holding a
 # live cell a line "<cx> <cy>" with its signed chunk coordinates and 64 lines of
-# 64 cells, '1' live and '0' dead. a reader skips header keys it does not know,
-# so a newer file's fields do not stop an older cellar from reading its cells.
-# the keys are rule (B/S notation) for a Life-like rule or kernel (the whole
-# kernel, see kernel.structure) for any other, generation, pan_x and pan_y (the
-# view's centre), zoom and mode (the colour mode by name). a file naming both
-# rules is read by its kernel. a key a file leaves out keeps what the reader
-# already had.
-# a "cellar 2" file is the same without the header, and a file in the custom
-# pattern format, what every world was saved as before the world became
-# unbounded, loads centred on the origin. patterns are saved and loaded through
+# 64 cells, each its state in as many decimal digits as the rule's highest
+# state takes, so '1' live and '0' dead under a two-state rule. a reader skips
+# header keys it does not know, so a newer file's fields do not stop an older
+# cellar from reading its cells. the keys are family (the rule family's id),
+# rule (the rule string, as the family writes it), states (how many states the
+# cells hold, 2 when left out), generation, pan_x and pan_y (the view's
+# centre), zoom and mode (the colour mode by name). a file naming no family
+# names a weighted rule. a key a file leaves out keeps what the reader already
+# had. the cells are kept as the pool holds them, which under a rule that births
+# on 0 is the world's complement at some generations (cellar.rules.weighted),
+# and the rule and generation beside them say which.
+# a "cellar 3" file is read the same, its rule B/S notation and its kernel key
+# the whole weighted kernel, preferred to the rule beside it. a "cellar 2" file
+# is the same without the header, and a file in the custom pattern format, what
+# every world was saved as before the world became unbounded, loads centred on
+# the origin. patterns are saved and loaded through
 # the format registry, see cellar.formats. saves create the file's directory
 # first.
 
@@ -20,13 +26,18 @@ use gfx: boom.graphics;
 use cellar.format;
 use cellar.formats;
 use cellar.formats.adapt;
-use cellar.kernel;
 use cellar.paths;
 use cellar.pattern;
 use cellar.render;
+use cellar.rule;
+use ruletable: cellar.rules.table;
+use cellar.rules.table.load;
+use cellar.rules.table.store;
+use cellar.rules.weighted;
 use cellar.sim;
 use cellar.space;
 use cellar.text;
+use cellar.topology;
 use allo: std.allocator;
 use std.allocator.page;
 use alloc_testing: std.allocator.testing;
@@ -54,20 +65,20 @@ val TEST_DIR: str = "out/test";
 pub val DIR_MODE: i32 = 0o755;
 # permission bits for saved files
 pub val FILE_MODE: i32 = 0o644;
-# bytes reserved for a chunk's header when sizing a buffer
-val HEADER_MAX: usize = 32;
 # the first line of a world file, less its version digit
 val MAGIC: str = "cellar ";
 # the version save_world writes
-val VERSION: u8 = '3';
+val VERSION: u8 = '4';
 # the oldest sparse version load_world reads
 val OLDEST: u8 = '2';
-# bytes of one chunk record past its coordinate line
-val CHUNK_TEXT: usize = 64 * 65;
 # bytes reserved for a world file's first line and header
-val HEAD_MAX: usize = 2048;
-# the longest header value read, less its NUL: a whole kernel
-val VALUE_MAX: usize = kernel.STRUCTURE_MAX;
+val HEAD_MAX: usize = rule.FORMAT_MAX + 2048;
+# the longest header value read, less its NUL: the longest rule string
+val VALUE_MAX: usize = rule.FORMAT_MAX;
+# the most states a world file's cells may hold
+val STATES_MAX: u32 = 256;
+# the family a file that names none records its rule in
+val LEGACY_FAMILY: str = "weighted";
 
 # how a world is being viewed, which a world file keeps beside its cells
 # ---
@@ -86,16 +97,20 @@ pub rec View {
 # ---
 # world:   it was a world file, which replaced the world, rather than a pattern stamped onto it
 # foreign: the file names a rule this cellar cannot run, so the rule was left as it was
-# box:     the cells a stamped pattern covers, none for a world or an empty pattern
+# box:     the cells a stamped pattern covers, none for a world, an empty pattern or a rule
+# stray:   it was a .rule file whose copy into the data directory failed, so
+#          its name resolves only for the rest of the session
 pub rec Opened {
     world:   bool;
     foreign: bool;
     box:     opt[space.Box];
+    stray:   bool;
 }
 
 # what a world load did beyond replacing the cells
 # ---
-# foreign: the file names a rule this cellar cannot run, so the rule was left as it was
+# foreign: the file names a rule this cellar cannot run, so the rule was left
+#          as it was and a state it lacks loaded as state 1
 pub rec Loaded {
     foreign: bool;
 }
@@ -117,6 +132,7 @@ pub tag Error: u8 {
     version;
     gpu;
     format: format.Error;
+    rule:   load.Fault;
 }
 
 # a one-line description of a persistence failure
@@ -130,6 +146,7 @@ pub fun error_message(e: Error) str {
     if (sel e.version)    { ret "version mismatch"; }
     if (sel e.gpu)        { ret "GPU read failed"; }
     if (sel e.format)     { ret format.error_message(e.format); }
+    if (sel e.rule)       { ret e.rule.why; }
     if (sel e.fs) {
         if (sel e.fs.io) { ret io_error.kind_name(e.fs.io.kind); }
     }
@@ -176,39 +193,49 @@ fun parse_uint(b: *Vector[u8], off: usize, out: *usize) usize {
     ret o;
 }
 
-# skip any non-cell bytes from p to the next '0' or '1'
-# ---
-# b:   the file contents
-# p:   where to start
-# ret: the offset of the cell, or the length when none remains
-fun next_cell(b: *Vector[u8], p: usize) usize {
-    var o: usize = p;
-    for (o < b.len && b.data[o] != '0' && b.data[o] != '1') { o = o + 1; }
-    ret o;
+# the decimal digits a cell takes in a file whose cells hold states states
+fun digits(states: u32) usize {
+    var n: usize = 1;
+    var v: u32   = states - 1;
+    for (v >= 10) {
+        v = v / 10;
+        n = n + 1;
+    }
+    ret n;
 }
 
-# parse the w x h cells after the header into out, row-major as 0 or 1
+# read a chunk's cells, each its state in w digits, skipping line ends
 #
 # every cell is read before the caller changes anything, so a short body is
-# refused while the world or pattern it was meant for is still untouched.
+# refused while the world it was meant for is still untouched.
 # ---
-# b:     the file contents
-# start: the offset just past the header
-# w:     declared width
-# h:     declared height
-# out:   receives w*h cells
-# ret:   ok, or truncated when the body runs out first
-fun parse_body(b: *Vector[u8], start: usize, w: usize, h: usize, out: *u8) err[Error] {
+# b:      the file contents
+# start:  where the cells start
+# w:      digits a cell takes
+# states: how many states a cell may hold
+# out:    receives space.CELLS states
+# end:    receives the offset past the last cell
+# ret:    ok, truncated when the body runs out first, or malformed for a state
+#         past the ones declared
+fun parse_chunk(b: *Vector[u8], start: usize, w: usize, states: u32, out: *u8, end: *usize) err[Error] {
     var p: usize = start;
     var i: usize = 0;
-    for (i < w * h) {
-        p = next_cell(b, p);
-        if (p >= b.len) { ret err[Error].err{Error.truncated{}}; }
-        out[i] = 0;
-        if (b.data[p] == '1') { out[i] = 1; }
-        p = p + 1;
-        i = i + 1;
+    for (i < space.CELLS) {
+        for (p < b.len && (b.data[p] < '0' || b.data[p] > '9')) { p = p + 1; }
+        var v: u32   = 0;
+        var d: usize = 0;
+        for (d < w) {
+            val c: u8 = text.byte_at(b.data, b.len, p);
+            if (c < '0' || c > '9') { ret err[Error].err{Error.truncated{}}; }
+            v = v * 10 + (c - '0')::u32;
+            p = p + 1;
+            d = d + 1;
+        }
+        if (v >= states) { ret err[Error].err{Error.format{format.Error.malformed{}}}; }
+        out[i] = v::u8;
+        i      = i + 1;
     }
+    @end = p;
     ret err[Error].ok{};
 }
 
@@ -248,18 +275,14 @@ fun write_header(buf: *u8, s: *sim.Sim, v: *View) usize {
     off      = off + 1;
     buf[off] = '\n';
     off      = off + 1;
-    # the notation is the form other tools read, and the structure holds the rest
-    var rb: [1101]u8;
-    if (kernel.life_like(?s.kernel)) {
-        off = text.buf_str(buf, off, "rule ");
-        off = text.buf_str(buf, off, kernel.notation(?s.kernel, ?rb[0]));
-    }
-    or {
-        off = text.buf_str(buf, off, "kernel ");
-        off = text.buf_str(buf, off, kernel.structure(?s.kernel, ?rb[0]));
-    }
-    off = text.buf_str(buf, off, "\n");
-    off = text.buf_str(buf, off, "generation ");
+    var rb: [rule.FORMAT_MAX + 1]u8;
+    off = text.buf_str(buf, off, "family ");
+    off = text.buf_str(buf, off, rule.family_id(rule.family_of(?s.rule)));
+    off = text.buf_str(buf, off, "\nrule ");
+    off = text.buf_str(buf, off, rule.format(?s.rule, ?rb[0]));
+    off = text.buf_str(buf, off, "\nstates ");
+    off = text.buf_u64(buf, off, rule.states(?s.rule)::u64);
+    off = text.buf_str(buf, off, "\ngeneration ");
     off = text.buf_u64(buf, off, s.generation);
     off = text.buf_str(buf, off, "\npan_x ");
     off = text.buf_f64(buf, off, v.pan_x);
@@ -272,7 +295,8 @@ fun write_header(buf: *u8, s: *sim.Sim, v: *View) usize {
     ret text.buf_str(buf, off, "\n\n");
 }
 
-# serialize the world's live chunks, its rule, its generation and the view to path
+# serialize the world's chunks that hold a state, its rule, its generation and
+# the view to path
 #
 # on the GPU the cells are read back first, a stall.
 # ---
@@ -287,49 +311,78 @@ pub fun save_world(a: *allo.Allocator, s: *sim.Sim, v: *View, path: str) err[Err
     val made: err[fs.FsError] = make_parent(a, path);
     if (sel made.err) { ret err[Error].err{Error.fs{made.err}}; }
 
-    val sp:   *space.Space = ?s.space;
-    var live: usize        = 0;
-    var sl:   usize        = 0;
-    for (sl < sp.hi) {
-        if (space.used(sp, sl)) {
-            space.recount(sp, sl);
-            if (sp.census[sl * space.CENSUS] != 0) { live = live + 1; }
-        }
-        sl = sl + 1;
+    var head: [HEAD_MAX]u8;
+    var out:  Out;
+    out.buf = vector.init[u8](a);
+    out.w   = digits(rule.states(?s.rule));
+    out.ok  = true;
+    val n:  usize                  = write_header(?head[0], s, v);
+    val hr: res[usize, allo.Error] = vector.reserve[u8](?out.buf, n);
+    out.ok = sel hr.ok;
+    var i: usize = 0;
+    for (i < n && out.ok) {
+        put(?out, head[i]);
+        i = i + 1;
     }
-    val cap: usize                = HEAD_MAX + live * (HEADER_MAX + CHUNK_TEXT);
-    val rb:  res[*u8, allo.Error] = allo.allocate[u8](a, cap);
-    if (sel rb.err) { ret err[Error].err{Error.alloc{rb.err}}; }
-    val buf: *u8   = rb.ok;
-    var off: usize = write_header(buf, s, v);
-    sl = 0;
-    for (sl < sp.hi) {
-        if (space.used(sp, sl) && sp.census[sl * space.CENSUS] != 0) {
-            off      = buf_i64(buf, off, space.slot_x(sp, sl));
-            buf[off] = ' ';
-            off      = buf_i64(buf, off + 1, space.slot_y(sp, sl));
-            buf[off] = '\n';
-            off      = off + 1;
-            val c: *u32  = ?sp.cells[sl * space.CELLS];
-            var i: usize = 0;
-            for (i < space.CELLS) {
-                var ch: u8 = '0';
-                if (c[i] >= 256) { ch = '1'; }
-                buf[off] = ch;
-                off      = off + 1;
-                if (i % 64 == 63) {
-                    buf[off] = '\n';
-                    off      = off + 1;
-                }
-                i = i + 1;
-            }
-        }
-        sl = sl + 1;
+    if (out.ok) { sim.chunks(s, write_chunk, (?out)::*u8); }
+    if (!out.ok) {
+        vector.dnit[u8](?out.buf);
+        ret err[Error].err{Error.alloc{allo.Error.exhausted{}}};
     }
-    val wrote: err[fs.FsError] = fs.write_bytes(path, buf, off, FILE_MODE);
-    allo.deallocate[u8](a, buf, cap);
+    val wrote: err[fs.FsError] = fs.write_bytes(path, out.buf.data, out.buf.len, FILE_MODE);
+    vector.dnit[u8](?out.buf);
     if (sel wrote.err) { ret err[Error].err{Error.fs{wrote.err}}; }
     ret err[Error].ok{};
+}
+
+# a world file being written
+# ---
+# buf: the bytes so far
+# w:   digits a state takes
+# ok:  every byte was kept
+rec Out {
+    buf: Vector[u8];
+    w:   usize;
+    ok:  bool;
+}
+
+fun put(o: *Out, b: u8) {
+    if (!o.ok) { ret; }
+    val r: res[usize, allo.Error] = vector.push[u8](?o.buf, b);
+    if (sel r.err) { o.ok = false; }
+}
+
+# write a chunk's line and its 64 rows of states
+fun write_chunk(ctx: *u8, cx: i64, cy: i64, cells: *u8) {
+    val o:   *Out  = ctx::*Out;
+    var num: [24]u8;
+    var n:   usize = buf_i64(?num[0], 0, cx);
+    num[n] = ' ';
+    n      = buf_i64(?num[0], n + 1, cy);
+    num[n] = '\n';
+    var i: usize = 0;
+    for (i <= n) {
+        put(o, num[i]);
+        i = i + 1;
+    }
+    var dg: [4]u8;
+    i = 0;
+    for (i < space.CELLS && o.ok) {
+        var v: u32   = cells[i]::u32;
+        var d: usize = o.w;
+        for (d > 0) {
+            dg[d - 1] = '0' + (v % 10)::u8;
+            v         = v / 10;
+            d         = d - 1;
+        }
+        d = 0;
+        for (d < o.w) {
+            put(o, dg[d]);
+            d = d + 1;
+        }
+        if (i % 64 == 63) { put(o, '\n'); }
+        i = i + 1;
+    }
 }
 
 # read a signed decimal at off, skipping spaces before it
@@ -378,32 +431,45 @@ fun world_version(b: *Vector[u8]) u8 {
 
 # what a world file's header says, each field only where the file names it
 # ---
+# family:     the family id it names, empty when it names none
 # ruled:      the file names a rule
-# rule:       the rule it names, when kernel.parse reads it
-# shaped:     the file names a whole kernel
-# shape:      the kernel it names, when kernel.from_structure reads it
+# rule:       the rule string it names
+# shaped:     the file names a whole weighted kernel, as cellar 3 wrote one
+# shape:      that kernel's structure
+# states:     how many states its cells hold
 # generation: the generation, 0 when the file names none
 # view:       the view, starting as the reader's own
 rec Head {
+    family:     [32]u8;
     ruled:      bool;
-    rule:       opt[kernel.Kernel];
+    rule:       [rule.FORMAT_MAX + 1]u8;
     shaped:     bool;
-    shape:      opt[kernel.Kernel];
+    shape:      [rule.FORMAT_MAX + 1]u8;
+    states:     u32;
     generation: u64;
     view:       View;
 }
 
-# the rule a header names, preferring its whole kernel, or none when it names
-# none or names one this version cannot run
-fun head_rule(h: *Head) opt[kernel.Kernel] {
-    if (h.shaped) { ret h.shape; }
-    ret h.rule;
+# the rule a header names, or none when it names none or one this version
+# cannot run: the whole kernel of a cellar 3 file before its notation, and a
+# rule of the family it names, or of the weighted family when it names none
+fun head_rule(h: *Head) opt[rule.Rule] {
+    var id: str = ?h.family[0];
+    if (h.shaped || h.family[0] == 0) { id = LEGACY_FAMILY; }
+    val f: opt[usize] = rule.family_named(id);
+    if (sel f.none) { ret opt[rule.Rule].none{}; }
+    var src: str = ?h.rule[0];
+    if (h.shaped) { src = ?h.shape[0]; }
+    val r: res[rule.Rule, str] = rule.parse_as(f.some, src);
+    if (sel r.err) { ret opt[rule.Rule].none{}; }
+    ret opt[rule.Rule].some{r.ok};
 }
 
 # whether a header names a rule this version cannot run
 fun foreign(h: *Head) bool {
-    val k: opt[kernel.Kernel] = head_rule(h);
-    ret (h.ruled || h.shaped) && sel k.none;
+    if (!h.ruled && !h.shaped && h.family[0] == 0) { ret false; }
+    val r: opt[rule.Rule] = head_rule(h);
+    ret sel r.none;
 }
 
 # whether a float is neither infinite nor NaN
@@ -427,14 +493,27 @@ fun value_f64(v: str, out: *f64) bool {
 # h:   the header read so far
 # ret: false when a key this version reads holds a value it cannot
 fun field(key: str, v: str, h: *Head) bool {
+    if (string.str_equals(key, "family")) {
+        val n: usize = string.str_len(v);
+        if (n > 31) { ret false; }
+        mem.raw_copy(?h.family[0], v, n + 1);
+        ret true;
+    }
     if (string.str_equals(key, "rule")) {
         h.ruled = true;
-        h.rule  = kernel.parse(v);
+        mem.raw_copy(?h.rule[0], v, string.str_len(v) + 1);
         ret true;
     }
     if (string.str_equals(key, "kernel")) {
         h.shaped = true;
-        h.shape  = kernel.from_structure(v);
+        mem.raw_copy(?h.shape[0], v, string.str_len(v) + 1);
+        ret true;
+    }
+    if (string.str_equals(key, "states")) {
+        val r: res[u64, parse.ParseError] = parse.parse_u64_exact(v, 10);
+        if (sel r.err)                          { ret false; }
+        if (r.ok < 2 || r.ok > STATES_MAX::u64) { ret false; }
+        h.states = r.ok::u32;
         ret true;
     }
     if (string.str_equals(key, "generation")) {
@@ -499,7 +578,7 @@ fun read_header(b: *Vector[u8], p: usize, out: *usize, h: *Head) err[Error] {
         var end: usize = e;
         for (end < b.len && b.data[end] != '\n') { end = end + 1; }
         for (end > e && (b.data[end - 1] == ' ' || b.data[end - 1] == '\t' || b.data[end - 1] == '\r')) { end = end - 1; }
-        var value: [1101]u8;
+        var value: [rule.FORMAT_MAX + 1]u8;
         var len:   usize = end - e;
         # a value too long for any field this version reads is read as none at all
         if (len > VALUE_MAX) { len = 0; }
@@ -511,15 +590,17 @@ fun read_header(b: *Vector[u8], p: usize, out: *usize, h: *Head) err[Error] {
     ret err[Error].ok{};
 }
 
-# the chunk records of a sparse world, as coordinates and 0/1 cells
+# the chunk records of a sparse world, as coordinates and states
 # ---
-# b:     the file contents
-# start: the offset of the first record
-# at:    receives each chunk's coordinates, two per chunk
-# cells: receives each chunk's space.CELLS cells
-# max:   the most chunks the pool can hold
-# ret:   ok, or why the file was refused
-fun parse_sparse(b: *Vector[u8], start: usize, at: *Vector[i64], cells: *Vector[u8], max: usize) err[Error] {
+# b:      the file contents
+# start:  the offset of the first record
+# states: how many states a cell may hold
+# at:     receives each chunk's coordinates, two per chunk
+# cells:  receives each chunk's space.CELLS states
+# max:    the most chunks the pool can hold
+# ret:    ok, or why the file was refused
+fun parse_sparse(b: *Vector[u8], start: usize, states: u32, at: *Vector[i64], cells: *Vector[u8], max: usize) err[Error] {
+    val w: usize = digits(states);
     var p: usize = start;
     for (true) {
         for (p < b.len && (b.data[p] == '\n' || b.data[p] == '\r' || b.data[p] == ' ')) { p = p + 1; }
@@ -538,14 +619,8 @@ fun parse_sparse(b: *Vector[u8], start: usize, at: *Vector[i64], cells: *Vector[
         val grow: res[usize, allo.Error] = vector.reserve[u8](cells, space.CELLS);
         if (sel grow.err) { ret err[Error].err{Error.alloc{grow.err}}; }
         cells.len = base + space.CELLS;
-        val parsed: err[Error] = parse_body(b, p, 64, 64, ?cells.data[base]);
+        val parsed: err[Error] = parse_chunk(b, p, w, states, ?cells.data[base], ?p);
         if (sel parsed.err) { ret parsed; }
-        # step past the cells just read
-        var n: usize = 0;
-        for (n < space.CELLS) {
-            p = next_cell(b, p) + 1;
-            n = n + 1;
-        }
     }
     ret err[Error].ok{};
 }
@@ -558,30 +633,48 @@ fun from_format(e: format.Error) Error {
     ret Error.format{e};
 }
 
-# read a pattern file's bytes into p through the format registry
+# read a pattern's bytes into p through the format registry
 #
-# the whole file is validated before p changes, so a refusal leaves p as it was.
+# the whole input is validated before p changes, so a refusal leaves p as it was.
 # ---
 # a:    allocator for the decoder's scratch
 # f:    the format to read it as
-# data: the file contents
+# data: the bytes
+# n:    how many
 # p:    pattern to populate
 # ret:  ok, or why the bytes were refused
-fun read_pattern(a: *allo.Allocator, f: *format.Format, data: *Vector[u8], p: *pattern.Pattern) err[Error] {
+fun read_pattern(a: *allo.Allocator, f: *format.Format, data: *u8, n: usize, p: *pattern.Pattern) err[Error] {
     var ps:   adapt.PatternSink;
     var info: format.Info;
     format.info_init(?info, a);
-    val r: err[format.Error] = formats.load(a, f, data.data, data.len, adapt.pattern_sink(?ps, p), ?info);
+    val r: err[format.Error] = formats.load(a, f, data, n, adapt.pattern_sink(?ps, p), ?info);
     format.info_dnit(?info);
     if (sel r.err) { ret err[Error].err{from_format(r.err)}; }
     ret err[Error].ok{};
 }
 
+# read a pattern in any registered format from bytes, such as the clipboard's
+#
+# the format is detected from the bytes, and the whole input is validated first,
+# so a refusal leaves p as it was. a pattern too large to hold is refused before
+# anything is allocated for it.
+# ---
+# a:    allocator for the decoder's scratch
+# p:    pattern to populate, keeping its name unless the bytes name one
+# data: the bytes
+# n:    how many
+# ret:  ok, or why the bytes were refused; malformed when no format reads them
+pub fun pattern_from(a: *allo.Allocator, p: *pattern.Pattern, data: *u8, n: usize) err[Error] {
+    var f: format.Format;
+    if (!formats.by_bytes(data, n, ?f)) { ret err[Error].err{Error.format{format.Error.malformed{}}}; }
+    ret read_pattern(a, ?f, data, n, p);
+}
+
 # read path and replace the world with what it holds
 #
 # the whole file is parsed before the world or the view changes, so a refusal
-# leaves both as they were. the file's rule replaces the simulation's when
-# kernel.parse reads it, and is otherwise left for the caller to report. the
+# leaves both as they were. the file's rule replaces the simulation's when its
+# family reads it, and is otherwise left for the caller to report. the
 # generation is the file's, or 0 when it names none.
 # ---
 # a:    allocator for the read and parse buffers
@@ -605,42 +698,52 @@ fun world_from(a: *allo.Allocator, s: *sim.Sim, v: *View, data: *Vector[u8]) res
         var start: usize = next_line(data, 0);
         if (ver < OLDEST || ver > VERSION) { ret res[Loaded, Error].err{Error.version{}}; }
         var h: Head;
+        h.family[0]  = 0;
         h.ruled      = false;
-        h.rule       = opt[kernel.Kernel].none{};
+        h.rule[0]    = 0;
         h.shaped     = false;
-        h.shape      = opt[kernel.Kernel].none{};
+        h.shape[0]   = 0;
+        h.states     = 2;
         h.generation = 0;
         h.view       = @v;
         if (ver >= '3') {
             val head: err[Error] = read_header(data, start, ?start, ?h);
             if (sel head.err) { ret res[Loaded, Error].err{head.err}; }
         }
-        var at:     Vector[i64] = vector.init[i64](a);
-        var cells:  Vector[u8]  = vector.init[u8](a);
-        val parsed: err[Error]  = parse_sparse(data, start, ?at, ?cells, s.space.max_slots);
+        # the world runs no rule of a family the GPU stepping it cannot step
+        var refused: bool        = false;
+        var at:      Vector[i64] = vector.init[i64](a);
+        var cells:   Vector[u8]  = vector.init[u8](a);
+        val parsed:  err[Error]  = parse_sparse(data, start, h.states, ?at, ?cells, sim.load_chunks(s));
         if (sel parsed.ok) {
+            # the world empties first, so a rule the quadtree cannot run moves
+            # nothing out of it, and the rule comes before the cells are written
+            # as its words
             sim.fill_begin(s);
-            var k: usize = 0;
+            val named: opt[rule.Rule] = head_rule(?h);
+            if (sel named.some && !sim.set_rule(s, named.some)) { refused = true; }
+            val have: u32   = rule.states(?s.rule);
+            var k:    usize = 0;
             for (k < at.len / 2) {
                 val ox: i64   = at.data[k * 2] * space.SIDE;
                 val oy: i64   = at.data[k * 2 + 1] * space.SIDE;
                 var i:  usize = 0;
                 for (i < space.CELLS) {
-                    if (cells.data[k * space.CELLS + i] != 0) { sim.fill_cell(s, ox + (i % 64)::i64, oy + (i / 64)::i64); }
+                    var st: u32 = cells.data[k * space.CELLS + i]::u32;
+                    if (st >= have) { st = 1; }
+                    if (st != 0)    { sim.fill_cell(s, ox + (i % 64)::i64, oy + (i / 64)::i64, st); }
                     i = i + 1;
                 }
                 k = k + 1;
             }
             sim.fill_end(s);
             s.generation = h.generation;
-            val rule: opt[kernel.Kernel] = head_rule(?h);
-            if (sel rule.some) { s.kernel = rule.some; }
-            @v = h.view;
+            @v           = h.view;
         }
         vector.dnit[i64](?at);
         vector.dnit[u8](?cells);
         if (sel parsed.err) { ret res[Loaded, Error].err{parsed.err}; }
-        ret res[Loaded, Error].ok{Loaded{foreign: foreign(?h)}};
+        ret res[Loaded, Error].ok{Loaded{foreign: refused || foreign(?h)}};
     }
 
     # an old dense world is a custom pattern, centred on the origin
@@ -649,7 +752,7 @@ fun world_from(a: *allo.Allocator, s: *sim.Sim, v: *View, data: *Vector[u8]) res
     var tmp:  pattern.Pattern;
     val made: err[allo.Error] = pattern.init(?tmp, a, 0, 0, "");
     if (sel made.err) { ret res[Loaded, Error].err{Error.alloc{made.err}}; }
-    val read: err[Error] = read_pattern(a, ?old, data, ?tmp);
+    val read: err[Error] = read_pattern(a, ?old, data.data, data.len, ?tmp);
     if (sel read.err) {
         pattern.dnit(?tmp);
         ret res[Loaded, Error].err{read.err};
@@ -661,7 +764,7 @@ fun world_from(a: *allo.Allocator, s: *sim.Sim, v: *View, data: *Vector[u8]) res
     for (y < tmp.h) {
         var x: usize = 0;
         for (x < tmp.w) {
-            if (pattern.get(?tmp, x, y) != 0) { sim.fill_cell(s, ox + x::i64, oy + y::i64); }
+            if (pattern.get(?tmp, x, y) != 0) { sim.fill_cell(s, ox + x::i64, oy + y::i64, 1); }
             x = x + 1;
         }
         y = y + 1;
@@ -672,38 +775,49 @@ fun world_from(a: *allo.Allocator, s: *sim.Sim, v: *View, data: *Vector[u8]) res
 }
 
 # stamp a pattern file's bytes onto the world centred on the origin, in the
-# format the registry detects, taking its rule when kernel.parse reads it
+# format the registry detects, taking its rule when a rule family reads it
 fun stamp_from(a: *allo.Allocator, s: *sim.Sim, data: *Vector[u8]) res[Opened, Error] {
     var f: format.Format;
     if (!formats.by_bytes(data.data, data.len, ?f)) { ret res[Opened, Error].err{Error.format{format.Error.malformed{}}}; }
-    var ws:   adapt.WorldSink;
-    var info: format.Info;
+    # the rule is read first and taken as the sink opens, so the cells are
+    # written as its states, a state past the world's rule's included
+    var ws:      adapt.WorldSink;
+    var info:    format.Info;
+    var foreign: bool = false;
     format.info_init(?info, a);
-    val r:       err[format.Error] = formats.load(a, ?f, data.data, data.len, adapt.centred_sink(?ws, s), ?info);
-    var foreign: bool              = false;
-    var box:     opt[space.Box]    = opt[space.Box].none{};
-    if (sel r.ok && info.bounded) {
-        box = opt[space.Box].some{space.Box{x0: info.x0 + ws.dx, y0: info.y0 + ws.dy, x1: info.x1 + ws.dx, y1: info.y1 + ws.dy}};
-    }
-    if (sel r.ok) {
+    val sink:  *format.Sink      = adapt.centred_sink(?ws, s);
+    val known: err[format.Error] = formats.validate(a, ?f, data.data, data.len, ?info);
+    if (sel known.ok) {
         val named: str = format.text_of(?info.rule);
         if (named[0] != 0) {
-            val k: opt[kernel.Kernel] = kernel.parse(named);
-            if (sel k.some) { s.kernel = k.some; }
-            or              { foreign = true; }
+            val k: res[rule.Rule, str] = rule.parse(named);
+            if (sel k.ok) { adapt.sink_rule(?ws, k.ok); }
+            or            { foreign = true; }
         }
     }
     format.info_dnit(?info);
+    format.info_init(?info, a);
+    val r:   err[format.Error] = formats.load(a, ?f, data.data, data.len, sink, ?info);
+    var box: opt[space.Box]    = opt[space.Box].none{};
+    if (sel r.ok && info.bounded) {
+        box = opt[space.Box].some{space.Box{x0: info.x0 + ws.dx, y0: info.y0 + ws.dy, x1: info.x1 + ws.dx, y1: info.y1 + ws.dy}};
+    }
+    # a rule the pool cannot take the world for is not taken either
+    if (ws.refused) { foreign = true; }
+    format.info_dnit(?info);
     if (sel r.err) { ret res[Opened, Error].err{from_format(r.err)}; }
-    ret res[Opened, Error].ok{Opened{world: false, foreign: foreign, box: box}};
+    ret res[Opened, Error].ok{Opened{world: false, foreign: foreign, box: box, stray: false}};
 }
 
 # open a file of any kind cellar reads, dispatching on its bytes
 #
 # a world file (its first line "cellar <version>") replaces the world and the
-# view, as load_world does. anything else is read as a pattern in the format the
+# view, as load_world does. a Golly .rule file (its first line "@RULE <name>")
+# becomes the world's rule, on the grid the world runs on, and is copied into
+# the data directory (cellar.rules.table.store). anything else is read as a
+# pattern in the format the
 # registry detects and stamped onto the world centred on the origin, its rule
-# replacing the simulation's when kernel.parse reads it. the whole file is
+# replacing the simulation's when a rule family reads it. the whole file is
 # validated first, so a refusal leaves the world, the rule and the view as they
 # were.
 # ---
@@ -715,18 +829,50 @@ fun stamp_from(a: *allo.Allocator, s: *sim.Sim, data: *Vector[u8]) res[Opened, E
 pub fun open_file(a: *allo.Allocator, s: *sim.Sim, v: *View, path: str) res[Opened, Error] {
     val rr: res[Vector[u8], fs.FsError] = fs.read_bytes(a, path);
     if (sel rr.err) { ret res[Opened, Error].err{Error.fs{rr.err}}; }
-    var data: Vector[u8] = rr.ok;
-    var r:    res[Opened, Error];
-    if (world_version(?data) != 0) { r = opened_world(world_from(a, s, v, ?data)); }
-    or                             { r = stamp_from(a, s, ?data); }
+    var data: Vector[u8]         = rr.ok;
+    val r:    res[Opened, Error] = open_bytes(a, s, v, ?data);
     vector.dnit[u8](?data);
     ret r;
+}
+
+# open a file's bytes as open_file does, which is how every caller that opens
+# a file into the world reads it alike
+# ---
+# a:    allocator for the parse buffers
+# s:    simulation to load into
+# v:    the view, which a world file replaces
+# data: the file's bytes
+# ret:  what the file was and did, or why nothing was loaded
+pub fun open_bytes(a: *allo.Allocator, s: *sim.Sim, v: *View, data: *Vector[u8]) res[Opened, Error] {
+    if (world_version(data) != 0)       { ret opened_world(world_from(a, s, v, data)); }
+    if (rule_file(data.data, data.len)) { ret rule_from(s, data); }
+    ret stamp_from(a, s, data);
+}
+
+# whether bytes are a Golly .rule file: the first line holding more than blanks
+# begins "@RULE"
+pub fun rule_file(p: *u8, n: usize) bool {
+    var i: usize = 0;
+    for (i < n && (p[i] == ' ' || p[i] == '\t' || p[i] == '\r' || p[i] == '\n')) { i = i + 1; }
+    ret n - i >= 5 && string.str_region_equals(?p[i], 0, 5, "@RULE");
+}
+
+# run a .rule file's rule on the world as it stands, on its grid, and copy the
+# file into the data directory, where a rule string naming it is looked up in
+# later sessions (cellar.rules.table.store)
+fun rule_from(s: *sim.Sim, data: *Vector[u8]) res[Opened, Error] {
+    val kept: res[u32, load.Fault] = store.intern(data.data, data.len);
+    if (sel kept.err) { ret res[Opened, Error].err{Error.rule{kept.err}}; }
+    val r:      rule.Rule = rule.Rule{kind: rule.Kind.table{ruletable.Rule{id: kept.ok}}, grid: s.rule.grid};
+    val stray:  bool      = !store.install(kept.ok, data.data, data.len);
+    val closed: bool      = !sim.set_rule(s, r);
+    ret res[Opened, Error].ok{Opened{world: false, foreign: closed, box: opt[space.Box].none{}, stray: stray}};
 }
 
 # a world load's outcome as an open's
 fun opened_world(w: res[Loaded, Error]) res[Opened, Error] {
     if (sel w.err) { ret res[Opened, Error].err{w.err}; }
-    ret res[Opened, Error].ok{Opened{world: true, foreign: w.ok.foreign, box: opt[space.Box].none{}}};
+    ret res[Opened, Error].ok{Opened{world: true, foreign: w.ok.foreign, box: opt[space.Box].none{}, stray: false}};
 }
 
 # copy a pattern's name, rule and comments into an Info
@@ -736,6 +882,28 @@ fun describe(a: *allo.Allocator, p: *pattern.Pattern, info: *format.Info) err[al
     val r: err[allo.Error] = format.set_str(a, ?info.rule, pattern.rule(p));
     if (sel r.err) { ret r; }
     ret format.set_str(a, ?info.comments, pattern.comments(p));
+}
+
+# encode a pattern, with its name, rule and comments where the format keeps them
+# ---
+# a:   allocator for the encoder's scratch
+# f:   the format to write
+# p:   pattern to encode, placed at its own x and y
+# out: receives the bytes, appended
+# ret: ok, or why the pattern could not be encoded
+pub fun encode_pattern(a: *allo.Allocator, f: *format.Format, p: *pattern.Pattern, out: *Vector[u8]) err[Error] {
+    var info: format.Info;
+    format.info_init(?info, a);
+    val told: err[allo.Error] = describe(a, p, ?info);
+    if (sel told.err) {
+        format.info_dnit(?info);
+        ret err[Error].err{Error.alloc{told.err}};
+    }
+    var src: adapt.PatternSource;
+    val enc: err[format.Error] = formats.save(a, f, adapt.pattern_source(?src, p), ?info, out);
+    format.info_dnit(?info);
+    if (sel enc.err) { ret err[Error].err{from_format(enc.err)}; }
+    ret err[Error].ok{};
 }
 
 # serialize a pattern to path in the format its extension names
@@ -748,20 +916,11 @@ fun describe(a: *allo.Allocator, p: *pattern.Pattern, info: *format.Info) err[al
 pub fun save_pattern(a: *allo.Allocator, p: *pattern.Pattern, path: str) err[Error] {
     var f: format.Format;
     if (!formats.by_path(path, ?f)) { ret err[Error].err{Error.format{format.Error.unsupported{}}}; }
-    var info: format.Info;
-    format.info_init(?info, a);
-    val told: err[allo.Error] = describe(a, p, ?info);
-    if (sel told.err) {
-        format.info_dnit(?info);
-        ret err[Error].err{Error.alloc{told.err}};
-    }
-    var src: adapt.PatternSource;
-    var out: Vector[u8]        = vector.init[u8](a);
-    val enc: err[format.Error] = formats.save(a, ?f, adapt.pattern_source(?src, p), ?info, ?out);
-    format.info_dnit(?info);
+    var out: Vector[u8] = vector.init[u8](a);
+    val enc: err[Error] = encode_pattern(a, ?f, p, ?out);
     if (sel enc.err) {
         vector.dnit[u8](?out);
-        ret err[Error].err{from_format(enc.err)};
+        ret enc;
     }
     val made: err[fs.FsError] = make_parent(a, path);
     if (sel made.err) {
@@ -842,12 +1001,7 @@ pub fun load_pattern(a: *allo.Allocator, p: *pattern.Pattern, path: str) err[Err
     val rr: res[Vector[u8], fs.FsError] = fs.read_bytes(a, path);
     if (sel rr.err) { ret err[Error].err{Error.fs{rr.err}}; }
     var data: Vector[u8] = rr.ok;
-    var f:    format.Format;
-    if (!formats.by_bytes(data.data, data.len, ?f)) {
-        vector.dnit[u8](?data);
-        ret err[Error].err{Error.format{format.Error.malformed{}}};
-    }
-    val r: err[Error] = read_pattern(a, ?f, ?data, p);
+    val r:    err[Error] = pattern_from(a, p, data.data, data.len);
     vector.dnit[u8](?data);
     ret r;
 }
@@ -868,7 +1022,7 @@ test load_world__round_trips_a_highlife_world_its_generation_and_view {
     var s:    sim.Sim;
     val made: err[allo.Error] = sim.init(?s, ?a);
     if (sel made.err) { ret 1; }
-    s.kernel = kernel.highlife();
+    sim.set_rule(?s, rule.preset_rule(1));
     block(?s, 0, 0);
     block(?s, 100000, -70000);
     var i: usize = 0;
@@ -901,11 +1055,10 @@ test load_world__round_trips_a_highlife_world_its_generation_and_view {
     if (sel loaded.err)    { ret 4; }
     if (loaded.ok.foreign) { ret 4; }
 
-    if (sim.population(?t) != 14)                               { ret 5; }
-    if (!sim.alive(?t, 0, 0) || !sim.alive(?t, 100001, -69999)) { ret 6; }
-    if (sim.alive(?t, 7, 7))                                    { ret 7; }
-    var hl: kernel.Kernel = kernel.highlife();
-    if (!kernel.same_rule(?t.kernel, ?hl) || t.generation != 4)       { ret 8; }
+    if (sim.population(?t) != 14)                                     { ret 5; }
+    if (!sim.alive(?t, 0, 0) || !sim.alive(?t, 100001, -69999))       { ret 6; }
+    if (sim.alive(?t, 7, 7))                                          { ret 7; }
+    if (!rule.same(?t.rule, ?s.rule) || t.generation != 4)            { ret 8; }
     if (w.pan_x != v.pan_x || w.pan_y != v.pan_y || w.zoom != v.zoom) { ret 9; }
     if (w.mode != render.MODE_HEAT)                                   { ret 10; }
 
@@ -924,10 +1077,14 @@ test load_world__round_trips_a_wide_weighted_kernel {
     var s:    sim.Sim;
     val made: err[allo.Error] = sim.init(?s, ?a);
     if (sel made.err) { ret 1; }
-    kernel.set_radius(?s.kernel, 2);
-    kernel.set_weight(?s.kernel, -2, 0, -4);
-    kernel.set_weight(?s.kernel, 1, 2, 3);
-    s.kernel.birth = kernel.set_bit(s.kernel.birth, 11);
+    # wider than cellar 0.4 ran, with negative weights and a sum past 63
+    var k: weighted.Kernel = weighted.life();
+    weighted.set_radius(?k, 12);
+    weighted.set_weight(?k, -12, 0, -4);
+    weighted.set_weight(?k, 1, 12, 3);
+    weighted.set(?k.birth, 11);
+    weighted.set(?k.survive, 70);
+    sim.set_rule(?s, rule.of(rule.Kind.weighted{k}));
     block(?s, 0, 0);
     var v: View = View{pan_x: 0.0, pan_y: 0.0, zoom: 1.0, mode: render.MODE_SOLID};
 
@@ -939,10 +1096,82 @@ test load_world__round_trips_a_wide_weighted_kernel {
     if (sel made2.err) { ret 3; }
     val loaded: res[Loaded, Error] = load_world(?a, ?t, ?v, path);
     fs.remove_file(path);
-    if (sel loaded.err)                                                      { ret 4; }
-    if (loaded.ok.foreign || t.kernel.radius != 2)                           { ret 5; }
-    if (!kernel.same_rule(?t.kernel, ?s.kernel))                             { ret 6; }
-    if (kernel.weight_at(?t.kernel, -2, 0) != -4 || sim.population(?t) != 4) { ret 7; }
+    if (sel loaded.err)                                  { ret 4; }
+    if (loaded.ok.foreign || rule.radius(?t.rule) != 12) { ret 5; }
+    if (!rule.same(?t.rule, ?s.rule))                    { ret 6; }
+    if (sim.population(?t) != 4)                         { ret 7; }
+    sim.dnit(?s);
+    sim.dnit(?t);
+    ret 0;
+}
+
+test load_world__round_trips_a_generations_world_and_its_dying_cells {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    sim.set_rule(?s, rule.preset_rule(4));
+    block(?s, 0, 0);
+    # a lone cell starts dying, leaving its chunk with no live cell at all
+    sim.paint(?s, 1000, 1000, 1);
+    # and one beside the block dies outside the live cells' box
+    sim.paint(?s, 20, 20, 1);
+    sim.step(?s);
+    var v: View = View{pan_x: 0.0, pan_y: 0.0, zoom: 1.0, mode: render.MODE_HEAT};
+
+    val path:  str        = "out/test/test_generations.cellar";
+    val saved: err[Error] = save_world(?a, ?s, ?v, path);
+    if (sel saved.err) { ret 2; }
+    var t:     sim.Sim;
+    val made2: err[allo.Error] = sim.init(?t, ?a);
+    if (sel made2.err) { ret 3; }
+    val loaded: res[Loaded, Error] = load_world(?a, ?t, ?v, path);
+    fs.remove_file(path);
+    if (sel loaded.err)                                     { ret 4; }
+    if (loaded.ok.foreign || !rule.same(?t.rule, ?s.rule))  { ret 5; }
+    if (rule.state(?t.rule, sim.cell(?t, 1000, 1000)) != 2) { ret 6; }
+    if (rule.state(?t.rule, sim.cell(?t, 20, 20)) != 2)     { ret 6; }
+    var y: i64 = -2;
+    for (y < 4) {
+        var x: i64 = -2;
+        for (x < 4) {
+            if (sim.cell(?t, x, y) != sim.cell(?s, x, y)) { ret 7; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    sim.dnit(?s);
+    sim.dnit(?t);
+    ret 0;
+}
+
+test load_world__round_trips_a_bounded_grid_in_its_rule {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    val k: res[rule.Rule, str] = rule.parse("B3/S23:K100*,90");
+    if (sel k.err)               { ret 1; }
+    if (!sim.set_rule(?s, k.ok)) { ret 1; }
+    block(?s, 0, 0);
+    # a block across the grid's east edge, half of it dropped
+    block(?s, 49, 0);
+    var v: View = View{pan_x: 0.0, pan_y: 0.0, zoom: 1.0, mode: render.MODE_SOLID};
+
+    val path:  str        = "out/test/test_bounded.cellar";
+    val saved: err[Error] = save_world(?a, ?s, ?v, path);
+    if (sel saved.err) { ret 2; }
+    var t:     sim.Sim;
+    val made2: err[allo.Error] = sim.init(?t, ?a);
+    if (sel made2.err) { ret 3; }
+    val loaded: res[Loaded, Error] = load_world(?a, ?t, ?v, path);
+    fs.remove_file(path);
+    if (sel loaded.err)                                                           { ret 4; }
+    if (loaded.ok.foreign || !rule.same(?t.rule, ?s.rule))                        { ret 5; }
+    if (!topology.bounded(?t.rule.grid))                                          { ret 6; }
+    if (sim.population(?t) != 6 || !sim.alive(?t, 49, 1) || sim.alive(?t, 50, 1)) { ret 7; }
     sim.dnit(?s);
     sim.dnit(?t);
     ret 0;
@@ -1125,13 +1354,19 @@ fun chunk_text(out: *Vector[u8], rec_line: str, first: str) {
 # load a world file of a header and one chunk at (-1, 2) whose first row starts "101"
 #[testing]
 fun load_versioned(a: *allo.Allocator, s: *sim.Sim, v: *View, path: str, head: str) res[Loaded, Error] {
+    ret load_cells(a, s, v, path, head, "101");
+}
+
+# load a world file of a header and one chunk at (-1, 2) whose first row starts with first
+#[testing]
+fun load_cells(a: *allo.Allocator, s: *sim.Sim, v: *View, path: str, head: str, first: str) res[Loaded, Error] {
     var body: Vector[u8] = vector.init[u8](a);
     var i:    usize      = 0;
     for (head[i] != 0) {
         vector.push[u8](?body, head[i]);
         i = i + 1;
     }
-    chunk_text(?body, "-1 2\n", "101");
+    chunk_text(?body, "-1 2\n", first);
     vector.push[u8](?body, 0);
     val dir: err[fs.FsError] = fs.create_dir_all(a, TEST_DIR, DIR_MODE);
     if (sel dir.err) { ret res[Loaded, Error].err{Error.fs{dir.err}}; }
@@ -1149,9 +1384,9 @@ test load_world__reads_cellar_2_and_every_cellar_3_header {
     var s:    sim.Sim;
     val made: err[allo.Error] = sim.init(?s, ?a);
     if (sel made.err) { ret 1; }
-    var v:  View          = View{pan_x: 1.5, pan_y: -2.5, zoom: 3.0, mode: render.MODE_AGE};
-    var lf: kernel.Kernel = kernel.life();
-    var hl: kernel.Kernel = kernel.highlife();
+    var v:  View      = View{pan_x: 1.5, pan_y: -2.5, zoom: 3.0, mode: render.MODE_AGE};
+    var lf: rule.Rule = rule.preset_rule(0);
+    var hl: rule.Rule = rule.preset_rule(1);
 
     # a 0.3.0 world
     val two: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v2.cellar", "cellar 2\n");
@@ -1162,36 +1397,42 @@ test load_world__reads_cellar_2_and_every_cellar_3_header {
     # a header with no keys loads the cells and leaves the rule and view alone
     s.generation = 9;
     val bare: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v3_bare.cellar", "cellar 3\n\n");
-    if (sel bare.err)                                                                    { ret 5; }
-    if (bare.ok.foreign || sim.population(?s) != 2 || s.generation != 0)                 { ret 5; }
-    if (!kernel.same_rule(?s.kernel, ?lf) || v.zoom != 3.0 || v.mode != render.MODE_AGE) { ret 5; }
+    if (sel bare.err)                                                           { ret 5; }
+    if (bare.ok.foreign || sim.population(?s) != 2 || s.generation != 0)        { ret 5; }
+    if (!rule.same(?s.rule, ?lf) || v.zoom != 3.0 || v.mode != render.MODE_AGE) { ret 5; }
 
     # keys are read in any case of line ending, and keys a later version adds are skipped
     val three: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v3.cellar", "cellar 3\r\nrule b36/s23\r\ngeneration 12\nlater stuff\nmode glow\npan_y 7.25\n\r\n");
     if (sel three.err)                                                  { ret 6; }
     if (three.ok.foreign || !sim.alive(?s, -64, 128))                   { ret 6; }
-    if (!kernel.same_rule(?s.kernel, ?hl) || s.generation != 12)        { ret 6; }
+    if (!rule.same(?s.rule, ?hl) || s.generation != 12)                 { ret 6; }
     if (v.pan_y != 7.25 || v.pan_x != 1.5 || v.mode != render.MODE_AGE) { ret 6; }
 
     # a rule cellar cannot run loads the world with the rule as it was
-    val odd: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v3_odd.cellar", "cellar 3\nrule B3/S23:T20,30\ngeneration 3\n\n");
-    if (sel odd.err)                                                               { ret 7; }
-    if (!odd.ok.foreign || !kernel.same_rule(?s.kernel, ?hl) || s.generation != 3) { ret 7; }
+    val odd: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v3_odd.cellar", "cellar 3\nrule B3/S23:S20\ngeneration 3\n\n");
+    if (sel odd.err)                                                      { ret 7; }
+    if (!odd.ok.foreign || !rule.same(?s.rule, ?hl) || s.generation != 3) { ret 7; }
 
     # a whole kernel is preferred to the notation beside it, and one this
     # version cannot run is foreign even beside a rule it can
     val both: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v3_both.cellar", "cellar 3\nrule B3/S23\nkernel 1 64 12 1 1 1 1 0 1 1 1 1\n\n");
-    if (sel both.err)                                                      { ret 12; }
-    if (both.ok.foreign || s.kernel.birth != 64 || s.kernel.survive != 12) { ret 12; }
-    val wide: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v3_wide.cellar", "cellar 3\nrule B3/S23\nkernel 9 8 12 1\n\n");
-    if (sel wide.err)                             { ret 13; }
-    if (!wide.ok.foreign || s.kernel.birth != 64) { ret 13; }
+    if (sel both.err)                                 { ret 12; }
+    if (both.ok.foreign || !sel s.rule.kind.weighted) { ret 12; }
+    if (sel s.rule.kind.weighted) {
+        if (s.rule.kind.weighted.birth.w[0] != 64 || s.rule.kind.weighted.survive.w[0] != 12) { ret 12; }
+    }
+    val wide: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v3_wide.cellar", "cellar 3\nrule B3/S23\nkernel 17 8 12 1\n\n");
+    if (sel wide.err)                                  { ret 13; }
+    if (!wide.ok.foreign || !sel s.rule.kind.weighted) { ret 13; }
+    if (sel s.rule.kind.weighted) {
+        if (s.rule.kind.weighted.birth.w[0] != 64) { ret 13; }
+    }
 
     # a version from the future, a header that never ends, and a value that
     # cannot be read, are refused untouched
-    val four: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v4.cellar", "cellar 4\n\n");
-    if (!sel four.err)         { ret 8; }
-    if (!sel four.err.version) { ret 8; }
+    val five: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v5.cellar", "cellar 5\n\n");
+    if (!sel five.err)         { ret 8; }
+    if (!sel five.err.version) { ret 8; }
     val open: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v3_open.cellar", "cellar 3\nrule B3/S23\n");
     if (!sel open.err) { ret 9; }
     val nan: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v3_nan.cellar", "cellar 3\nzoom nan\n\n");
@@ -1256,5 +1497,117 @@ test migrate__moves_0_3_0_saves_off_cells {
     fs.remove_file(?nc[0]);
     pattern.dnit(?q);
     sim.dnit(?s);
+    ret 0;
+}
+
+test load_world__reads_a_cellar_4_rule_by_its_family {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    var v:  View      = View{pan_x: 0.0, pan_y: 0.0, zoom: 1.0, mode: render.MODE_SOLID};
+    var hl: rule.Rule = rule.preset_rule(1);
+
+    val four: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v4.cellar", "cellar 4\nrule B36/S23\nfamily weighted\nstates 2\n\n");
+    if (sel four.err)                                         { ret 2; }
+    if (four.ok.foreign || !rule.same(?s.rule, ?hl))          { ret 3; }
+    if (!sim.alive(?s, -64, 128) || !sim.alive(?s, -62, 128)) { ret 4; }
+
+    # a family this version does not run is foreign, and a state the rule
+    # lacks loads live
+    val later: res[Loaded, Error] = load_cells(?a, ?s, ?v, "out/test/test_v4_later.cellar", "cellar 4\nfamily lenia\nrule R13\nstates 3\n\n", "102");
+    if (sel later.err)                                       { ret 5; }
+    if (!later.ok.foreign || !rule.same(?s.rule, ?hl))       { ret 6; }
+    if (sim.population(?s) != 2 || !sim.alive(?s, -62, 128)) { ret 7; }
+
+    # a state past the ones declared is refused
+    val bad: res[Loaded, Error] = load_cells(?a, ?s, ?v, "out/test/test_v4_bad.cellar", "cellar 4\nstates 2\n\n", "102");
+    if (!sel bad.err) { ret 8; }
+    val big: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v4_big.cellar", "cellar 4\nstates 300\n\n");
+    if (!sel big.err) { ret 9; }
+    sim.dnit(?s);
+    ret 0;
+}
+
+test open_file__runs_a_rule_file_and_installs_it_where_its_name_is_looked_up {
+    var a: allo.Allocator;
+    page.make(?a);
+    val data:  str             = "out/test/rule_open/data";
+    val away:  str             = "out/test/rule_open/away";
+    val made1: err[fs.FsError] = fs.create_dir_all(?a, data, DIR_MODE);
+    val made2: err[fs.FsError] = fs.create_dir_all(?a, away, DIR_MODE);
+    if (sel made1.err || sel made2.err) { ret 1; }
+    fs.remove_file("out/test/rule_open/data/Spin.rule");
+    store.search(data);
+
+    # a live cell turns to the next of three live states, and one beside a
+    # state 3 cell is born
+    val text: str             = "@RULE Spin\n@TABLE\nn_states:4\nneighborhood:vonNeumann\nsymmetries:rotate4\n1,a,b,c,d,2\n2,a,b,c,d,3\n3,a,b,c,d,1\n0,3,0,0,0,1\nvar a={0,1,2,3}\n";
+    val path: str             = "out/test/rule_open/away/Spin.rule";
+    val w1:   err[fs.FsError] = fs.write_bytes(path, text::*u8, string.str_len(text), FILE_MODE);
+    if (sel w1.err) { ret 2; }
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 3; }
+    var v: View = View{pan_x: 0.0, pan_y: 0.0, zoom: 1.0, mode: 0};
+
+    # variables must come before the transitions naming them, so the file is
+    # refused at the line that names one first, and the rule is kept
+    val bad: res[Opened, Error] = open_file(?a, ?s, ?v, path);
+    if (!sel bad.err || rule.family_of(?s.rule) != 0) { ret 4; }
+    if (sel bad.err) {
+        if (!sel bad.err.rule) { ret 5; }
+        if (sel bad.err.rule) {
+            if (bad.err.rule.line != 6) { ret 5; }
+        }
+    }
+
+    val good: str             = "@RULE Spin\n@TABLE\nn_states:4\nneighborhood:vonNeumann\nsymmetries:rotate4\nvar a={0,1,2,3}\nvar b=a\nvar c=a\nvar d=a\n1,a,b,c,d,2\n2,a,b,c,d,3\n3,a,b,c,d,1\n0,3,0,0,0,1\n";
+    val w2:   err[fs.FsError] = fs.write_bytes(path, good::*u8, string.str_len(good), FILE_MODE);
+    if (sel w2.err) { ret 6; }
+    val opened: res[Opened, Error] = open_file(?a, ?s, ?v, path);
+    if (sel opened.err)                                          { ret 7; }
+    if (opened.ok.world || opened.ok.foreign || opened.ok.stray) { ret 8; }
+    var buf: [rule.FORMAT_MAX + 1]u8;
+    if (rule.family_of(?s.rule) != 3 || !string.str_equals(rule.format(?s.rule, ?buf[0]), "Spin")) { ret 9; }
+
+    # the file was copied where its name is looked up, and the name gives the
+    # same rule back, as a pattern naming it takes it
+    if (!present("out/test/rule_open/data/Spin.rule")) { ret 10; }
+    val again: res[rule.Rule, str] = rule.parse("Spin");
+    if (sel again.err)                  { ret 11; }
+    if (!rule.same(?again.ok, ?s.rule)) { ret 11; }
+    # on HashLife, which cannot run a table, the world moves off the tree as
+    # the rule is taken, before the cells go in
+    sim.set_rule(?s, rule.preset_rule(0));
+    if (!sim.use_hashlife(?s, true)) { ret 15; }
+    val rle: str             = "x = 2, y = 1, rule = Spin\nAC!\n";
+    val pat: str             = "out/test/rule_open/away/spin.rle";
+    val w3:  err[fs.FsError] = fs.write_bytes(pat, rle::*u8, string.str_len(rle), FILE_MODE);
+    if (sel w3.err) { ret 12; }
+    val stamped: res[Opened, Error] = open_file(?a, ?s, ?v, pat);
+    if (sel stamped.err || !rule.same(?again.ok, ?s.rule)) { ret 13; }
+    if (sel stamped.ok && stamped.ok.foreign)              { ret 13; }
+    # the pattern's cells are written as the states of its rule, which the
+    # world's rule before it lacked
+    var ones:   usize = 0;
+    var threes: usize = 0;
+    var y:      i64   = -2;
+    for (y <= 2) {
+        var x: i64 = -2;
+        for (x <= 2) {
+            val st: u32 = rule.state(?s.rule, sim.cell(?s, x, y));
+            if (st == 1) { ones = ones + 1; }
+            if (st == 3) { threes = threes + 1; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    if (sim.population(?s) != 2 || ones != 1 || threes != 1 || sim.on_tree(?s)) { ret 14; }
+    sim.dnit(?s);
+    fs.remove_file(path);
+    fs.remove_file(pat);
+    fs.remove_file("out/test/rule_open/data/Spin.rule");
     ret 0;
 }

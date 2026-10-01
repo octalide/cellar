@@ -11,69 +11,168 @@ regions with live cells and their neighbours, growing in any direction. It is
 stepped on the GPU by compute shaders written in Mach, and drawn straight from
 the GPU's buffers, so neither stepping nor drawing crosses to the CPU. Where no
 GPU can run the compute shaders, the CPU steps it instead, split across every
-core by chunk. boom owns the window, input, Vulkan renderer and frame loop; the
+core by chunk. For huge patterns and generation counts, a rule of radius 1
+without B0 can instead run on HashLife: the world becomes a hash-consed
+quadtree stepped by Gosper's algorithm, a power of two generations at a time,
+and drawn from the tree at the current zoom, so a Gosper gun reaches
+generation 2^30 in a moment. HashLife keeps no heat or age, so it draws in the
+solid colour. boom owns the window, input, Vulkan renderer and frame loop; the
 interface is drawn over the cells in the same overlay pass by a small
 immediate-mode layer of cellar's own, with text from an embedded TrueType face.
 
-A kernel is a `(2r+1)x(2r+1)` integer-weight footprint plus birth and survive
-bitmasks over the saturated weighted neighbor sum, so it generalizes
-Larger-than-Life while still expressing the classic Life family exactly.
+A kernel is a `(2r+1)x(2r+1)` integer-weight footprint, of radius up to 16 and
+negative weights allowed, plus birth and survive sets over the saturated
+weighted neighbor sum, so it generalizes Larger-than-Life (Golly's
+`R5,C0,M1,S34..58,B34..45,NM` for Bosco's rule, or HROT's
+`R2,C0,S2-3,B3,NC`) while still expressing the classic Life family exactly.
+Golly's weighted neighbourhoods read and write as well, `NW` then a hex weight
+for each cell row by row (`R1,C0,S2-3,B3,NW111101111` is Life).
 Built-in kernels: Conway's Life (`B3/S23`), HighLife (`B36/S23`), Seeds
 (`B2/S`) and Day & Night (`B3678/S34678`).
 
+Generations rules add dying states: in `B2/S/C3` (Brian's Brain) a live cell
+that does not survive passes through the states up to `C`-1 before it is dead,
+and only live cells count as neighbours. Golly's older form, survive, birth and
+states (`345/2/4` for Star Wars), reads too. The trails colour mode shows each
+state in its own colour. Built-in: Brian's Brain (`B2/S/C3`) and Star Wars
+(`B2/S345/C4`).
+
+Isotropic non-totalistic rules see how the eight neighbours are arranged,
+not only how many are live, in Hensel's notation as Golly writes it: a count
+followed by letters takes the arrangements the letters name, with their
+rotations and reflections, and a minus before the letters every arrangement
+but those, so `B2-a/S12` (Just Friends) births on two neighbours unless they
+sit side by side. Golly's MAP strings, `MAP` and 86 base64 characters, name any
+two-state rule of the Moore neighbourhood, isotropic or not, and read into the
+same kind of rule. B0 rules of either form run as the weighted ones do, and
+those without B0 run on HashLife too. Built-in: tlife (`B3/S2-i34q`) and Just
+Friends (`B2-a/S12`).
+
+Rule tables are Golly's RuleLoader `.rule` files: a `@TABLE` of transitions
+over the von Neumann, Moore or hexagonal neighbourhood (Golly's, on the square
+grid) with its variables and symmetries, or a `@TREE`, of up to 256 states,
+coloured by the file's `@COLORS`. Open a `.rule` file with `cellar <file>`, by
+dropping it on the window, or from the files panel, and its rule runs on the
+world as it stands. A rule string naming a table is its name, as Golly writes
+it (`WireWorld`, `Langtons-Loops:T200,200`), and is looked up as
+`<name>.rule` in the data directory first, then among the tables opened this
+session, then among the built-in WireWorld and Langton's Loops (see
+`res/rules`). Opening a `.rule` file copies it into the data directory, so
+worlds, patterns and settings naming it find it in later sessions, and a file
+there is read again each time its name is set, so an edit takes effect then.
+Every state but 0 is live, and a table whose empty neighbourhood gives a live
+cell is refused, since it would flip the unbounded background.
+
+Any rule runs on a bounded grid named after it as Golly writes one:
+`B3/S23:T100,100` is a 100 by 100 torus, `:P` a plane with dead edges, `:K`
+a Klein bottle whose starred size (`:K100*,80`) is the edge joined with a
+twist, and `:C` a cross-surface. A lone size gives a square, and a 0 leaves a
+plane or torus unbounded along that axis. Cells written off the grid are
+dropped.
+
 ## Controls
 
-| input                  | action                                  |
-|------------------------|-----------------------------------------|
-| `space`                | play / pause                            |
-| `S`                    | single step                             |
-| `R`                    | randomize                               |
-| `C`                    | clear                                   |
-| `D`, `E`, `T`          | draw, erase or stamp tool               |
-| `Z`, `X`               | rotate the stamp, flip the stamp        |
-| left mouse             | use the tool                            |
-| right or middle mouse  | drag to pan                             |
-| scroll                 | zoom toward the cursor                  |
-| arrow keys             | pan                                     |
-| `F`                    | frame the randomize area                |
-| `M`                    | next colour mode                        |
-| `G`                    | grid lines                              |
-| `Tab`                  | hide / show the panel                   |
-| `H`, `F1`              | key reference                           |
-| `F11`                  | toggle borderless fullscreen            |
-| `F12`                  | screenshot                              |
-| `Esc`                  | close the key reference, or quit        |
+| input                    | action                                                           |
+|--------------------------|------------------------------------------------------------------|
+| `space`                  | play / pause                                                     |
+| `S`                      | single step                                                      |
+| `R`                      | randomize                                                        |
+| `C`                      | clear                                                            |
+| `Backspace`              | reset to where play started                                      |
+| `Ctrl+Z`                 | undo                                                             |
+| `Ctrl+Shift+Z`, `Ctrl+Y` | redo                                                             |
+| `D`, `E`, `T`, `V`       | draw, erase, stamp or select tool                                |
+| `Z`, `X`                 | rotate the stamp, flip the stamp                                 |
+| `Q`, `Shift+Q`           | next or previous state to draw, with a rule of more than two     |
+| left mouse               | use the tool; drag to select                                     |
+| `Ctrl+C`, `Ctrl+X`       | copy or cut the selection to the stamp and the clipboard, as RLE |
+| `Ctrl+V`                 | paste a pattern as the stamp, keeping the current rule           |
+| `Ctrl+Shift+V`           | paste a pattern as the stamp, taking its rule                    |
+| `Delete`                 | clear the selection                                              |
+| `Shift+Delete`           | clear outside the selection                                      |
+| `Ctrl+R`                 | fill the selection at random                                     |
+| `I`                      | invert the selection                                             |
+| `B`                      | shrink the selection to its live cells                           |
+| right or middle mouse    | drag to pan                                                      |
+| scroll                   | zoom toward the cursor                                           |
+| arrow keys               | pan                                                              |
+| `F`                      | frame the randomize area                                         |
+| `M`                      | next colour mode                                                 |
+| `G`                      | grid lines                                                       |
+| `Tab`                    | hide / show the panel                                            |
+| `H`, `F1`                | key reference                                                    |
+| `F11`                    | toggle borderless fullscreen                                     |
+| `F12`                    | screenshot                                                       |
+| `Esc`                    | close the reference, deselect, or quit                           |
+
+Undo steps back through strokes, stamps, selection operations, pastes, rule
+changes, clears, randomizes, resets, loads and dropped files, with as many steps as 256 MiB of
+before-images holds. A stretch of play is one step too: undoing it returns to
+where play started, and undo or redo while running pauses first. Any new
+change clears what could be redone.
 
 A readout of the generation, population, rule and speed sits in the top-left
 corner, and the side panel groups every control by task:
 
-- **run**: play, step, speed, uncapped stepping, randomize and clear, and the
-  area randomize fills, from 32 to 4096 cells square
-- **draw**: the tool, a palette of built-in patterns and a custom one drawn in
-  place, with a preview of the selected pattern
-- **rule**: presets, the rule in B/S notation, radius, a clickable weight grid,
-  and birth and survive toggles over the reachable sums
+- **run**: play, step, speed, uncapped stepping, randomize and clear, the
+  area randomize fills, from 32 to 4096 cells square, and the engine: the chunk
+  pool, or HashLife where the rule allows, with its step of 2^k generations
+  and a generation to go straight to
+- **draw**: the tool, with a rule of more than two states the state the pen
+  and the custom pattern's editor paint, each in the rule's colour for it, a
+  library of about three hundred classic patterns (still lifes, oscillators,
+  spaceships, guns, puffers, methuselahs and growth) to browse by category or
+  search by name, a custom pattern drawn in place, and a preview of the
+  selected one, and with the select tool the operations on the selection.
+  copying or cutting a selection makes it the custom pattern and arms the
+  stamp. The library's sources are listed in
+  [res/patterns](res/patterns/README.md)
+- **rule**: presets, the rule in B/S notation, radius, a clickable weight grid
+  whose cells cycle from 0 up to 4 and on through -4 to -1, and birth and
+  survive toggles over the reachable sums
 - **view**: colour mode (a solid colour from a set of swatches, fading trails,
-  or colour by age), grid lines, and the interface size from 100 to 200 percent
+  or colour by age; a rule table's states show in its own colours in place of
+  the solid one), grid lines, and the interface size from 100 to 200 percent
 - **files**: named saves of the world and the custom pattern, a list of every
-  world and pattern in the data directory to load from, and screenshots
+  world, pattern and `.rule` file in the data directory to load or run, and
+  screenshots
 
 Settings and the rule are kept between runs. They, saved worlds and patterns,
 and screenshots live in the platform's user data directory:
 `$XDG_DATA_HOME/cellar` (or `~/.local/share/cellar`) on linux,
 `~/Library/Application Support/cellar` on macOS and `%APPDATA%\cellar` on
-windows. The first run brings over anything an older version left in
+windows. The engine chosen in the run section and HashLife's step exponent are
+kept too. `--engine` overrides the saved engine for that run and leaves the
+saved choice alone until the panel changes it, and a saved HashLife that cannot
+run the loaded rule starts on the chunk engine with a message. The first run
+brings over anything an older version left in
 `arrangements/` in the working directory.
 
 `cellar <file>` opens a file at startup: a `.cellar` world loads as the world,
-and a pattern in any format cellar reads (RLE, plaintext `.cells`, Life 1.05
-and 1.06) is stamped onto an empty world centred on the origin and framed, taking its
-rule when cellar can run it. A file that cannot be read leaves the world as it
-was and says why. Options may come before or after the file, and `--` ends
+a `.rule` file's rule runs on the world, and a pattern in any format cellar reads (RLE, plaintext `.cells`, Life 1.05
+and 1.06, Golly's Macrocell `.mc`) is stamped onto an empty world centred on the
+origin and framed, taking its rule when cellar can run it. A file that cannot be
+read, or a pattern too large for the world to hold, leaves the world as it was
+and says why. With `--engine hashlife` a Macrocell file is built straight into
+HashLife's tree from its nodes, so a pattern far past the chunk pool opens in
+the time its file takes to read, and undo takes it back. Options may come before or after the file, and `--` ends
 them, so `cellar -- -x.rle` opens a file whose name starts with a dash.
+
+A file dropped on the window opens the same way, a pattern stamped onto the
+world as it stands. When several are dropped the first opens and the rest are
+left alone. `Ctrl+V` reads any of those pattern formats from the clipboard as
+the stamp, and `Ctrl+C` puts a copied selection on the clipboard as RLE with
+its rule, ready to paste into LifeWiki or Golly.
 
 `cellar --capture shot.png` draws a second of frames, saves the last one and
 exits, leaving the saved settings alone.
+
+`cellar run <file> --gens <n> [--rule <rule>] [--out <file>] [--quiet]` runs
+a world or pattern headless, with no window and no GPU. The file opens as it
+would at startup, runs under `--rule` or else its own rule for `n`
+generations on the CPU, and is written in the format `--out`'s extension names
+(`.rle`, `.cells`, `.mc`), or as RLE on stdout without one. The
+generation and population go to stderr unless `--quiet`.
 
 ## Install
 

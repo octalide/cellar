@@ -1,0 +1,903 @@
+# the rule a world runs, as a tag over rule families, and the preset table
+#
+# a family is a kind of rule: its own rule string, cell word, CPU step and GPU
+# step stage. the rest of cellar reaches a rule only through this module, so it
+# never learns what a family's rule holds or what its cell word means. a family
+# is a module under cellar.rules that provides, for its rule type R:
+#
+#   parse(s: str) res[R, str]        read its rule string, or say what is wrong
+#   claims(s: str) bool              whether s is plausibly its syntax, so that
+#                                    parse reports the error of the family a
+#                                    string every family refuses meant. the
+#                                    first family in order to claim a string
+#                                    wins, so a claim need only be exact among
+#                                    the families before it
+#   format(r: *R, buf: *u8) str      write the string parse reads back as r
+#   FORMAT_MAX: usize                the longest string format writes
+#   display(r: *R, buf: *u8) str     a short form for the readout, at most
+#                                    DISPLAY_MAX bytes
+#   same_rule(a: *R, b: *R) bool     whether two rules step alike
+#   states(r: *R) u32                how many states a cell can be in
+#   word_of(r: *R, state: u32) u32   the word a fresh cell of a state holds
+#   state_of(c: u32) u32             the state a word holds
+#   sense() layout.Sense             how shared code reads the word
+#   radius(r: *R) usize              how far one generation reaches
+#   caps(r: *R) Caps                 what the rule can do (see Caps)
+#   step_chunk(r, b, t)              one chunk's CPU step from generation
+#                                    b.gen (see space.Block)
+#   next_of(r: *R, nb: *u32) u32     the state a cell becomes from the states
+#                                    of its 3 by 3 block, row-major with it at
+#                                    4, for a rule caps.hashlife holds: the
+#                                    quadtree engine's base case (cellar.hashlife)
+#   pack(r: *R, w: *u32)             its rule, into layout.RULE words of the
+#                                    meta head, for its stage
+#   TABLE: bool                      its stage binds a rule buffer
+#   table_words(r: *R) usize         the words of the rule buffer r needs
+#   pack_table(r: *R, w: *u32)       its rule, into table_words(r) words of
+#                                    the rule buffer, for its stage
+#   colour(r: *R, state: u32) opt[u32]
+#                                    the colour, 0xrrggbb, the rule draws a
+#                                    live cell of a state in, or none to draw
+#                                    it in the view's solid colour
+#   stage(len: *usize) *u8           its step stage's SPIR-V
+#   SAMPLE_COUNT, sample(i) str      rule strings the per-family tests run
+#
+# and a case of Kind and a line in each function below. a function that finds
+# no case for its rule panics, since every case is handled above it, and the
+# test that runs every function over every family's samples finds a missed line.
+#
+# the states and their words belong to the rule, not only its family: a
+# generations rule has as many states as its string names, and its words show
+# where each state lies among them.
+#
+# changing a world's rule to one whose words differ, one of another family or
+# of the same family with other states, re-encodes its cells: each word becomes
+# the new rule's word for the state the old rule reads in it, word(new,
+# state(old, c)), and a state the new rule lacks becomes state 0, the quiescent
+# background, the one mapping safe between any two rules. a family that needs
+# a smarter mapping can later offer adopt(state, from) u32 as the extension
+# point. sim.set_rule does this. word zero is always the quiescent background
+# (see cellar.layout), and a family's step keeps it: a chunk of zeros with none
+# live around it steps to zeros under every rule. a rule that births on 0 would
+# flip the unbounded background, so its family holds the world's complement on
+# the generations it flips, and says so through caps.b0: the draw shows those
+# generations inverted and the simulation's edits and reads see the world
+# through them. a plane's dead edge is then held live on those generations
+# (outside), and the family's stage reads it so.
+#
+# a rule also names the grid it runs on (cellar.topology), written as Golly
+# does, after a colon: "B3/S23:T100,100". the grid belongs to the rule rather
+# than to a family, since every family's step reads through the same page
+# table, and rather than to the world beside the rule, since the rule string
+# is what world files, settings, batch jobs and pattern files record: kept in
+# the rule, the grid travels everywhere the rule string does. a family that
+# cannot run on a bounded grid says so in its caps, and parse refuses the pair.
+#
+# a rule buffer holds what does not fit a family's window of the meta head: a
+# wide kernel's weights and sums, or a rule table's transitions. a family with
+# TABLE set has its stage bind one more storage buffer than the four every
+# step stage binds, at layout.TABLE_BINDING (layout.Table), and a family
+# without it binds none and gives table_words 0. the rule buffer is its
+# family's alone, sized by table_words for the rule running, and packed and
+# uploaded only when the rule changes, never each frame, so a rule table of
+# megabytes costs its upload once. the window keeps what the stage reads for
+# every cell and changes with the rule alone, a radius or a state count, and
+# the buffer's layout is the family's own, as the window's is. a device whose
+# dispatches bind too few storage buffers for a family's stage
+# (bindings(i) against boom's max_dispatch_bindings) cannot step that family's
+# rules on the GPU, and the simulation refuses them there (see cellar.sim).
+
+use cellar.layout;
+use cellar.rules.generations;
+use cellar.rules.nontotalistic;
+use ruletable: cellar.rules.table;
+use cellar.rules.weighted;
+use cellar.space;
+use cellar.topology;
+use allo: std.allocator;
+use std.allocator.page;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.system.panic;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string;
+use std.types.string.str;
+
+# a family's rule
+# ---
+# weighted:      a weighted outer-totalistic kernel, the Life family and its
+#                radius, weight and range generalizations
+# generations:   a Life-like rule whose cells die through dying states
+# nontotalistic: a two-state rule that sees how the eight neighbours are
+#                arranged, Hensel's isotropic notation and Golly's MAP strings
+# table:         a rule table or tree of up to 256 states, Golly's .rule files
+pub tag Kind: u8 {
+    weighted:      weighted.Kernel;
+    generations:   generations.Rule;
+    nontotalistic: nontotalistic.Rule;
+    table:         ruletable.Rule;
+}
+
+# a rule: a family's rule and the grid it runs on
+# ---
+# kind: the family's rule
+# grid: the grid, the unbounded plane unless the rule string names one
+pub rec Rule {
+    kind: Kind;
+    grid: topology.Grid;
+}
+
+# a family's rule on the unbounded plane
+pub fun of(k: Kind) Rule {
+    ret Rule{kind: k, grid: topology.open()};
+}
+
+# rule families this version runs
+pub val FAMILIES: usize = 4;
+
+# the longest rule string any family's format writes, less its NUL, the
+# weighted family's being the longest (see dispatch__every_function_handles_every_family)
+val FAMILY_MAX: usize = weighted.FORMAT_MAX;
+# the longest rule string format writes, grid included, less its NUL
+pub val FORMAT_MAX: usize = FAMILY_MAX + topology.FORMAT_MAX;
+
+# what a rule can do, which engines and features ask before taking it on
+# ---
+# b0:        a dead cell with no live neighbour is born and the background
+#            flips each generation: odd generations' cells hold the world's
+#            complement, drawn and edited inverted
+# isotropic: it treats every rotation and reflection of a pattern alike
+# hashlife:  a quadtree engine can run it
+# bounded:   it can run on a bounded grid
+# life_like: it is a Life-like rule, two states on the radius-1 Moore
+#            neighbourhood, outer totalistic, the rules whose patterns
+#            Catagolue's apgcodes name, and not one that births on 0, whose
+#            held cells are the world's complement
+pub rec Caps {
+    b0:        bool;
+    isotropic: bool;
+    hashlife:  bool;
+    bounded:   bool;
+    life_like: bool;
+}
+
+# the id family i's rule strings are recorded under, in world and settings files
+pub fun family_id(i: usize) str {
+    if (i == 3) { ret "table"; }
+    if (i == 2) { ret "nontotalistic"; }
+    if (i == 1) { ret "generations"; }
+    ret "weighted";
+}
+
+# the family a recorded id names
+# ---
+# id:  the id, as family_id gave it
+# ret: the family, or none for one this version does not run
+pub fun family_named(id: str) opt[usize] {
+    var i: usize = 0;
+    for (i < FAMILIES) {
+        if (string.str_equals(family_id(i), id)) { ret opt[usize].some{i}; }
+        i = i + 1;
+    }
+    ret opt[usize].none{};
+}
+
+# the family a rule belongs to
+pub fun family_of(r: *Rule) usize {
+    if (sel r.kind.weighted)      { ret 0; }
+    if (sel r.kind.generations)   { ret 1; }
+    if (sel r.kind.nontotalistic) { ret 2; }
+    if (sel r.kind.table)         { ret 3; }
+    unmatched();
+    ret 0;
+}
+
+# a rule of a case no function below handles, which cannot be
+fun unmatched() {
+    panic.panic("cellar.rule: a rule of no family");
+}
+
+# family i's step stage, as SPIR-V
+# ---
+# i:   the family
+# len: receives its length in bytes
+# ret: its first byte
+pub fun stage(i: usize, len: *usize) *u8 {
+    if (i == 3) { ret ruletable.stage(len); }
+    if (i == 2) { ret nontotalistic.stage(len); }
+    if (i == 1) { ret generations.stage(len); }
+    ret weighted.stage(len);
+}
+
+# whether family i's step stage binds a rule buffer
+pub fun table(i: usize) bool {
+    if (i == 3) { ret ruletable.TABLE; }
+    if (i == 2) { ret nontotalistic.TABLE; }
+    if (i == 1) { ret generations.TABLE; }
+    ret weighted.TABLE;
+}
+
+# the storage buffers family i's step stage binds
+pub fun bindings(i: usize) usize {
+    if (table(i)) { ret layout.STEP_BINDINGS::usize + 1; }
+    ret layout.STEP_BINDINGS::usize;
+}
+
+# how many sample rule strings family i gives its tests
+pub fun sample_count(i: usize) usize {
+    if (i == 3) { ret ruletable.SAMPLE_COUNT; }
+    if (i == 2) { ret nontotalistic.SAMPLE_COUNT; }
+    if (i == 1) { ret generations.SAMPLE_COUNT; }
+    ret weighted.SAMPLE_COUNT;
+}
+
+# family i's sample rule string n
+pub fun sample(i: usize, n: usize) str {
+    if (i == 3) { ret ruletable.sample(n); }
+    if (i == 2) { ret nontotalistic.sample(n); }
+    if (i == 1) { ret generations.sample(n); }
+    ret weighted.sample(n);
+}
+
+# read family i's part of a rule string
+fun parse_kind(i: usize, s: str) res[Kind, str] {
+    if (i == 3) {
+        val t: res[ruletable.Rule, str] = ruletable.parse(s);
+        if (sel t.err) { ret res[Kind, str].err{t.err}; }
+        ret res[Kind, str].ok{Kind.table{t.ok}};
+    }
+    if (i == 2) {
+        val n: res[nontotalistic.Rule, str] = nontotalistic.parse(s);
+        if (sel n.err) { ret res[Kind, str].err{n.err}; }
+        ret res[Kind, str].ok{Kind.nontotalistic{n.ok}};
+    }
+    if (i == 1) {
+        val g: res[generations.Rule, str] = generations.parse(s);
+        if (sel g.err) { ret res[Kind, str].err{g.err}; }
+        ret res[Kind, str].ok{Kind.generations{g.ok}};
+    }
+    val k: res[weighted.Kernel, str] = weighted.parse(s);
+    if (sel k.err) { ret res[Kind, str].err{k.err}; }
+    ret res[Kind, str].ok{Kind.weighted{k.ok}};
+}
+
+# split a rule string at its first colon: the family's part, less trailing
+# spaces, into head, and the grid the rest names, the unbounded plane without one
+# ---
+# s:    NUL-terminated rule text
+# head: at least FAMILY_MAX + 1 bytes
+# ret:  the grid, or what is wrong with it
+fun split(s: str, head: *u8) res[topology.Grid, str] {
+    var n: usize = 0;
+    for (s[n] != 0 && s[n] != ':') {
+        if (n == FAMILY_MAX) { ret res[topology.Grid, str].err{"the rule is too long"}; }
+        head[n] = s[n];
+        n       = n + 1;
+    }
+    var e: usize = n;
+    for (e > 0 && head[e - 1] == ' ') { e = e - 1; }
+    head[e] = 0;
+    if (s[n] == 0) { ret res[topology.Grid, str].ok{topology.open()}; }
+    ret topology.parse(?s[n + 1]);
+}
+
+# a family's rule on a grid, or why it cannot run there
+fun placed(k: Kind, g: topology.Grid) res[Rule, str] {
+    var r:   Rule     = Rule{kind: k, grid: g};
+    val why: opt[str] = refusal(?r);
+    if (sel why.some) { ret res[Rule, str].err{why.some}; }
+    ret res[Rule, str].ok{r};
+}
+
+# why a rule cannot run as it stands, its family's rule on its grid, or none
+# when it can. parse refuses such a rule, and sim.set_rule one built any other
+# way, such as a kernel edited wider than a small grid
+pub fun refusal(r: *Rule) opt[str] {
+    if (!topology.bounded(?r.grid))            { ret opt[str].none{}; }
+    if (!kind_caps(?r.kind).bounded)           { ret opt[str].some{"the rule cannot run on a bounded grid"}; }
+    if (!topology.reaches(?r.grid, radius(r))) { ret opt[str].some{"a joined edge of the grid is shorter than the rule reaches"}; }
+    # a plane's edge a flipping background holds live is stepped along its
+    # whole length (see rimmed), which an unbounded axis does not end
+    if (rimmed(r) && (r.grid.w == 0 || r.grid.h == 0)) { ret opt[str].some{"a rule that births on 0 cannot run on a plane unbounded along an axis"}; }
+    ret opt[str].none{};
+}
+
+# read a rule string as family i's, with its grid
+# ---
+# i:   the family
+# s:   NUL-terminated rule text
+# ret: the rule, or what is wrong with s
+pub fun parse_as(i: usize, s: str) res[Rule, str] {
+    var head: [FAMILY_MAX + 1]u8;
+    val g:    res[topology.Grid, str] = split(s, ?head[0]);
+    if (sel g.err) { ret res[Rule, str].err{g.err}; }
+    val k: res[Kind, str] = parse_kind(i, ?head[0]);
+    if (sel k.err) { ret res[Rule, str].err{k.err}; }
+    ret placed(k.ok, g.ok);
+}
+
+# whether family i plausibly meant a rule string
+fun claims(i: usize, s: str) bool {
+    if (i == 3) { ret ruletable.claims(s); }
+    if (i == 2) { ret nontotalistic.claims(s); }
+    if (i == 1) { ret generations.claims(s); }
+    ret weighted.claims(s);
+}
+
+# read a rule string as whichever family's it is, trying each in turn, with its grid
+# ---
+# s:   NUL-terminated rule text
+# ret: the rule, or what the family whose syntax s plausibly is found wrong
+#      with it, the first family's when none claims it
+pub fun parse(s: str) res[Rule, str] {
+    var head: [FAMILY_MAX + 1]u8;
+    val g:    res[topology.Grid, str] = split(s, ?head[0]);
+    if (sel g.err) { ret res[Rule, str].err{g.err}; }
+    val first: res[Kind, str] = parse_kind(0, ?head[0]);
+    if (sel first.ok) { ret placed(first.ok, g.ok); }
+    var i: usize = 1;
+    for (i < FAMILIES) {
+        val k: res[Kind, str] = parse_kind(i, ?head[0]);
+        if (sel k.ok) { ret placed(k.ok, g.ok); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < FAMILIES) {
+        if (claims(i, ?head[0])) {
+            val k: res[Kind, str] = parse_kind(i, ?head[0]);
+            if (sel k.err) { ret res[Rule, str].err{k.err}; }
+        }
+        i = i + 1;
+    }
+    ret res[Rule, str].err{first.err};
+}
+
+# write a rule's string in its family's form, which parse_as reads back as it
+# ---
+# r:   the rule
+# buf: at least FORMAT_MAX + 1 bytes
+# ret: buf
+pub fun format(r: *Rule, buf: *u8) str {
+    if (sel r.kind.weighted)      { weighted.format(?r.kind.weighted, buf); }
+    or (sel r.kind.generations)   { generations.format(?r.kind.generations, buf); }
+    or (sel r.kind.nontotalistic) { nontotalistic.format(?r.kind.nontotalistic, buf); }
+    or (sel r.kind.table)         { ruletable.format(?r.kind.table, buf); }
+    or                            { unmatched(); }
+    topology.format(?r.grid, buf, string.str_len(buf));
+    ret buf;
+}
+
+# the most bytes a family's display form takes, less its NUL
+val FAMILY_DISPLAY_MAX: usize = 199;
+# the most bytes display writes, grid included, less its NUL
+pub val DISPLAY_MAX: usize = FAMILY_DISPLAY_MAX + topology.FORMAT_MAX;
+
+# write a rule's short form for the readout, which need not name it whole
+# ---
+# r:   the rule
+# buf: at least DISPLAY_MAX + 1 bytes
+# ret: buf
+pub fun display(r: *Rule, buf: *u8) str {
+    if (sel r.kind.weighted)      { weighted.display(?r.kind.weighted, buf); }
+    or (sel r.kind.generations)   { generations.display(?r.kind.generations, buf); }
+    or (sel r.kind.nontotalistic) { nontotalistic.display(?r.kind.nontotalistic, buf); }
+    or (sel r.kind.table)         { ruletable.display(?r.kind.table, buf); }
+    or                            { unmatched(); }
+    topology.format(?r.grid, buf, string.str_len(buf));
+    ret buf;
+}
+
+# whether two rules step alike, families and grids included
+pub fun same(a: *Rule, b: *Rule) bool {
+    ret same_kind(?a.kind, ?b.kind) && topology.same(?a.grid, ?b.grid);
+}
+
+# whether two families' rules step alike on the same grid
+fun same_kind(a: *Kind, b: *Kind) bool {
+    if (sel a.weighted) {
+        if (sel b.weighted) { ret weighted.same_rule(?a.weighted, ?b.weighted); }
+    }
+    if (sel a.generations) {
+        if (sel b.generations) { ret generations.same_rule(?a.generations, ?b.generations); }
+    }
+    if (sel a.nontotalistic) {
+        if (sel b.nontotalistic) { ret nontotalistic.same_rule(?a.nontotalistic, ?b.nontotalistic); }
+    }
+    if (sel a.table) {
+        if (sel b.table) { ret ruletable.same_rule(?a.table, ?b.table); }
+    }
+    ret false;
+}
+
+# how many states a cell of the rule can be in
+pub fun states(r: *Rule) u32 {
+    if (sel r.kind.weighted)      { ret weighted.states(?r.kind.weighted); }
+    if (sel r.kind.generations)   { ret generations.states(?r.kind.generations); }
+    if (sel r.kind.nontotalistic) { ret nontotalistic.states(?r.kind.nontotalistic); }
+    if (sel r.kind.table)         { ret ruletable.states(?r.kind.table); }
+    unmatched();
+    ret 0;
+}
+
+# the word a fresh cell of a state is written as
+# ---
+# r:     the rule
+# state: below states(r)
+# ret:   the word
+pub fun word(r: *Rule, state: u32) u32 {
+    if (sel r.kind.weighted)      { ret weighted.word_of(?r.kind.weighted, state); }
+    if (sel r.kind.generations)   { ret generations.word_of(?r.kind.generations, state); }
+    if (sel r.kind.nontotalistic) { ret nontotalistic.word_of(?r.kind.nontotalistic, state); }
+    if (sel r.kind.table)         { ret ruletable.word_of(?r.kind.table, state); }
+    unmatched();
+    ret 0;
+}
+
+# the state a cell's word holds, its display channels aside
+pub fun state(r: *Rule, c: u32) u32 {
+    if (sel r.kind.weighted)      { ret weighted.state_of(c); }
+    if (sel r.kind.generations)   { ret generations.state_of(c); }
+    if (sel r.kind.nontotalistic) { ret nontotalistic.state_of(c); }
+    if (sel r.kind.table)         { ret ruletable.state_of(c); }
+    unmatched();
+    ret 0;
+}
+
+# how shared code reads the rule's cell word: the census, the pool and the draw
+pub fun sense(r: *Rule) layout.Sense {
+    var none: layout.Sense;
+    if (sel r.kind.weighted)      { ret weighted.sense(); }
+    if (sel r.kind.generations)   { ret generations.sense(); }
+    if (sel r.kind.nontotalistic) { ret nontotalistic.sense(); }
+    if (sel r.kind.table)         { ret ruletable.sense(); }
+    unmatched();
+    ret none;
+}
+
+# how far one generation reaches, in cells
+pub fun radius(r: *Rule) usize {
+    if (sel r.kind.weighted)      { ret weighted.radius(?r.kind.weighted); }
+    if (sel r.kind.generations)   { ret generations.radius(?r.kind.generations); }
+    if (sel r.kind.nontotalistic) { ret nontotalistic.radius(?r.kind.nontotalistic); }
+    if (sel r.kind.table)         { ret ruletable.radius(?r.kind.table); }
+    unmatched();
+    ret 0;
+}
+
+# what the rule can do. a quadtree engine runs only the unbounded plane
+pub fun caps(r: *Rule) Caps {
+    var c: Caps = kind_caps(?r.kind);
+    if (topology.bounded(?r.grid)) { c.hashlife = false; }
+    ret c;
+}
+
+# the word a cell past a plane's dead edge reads as to a step from generation
+# gen: dead, and so live as held on the generations a flipping background
+# (caps.b0) holds as the world's complement
+pub fun outside(r: *Rule, gen: u64) u32 {
+    if ((gen & 1) != 0 && kind_caps(?r.kind).b0) { ret word(r, 1); }
+    ret 0;
+}
+
+# whether a step reads the rule's plane edge live on some generation, so the
+# chunks along it change with nothing alive near them and must all be kept
+# and stepped (cellar.space.keep_rim)
+pub fun rimmed(r: *Rule) bool {
+    ret r.grid.shape == topology.PLANE && kind_caps(?r.kind).b0;
+}
+
+# what a family's rule can do
+fun kind_caps(k: *Kind) Caps {
+    if (sel k.weighted) {
+        val c: weighted.Caps = weighted.caps(?k.weighted);
+        ret Caps{b0: c.b0, isotropic: c.isotropic, hashlife: c.hashlife, bounded: c.bounded, life_like: c.life_like};
+    }
+    if (sel k.generations) {
+        val c: generations.Caps = generations.caps(?k.generations);
+        ret Caps{b0: c.b0, isotropic: c.isotropic, hashlife: c.hashlife, bounded: c.bounded, life_like: c.life_like};
+    }
+    if (sel k.nontotalistic) {
+        val c: nontotalistic.Caps = nontotalistic.caps(?k.nontotalistic);
+        ret Caps{b0: c.b0, isotropic: c.isotropic, hashlife: c.hashlife, bounded: c.bounded, life_like: c.life_like};
+    }
+    if (sel k.table) {
+        val c: ruletable.Caps = ruletable.caps(?k.table);
+        ret Caps{b0: c.b0, isotropic: c.isotropic, hashlife: c.hashlife, bounded: c.bounded, life_like: c.life_like};
+    }
+    unmatched();
+    var none: Caps;
+    ret none;
+}
+
+# step one chunk on the CPU
+# ---
+# r: the rule
+# b: the chunk's block and back cells
+# t: the tally the step keeps of what it writes, reading cells by sense(r)
+pub fun step_chunk(r: *Rule, b: *space.Block, t: *space.Tally) {
+    if (sel r.kind.weighted) {
+        weighted.step_chunk(?r.kind.weighted, b, t);
+        ret;
+    }
+    if (sel r.kind.generations) {
+        generations.step_chunk(?r.kind.generations, b, t);
+        ret;
+    }
+    if (sel r.kind.nontotalistic) {
+        nontotalistic.step_chunk(?r.kind.nontotalistic, b, t);
+        ret;
+    }
+    if (sel r.kind.table) {
+        ruletable.step_chunk(?r.kind.table, b, t);
+        ret;
+    }
+    unmatched();
+}
+
+# the state a cell becomes from the states of the 3 by 3 block around it
+# ---
+# r:   a rule caps(r).hashlife holds
+# nb:  nine states below states(r), row-major with the cell at 4
+# ret: its next state
+pub fun next(r: *Rule, nb: *u32) u32 {
+    if (sel r.kind.weighted)      { ret weighted.next_of(?r.kind.weighted, nb); }
+    if (sel r.kind.generations)   { ret generations.next_of(?r.kind.generations, nb); }
+    if (sel r.kind.nontotalistic) { ret nontotalistic.next_of(?r.kind.nontotalistic, nb); }
+    if (sel r.kind.table)         { ret ruletable.next_of(?r.kind.table, nb); }
+    unmatched();
+    ret 0;
+}
+
+# pack the rule into the family's window of the meta head
+# ---
+# r: the rule
+# w: layout.RULE words
+pub fun pack(r: *Rule, w: *u32) {
+    if (sel r.kind.weighted) {
+        weighted.pack(?r.kind.weighted, w);
+        ret;
+    }
+    if (sel r.kind.generations) {
+        generations.pack(?r.kind.generations, w);
+        ret;
+    }
+    if (sel r.kind.nontotalistic) {
+        nontotalistic.pack(?r.kind.nontotalistic, w);
+        ret;
+    }
+    if (sel r.kind.table) {
+        ruletable.pack(?r.kind.table, w);
+        ret;
+    }
+    unmatched();
+}
+
+# the words of the rule buffer a rule needs, 0 for a family that keeps none
+pub fun table_words(r: *Rule) usize {
+    if (sel r.kind.weighted)      { ret weighted.table_words(?r.kind.weighted); }
+    if (sel r.kind.generations)   { ret generations.table_words(?r.kind.generations); }
+    if (sel r.kind.nontotalistic) { ret nontotalistic.table_words(?r.kind.nontotalistic); }
+    if (sel r.kind.table)         { ret ruletable.table_words(?r.kind.table); }
+    unmatched();
+    ret 0;
+}
+
+# pack the rule into its family's rule buffer
+# ---
+# r: the rule
+# w: table_words(r) words
+pub fun pack_table(r: *Rule, w: *u32) {
+    if (sel r.kind.weighted) {
+        weighted.pack_table(?r.kind.weighted, w);
+        ret;
+    }
+    if (sel r.kind.generations) {
+        generations.pack_table(?r.kind.generations, w);
+        ret;
+    }
+    if (sel r.kind.nontotalistic) {
+        nontotalistic.pack_table(?r.kind.nontotalistic, w);
+        ret;
+    }
+    if (sel r.kind.table) {
+        ruletable.pack_table(?r.kind.table, w);
+        ret;
+    }
+    unmatched();
+}
+
+# the colour a live cell of a state is drawn in
+# ---
+# r:     the rule
+# state: below states(r)
+# ret:   0xrrggbb, or none to draw it in the view's solid colour
+pub fun colour(r: *Rule, state: u32) opt[u32] {
+    if (sel r.kind.weighted)      { ret weighted.colour(?r.kind.weighted, state); }
+    if (sel r.kind.generations)   { ret generations.colour(?r.kind.generations, state); }
+    if (sel r.kind.nontotalistic) { ret nontotalistic.colour(?r.kind.nontotalistic, state); }
+    if (sel r.kind.table)         { ret ruletable.colour(?r.kind.table, state); }
+    unmatched();
+    ret opt[u32].none{};
+}
+
+# a built-in rule
+# ---
+# label:      its display name
+# rulestring: its rule, as parse reads it
+pub rec Preset {
+    label:      str;
+    rulestring: str;
+}
+
+# built-in rules
+pub val PRESET_COUNT: usize = 8;
+
+val PRESETS: [8]Preset = [8]Preset{
+    Preset{label: "Life", rulestring: "B3/S23"},
+    Preset{label: "HighLife", rulestring: "B36/S23"},
+    Preset{label: "Seeds", rulestring: "B2/S"},
+    Preset{label: "Day & Night", rulestring: "B3678/S34678"},
+    Preset{label: "Brian's Brain", rulestring: "B2/S/C3"},
+    Preset{label: "Star Wars", rulestring: "B2/S345/C4"},
+    Preset{label: "tlife", rulestring: "B3/S2-i34q"},
+    Preset{label: "Just Friends", rulestring: "B2-a/S12"},
+};
+
+# built-in rule i
+pub fun preset(i: usize) Preset {
+    ret PRESETS[i];
+}
+
+# the rule of built-in i
+pub fun preset_rule(i: usize) Rule {
+    # every preset parses, which the tests hold to
+    var out: Rule;
+    val r:   res[Rule, str] = parse(PRESETS[i].rulestring);
+    if (sel r.ok) { out = r.ok; }
+    ret out;
+}
+
+# the built-in whose rule r applies, if any
+pub fun match_preset(r: *Rule) opt[usize] {
+    var i: usize = 0;
+    for (i < PRESET_COUNT) {
+        var p: Rule = preset_rule(i);
+        if (same(r, ?p)) { ret opt[usize].some{i}; }
+        i = i + 1;
+    }
+    ret opt[usize].none{};
+}
+
+# a rule's display name: its preset's label, or "custom"
+pub fun label(r: *Rule) str {
+    val m: opt[usize] = match_preset(r);
+    if (sel m.some) { ret PRESETS[m.some].label; }
+    ret "custom";
+}
+
+test preset__every_rule_string_parses_and_round_trips {
+    var b: [FORMAT_MAX + 1]u8;
+    var i: usize = 0;
+    for (i < PRESET_COUNT) {
+        val r: res[Rule, str] = parse(PRESETS[i].rulestring);
+        if (!sel r.ok) { ret 1; }
+        val again: res[Rule, str] = parse_as(family_of(?r.ok), format(?r.ok, ?b[0]));
+        if (!sel again.ok)           { ret 2; }
+        if (!same(?again.ok, ?r.ok)) { ret 3; }
+        val m: opt[usize] = match_preset(?r.ok);
+        if (!sel m.some) { ret 4; }
+        if (m.some != i) { ret 4; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test match_preset__names_a_preset_rule_and_nothing_else {
+    var r: Rule = preset_rule(1);
+    if (!string.str_equals(label(?r), "HighLife")) { ret 1; }
+    if (sel r.kind.weighted)                       { weighted.toggle(?r.kind.weighted.birth, 5); }
+    val n: opt[usize] = match_preset(?r);
+    if (sel n.some)                              { ret 2; }
+    if (!string.str_equals(label(?r), "custom")) { ret 3; }
+    ret 0;
+}
+
+test parse__reports_the_error_of_the_family_the_string_means {
+    val table: res[Rule, str] = parse("WireWrld");
+    if (sel table.ok) { ret 1; }
+    if (sel table.err) {
+        if (!string.str_equals(table.err, "no rule of that name was found in the data directory, in this session or among the built-ins")) { ret 1; }
+    }
+    val life: res[Rule, str] = parse("B3/S2x");
+    if (sel life.ok) { ret 2; }
+    if (sel life.err) {
+        if (!string.str_equals(life.err, "a neighbour count is beyond 8")) { ret 2; }
+    }
+    val gen: res[Rule, str] = parse("B2/S/C99999");
+    if (sel gen.ok) { ret 3; }
+    if (sel gen.err) {
+        if (!string.str_equals(gen.err, "the state count is not 2 to 256")) { ret 3; }
+    }
+    # hensel's letters and a MAP string, base64 slashes and all, are the
+    # non-totalistic family's
+    val hen: res[Rule, str] = parse("B2-x/S12");
+    if (sel hen.ok) { ret 4; }
+    if (sel hen.err) {
+        if (!string.str_equals(hen.err, "a minus needs letters after it")) { ret 4; }
+    }
+    val eight: res[Rule, str] = parse("B3/S1e8c");
+    if (sel eight.ok) { ret 5; }
+    if (sel eight.err) {
+        if (!string.str_equals(eight.err, "a letter names no arrangement of that many neighbours")) { ret 5; }
+    }
+    val short: res[Rule, str] = parse("MAPAB/C/D");
+    if (sel short.ok) { ret 6; }
+    if (sel short.err) {
+        if (!string.str_equals(short.err, "a MAP rule holds 86 base64 characters, one bit for each neighbourhood of the Moore neighbourhood")) { ret 6; }
+    }
+    ret 0;
+}
+
+test dispatch__every_function_handles_every_family {
+    var a: allo.Allocator;
+    page.make(?a);
+    var own: [4096]u32;
+    var out: [4096]u32;
+    var buf: [FORMAT_MAX + 1]u8;
+    var win: [112]u32;
+    var f:   usize = 0;
+    for (f < FAMILIES) {
+        val named: opt[usize] = family_named(family_id(f));
+        if (sel named.none)  { ret 1; }
+        if (named.some != f) { ret 1; }
+        var len: usize = 0;
+        if (stage(f, ?len) == nil || len == 0)                                                          { ret 2; }
+        if (bindings(f) < layout.STEP_BINDINGS::usize || bindings(f) > layout.STEP_BINDINGS::usize + 1) { ret 2; }
+        var n: usize = 0;
+        for (n < sample_count(f)) {
+            val got: res[Rule, str] = parse_as(f, sample(f, n));
+            if (sel got.err) { ret 3; }
+            var r: Rule = got.ok;
+            if (family_of(?r) != f || !same(?r, ?r)) { ret 4; }
+            val back: res[Rule, str] = parse_as(f, format(?r, ?buf[0]));
+            if (sel back.err)                 { ret 5; }
+            if (!same(?back.ok, ?r))          { ret 5; }
+            if (display(?r, ?buf[0])[0] == 0) { ret 6; }
+            # word 0 is the quiescent background, and every state survives a round trip
+            if (states(?r) < 2 || word(?r, 0) != 0 || state(?r, 0) != 0) { ret 7; }
+            var st: u32 = 0;
+            for (st < states(?r)) {
+                if (state(?r, word(?r, st)) != st) { ret 8; }
+                st = st + 1;
+            }
+            val sn: layout.Sense = sense(?r);
+            if (layout.live(0, sn.live_mask, sn.live_lo, sn.live_hi) != 0) { ret 9; }
+            if (radius(?r) == 0)                                           { ret 10; }
+            caps(?r);
+            pack(?r, ?win[0]);
+            # a family with a rule buffer packs its rule there, and one without packs none
+            val words: usize = table_words(?r);
+            if (table(f) != (words != 0)) { ret 13; }
+            var tab:  Vector[u32]            = vector.init[u32](?a);
+            val room: res[usize, allo.Error] = vector.ensure[u32](?tab, words + 1);
+            if (sel room.err) { ret 14; }
+            tab.data[words] = 0xdeadbeef;
+            pack_table(?r, tab.data);
+            if (tab.data[words] != 0xdeadbeef) { ret 14; }
+            vector.dnit[u32](?tab);
+            label(?r);
+            match_preset(?r);
+            colour(?r, states(?r) - 1);
+            if (string.str_len(format(?r, ?buf[0])) > FAMILY_MAX) { ret 15; }
+            # a busy step of an empty chunk alone leaves it empty, at either parity
+            var i: usize = 0;
+            for (i < 4096) {
+                own[i] = 0;
+                out[i] = 1;
+                i      = i + 1;
+            }
+            var b: space.Block;
+            var k: usize = 0;
+            for (k < 9) {
+                b.nb[k] = nil;
+                k       = k + 1;
+            }
+            b.nb[4] = ?own[0];
+            b.out   = ?out[0];
+            b.busy  = true;
+            var p: u64 = 0;
+            for (p < 2) {
+                b.gen = p;
+                var t: space.Tally = space.tally(sn);
+                step_chunk(?r, ?b, ?t);
+                i = 0;
+                for (i < 4096) {
+                    if (out[i] != 0) { ret 11; }
+                    i = i + 1;
+                }
+                if (t.live != 0) { ret 12; }
+                p = p + 1;
+            }
+            # next, which a quadtree steps by, steps a row of three as the chunk
+            # step does, for every rule a quadtree can run
+            if (caps(?r).hashlife) {
+                i = 0;
+                for (i < 4096) {
+                    own[i] = 0;
+                    i      = i + 1;
+                }
+                own[10 * 64 + 10] = word(?r, 1);
+                own[10 * 64 + 11] = word(?r, 1);
+                own[10 * 64 + 12] = word(?r, 1);
+                b.gen             = 0;
+                var tb: space.Tally = space.tally(sn);
+                step_chunk(?r, ?b, ?tb);
+                var nb: [9]u32;
+                var y:  usize = 8;
+                for (y < 13) {
+                    var x: usize = 8;
+                    for (x < 15) {
+                        var q: usize = 0;
+                        for (q < 9) {
+                            nb[q] = state(?r, own[(y + q / 3 - 1) * 64 + x + q % 3 - 1]);
+                            q     = q + 1;
+                        }
+                        if (next(?r, ?nb[0]) != state(?r, out[y * 64 + x])) { ret 13; }
+                        x = x + 1;
+                    }
+                    y = y + 1;
+                }
+            }
+            n = n + 1;
+        }
+        f = f + 1;
+    }
+    ret 0;
+}
+
+test parse__carries_a_grid_suffix_through_format {
+    var b:     [FORMAT_MAX + 1]u8;
+    val texts: [5]str = [5]str{"B3/S23:T100,100", "B2/S/C3:K64*,48", "B3/S23:P30,20", "B36/S23:C9,11", "B3/S23:T0,40"};
+    var i:     usize  = 0;
+    for (i < 5) {
+        val r: res[Rule, str] = parse(texts[i]);
+        if (sel r.err) { ret 1; }
+        var got: Rule = r.ok;
+        if (!topology.bounded(?got.grid))                      { ret 2; }
+        if (!string.str_equals(format(?got, ?b[0]), texts[i])) { ret 3; }
+        val again: res[Rule, str] = parse_as(family_of(?got), ?b[0]);
+        if (sel again.err)          { ret 4; }
+        if (!same(?again.ok, ?got)) { ret 5; }
+        if (caps(?got).hashlife)    { ret 6; }
+        i = i + 1;
+    }
+    # the grid is part of what steps alike, and a grid too short for the rule's
+    # reach, or a bad suffix, is refused
+    val life:  res[Rule, str] = parse("B3/S23");
+    val torus: res[Rule, str] = parse("B3/S23:T100,100");
+    if (sel life.err)  { ret 7; }
+    if (sel torus.err) { ret 7; }
+    var l: Rule = life.ok;
+    var t: Rule = torus.ok;
+    if (same(?l, ?t) || topology.bounded(?l.grid)) { ret 8; }
+    val narrow: res[Rule, str] = parse("R4,C0,M1,S2..3,B3..3,NM:T3,40");
+    if (sel narrow.ok) { ret 9; }
+    val shifted: res[Rule, str] = parse("B3/S23:T10+1,10");
+    if (sel shifted.ok) { ret 10; }
+    # a flipping background runs on a plane whose edge ends, but not along an
+    # unbounded axis, where the edge it holds live never does
+    val b0: res[Rule, str] = parse("B0123/S123:P40,40");
+    if (sel b0.err) { ret 11; }
+    val b0t: res[Rule, str] = parse("B0123/S123:T40,40");
+    if (sel b0t.err) { ret 12; }
+    val b0s: res[Rule, str] = parse("B0123/S123:P0,40");
+    if (sel b0s.ok) { ret 13; }
+    val comp: res[Rule, str] = parse("B0123478/S01234678:P0,40");
+    if (sel comp.err) { ret 14; }
+    ret 0;
+}

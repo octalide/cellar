@@ -1,0 +1,210 @@
+# classifying a pattern on a thread of its own, off the frame
+#
+# neither of cellar's other threads fits: a team's run blocks its caller until
+# every job is done, and the runner steps the world under the world's lock,
+# which a classification never needs, since it runs a copy in a pool of its
+# own. so a job gets a thread of its own, which exits when the job is done.
+#
+# the worker owns everything the thread touches: a copy of the pattern made
+# before the thread starts, the rule by value, and an allocator of its own.
+# the thread only reads the copy and writes the result, and nothing on the
+# frame's side reads the result before the thread has finished, which done
+# says atomically and the join then makes certain. a new job cancels the one
+# running and replaces it, since a second Identify asks about a new selection.
+
+use cellar.identify;
+use cellar.pattern;
+use cellar.rule;
+use allo: std.allocator;
+use std.allocator.page;
+use std.sync.atomic;
+use std.sync.thread;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.size.usize;
+use std.types.string.str;
+
+# a classification running or finished on its own thread
+# ---
+# a:      allocator for the copy and the search, the thread's own
+# thread: the job's thread, joinable while busy
+# busy:   a job was started and has not been collected, read and written on
+#         the starting thread only
+# done:   1 once the thread has written the result, set atomically
+# stop:   set to 1 to cancel the job
+# p:      the thread's copy of the pattern
+# r:      the rule it runs under
+# lim:    the limits it runs under, whose stop is this worker's
+# ran:    the allocator's refusal, if any, once done
+# got:    the result, once done
+pub rec Worker {
+    a:      allo.Allocator;
+    thread: thread.Thread;
+    busy:   bool;
+    done:   i64;
+    stop:   i64;
+    p:      pattern.Pattern;
+    r:      rule.Rule;
+    lim:    identify.Limits;
+    ran:    err[allo.Error];
+    got:    identify.Result;
+}
+
+# make an idle worker; it must not move while a job runs
+pub fun init(w: *Worker) {
+    page.make(?w.a);
+    w.busy = false;
+    w.done = 0;
+    w.stop = 0;
+}
+
+fun work(arg: *u8) {
+    val w: *Worker = arg::*Worker;
+    w.ran = identify.classify(?w.a, ?w.r, ?w.p, w.lim, ?w.got);
+    atomic.store(?w.done, 1);
+}
+
+# wait for the running job's thread and release its copy
+fun finish(w: *Worker) {
+    thread.join(?w.thread);
+    pattern.dnit(?w.p);
+    w.busy = false;
+}
+
+# cancel the running job, if any, and wait for it to stop
+pub fun cancel(w: *Worker) {
+    if (!w.busy) { ret; }
+    atomic.store(?w.stop, 1);
+    finish(w);
+}
+
+# start classifying a pattern, cancelling the job running before it
+# ---
+# w:   the worker
+# r:   the rule
+# p:   the pattern, copied before this returns, so the caller keeps it
+# lim: the limits, whose stop the worker replaces with its own
+# ret: false when the copy or the thread could not be made, leaving the
+#      worker idle
+pub fun start(w: *Worker, r: rule.Rule, p: *pattern.Pattern, lim: identify.Limits) bool {
+    cancel(w);
+    val copied: err[allo.Error] = pattern.clone(?w.p, ?w.a, p);
+    if (sel copied.err) { ret false; }
+    w.r        = r;
+    w.lim      = lim;
+    w.lim.stop = ?w.stop;
+    atomic.store(?w.done, 0);
+    atomic.store(?w.stop, 0);
+    val spawned: thread.Operation = thread.spawn_with(work, w::*u8, ?w.thread);
+    if (sel spawned.err) {
+        pattern.dnit(?w.p);
+        ret false;
+    }
+    w.busy = true;
+    ret true;
+}
+
+# whether a job is running and has not been collected
+pub fun running(w: *Worker) bool {
+    ret w.busy;
+}
+
+# what collect found
+# ---
+# idle:   no job has finished since the last collect
+# failed: a job finished, but the allocator refused what it needed
+# ready:  a job finished with this result
+pub tag Collected: u8 {
+    idle;
+    failed: allo.Error;
+    ready:  identify.Result;
+}
+
+# take a finished job's result, never waiting on one still running
+pub fun collect(w: *Worker) Collected {
+    if (!w.busy || atomic.load(?w.done) == 0) { ret Collected.idle{}; }
+    finish(w);
+    if (sel w.ran.err) { ret Collected.failed{w.ran.err}; }
+    ret Collected.ready{w.got};
+}
+
+# wait for the running job to finish, for tests that need its result; the
+# join collect makes afterwards finds the thread already joined
+#[testing]
+pub fun wait(w: *Worker) {
+    if (w.busy) { thread.join(?w.thread); }
+}
+
+# whether two results agree in every field a caller reads
+#[testing]
+fun same(x: *identify.Result, y: *identify.Result) bool {
+    if (identify.fate_id(x.fate) != identify.fate_id(y.fate))                                           { ret false; }
+    if (x.at != y.at || x.period != y.period || x.dx != y.dx || x.dy != y.dy || x.objects != y.objects) { ret false; }
+    var i: usize = 0;
+    for (x.code[i] != 0 || y.code[i] != 0) {
+        if (x.code[i] != y.code[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+test start__delivers_what_classify_gives {
+    var a: allo.Allocator;
+    page.make(?a);
+    var w: Worker;
+    init(?w);
+    var shapes: [4]str;
+    shapes[0] = ".O./..O/OOO";
+    shapes[1] = ".OOO/OOO.";
+    shapes[2] = "OO......./OO......./........./......OOO";
+    shapes[3] = "OO";
+    var i: usize = 0;
+    for (i < 4) {
+        var p: pattern.Pattern;
+        if (!identify.rows(?p, ?a, shapes[i])) { ret 1; }
+        var r:    rule.Rule = identify.life();
+        var sync: identify.Result;
+        identify.classify(?a, ?r, ?p, identify.limits(), ?sync);
+        if (!start(?w, r, ?p, identify.limits())) { ret 2; }
+        # the worker holds a copy, so the caller's pattern may go at once
+        pattern.dnit(?p);
+        wait(?w);
+        var c: Collected = collect(?w);
+        if (!sel c.ready)           { ret 3; }
+        if (!same(?c.ready, ?sync)) { ret 4; }
+        if (running(?w))            { ret 5; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test start__cancels_the_job_before_it {
+    var a: allo.Allocator;
+    page.make(?a);
+    var w: Worker;
+    init(?w);
+    # an R-pentomino under limits so wide it would run for a long time
+    var slow: pattern.Pattern;
+    if (!identify.rows(?slow, ?a, ".OO/OO./.O.")) { ret 1; }
+    var lim: identify.Limits = identify.limits();
+    lim.gens = 100000;
+    lim.side = 2048;
+    if (!start(?w, identify.life(), ?slow, lim)) { ret 2; }
+    var fast: pattern.Pattern;
+    if (!identify.rows(?fast, ?a, "OOO"))                      { ret 3; }
+    if (!start(?w, identify.life(), ?fast, identify.limits())) { ret 4; }
+    wait(?w);
+    val c: Collected = collect(?w);
+    if (!sel c.ready)                                        { ret 5; }
+    if (!sel c.ready.fate.oscillator || c.ready.period != 2) { ret 5; }
+    # cancelling a running job leaves the worker idle with nothing to collect
+    if (!start(?w, identify.life(), ?slow, lim)) { ret 6; }
+    cancel(?w);
+    val after: Collected = collect(?w);
+    if (running(?w) || !sel after.idle) { ret 7; }
+    pattern.dnit(?slow);
+    pattern.dnit(?fast);
+    ret 0;
+}

@@ -1,0 +1,733 @@
+# headless runs: open a file into a world, step it on the CPU or on HashLife,
+# write it out
+#
+# a batch owns a simulation that is never handed a GPU, so nothing here opens
+# a window or reaches boom's renderer. on HashLife a step of n generations goes
+# straight to the generation, by the powers of two n is made of. a file is opened as the app opens it
+# (cellar.persist.open_bytes), so a world file replaces the world and a pattern
+# is stamped centred on the origin through the format registry and the world
+# sink, and a step is sim.step, the step the app takes. a run on HashLife moves
+# onto it before the file is opened, so a file built as nodes (Macrocell) goes
+# straight into the tree rather than through the pool. the stages are separate
+# calls on a Batch so a script can drive them in any order and read the world
+# between them, and run strings them together for `cellar run`.
+
+use cellar.args;
+use cellar.format;
+use cellar.formats;
+use cellar.formats.adapt;
+use cellar.pattern;
+use cellar.persist;
+use cellar.rule;
+use cellar.rules.weighted;
+use cellar.sim;
+use cellar.space;
+use allo: std.allocator;
+use std.allocator.page;
+use std.chrono.duration;
+use std.chrono.time;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use fs: std.filesystem;
+use std.io.writer;
+use mem: std.memory;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string;
+use std.types.string.str;
+
+# the format a run writes when it names no file
+pub val DEFAULT_FORMAT: str = "rle";
+
+# a world stepped headless
+# ---
+# a:       allocator backing the world and every buffer the batch takes
+# s:       the simulation, stepped on the CPU
+# foreign: the opened file names a rule this cellar cannot run, and no rule
+#          has been set since
+pub rec Batch {
+    a:       *allo.Allocator;
+    s:       sim.Sim;
+    foreign: bool;
+}
+
+# where a batch stands
+# ---
+# generation: completed generations, counted from the file's own
+# population: live cells
+pub rec Report {
+    generation: u64;
+    population: usize;
+}
+
+# what `cellar run` asks of a batch
+# ---
+# pattern: the world or pattern file to open
+# rule:    the rule to run under, or nil for the file's
+# gens:    generations to step
+# engine:  args.ENGINE_ANY or ENGINE_CPU for the pool, ENGINE_HASHLIFE for the
+#          quadtree
+# out:     the file to write, its format by its extension, or nil for
+#          DEFAULT_FORMAT on stdout
+pub rec Job {
+    pattern: str;
+    rule:    str;
+    gens:    u64;
+    engine:  u8;
+    out:     str;
+}
+
+# why a batch stopped
+# ---
+# alloc:   the allocator refused the world or a buffer
+# read:    the file could not be read
+# open:    the file was refused, see cellar.persist.Error
+# rule:    the rule text was refused, for the reason given
+# foreign: the file names a rule this cellar cannot run and none was given
+# full:    the world outgrew the pool or HashLife's node table, so stepping
+#          on would go wrong
+# engine:  the engine asked for cannot run the rule or take the world
+# format:  the world could not be written, see cellar.format.Error
+# write:   the output file could not be written
+# stdout:  standard output refused the result
+pub tag Error: u8 {
+    alloc: allo.Error;
+    read:  fs.FsError;
+    open:  persist.Error;
+    rule:  str;
+    foreign;
+    full;
+    engine;
+    format: format.Error;
+    write:  fs.FsError;
+    stdout;
+}
+
+# a one-line description of why a batch stopped
+# ---
+# e:   the failure
+# ret: static text, or the rule's own reason
+pub fun error_message(e: Error) str {
+    if (sel e.alloc)   { ret "out of memory"; }
+    if (sel e.read)    { ret "the file could not be read"; }
+    if (sel e.open)    { ret persist.error_message(e.open); }
+    if (sel e.rule)    { ret e.rule; }
+    if (sel e.foreign) { ret "the file's rule is not one cellar can run; name one with --rule"; }
+    if (sel e.full)    { ret "the world outgrew what cellar can hold"; }
+    if (sel e.engine)  { ret "HashLife cannot run the rule; it runs radius 1 rules without B0 on the unbounded plane"; }
+    if (sel e.format)  { ret format.error_message(e.format); }
+    if (sel e.write)   { ret "the output file could not be written"; }
+    ret "standard output could not be written";
+}
+
+# what a job's failure is about: its rule text, its output, or its file
+# ---
+# e:   the failure
+# j:   the job that failed
+# ret: the argument to name beside error_message
+pub fun error_subject(e: Error, j: *Job) str {
+    if (sel e.rule)   { ret j.rule; }
+    if (sel e.engine) { ret "--engine hashlife"; }
+    if (sel e.format || sel e.write || sel e.stdout) {
+        if (j.out == nil) { ret "stdout"; }
+        ret j.out;
+    }
+    ret j.pattern;
+}
+
+# an empty world under the first preset's rule
+# ---
+# b:   batch to initialize; close releases it, and it must not move once open
+# a:   allocator backing it
+# ret: ok, or the allocator's refusal
+pub fun open(b: *Batch, a: *allo.Allocator) err[Error] {
+    b.a       = a;
+    b.foreign = false;
+    val made: err[allo.Error] = sim.init(?b.s, a);
+    if (sel made.err) { ret err[Error].err{Error.alloc{made.err}}; }
+    ret err[Error].ok{};
+}
+
+# release the world
+pub fun close(b: *Batch) {
+    sim.dnit(?b.s);
+}
+
+# the simulation, for a caller that reads or analyses the world between stages
+pub fun world(b: *Batch) *sim.Sim {
+    ret ?b.s;
+}
+
+# open a file's bytes into the world as the app opens a file, taking its rule
+# when a family reads it
+# ---
+# b:    batch
+# data: the file's bytes
+# ret:  ok, or why nothing was loaded
+pub fun load(b: *Batch, data: *Vector[u8]) err[Error] {
+    var v: persist.View                       = persist.View{pan_x: 0.0, pan_y: 0.0, zoom: 1.0, mode: 0};
+    val r: res[persist.Opened, persist.Error] = persist.open_bytes(b.a, ?b.s, ?v, data);
+    if (sel r.err) { ret err[Error].err{Error.open{r.err}}; }
+    b.foreign = r.ok.foreign;
+    ret err[Error].ok{};
+}
+
+# run the world under a rule from its text, as the app's rule editor sets one
+# ---
+# b:    batch
+# text: a rule string any family reads
+# ret:  ok, or the family's reason for refusing it
+pub fun set_rule(b: *Batch, text: str) err[Error] {
+    val r: res[rule.Rule, str] = rule.parse(text);
+    if (sel r.err) { ret err[Error].err{Error.rule{r.err}}; }
+    sim.set_rule(?b.s, r.ok);
+    b.foreign = false;
+    ret err[Error].ok{};
+}
+
+# move the world onto HashLife, or back into the pool
+# ---
+# b:    batch
+# tree: HashLife
+# ret:  ok, or engine when HashLife cannot run the rule or take the world
+pub fun use_hashlife(b: *Batch, tree: bool) err[Error] {
+    if (!sim.use_hashlife(?b.s, tree)) { ret err[Error].err{Error.engine{}}; }
+    ret err[Error].ok{};
+}
+
+# advance the world n generations
+# ---
+# b:   batch
+# n:   generations
+# ret: ok, or full once the world outgrew the pool or the node table, the
+#      generations stepped before it counted
+pub fun step(b: *Batch, n: u64) err[Error] {
+    if (sim.on_tree(?b.s)) {
+        # straight to the generation, in pieces jump takes
+        var left: u64 = n;
+        for (left > 0) {
+            var d: u64 = left;
+            if (d > (1::u64 << 48))                  { d = 1::u64 << 48; }
+            if (!sim.jump(?b.s, b.s.generation + d)) { ret err[Error].err{Error.full{}}; }
+            left = left - d;
+        }
+        ret err[Error].ok{};
+    }
+    var i: u64 = 0;
+    for (i < n) {
+        sim.step(?b.s);
+        if (b.s.full) { ret err[Error].err{Error.full{}}; }
+        i = i + 1;
+    }
+    ret err[Error].ok{};
+}
+
+# the world's generation and population
+pub fun report(b: *Batch) Report {
+    ret Report{generation: b.s.generation, population: sim.population(?b.s)};
+}
+
+# encode the world's live cells, where they lie, under the rule it runs
+# ---
+# b:   batch
+# f:   the format to write
+# out: receives the file's bytes, appended
+# ret: ok, or why the world could not be written
+pub fun encode(b: *Batch, f: *format.Format, out: *Vector[u8]) err[Error] {
+    var info: format.Info;
+    format.info_init(?info, b.a);
+    var text: [rule.FORMAT_MAX + 1]u8;
+    val told: err[allo.Error] = format.set_str(b.a, ?info.rule, rule.format(?b.s.rule, ?text[0]));
+    if (sel told.err) {
+        format.info_dnit(?info);
+        ret err[Error].err{Error.alloc{told.err}};
+    }
+    var ws:  adapt.WorldSource;
+    var enc: err[format.Error]                 = err[format.Error].ok{};
+    val src: res[*format.Source, format.Error] = adapt.world_source(?ws, ?b.s, b.a);
+    if (sel src.err) { enc = err[format.Error].err{src.err}; }
+    if (sel src.ok)  { enc = formats.save(b.a, f, src.ok, ?info, out); }
+    adapt.world_source_dnit(?ws);
+    format.info_dnit(?info);
+    if (sel enc.err) { ret err[Error].err{Error.format{enc.err}}; }
+    ret err[Error].ok{};
+}
+
+# the format a job writes: the one owning its file's extension, or the default
+fun format_of(j: *Job, f: *format.Format) err[Error] {
+    if (j.out == nil) {
+        if (formats.by_id(DEFAULT_FORMAT, f)) { ret err[Error].ok{}; }
+    }
+    or (formats.by_path(j.out, f)) { ret err[Error].ok{}; }
+    ret err[Error].err{Error.format{format.Error.unsupported{}}};
+}
+
+# write the result where the job names, a file or stdout
+fun deliver(b: *Batch, j: *Job, out: *Vector[u8]) err[Error] {
+    if (j.out == nil) {
+        var w: writer.Writer          = fs.writer(fs.STDOUT);
+        val r: err[writer.WriteError] = writer.write_all(?w, out.data, out.len);
+        if (sel r.err) { ret err[Error].err{Error.stdout{}}; }
+        ret err[Error].ok{};
+    }
+    val made: err[fs.FsError] = persist.make_parent(b.a, j.out);
+    if (sel made.err) { ret err[Error].err{Error.write{made.err}}; }
+    val wrote: err[fs.FsError] = fs.write_bytes(j.out, out.data, out.len, persist.FILE_MODE);
+    if (sel wrote.err) { ret err[Error].err{Error.write{wrote.err}}; }
+    ret err[Error].ok{};
+}
+
+# the stages of a job on an open batch, stopping at the first that fails
+fun drive(b: *Batch, j: *Job, f: *format.Format, out: *Vector[u8]) err[Error] {
+    # the tree takes the file first, and the world stays there unless the
+    # file's rule is one HashLife cannot run, which the move after it judges
+    if (j.engine == args.ENGINE_HASHLIFE) {
+        val early: err[Error] = use_hashlife(b, true);
+        if (sel early.err) { ret early; }
+    }
+    val rr: res[Vector[u8], fs.FsError] = fs.read_bytes(b.a, j.pattern);
+    if (sel rr.err) { ret err[Error].err{Error.read{rr.err}}; }
+    var data:   Vector[u8] = rr.ok;
+    val loaded: err[Error] = load(b, ?data);
+    vector.dnit[u8](?data);
+    if (sel loaded.err) { ret loaded; }
+    if (j.rule != nil) {
+        val ruled: err[Error] = set_rule(b, j.rule);
+        if (sel ruled.err) { ret ruled; }
+    }
+    if (b.foreign) { ret err[Error].err{Error.foreign{}}; }
+    if (j.engine == args.ENGINE_HASHLIFE) {
+        val moved: err[Error] = use_hashlife(b, true);
+        if (sel moved.err) { ret moved; }
+    }
+    val stepped: err[Error] = step(b, j.gens);
+    if (sel stepped.err) { ret stepped; }
+    val coded: err[Error] = encode(b, f, out);
+    if (sel coded.err) { ret coded; }
+    ret deliver(b, j, out);
+}
+
+# open a file, run it under the job's rule or else its own, step it, and write
+# the result, all headless
+#
+# the rule and the output format are judged before the file is read, so a job
+# asking for either wrongly reads and writes nothing.
+# ---
+# a:   allocator for the world and the buffers
+# j:   the job
+# ret: where the world stood once written, or why the job stopped
+pub fun run(a: *allo.Allocator, j: *Job) res[Report, Error] {
+    if (j.rule != nil) {
+        val r: res[rule.Rule, str] = rule.parse(j.rule);
+        if (sel r.err) { ret res[Report, Error].err{Error.rule{r.err}}; }
+    }
+    var f:  format.Format;
+    val fo: err[Error] = format_of(j, ?f);
+    if (sel fo.err) { ret res[Report, Error].err{fo.err}; }
+    var b:      Batch;
+    val opened: err[Error] = open(?b, a);
+    if (sel opened.err) { ret res[Report, Error].err{opened.err}; }
+    var out:  Vector[u8] = vector.init[u8](a);
+    val done: err[Error] = drive(?b, j, ?f, ?out);
+    vector.dnit[u8](?out);
+    val at: Report = report(?b);
+    close(?b);
+    if (sel done.err) { ret res[Report, Error].err{done.err}; }
+    ret res[Report, Error].ok{at};
+}
+
+# a glider heading down and right
+#[testing]
+val GLIDER: str = "x = 3, y = 3, rule = B3/S23\nbo$2bo$3o!\n";
+
+# the gosper gun, whose population grows by a glider every 30 generations
+#[testing]
+val GUN: str = "x = 36, y = 9, rule = B3/S23\n24bo$22bobo$12b2o6b2o12b2o$11bo3bo4b2o12b2o$2o8bo5bo3b2o$2o8bo3bob2o4bobo$10bo5bo7bo$11bo3bo$12b2o!\n";
+
+# a file's bytes from text
+#[testing]
+fun bytes_of(a: *allo.Allocator, text: str) Vector[u8] {
+    var v: Vector[u8] = vector.init[u8](a);
+    var i: usize      = 0;
+    for (text[i] != 0) {
+        vector.push[u8](?v, text[i]);
+        i = i + 1;
+    }
+    ret v;
+}
+
+# open a batch on a file's text
+#[testing]
+fun open_on(b: *Batch, a: *allo.Allocator, text: str) bool {
+    val o: err[Error] = open(b, a);
+    if (sel o.err) { ret false; }
+    var data: Vector[u8] = bytes_of(a, text);
+    val l:    err[Error] = load(b, ?data);
+    vector.dnit[u8](?data);
+    ret sel l.ok;
+}
+
+test step__a_glider_returns_to_its_shape_a_cell_down_and_right_in_four {
+    var a: allo.Allocator;
+    page.make(?a);
+    var b: Batch;
+    if (!open_on(?b, ?a, GLIDER)) { ret 1; }
+    val s:   *sim.Sim       = world(?b);
+    val was: opt[space.Box] = sim.bounds(s);
+    if (!sel was.some) { ret 2; }
+    val box:  space.Box = was.some;
+    var live: [16]bool;
+    var y:    i64       = 0;
+    for (y < 3) {
+        var x: i64 = 0;
+        for (x < 3) {
+            live[(y * 3 + x)::usize] = sim.alive(s, box.x0 + x, box.y0 + y);
+            x                        = x + 1;
+        }
+        y = y + 1;
+    }
+    val st: err[Error] = step(?b, 4);
+    if (sel st.err) { ret 3; }
+    val r: Report = report(?b);
+    if (r.generation != 4 || r.population != 5) { ret 4; }
+    val now: opt[space.Box] = sim.bounds(s);
+    if (!sel now.some)                                          { ret 5; }
+    if (now.some.x0 != box.x0 + 1 || now.some.y0 != box.y0 + 1) { ret 6; }
+    y = 0;
+    for (y < 3) {
+        var x: i64 = 0;
+        for (x < 3) {
+            if (sim.alive(s, box.x0 + x + 1, box.y0 + y + 1) != live[(y * 3 + x)::usize]) { ret 7; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    close(?b);
+    ret 0;
+}
+
+test step__the_gosper_gun_adds_a_glider_every_thirty {
+    var a: allo.Allocator;
+    page.make(?a);
+    var b: Batch;
+    if (!open_on(?b, ?a, GUN))       { ret 1; }
+    if (report(?b).population != 36) { ret 2; }
+    var want: [3]usize;
+    want[0] = 41;
+    want[1] = 46;
+    want[2] = 51;
+    var k: usize = 0;
+    for (k < 3) {
+        val st: err[Error] = step(?b, 30);
+        if (sel st.err) { ret 3; }
+        val r: Report = report(?b);
+        if (r.generation != ((k + 1) * 30)::u64 || r.population != want[k]) { ret 4 + k::i32; }
+        k = k + 1;
+    }
+    close(?b);
+    ret 0;
+}
+
+test encode__writes_what_the_app_holds_after_the_same_steps {
+    var a: allo.Allocator;
+    page.make(?a);
+    # the app: open the file, set the rule, step as the runner does
+    var app: sim.Sim;
+    val m:   err[allo.Error] = sim.init(?app, ?a);
+    if (sel m.err) { ret 1; }
+    var v:    persist.View                       = persist.View{pan_x: 0.0, pan_y: 0.0, zoom: 1.0, mode: 0};
+    var data: Vector[u8]                         = bytes_of(?a, GUN);
+    val o:    res[persist.Opened, persist.Error] = persist.open_bytes(?a, ?app, ?v, ?data);
+    if (sel o.err) { ret 2; }
+    val hl: res[rule.Rule, str] = rule.parse("B36/S23");
+    if (sel hl.err) { ret 3; }
+    sim.set_rule(?app, hl.ok);
+    var i: usize = 0;
+    for (i < 75) {
+        sim.step(?app);
+        i = i + 1;
+    }
+
+    # the batch, the same file and rule, written out as RLE
+    var b:  Batch;
+    val ob: err[Error] = open(?b, ?a);
+    if (sel ob.err) { ret 4; }
+    val lb: err[Error] = load(?b, ?data);
+    vector.dnit[u8](?data);
+    if (sel lb.err) { ret 5; }
+    val rb: err[Error] = set_rule(?b, "B36/S23");
+    if (sel rb.err) { ret 6; }
+    val sb: err[Error] = step(?b, 75);
+    if (sel sb.err) { ret 7; }
+    var f: format.Format;
+    if (!formats.by_id("rle", ?f)) { ret 8; }
+    var out: Vector[u8] = vector.init[u8](?a);
+    val eb:  err[Error] = encode(?b, ?f, ?out);
+    if (sel eb.err) { ret 9; }
+    close(?b);
+
+    # read back, the cells lie where the app's do and nowhere else
+    var p:  pattern.Pattern;
+    val pm: err[allo.Error] = pattern.init(?p, ?a, 0, 0, "");
+    if (sel pm.err) { ret 10; }
+    var info: format.Info;
+    format.info_init(?info, ?a);
+    var ps:   adapt.PatternSink;
+    val back: err[format.Error] = formats.load(?a, ?f, out.data, out.len, adapt.pattern_sink(?ps, ?p), ?info);
+    if (sel back.err)                                              { ret 11; }
+    if (!string.str_equals(format.text_of(?info.rule), "B36/S23")) { ret 12; }
+    format.info_dnit(?info);
+    vector.dnit[u8](?out);
+    var seen: usize = 0;
+    var y:    usize = 0;
+    for (y < p.h) {
+        var x: usize = 0;
+        for (x < p.w) {
+            val on: bool = pattern.get(?p, x, y) != 0;
+            if (on != sim.alive(?app, p.x + x::i64, p.y + y::i64)) { ret 13; }
+            if (on)                                                { seen = seen + 1; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    if (seen == 0 || seen != sim.population(?app)) { ret 14; }
+    pattern.dnit(?p);
+    sim.dnit(?app);
+    ret 0;
+}
+
+# whether every cell in a state but 0 in a holds the same state in b, and how
+# many there are
+#[testing]
+fun states_in(a: *sim.Sim, b: *sim.Sim, n: *usize) bool {
+    val sp: *space.Space = ?a.space;
+    var sl: usize        = 0;
+    for (sl < sp.hi) {
+        if (space.used(sp, sl)) {
+            val ox: i64   = space.slot_x(sp, sl) * space.SIDE;
+            val oy: i64   = space.slot_y(sp, sl) * space.SIDE;
+            var i:  usize = 0;
+            for (i < space.CELLS) {
+                val v: u32 = rule.state(?a.rule, sp.cells[sl * space.CELLS + i]);
+                if (v != 0) {
+                    val x: i64 = ox + (i % space.SIDE::usize)::i64;
+                    val y: i64 = oy + (i / space.SIDE::usize)::i64;
+                    if (rule.state(?b.rule, sim.cell(b, x, y)) != v) { ret false; }
+                    @n = @n + 1;
+                }
+                i = i + 1;
+            }
+        }
+        sl = sl + 1;
+    }
+    ret true;
+}
+
+test encode__writes_every_dying_cell_of_a_generations_world {
+    var a: allo.Allocator;
+    page.make(?a);
+    var b:  Batch;
+    val ob: err[Error] = open(?b, ?a);
+    if (sel ob.err) { ret 1; }
+    sim.set_rule(?b.s, rule.preset_rule(4));
+    # a block dies into a ring of births, a lone cell beside it dies outside
+    # the live box, and a far one leaves a chunk with no live cell at all
+    sim.paint(?b.s, 0, 0, 1);
+    sim.paint(?b.s, 1, 0, 1);
+    sim.paint(?b.s, 0, 1, 1);
+    sim.paint(?b.s, 1, 1, 1);
+    sim.paint(?b.s, 20, 20, 1);
+    sim.paint(?b.s, 1000, 1000, 1);
+    val sb: err[Error] = step(?b, 1);
+    if (sel sb.err)                                             { ret 2; }
+    if (rule.state(?b.s.rule, sim.cell(?b.s, 20, 20)) != 2)     { ret 3; }
+    if (rule.state(?b.s.rule, sim.cell(?b.s, 1000, 1000)) != 2) { ret 4; }
+
+    val ids: [2]str = [2]str{"rle", "macrocell"};
+    var k:   usize  = 0;
+    for (k < 2) {
+        var f: format.Format;
+        if (!formats.by_id(ids[k], ?f)) { ret 5; }
+        var out: Vector[u8] = vector.init[u8](?a);
+        val eb:  err[Error] = encode(?b, ?f, ?out);
+        if (sel eb.err) { ret 6; }
+
+        var t:  sim.Sim;
+        val mt: err[allo.Error] = sim.init(?t, ?a);
+        if (sel mt.err) { ret 7; }
+        sim.set_rule(?t, rule.preset_rule(4));
+        var info: format.Info;
+        format.info_init(?info, ?a);
+        var ws:   adapt.WorldSink;
+        val back: err[format.Error] = formats.load(?a, ?f, out.data, out.len, adapt.world_sink(?ws, ?t, 0, 0), ?info);
+        format.info_dnit(?info);
+        vector.dnit[u8](?out);
+        if (sel back.err) { ret 8; }
+
+        # every cell in a state but 0 lies in both worlds, in the same state
+        var n: usize = 0;
+        var m: usize = 0;
+        if (!states_in(?b.s, ?t, ?n) || !states_in(?t, ?b.s, ?m)) { ret 9; }
+        if (n == 0 || n != m)                                     { ret 10; }
+        sim.dnit(?t);
+        k = k + 1;
+    }
+    close(?b);
+    ret 0;
+}
+
+test run__on_hashlife_writes_what_the_chunk_engine_does {
+    var a: allo.Allocator;
+    page.make(?a);
+    val dir: err[fs.FsError] = persist.make_parent(?a, "out/test/batch_engine/gun.rle");
+    if (sel dir.err) { ret 1; }
+    val w: err[fs.FsError] = fs.write_bytes("out/test/batch_engine/gun.rle", GUN, string.str_len(GUN), persist.FILE_MODE);
+    if (sel w.err) { ret 1; }
+    var pool: Job                = Job{pattern: "out/test/batch_engine/gun.rle", rule: nil, gens: 1000, engine: args.ENGINE_CPU, out: "out/test/batch_engine/pool.rle"};
+    var tree: Job                = Job{pattern: "out/test/batch_engine/gun.rle", rule: nil, gens: 1000, engine: args.ENGINE_HASHLIFE, out: "out/test/batch_engine/tree.rle"};
+    val p:    res[Report, Error] = run(?a, ?pool);
+    val t:    res[Report, Error] = run(?a, ?tree);
+    if (sel p.err) { ret 2; }
+    if (sel t.err) { ret 2; }
+    # 1000 is 10 past 33 glider periods: the gun and 33 gliders
+    if (p.ok.generation != 1000 || t.ok.generation != 1000) { ret 3; }
+    if (p.ok.population != t.ok.population)                 { ret 4; }
+    val pb: res[Vector[u8], fs.FsError] = fs.read_bytes(?a, "out/test/batch_engine/pool.rle");
+    val tb: res[Vector[u8], fs.FsError] = fs.read_bytes(?a, "out/test/batch_engine/tree.rle");
+    if (sel pb.err) { ret 5; }
+    if (sel tb.err) { ret 5; }
+    var pv: Vector[u8] = pb.ok;
+    var tv: Vector[u8] = tb.ok;
+    if (pv.len == 0 || pv.len != tv.len || !mem.equal[u8](pv.data, tv.data, pv.len)) { ret 6; }
+    vector.dnit[u8](?pv);
+    vector.dnit[u8](?tv);
+    # Macrocell is written from the tree's nodes on HashLife and from runs on
+    # the pool, and both read back to the same cells
+    if (!same_as_rle(?a, "out/test/batch_engine/gun.rle", args.ENGINE_CPU, "out/test/batch_engine/pool.mc", "out/test/batch_engine/pool_mc.rle"))      { ret 10; }
+    if (!same_as_rle(?a, "out/test/batch_engine/gun.rle", args.ENGINE_HASHLIFE, "out/test/batch_engine/tree.mc", "out/test/batch_engine/tree_mc.rle")) { ret 11; }
+    val pm: res[Vector[u8], fs.FsError] = fs.read_bytes(?a, "out/test/batch_engine/pool_mc.rle");
+    val tm: res[Vector[u8], fs.FsError] = fs.read_bytes(?a, "out/test/batch_engine/tree_mc.rle");
+    if (sel pm.err) { ret 12; }
+    if (sel tm.err) { ret 12; }
+    var pmv: Vector[u8] = pm.ok;
+    var tmv: Vector[u8] = tm.ok;
+    if (pmv.len == 0 || pmv.len != tmv.len || !mem.equal[u8](pmv.data, tmv.data, pmv.len)) { ret 13; }
+    vector.dnit[u8](?pmv);
+    vector.dnit[u8](?tmv);
+
+    # a rule HashLife cannot run is refused, naming the engine
+    var wide: Job                = Job{pattern: "out/test/batch_engine/gun.rle", rule: weighted.sample(1), gens: 10, engine: args.ENGINE_HASHLIFE, out: "out/test/batch_engine/wide.rle"};
+    val r:    res[Report, Error] = run(?a, ?wide);
+    if (!(sel r.err && sel r.err.engine))                                                  { ret 7; }
+    if (sel r.err && !string.str_equals(error_subject(r.err, ?wide), "--engine hashlife")) { ret 8; }
+    # and so is a bounded grid, which only the pool runs
+    var torus: Job                = Job{pattern: "out/test/batch_engine/gun.rle", rule: "B3/S23:T200,200", gens: 10, engine: args.ENGINE_HASHLIFE, out: "out/test/batch_engine/torus.rle"};
+    val tr:    res[Report, Error] = run(?a, ?torus);
+    if (!(sel tr.err && sel tr.err.engine)) { ret 9; }
+    fs.remove_file("out/test/batch_engine/gun.rle");
+    fs.remove_file("out/test/batch_engine/pool.rle");
+    fs.remove_file("out/test/batch_engine/tree.rle");
+    fs.remove_file("out/test/batch_engine/pool.mc");
+    fs.remove_file("out/test/batch_engine/tree.mc");
+    fs.remove_file("out/test/batch_engine/pool_mc.rle");
+    fs.remove_file("out/test/batch_engine/tree_mc.rle");
+    ret 0;
+}
+
+# run a pattern 1000 generations on an engine to a Macrocell file, then that
+# file on the pool to RLE
+#[testing]
+fun same_as_rle(a: *allo.Allocator, from: str, engine: u8, mc: str, rle: str) bool {
+    var there: Job                = Job{pattern: from, rule: nil, gens: 1000, engine: engine, out: mc};
+    val r:     res[Report, Error] = run(a, ?there);
+    if (sel r.err) { ret false; }
+    var back: Job                = Job{pattern: mc, rule: nil, gens: 0, engine: args.ENGINE_CPU, out: rle};
+    val k:    res[Report, Error] = run(a, ?back);
+    if (sel k.err) { ret false; }
+    ret k.ok.population == r.ok.population;
+}
+
+test run__writes_the_gun_at_two_to_the_thirty_to_macrocell_and_reopens_it_from_its_nodes {
+    var a: allo.Allocator;
+    page.make(?a);
+    val dir: err[fs.FsError] = persist.make_parent(?a, "out/test/batch_far/gun.rle");
+    if (sel dir.err) { ret 1; }
+    val w: err[fs.FsError] = fs.write_bytes("out/test/batch_far/gun.rle", GUN, string.str_len(GUN), persist.FILE_MODE);
+    if (sel w.err) { ret 1; }
+    # about 36 million gliders, which a run of each took minutes to write, in
+    # the time of a few thousand nodes
+    val start: time.InstantClock = time.instant();
+    if (sel start.err) { ret 2; }
+    var far: Job                = Job{pattern: "out/test/batch_far/gun.rle", rule: nil, gens: 1073741824, engine: args.ENGINE_HASHLIFE, out: "out/test/batch_far/far.mc"};
+    val r:   res[Report, Error] = run(?a, ?far);
+    if (sel r.err) { ret 3; }
+    val took: time.Elapsed = time.elapsed(start.ok);
+    if (sel took.err)                  { ret 4; }
+    if (took.ok > 2 * duration.SECOND) { ret 5; }
+    val at: Report = r.ok;
+    if (at.generation != 1073741824) { ret 6; }
+
+    # the file holds the world's cells in a few thousand nodes
+    val fb: res[Vector[u8], fs.FsError] = fs.read_bytes(?a, "out/test/batch_far/far.mc");
+    if (sel fb.err) { ret 7; }
+    var data: Vector[u8] = fb.ok;
+    if (data.len > 65536) { ret 8; }
+    var f: format.Format;
+    if (!formats.by_id("macrocell", ?f)) { ret 9; }
+    var info: format.Info;
+    format.info_init(?info, ?a);
+    val v: err[format.Error] = formats.validate(?a, ?f, data.data, data.len, ?info);
+    if (sel v.err)                  { ret 10; }
+    if (info.live != at.population) { ret 11; }
+
+    # and reopens onto HashLife from its nodes rather than its cells, in the
+    # time a few thousand nodes take too
+    val again: time.InstantClock = time.instant();
+    if (sel again.err) { ret 12; }
+    var back: Job                = Job{pattern: "out/test/batch_far/far.mc", rule: nil, gens: 0, engine: args.ENGINE_HASHLIFE, out: "out/test/batch_far/back.mc"};
+    val k:    res[Report, Error] = run(?a, ?back);
+    if (sel k.err) { ret 13; }
+    val took_back: time.Elapsed = time.elapsed(again.ok);
+    if (sel took_back.err)                  { ret 14; }
+    if (took_back.ok > 5 * duration.SECOND) { ret 15; }
+    if (k.ok.population != at.population)   { ret 16; }
+
+    # the open centred the pattern, and moved back by as much it is the file it came from
+    val bb: res[Vector[u8], fs.FsError] = fs.read_bytes(?a, "out/test/batch_far/back.mc");
+    if (sel bb.err) { ret 17; }
+    var moved: Vector[u8] = bb.ok;
+    var got:   format.Info;
+    format.info_init(?got, ?a);
+    val vb: err[format.Error] = formats.validate(?a, ?f, moved.data, moved.len, ?got);
+    if (sel vb.err || got.live != info.live || got.x1 - got.x0 != info.x1 - info.x0 || got.y1 - got.y0 != info.y1 - info.y0) { ret 18; }
+    var b:      Batch;
+    val opened: err[Error] = open(?b, ?a);
+    if (sel opened.err) { ret 19; }
+    val tree: err[Error] = use_hashlife(?b, true);
+    if (sel tree.err) { ret 20; }
+    var ws:   adapt.WorldSink;
+    var told: format.Info;
+    format.info_init(?told, ?a);
+    val l: err[format.Error] = formats.load(?a, ?f, moved.data, moved.len, adapt.world_sink(?ws, world(?b), info.x0 - got.x0, info.y0 - got.y0), ?told);
+    if (sel l.err) { ret 21; }
+    var same: Vector[u8] = vector.init[u8](?a);
+    val e:    err[Error] = encode(?b, ?f, ?same);
+    if (sel e.err)                                                              { ret 22; }
+    if (same.len != data.len || !mem.equal[u8](same.data, data.data, data.len)) { ret 23; }
+    close(?b);
+    vector.dnit[u8](?same);
+    vector.dnit[u8](?moved);
+    format.info_dnit(?told);
+    format.info_dnit(?got);
+    format.info_dnit(?info);
+    vector.dnit[u8](?data);
+    fs.remove_file("out/test/batch_far/gun.rle");
+    fs.remove_file("out/test/batch_far/far.mc");
+    fs.remove_file("out/test/batch_far/back.mc");
+    ret 0;
+}
