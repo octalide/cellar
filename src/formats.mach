@@ -21,6 +21,7 @@ use cellar.pattern;
 use cellar.rule;
 use cellar.sim;
 use cellar.space;
+use cellar.topology;
 use allo: std.allocator;
 use std.allocator.page;
 use std.collections.vector;
@@ -1049,6 +1050,104 @@ test save__fails_rather_than_write_a_world_short_without_the_memory_to_read_it {
     if (sel short.err && !(sel short.err.alloc)) { ret 5; }
     vector.dnit[u8](?out);
     sim.dnit(?s);
+    ret 0;
+}
+
+# a world under a strobing B0 rule on a bounded grid, stepped gens times
+fun strobing(a: *allo.Allocator, s: *sim.Sim, text: str, soup: bool, gens: usize) bool {
+    val m: err[allo.Error] = sim.init(s, a);
+    if (sel m.err) { ret false; }
+    val parsed: res[rule.Rule, str] = rule.parse(text);
+    if (sel parsed.err) { ret false; }
+    sim.set_rule(s, parsed.ok);
+    if (soup) { sim.randomize(s, 0.3, 10); }
+    var i: usize = 0;
+    for (i < gens) {
+        sim.step(s);
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the world as a file, loaded as a fresh world at generation 0 under the same rule
+fun reloaded(a: *allo.Allocator, s: *sim.Sim, t: *sim.Sim, text: str) bool {
+    var out:   Vector[u8]        = vector.init[u8](a);
+    val saved: err[format.Error] = save_world(a, s, a, ?out);
+    if (sel saved.err) { ret false; }
+    var live: u64  = 0;
+    val ok:   bool = strobing(a, t, text, false, 0) && world_takes(a, t, "rle", out.data, out.len, ?live);
+    vector.dnit[u8](?out);
+    ret ok && live::usize == sim.population(s);
+}
+
+# whether two worlds agree on every cell of the grid and a margin around it
+fun same_cells(s: *sim.Sim, t: *sim.Sim) bool {
+    var y: i64 = -7;
+    for (y < 7) {
+        var x: i64 = -7;
+        for (x < 7) {
+            if (sim.alive(s, x, y) != sim.alive(t, x, y)) { ret false; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    ret true;
+}
+
+test save__a_finite_grid_reads_its_true_cells_at_an_odd_generation {
+    var a: allo.Allocator;
+    page.make(?a);
+    var g: usize = 0;
+    for (g < 2) {
+        var text: str = "B03/S23:P10,10";
+        if (g == 1) { text = "B03/S23:T10,10"; }
+        var s: sim.Sim;
+        if (!strobing(?a, ?s, text, false, 1) || !sim.flipped(?s)) { ret 1; }
+        # the empty world's every cell is born, and none lies off the grid
+        if (sim.population(?s) != 100 || !sim.alive(?s, -5, -5) || !sim.alive(?s, 4, 4)) { ret 2; }
+        if (sim.alive(?s, 5, 0) || sim.alive(?s, 0, -6))                                 { ret 3; }
+        val b: opt[space.Box] = sim.bounds(?s);
+        if (!(sel b.some))                                                          { ret 4; }
+        if (b.some.x0 != -5 || b.some.y0 != -5 || b.some.x1 != 5 || b.some.y1 != 5) { ret 4; }
+        var row: [14]u8;
+        if (!sim.read_begin(?s, -7, 0, 7, 1) || !sim.read_run(?s, -7, 0, 14, ?row[0]) || !sim.read_end(?s)) { ret 5; }
+        var k: usize = 0;
+        for (k < 14) {
+            var on: u8 = 0;
+            if (k >= 2 && k < 12) { on = 1; }
+            if (row[k] != on)     { ret 6; }
+            k = k + 1;
+        }
+        var t: sim.Sim;
+        if (!reloaded(?a, ?s, ?t, text) || sim.population(?t) != 100 || t.generation != 0) { ret 7; }
+        sim.step(?s);
+        if (sim.flipped(?s) || sim.population(?s) != (4 - 4 * g::usize)) { ret 8; }
+        sim.dnit(?t);
+        sim.dnit(?s);
+        g = g + 1;
+    }
+    ret 0;
+}
+
+test save__a_soup_saved_at_an_odd_generation_steps_on_as_the_world_does {
+    var a: allo.Allocator;
+    page.make(?a);
+    var g: usize = 0;
+    for (g < 3) {
+        var text: str = "B03/S23:P10,10";
+        if (g == 1) { text = "B03/S23:T10,10"; }
+        if (g == 2) { text = "B0124-k/S1c25:P10,10"; }
+        var s: sim.Sim;
+        if (!strobing(?a, ?s, text, true, 1) || !sim.flipped(?s)) { ret 1; }
+        var t: sim.Sim;
+        if (!reloaded(?a, ?s, ?t, text) || !same_cells(?s, ?t)) { ret 2; }
+        sim.step(?s);
+        sim.step(?t);
+        if (!same_cells(?s, ?t) || sim.population(?s) != sim.population(?t)) { ret 3; }
+        sim.dnit(?t);
+        sim.dnit(?s);
+        g = g + 1;
+    }
     ret 0;
 }
 
