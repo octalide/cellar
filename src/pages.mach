@@ -1,0 +1,418 @@
+# what the panels hold, beyond the patterns (cellar.arrange) and the rule
+# (cellar.kedit): the world, the view, the stats, the settings and the files
+#
+# each page draws into a panel's padded column and applies its controls. the
+# pages read the world only through what it shows (world.Shown), and change it
+# only through commands.
+
+use blit;
+use bctx: blit.context;
+use binp: blit.input;
+use bint: blit.interact;
+use blay: blit.layout;
+use bth:  blit.theme;
+use bw:   blit.widget;
+use cellar.app;
+use cellar.arrange;
+use cellar.ceiling;
+use cellar.command;
+use cellar.history;
+use cellar.identify.worker;
+use cellar.look;
+use cellar.paths;
+use cellar.render;
+use rules: cellar.rule;
+use cellar.saves;
+use cellar.sim;
+use cellar.space;
+use cellar.text;
+use cellar.theme;
+use cellar.world;
+use fs: std.filesystem;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.size.usize;
+use std.types.string.str;
+
+# unscaled height of the population graph
+val GRAPH: f32 = 48.0;
+# the version the settings show
+val VERSION: str = $mach.project.version;
+
+# the world panel: the randomize area and the world's clearing, and the
+# operations on a selection
+# ---
+# ui: the interface
+# l:  cellar's look
+# a:  application state
+pub fun world_page(ui: *bctx.Context, l: look.Look, a: *app.App) {
+    look.heading(ui, l, "Randomize");
+    var areas: [8]str;
+    areas[0] = "32";
+    areas[1] = "64";
+    areas[2] = "128";
+    areas[3] = "256";
+    areas[4] = "512";
+    areas[5] = "1k";
+    areas[6] = "2k";
+    areas[7] = "4k";
+    val area: usize = bw.button_grid(ui, ?areas[0], app.BOUNDS_COUNT, 4, a.bounds_idx);
+    if (area < app.BOUNDS_COUNT) { a.bounds_idx = area; }
+    look.note(ui, l, "Randomize fills a square this wide");
+    var more: [2]str;
+    more[0] = "Randomize";
+    more[1] = "Clear";
+    val act: usize = bw.buttons(ui, ?more[0], 2);
+    if (act == 0) { app.submit(a, command.Command.randomize{app.bounds_size(a.bounds_idx)}); }
+    if (act == 1) { app.submit(a, command.Command.clear{}); }
+
+    look.heading(ui, l, "Selection");
+    arrange.selection(ui, l, a);
+}
+
+# the solid colours as swatches across the column, the chosen one framed
+fun swatches(ui: *bctx.Context, a: *app.App) {
+    val n:  usize     = theme.SWATCH_COUNT;
+    val av: bctx.Area = bw.avail(ui);
+    val g:  f32       = bctx.px(ui, 4.0);
+    val sz: f32       = (av.x1 - av.x0 - g * (n - 1)::f32) / n::f32;
+    val r:  bctx.Area = bw.place(ui, blay.fill(1.0), blay.fixed(sz), 0.0, sz);
+    val t:  f32       = bctx.px(ui, 2.0);
+    val in: f32       = bctx.px(ui, 4.0);
+    var i:  usize     = 0;
+    for (i < n) {
+        val x0: f32 = r.x0 + i::f32 * (sz + g);
+        bctx.push_id_int(ui, i::u64);
+        val h: bint.Hit = bint.hit(ui, bctx.id_of(ui, "swatch"), x0, r.y0, x0 + sz, r.y0 + sz, binp.BUTTON_LEFT);
+        bctx.pop_id(ui);
+        val c: u32 = theme.swatch(i);
+        if (c == a.solid) { bctx.frame(ui, x0, r.y0, x0 + sz, r.y0 + sz, t, look.colour(theme.TEXT, 1.0)); }
+        or (h.hot)        { bctx.frame(ui, x0, r.y0, x0 + sz, r.y0 + sz, t, look.colour(theme.TEXT_DIM, 1.0)); }
+        bctx.quad(ui, x0 + in, r.y0 + in, x0 + sz - in, r.y0 + sz - in, look.colour(c, 1.0));
+        if (h.clicked) { a.solid = c; }
+        i = i + 1;
+    }
+}
+
+# the view panel: the colour mode, the solid colour, grid lines and framing
+# ---
+# ui: the interface
+# l:  cellar's look
+# a:  application state
+# s:  the world as shown, whose engine says which colour modes it keeps
+pub fun view_page(ui: *bctx.Context, l: look.Look, a: *app.App, s: *world.Shown) {
+    # the colour modes are what the engine keeps: trails need heat and age needs age
+    val c:     sim.Caps = world.caps(s);
+    val solid: bool     = a.mode == render.MODE_SOLID::usize || !c.heat || !c.age;
+    look.heading(ui, l, "Colour");
+    if (c.heat && c.age) {
+        var modes: [3]str;
+        modes[0] = "Solid";
+        modes[1] = "Trails";
+        modes[2] = "Age";
+        bw.segmented(ui, ?modes[0], app.MODE_COUNT, ?a.mode);
+    }
+    or         { look.note(ui, l, "HashLife keeps no heat or age, so draws solid"); }
+    if (solid) { swatches(ui, a); }
+    bw.toggle(ui, "Grid lines", ?a.gutter);
+    if (bw.button(ui, "Frame the randomize area")) { app.frame_area(a); }
+}
+
+# the population over the recent samples, each held until the generation of
+# the next, and scaled so the largest fills the height, with the peak in its
+# corner
+fun graph(ui: *bctx.Context, l: look.Look, s: *world.Shown) {
+    val h:  *history.History = world.recent(s);
+    val gh: f32              = bctx.px(ui, GRAPH);
+    val r:  bctx.Area        = bw.place(ui, blay.fill(1.0), blay.fixed(gh), 0.0, gh);
+    bctx.quad(ui, r.x0, r.y0, r.x1, r.y1, look.colour(theme.WORLD, 1.0));
+    val peak: u64 = history.peak(h);
+    val pad:  f32 = bctx.px(ui, 4.0);
+    if (h.len != 0 && peak != 0) {
+        val first: u64             = history.gen_at(h, 0);
+        val span:  f32             = (history.gen_at(h, h.len - 1) - first + 1)::f32;
+        val gw:    f32             = (r.x1 - r.x0 - pad * 2.0) / span;
+        val ht:    f32             = r.y1 - r.y0 - pad * 2.0;
+        val bar:   blit.draw.Color = look.colour(theme.ACCENT, 0.5);
+        var i:     usize           = 0;
+        for (i < h.len) {
+            var end: f32 = span;
+            if (i + 1 < h.len) { end = (history.gen_at(h, i + 1) - first)::f32; }
+            val x0:  f32 = r.x0 + pad + (history.gen_at(h, i) - first)::f32 * gw;
+            val x1:  f32 = r.x0 + pad + end * gw;
+            val top: f32 = r.y1 - pad - ht * history.pop_at(h, i)::f32 / peak::f32;
+            bctx.quad(ui, x0, top, x1, r.y1 - pad, bar);
+            i = i + 1;
+        }
+    }
+    var rd: [48]u8;
+    var o:  usize = text.buf_str(?rd[0], 0, "population, peak ");
+    o     = text.buf_grouped(?rd[0], o, peak);
+    rd[o] = 0;
+    bctx.push_style(ui, l.small);
+    bctx.text_at(ui, ?rd[0], r.x0 + pad * 2.0, r.y0 + pad, look.colour(theme.TEXT, 1.0));
+    bctx.pop_style(ui);
+}
+
+# the stats as label and value pairs, cols to a row, in the small face
+# ---
+# ui:     the interface
+# l:      cellar's look
+# labels: n labels
+# values: their values
+# n:      how many
+# cols:   pairs to a row
+fun pairs(ui: *bctx.Context, l: look.Look, labels: *str, values: *str, n: usize, cols: usize) {
+    bctx.push_style(ui, l.small);
+    val lh:   f32       = bctx.line_height(ui);
+    val rows: usize     = (n + cols - 1) / cols;
+    val r:    bctx.Area = bw.place(ui, blay.fill(1.0), blay.fixed(lh * rows::f32), 0.0, lh * rows::f32);
+    val cw:   f32       = (r.x1 - r.x0) / cols::f32;
+    val gap:  f32       = bctx.px(ui, 8.0);
+    var i:    usize     = 0;
+    for (i < n) {
+        val x: f32 = r.x0 + (i % cols)::f32 * cw;
+        val y: f32 = r.y0 + (i / cols)::f32 * lh;
+        val w: f32 = bctx.text_width(ui, labels[i]) + gap;
+        bctx.text_at(ui, labels[i], x, y, look.colour(theme.TEXT_FAINT, 1.0));
+        blit.text.fit_at(ui, values[i], x + w, y, cw - w - gap, blit.text.CUT_END, look.colour(theme.TEXT, 1.0));
+        i = i + 1;
+    }
+    bctx.pop_style(ui);
+}
+
+# the stats panel: the population graph, the readout in full, and what the
+# last selection identified was
+# ---
+# ui: the interface
+# l:  cellar's look
+# a:  application state
+# s:  the world as shown
+pub fun stats_page(ui: *bctx.Context, l: look.Look, a: *app.App, s: *world.Shown) {
+    graph(ui, l, s);
+
+    var labels: [7]str;
+    var values: [7]str;
+    var gen:    [32]u8;
+    var pop:    [32]u8;
+    var box:    [64]u8;
+    var sp:     [48]u8;
+    var rb:     [rules.DISPLAY_MAX + 1]u8;
+    gen[text.buf_grouped(?gen[0], 0, world.generation(s))]      = 0;
+    pop[text.buf_grouped(?pop[0], 0, world.population(s)::u64)] = 0;
+    var o: usize          = text.buf_str(?box[0], 0, "none");
+    val b: opt[space.Box] = world.bounds(s);
+    if (sel b.some) {
+        o = text.buf_grouped(?box[0], 0, (b.some.x1 - b.some.x0)::u64);
+        o = text.buf_str(?box[0], o, " x ");
+        o = text.buf_grouped(?box[0], o, (b.some.y1 - b.some.y0)::u64);
+    }
+    box[o] = 0;
+    if (a.uncapped != 0) { o = text.buf_str(?sp[0], 0, "uncapped"); }
+    or {
+        o = text.buf_u64(?sp[0], 0, (a.speed + 0.5)::u64);
+        o = text.buf_str(?sp[0], o, " gen/s");
+    }
+    if (world.hashlife(s) && world.exponent(s) != 0) {
+        o = text.buf_str(?sp[0], o, " x2^");
+        o = text.buf_u64(?sp[0], o, world.exponent(s)::u64);
+    }
+    sp[o]     = 0;
+    labels[0] = "gen";
+    values[0] = ?gen[0];
+    labels[1] = "pop";
+    values[1] = ?pop[0];
+    labels[2] = "box";
+    values[2] = ?box[0];
+    labels[3] = "speed";
+    values[3] = ?sp[0];
+    labels[4] = "world";
+    values[4] = "paused";
+    if (world.running(s)) { values[4] = "running"; }
+    labels[5] = "engine";
+    values[5] = "chunks";
+    if (world.hashlife(s)) { values[5] = "HashLife"; }
+    labels[6] = world.rule_label(s);
+    values[6] = world.rule_string(s, ?rb[0]);
+    pairs(ui, l, ?labels[0], ?values[0], 6, 2);
+    pairs(ui, l, ?labels[6], ?values[6], 1, 1);
+    if (world.full(s)) { look.line(ui, l.small, world.full_reason(s), theme.WARN); }
+
+    if (worker.running(?a.identifier)) { look.note(ui, l, app.IDENTIFYING); }
+    or (a.identified[0] != 0)          { look.note(ui, l, ?a.identified[0]); }
+    or                                 { look.note(ui, l, "Identify a selection to name what it holds"); }
+}
+
+# the ceilings a run pauses at, each switched on or off, its limit dragged along
+# 1, 2 and 5 times the powers of ten
+fun ceilings(ui: *bctx.Context, l: look.Look, a: *app.App, s: *world.Shown) {
+    look.heading(ui, l, "Pause a run that passes");
+    var c:       ceiling.Ceilings = world.ceilings(s);
+    var changed: bool             = false;
+    var k:       usize            = 0;
+    for (k < ceiling.COUNT) {
+        bctx.push_id_int(ui, k::u64);
+        var on: u8 = 0;
+        if (c.on[k]) { on = 1; }
+        if (bw.toggle(ui, ceiling.label(k), ?on)) {
+            c.on[k] = on != 0;
+            changed = true;
+        }
+        if (c.on[k]) {
+            var rd: [48]u8;
+            var o:  usize = text.buf_grouped(?rd[0], 0, c.limit[k]);
+            o     = text.buf_str(?rd[0], o, " ");
+            o     = text.buf_str(?rd[0], o, ceiling.unit(k));
+            rd[o] = 0;
+            var v: f32 = ceiling.notch_of(c.limit[k])::f32;
+            if (bw.slider(ui, "Limit", ?rd[0], ?v, ceiling.notch_lo(k)::f32, ceiling.notch_hi(k)::f32)) {
+                val n: u64 = ceiling.notch((v + 0.5)::usize);
+                if (n != c.limit[k]) {
+                    c.limit[k] = n;
+                    changed    = true;
+                }
+            }
+        }
+        bctx.pop_id(ui);
+        k = k + 1;
+    }
+    if (changed) { app.submit(a, command.Command.ceilings{c}); }
+}
+
+# the settings panel: the ceilings a run pauses at and the interface's size
+# ---
+# ui: the interface
+# l:  cellar's look
+# a:  application state
+# s:  the world as shown
+pub fun settings_page(ui: *bctx.Context, l: look.Look, a: *app.App, s: *world.Shown) {
+    ceilings(ui, l, a, s);
+    look.heading(ui, l, "Interface size");
+    var scales: [4]str;
+    scales[0] = "100%";
+    scales[1] = "125%";
+    scales[2] = "150%";
+    scales[3] = "200%";
+    bw.segmented(ui, ?scales[0], app.SCALE_COUNT, ?a.scale_idx);
+    var v: [64]u8;
+    var o: usize = text.buf_str(?v[0], 0, "cellar ");
+    o    = text.buf_str(?v[0], o, VERSION);
+    v[o] = 0;
+    look.line(ui, l.small, ?v[0], theme.TEXT_FAINT);
+}
+
+# save the world or the custom pattern under the typed name
+fun save(a: *app.App, p: *paths.Paths, kind: u8) {
+    val name: str = blit.field.text(?a.name);
+    if (!saves.usable(name)) {
+        app.say(a, "type a name to save under");
+        ret;
+    }
+    var fname: [80]u8;
+    var path:  [1152]u8;
+    paths.file(p, saves.file_name(name, kind, ?fname[0]), ?path[0]);
+    val f: opt[command.File] = app.file(a, ?path[0]);
+    if (sel f.none)               { ret; }
+    if (kind == saves.KIND_WORLD) { app.submit(a, command.Command.save_world{f.some}); }
+    or                            { app.submit(a, command.Command.save_pattern{f.some}); }
+}
+
+# load a listed file, a world as the world and a pattern as the custom pattern,
+# taking its name as the one to save under, or run a rule table on the world
+fun load(a: *app.App, p: *paths.Paths, e: *saves.Entry) {
+    var path: [1152]u8;
+    paths.file(p, e.name, ?path[0]);
+    val f: opt[command.File] = app.file(a, ?path[0]);
+    if (sel f.none) { ret; }
+    if (e.kind == saves.KIND_RULE) {
+        app.submit(a, command.Command.open{f.some});
+        ret;
+    }
+    var name: [80]u8;
+    blit.field.set(?a.name, saves.stem(e.name, ?name[0]));
+    if (e.kind == saves.KIND_WORLD) { app.submit(a, command.Command.load_world{f.some}); }
+    or                              { app.submit(a, command.Command.load_pattern{f.some}); }
+}
+
+# a file's kind as the list shows it
+fun kind_name(e: *saves.Entry) str {
+    if (e.kind == saves.KIND_WORLD) { ret "world"; }
+    if (e.kind == saves.KIND_RULE)  { ret "rule"; }
+    ret "pattern";
+}
+
+# a listed file as a row, its name cut from the front to fit and its kind at
+# the right; ret whether it was clicked
+fun entry(ui: *bctx.Context, l: look.Look, e: *saves.Entry) bool {
+    val rh:   f32        = bctx.px(ui, 24.0);
+    val r:    bctx.Area  = bw.place(ui, blay.fill(1.0), blay.fixed(rh), 0.0, rh);
+    val h:    bint.Hit   = bint.hit(ui, bctx.id_of(ui, "file"), r.x0, r.y0, r.x1, r.y1, binp.BUTTON_LEFT);
+    val st:   u8         = bth.pick(h.hot, h.active, false, false);
+    val ink:  *bth.Paint = bctx.paint_of(ui, bth.LIST_ITEM, st);
+    val pad:  f32        = bctx.px(ui, 8.0);
+    val kind: str        = kind_name(e);
+    bctx.box(ui, bth.LIST_ITEM, st, r.x0, r.y0, r.x1, r.y1);
+    bctx.push_style(ui, l.small);
+    val kw: f32 = bctx.text_width(ui, kind);
+    look.text_mid(ui, kind, r.x1 - pad - kw, r.y0, r.y1, ink.mark);
+    bctx.pop_style(ui);
+    val ty: f32 = r.y0 + (rh - bctx.line_height(ui)) / 2.0;
+    blit.text.fit_at(ui, e.name, r.x0 + pad, ty, r.x1 - r.x0 - kw - pad * 3.0, blit.text.CUT_START, ink.text);
+    ret h.clicked;
+}
+
+# the end of a path that fits across the column, in the small face
+fun path_line(ui: *bctx.Context, l: look.Look, s: str) {
+    bctx.push_style(ui, l.small);
+    val lh: f32       = bctx.line_height(ui);
+    val r:  bctx.Area = bw.place(ui, blay.fill(1.0), blay.fixed(lh), 0.0, lh);
+    blit.text.fit_at(ui, s, r.x0, r.y0, r.x1 - r.x0, blit.text.CUT_START, look.colour(theme.TEXT_DIM, 1.0));
+    bctx.pop_style(ui);
+}
+
+# the files panel: a name to save the world or the custom pattern under, the
+# worlds, patterns and rules in the data directory, and the screenshot. the
+# directory is read as the panel comes into view and after each save
+# ---
+# ui: the interface
+# l:  cellar's look
+# a:  application state
+# p:  the data directory
+pub fun files_page(ui: *bctx.Context, l: look.Look, a: *app.App, p: *paths.Paths) {
+    if (!p.ok) {
+        look.note(ui, l, "no user data directory is known");
+        ret;
+    }
+    if (!a.files_seen) { a.saves.stale = true; }
+    if (a.saves.stale) {
+        val listed: err[fs.FsError] = saves.refresh(?a.saves, paths.dir(p));
+        if (sel listed.err) { app.say(a, "the data directory could not be read"); }
+    }
+
+    bw.text_field(ui, "name", ?a.name, "Name to save as");
+    var sl: [2]str;
+    sl[0] = "Save world";
+    sl[1] = "Save pattern";
+    val w: usize = bw.buttons(ui, ?sl[0], 2);
+    if (w == 0)                      { save(a, p, saves.KIND_WORLD); }
+    if (w == 1)                      { save(a, p, saves.KIND_PATTERN); }
+    if (bw.button(ui, "Screenshot")) { a.shot = true; }
+    path_line(ui, l, paths.dir(p));
+
+    if (a.saves.items.len == 0) {
+        look.note(ui, l, "No saved worlds or patterns yet");
+        ret;
+    }
+    look.note(ui, l, "Click a world to load it, a pattern to edit it, a rule to run it");
+    var i: usize = 0;
+    for (i < a.saves.items.len) {
+        bctx.push_id_int(ui, i::u64);
+        val clicked: bool = entry(ui, l, ?a.saves.items.data[i]);
+        bctx.pop_id(ui);
+        if (clicked) { load(a, p, ?a.saves.items.data[i]); }
+        i = i + 1;
+    }
+}

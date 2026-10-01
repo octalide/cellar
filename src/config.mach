@@ -18,7 +18,7 @@
 # of seven built-ins in the pattern slot, which is read through the names those
 # built-ins have in the library, and version 1 has no window positions.
 # version 3 added the selection line, version 4 the rule line, version 5 the
-# engine line, and version 6 the ceilings line.
+# engine line, version 6 the ceilings line and version 7 the layout.
 #
 # the engine line is "<engine> <exponent>" after the rule line: the engine
 # chosen, cpu, gpu or hashlife, and HashLife's step exponent. a file without it
@@ -31,6 +31,12 @@
 # the ceilings line follows it: for each ceiling in cellar.ceiling's order, 1
 # or 0 for on or off, then its limit. a file without it keeps the defaults, and
 # `cellar run` reads it alone (load_ceilings).
+#
+# the rest of the file after the ceilings line is the panels' layout, blit's
+# store document as cellar.panel keeps it. a file before version 7 has none,
+# so the panels open in the default layout. the first line's five slots after
+# the panel flag held which sections of the old side panel were expanded, and
+# are written as 0 and skipped.
 
 use cellar.app;
 use cellar.ceiling;
@@ -59,8 +65,8 @@ use std.types.size.usize;
 use std.types.string;
 use std.types.string.str;
 
-# settings-format version written; versions 1 to 5 are still read
-val VERSION: u64 = 6;
+# settings-format version written; versions 1 to 6 are still read
+val VERSION: u64 = 7;
 # the last version that kept the rule as a weighted kernel's integers
 val KERNEL_INTS: usize = 3;
 # the first version with the selection line
@@ -69,6 +75,10 @@ val SEL_LINE: usize = 3;
 val ENGINE_LINE: usize = 5;
 # the first version with the ceilings line
 val CEILING_LINE: usize = 6;
+# the first version with the layout
+val LAYOUT: usize = 7;
+# the first line's retired slots, between the panel flag and the scale
+val RETIRED: usize = 5;
 
 # the engine line's words for the engine chosen
 val ENGINE_CPU:      str = "cpu";
@@ -209,29 +219,30 @@ pub fun save(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) err[persi
     val made: err[fs.FsError] = persist.make_parent(a, path);
     if (sel made.err) { ret err[persist.Error].err{persist.Error.fs{made.err}}; }
 
-    val rc: res[*u8, allo.Error] = allo.allocate[u8](a, CAP);
+    val cap: usize                = CAP + ap.layout.len;
+    val rc:  res[*u8, allo.Error] = allo.allocate[u8](a, cap);
     if (sel rc.err) { ret err[persist.Error].err{persist.Error.alloc{rc.err}}; }
     val buf: *u8 = rc.ok;
 
     var o: usize = 0;
-    o      = wr(buf, o, VERSION);
-    o      = wr(buf, o, (ap.speed * 10.0)::u64);
-    o      = wr(buf, o, ap.mode::u64);
-    o      = wr(buf, o, ap.gutter::u64);
-    o      = wr(buf, o, ap.uncapped::u64);
-    o      = wr(buf, o, (ap.tool == app.TOOL_ERASE)::u64);
-    o      = wr(buf, o, ap.bounds_idx::u64);
-    o      = wr(buf, o, (ap.tool == app.TOOL_STAMP)::u64);
-    o      = wr(buf, o, 0);
-    o      = wr(buf, o, theme.red(ap.solid)::u64);
-    o      = wr(buf, o, theme.green(ap.solid)::u64);
-    o      = wr(buf, o, theme.blue(ap.solid)::u64);
-    o      = wr(buf, o, ap.panel::u64);
-    o      = wr(buf, o, ap.open_run::u64);
-    o      = wr(buf, o, ap.open_draw::u64);
-    o      = wr(buf, o, ap.open_rule::u64);
-    o      = wr(buf, o, ap.open_view::u64);
-    o      = wr(buf, o, ap.open_files::u64);
+    o = wr(buf, o, VERSION);
+    o = wr(buf, o, (ap.speed * 10.0)::u64);
+    o = wr(buf, o, ap.mode::u64);
+    o = wr(buf, o, ap.gutter::u64);
+    o = wr(buf, o, ap.uncapped::u64);
+    o = wr(buf, o, (ap.tool == app.TOOL_ERASE)::u64);
+    o = wr(buf, o, ap.bounds_idx::u64);
+    o = wr(buf, o, (ap.tool == app.TOOL_STAMP)::u64);
+    o = wr(buf, o, 0);
+    o = wr(buf, o, theme.red(ap.solid)::u64);
+    o = wr(buf, o, theme.green(ap.solid)::u64);
+    o = wr(buf, o, theme.blue(ap.solid)::u64);
+    o = wr(buf, o, ap.panel::u64);
+    var r: usize = 0;
+    for (r < RETIRED) {
+        o = wr(buf, o, 0);
+        r = r + 1;
+    }
     o      = wr(buf, o, ap.scale_idx::u64);
     buf[o] = '\n';
     o      = o + 1;
@@ -259,9 +270,16 @@ pub fun save(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) err[persi
         k = k + 1;
     }
     buf[o - 1] = '\n';
+    # the layout runs to the end of the file, without its NUL
+    var l: usize = 0;
+    for (l + 1 < ap.layout.len) {
+        buf[o] = ap.layout.data[l];
+        o      = o + 1;
+        l      = l + 1;
+    }
 
     val wrote: err[fs.FsError] = fs.write_bytes(path, buf, o, persist.FILE_MODE);
-    allo.deallocate[u8](a, buf, CAP);
+    allo.deallocate[u8](a, buf, cap);
     if (sel wrote.err) { ret err[persist.Error].err{persist.Error.fs{wrote.err}}; }
     ret err[persist.Error].ok{};
 }
@@ -288,6 +306,7 @@ pub fun load(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) err[persi
         vector.dnit[u8](?data);
         ret err[persist.Error].err{persist.Error.version{}};
     }
+    app.keep_layout(ap, nil, 0);
     # the integers end with the first line
     val full: usize = data.len;
     var nl:   usize = 0;
@@ -318,13 +337,13 @@ pub fun load(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) err[persi
     if (version <= KERNEL_INTS) { sim.set_rule(s, rule.of(rule.Kind.weighted{read_kernel(?data, ?p)})); }
 
     if (version >= 2) {
-        ap.panel      = bit(read_uint(?data, ?p));
-        ap.open_run   = bit(read_uint(?data, ?p));
-        ap.open_draw  = bit(read_uint(?data, ?p));
-        ap.open_rule  = bit(read_uint(?data, ?p));
-        ap.open_view  = bit(read_uint(?data, ?p));
-        ap.open_files = bit(read_uint(?data, ?p));
-        ap.scale_idx  = read_uint(?data, ?p);
+        ap.panel = bit(read_uint(?data, ?p));
+        var r: usize = 0;
+        for (r < RETIRED) {
+            read_uint(?data, ?p);
+            r = r + 1;
+        }
+        ap.scale_idx = read_uint(?data, ?p);
         if (ap.scale_idx >= app.SCALE_COUNT) { ap.scale_idx = 0; }
     }
     data.len = full;
@@ -349,6 +368,12 @@ pub fun load(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) err[persi
                 read_ceilings(?data, at + 1, ?c);
                 sim.set_ceilings(s, c);
             }
+        }
+        if (version >= LAYOUT) {
+            # the layout is the rest of the file after the ceilings
+            at = at + 1;
+            for (at < full && data.data[at] != '\n') { at = at + 1; }
+            if (at < full) { app.keep_layout(ap, ?data.data[at + 1], full - at - 1); }
         }
     }
     vector.dnit[u8](?data);
@@ -507,12 +532,11 @@ test load__round_trips_settings {
 
     var ap: app.App;
     app.init(?ap);
-    ap.speed     = 30.0;
-    ap.mode      = 2;
-    ap.uncapped  = 1;
-    ap.solid     = 0xff0080;
-    ap.open_rule = 1;
-    ap.tool      = app.TOOL_STAMP;
+    ap.speed    = 30.0;
+    ap.mode     = 2;
+    ap.uncapped = 1;
+    ap.solid    = 0xff0080;
+    ap.tool     = app.TOOL_STAMP;
     sim.set_rule(?s, rule.preset_rule(1));
 
     val path:  str                = "out/test/test_config.config";
@@ -529,7 +553,6 @@ test load__round_trips_settings {
 
     if (bp.mode != 2)                 { ret 1; }
     if (bp.uncapped != 1)             { ret 1; }
-    if (bp.open_rule != 1)            { ret 1; }
     if (bp.solid != 0xff0080)         { ret 1; }
     if (bp.tool != app.TOOL_STAMP)    { ret 1; }
     if (!rule.same(?t.rule, ?s.rule)) { ret 1; }
@@ -856,6 +879,19 @@ test load__reads_every_version {
     if (!loads_ok(?a, ?ap, ?s, path)) { ret 74; }
     got = sim.ceilings(?s);
     if (got.limit[ceiling.POPULATION] != 12345) { ret 75; }
+
+    # version 7 keeps the layout after the ceilings, and an older file has none
+    val doc: str = "[window.12]\nx = 4.0\n\n[docked.12]\nnode = 3\n";
+    if (!app.keep_layout(?ap, doc::*u8, string.str_len(doc))) { ret 76; }
+    if (!saves_ok(?a, ?ap, ?s, path))                         { ret 77; }
+    app.keep_layout(?ap, nil, 0);
+    if (!loads_ok(?a, ?ap, ?s, path) || ap.layout.len != string.str_len(doc) + 1) { ret 78; }
+    if (!string.str_equals(ap.layout.data::str, doc))                             { ret 79; }
+    got = sim.ceilings(?s);
+    if (got.limit[ceiling.POPULATION] != 12345) { ret 80; }
+    val w6: err[fs.FsError] = fs.write_bytes(path, odd::*u8, string.str_len(odd), persist.FILE_MODE);
+    if (sel w6.err)                                         { ret 82; }
+    if (!loads_ok(?a, ?ap, ?s, path) || ap.layout.len != 0) { ret 83; }
 
     fs.remove_file(path);
     app.dnit(?ap);
