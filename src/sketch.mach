@@ -8,12 +8,15 @@
 # below a pixel per cell. a draw samples the finest level whose texels are at
 # least a pixel wide, so no cell falls between samples. the atlas is rebuilt
 # only when the cells or the orientation change, which the stamp a pattern
-# carries tells (pattern.Pattern.seen).
+# carries tells (pattern.Pattern.seen). the stamp's ghost is drawn over the
+# world into boom's pass (cellar.paint), and the draw section's preview by blit
+# as an image, which takes its texels premultiplied.
 
+use blit;
 use gfx: boom.graphics;
 use boom.graphics.renderer.pass_draw_sprite_filtered;
+use cellar.paint;
 use cellar.pattern;
-use cellar.ui;
 use allo: std.allocator;
 use std.allocator.page;
 use std.types.bool.bool;
@@ -48,6 +51,7 @@ val KNEE:  f32 = 0.2;
 # ah:     atlas height in texels
 # lx:     each level's left edge in the atlas
 # ly:     each level's top edge
+# premul: the texels are written premultiplied, as blit samples them
 pub rec Sketch {
     tex:    gfx.Texture;
     made:   bool;
@@ -61,6 +65,7 @@ pub rec Sketch {
     ah:     usize;
     lx:     [LEVELS]usize;
     ly:     [LEVELS]usize;
+    premul: bool;
 }
 
 # the sketches the interface keeps, and the stamps it gives patterns
@@ -68,7 +73,7 @@ pub rec Sketch {
 # a:       allocator for the scratch a build needs
 # d:       the device the atlases live on
 # next:    the last stamp given
-# preview: the draw section's preview, as the pattern is drawn
+# preview: the draw section's preview, as the pattern is drawn, for blit
 # ghost:   the stamp's ghost over the world, as it would be laid down
 pub rec Sketches {
     a:       *allo.Allocator;
@@ -80,11 +85,13 @@ pub rec Sketches {
 
 # start with no atlas
 pub fun init(s: *Sketches, a: *allo.Allocator, d: *gfx.Device) {
-    s.a            = a;
-    s.d            = d;
-    s.next         = 0;
-    s.preview.made = false;
-    s.ghost.made   = false;
+    s.a              = a;
+    s.d              = d;
+    s.next           = 0;
+    s.preview.made   = false;
+    s.preview.premul = false;
+    s.ghost.made     = false;
+    s.ghost.premul   = false;
 }
 
 fun drop(s: *Sketches, k: *Sketch) {
@@ -181,8 +188,9 @@ fun halve(k: *Sketch, l: usize, src: *u32, dst: *u32) {
     }
 }
 
-# write level l's counts into the atlas as white at the density they show
-fun paint(k: *Sketch, l: usize, counts: *u32, px: *u8) {
+# write level l's counts into the atlas as white at the density they show,
+# premultiplied when the sketch asks for it
+fun fill(k: *Sketch, l: usize, counts: *u32, px: *u8) {
     val span: usize = k.k << l;
     val lw:   usize = side(k.w, k.k, l);
     val lh:   usize = side(k.h, k.k, l);
@@ -197,11 +205,14 @@ fun paint(k: *Sketch, l: usize, counts: *u32, px: *u8) {
             if (n != 0) {
                 var cw: usize = k.w - x * span;
                 if (cw > span) { cw = span; }
-                val at: usize = ((k.ly[l] + y) * k.aw + k.lx[l] + x) * 4;
-                px[at]     = 255;
-                px[at + 1] = 255;
-                px[at + 2] = 255;
-                px[at + 3] = (cover(n::f32 / (cw * ch)::f32) * 255.0 + 0.5)::u8;
+                val at:    usize = ((k.ly[l] + y) * k.aw + k.lx[l] + x) * 4;
+                val alpha: u8    = (cover(n::f32 / (cw * ch)::f32) * 255.0 + 0.5)::u8;
+                var white: u8    = 255;
+                if (k.premul) { white = alpha; }
+                px[at]     = white;
+                px[at + 1] = white;
+                px[at + 2] = white;
+                px[at + 3] = alpha;
             }
             x = x + 1;
         }
@@ -236,7 +247,7 @@ fun build(s: *Sketches, k: *Sketch, p: *pattern.Pattern, o: u8) bool {
             a = b;
             b = t;
         }
-        paint(k, l, a, px.ok);
+        fill(k, l, a, px.ok);
         l = l + 1;
     }
     val t: res[gfx.Texture, gfx.Error] = gfx.texture(s.d, px.ok, k.aw::i32, k.ah::i32, gfx.ColorSpace.linear{});
@@ -253,12 +264,38 @@ pub fun large(w: usize, h: usize) bool {
     ret w > 0 && h > SMALL / w;
 }
 
-# draw p laid down in orientation o from k's atlas, its top-left cell at (x0, y0)
-# and ppc pixels a cell, building the atlas first when p changed since
+# where a draw of p samples k's atlas: the finest level whose texels are a
+# pixel or wider, as a rect of the atlas in uv
 # ---
-# u:     the interface
+# s:   the sketches
+# k:   the sketch this draw keeps, one per place a pattern is drawn
+# p:   the pattern
+# o:   orientation, below pattern.ORIENT_COUNT
+# ppc: pixels a cell
+# ret: the rect, or none when p is empty or its atlas could not be built
+fun source(s: *Sketches, k: *Sketch, p: *pattern.Pattern, o: u8, ppc: f32) opt[gfx.Rect] {
+    if (p.w == 0 || p.h == 0) { ret opt[gfx.Rect].none{}; }
+    if (p.seen == 0) {
+        s.next = s.next + 1;
+        p.seen = s.next;
+    }
+    if (!k.made || k.seen != p.seen || k.orient != o) {
+        if (!build(s, k, p, o)) { ret opt[gfx.Rect].none{}; }
+    }
+    var l: usize = 0;
+    for (l + 1 < k.levels && ppc * (k.k << l)::f32 < 1.0) { l = l + 1; }
+    val span: f32 = (k.k << l)::f32;
+    ret opt[gfx.Rect].some{gfx.rect(k.lx[l]::f32 / k.aw::f32, k.ly[l]::f32 / k.ah::f32,
+        k.w::f32 / span / k.aw::f32, k.h::f32 / span / k.ah::f32)};
+}
+
+# draw p laid down in orientation o over the world from k's atlas, its
+# top-left cell at (x0, y0) and ppc pixels a cell, building the atlas first
+# when p changed since
+# ---
+# d:     the world's pass
 # s:     the sketches
-# k:     the sketch this draw keeps, one per place a pattern is drawn
+# k:     the sketch this draw keeps, written straight
 # p:     the pattern
 # o:     orientation, below pattern.ORIENT_COUNT
 # x0:    screen x of the pattern's left edge
@@ -266,23 +303,29 @@ pub fun large(w: usize, h: usize) bool {
 # ppc:   pixels a cell
 # hex:   the colour of a live cell
 # alpha: its opacity
-pub fun draw(u: *ui.Ui, s: *Sketches, k: *Sketch, p: *pattern.Pattern, o: u8, x0: f32, y0: f32, ppc: f32, hex: u32, alpha: f32) {
-    if (p.w == 0 || p.h == 0) { ret; }
-    if (p.seen == 0) {
-        s.next = s.next + 1;
-        p.seen = s.next;
-    }
-    if (!k.made || k.seen != p.seen || k.orient != o) {
-        if (!build(s, k, p, o)) { ret; }
-    }
-    # the finest level whose texels are a pixel or wider
-    var l: usize = 0;
-    for (l + 1 < k.levels && ppc * (k.k << l)::f32 < 1.0) { l = l + 1; }
-    val span: f32      = (k.k << l)::f32;
-    val src:  gfx.Rect = gfx.rect(k.lx[l]::f32 / k.aw::f32, k.ly[l]::f32 / k.ah::f32,
-        k.w::f32 / span / k.aw::f32, k.h::f32 / span / k.ah::f32);
+pub fun draw(d: *paint.Paint, s: *Sketches, k: *Sketch, p: *pattern.Pattern, o: u8, x0: f32, y0: f32, ppc: f32, hex: u32, alpha: f32) {
+    val src: opt[gfx.Rect] = source(s, k, p, o, ppc);
+    if (sel src.none) { ret; }
     val dest: gfx.Rect = gfx.rect(x0, y0, k.w::f32 * ppc, k.h::f32 * ppc);
-    pass_draw_sprite_filtered(u.pass, opt[*gfx.Texture].some{?k.tex}, dest, src, ui.col(u, hex, alpha), gfx.TextureFilter.nearest{});
+    pass_draw_sprite_filtered(d.pass, opt[*gfx.Texture].some{?k.tex}, dest, src.some, paint.col(d, hex, alpha), gfx.TextureFilter.nearest{});
+}
+
+# p laid down in orientation o as a blit image from k's atlas, at ppc pixels
+# a cell, building the atlas first when p changed since; blit stretches it
+# over the pattern's w by h cells
+# ---
+# s:   the sketches
+# k:   the sketch this image keeps, written premultiplied
+# p:   the pattern
+# o:   orientation, below pattern.ORIENT_COUNT
+# ppc: pixels a cell
+# ret: the image, which stays valid until p or o changes, or none when there is nothing to draw
+pub fun image(s: *Sketches, k: *Sketch, p: *pattern.Pattern, o: u8, ppc: f32) opt[blit.draw.Image] {
+    val src: opt[gfx.Rect] = source(s, k, p, o, ppc);
+    if (sel src.none) { ret opt[blit.draw.Image].none{}; }
+    val r: gfx.Rect = src.some;
+    ret opt[blit.draw.Image].some{blit.draw.Image{tex: gfx.blit_texture(?k.tex), u0: r.x, v0: r.y, u1: r.x + r.w, v1: r.y + r.h,
+        filter: blit.draw.FILTER_NEAREST}};
 }
 
 test layout__stacks_the_halved_levels_beside_level_zero {
