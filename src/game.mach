@@ -1,15 +1,18 @@
 # the boom hooks that run cellar: setup, input, stepping, drawing, teardown
 #
-# boom owns the window, the input fold, the renderer and the frame loop. keys,
-# scrolling and panning are read in the fixed tick, where boom gives every edge
-# to exactly one tick. the world is stepped on the simulation thread
+# boom owns the window, the input fold, the renderer and the frame loop. keys
+# and panning are read in the fixed tick, where boom gives every edge to
+# exactly one tick, and the window's events are folded into the interface's
+# input each frame (cellar.gui). the world is stepped on the simulation thread
 # (cellar.runner) on the CPU and HashLife, capped at the rate the speed slider
 # sets or uncapped, and on the GPU when it can be (cellar.gpu), where the
 # generations are recorded with the frame: the capped ones the thread owes, or
-# as many a frame as the GPU's budget allows uncapped. each frame draws the
-# cells straight from the GPU's pool, then the readout and the side panel over
-# them, in one overlay pass, and lets a press on the world paint, erase or
-# stamp once the interface has said nothing of its own is under the cursor.
+# as many a frame as the GPU's budget allows uncapped. each frame builds the
+# interface in blit, where the world claims its view beneath every control so
+# a press, the wheel and the hovered cell reach it only where nothing of the
+# interface is on top, then draws the cells straight from the GPU's pool, the
+# world's own overlays (cellar.paint) and the interface over them in one
+# overlay pass.
 #
 # a frame never waits on a step. it holds the world only when the thread is not
 # stepping it, or between steps when commands are queued, and then applies them,
@@ -64,7 +67,6 @@ use cellar.sketch;
 use cellar.space;
 use cellar.theme;
 use cellar.topology;
-use cellar.ui;
 use cellar.world;
 use allo: std.allocator;
 use std.allocator.page;
@@ -86,19 +88,12 @@ use std.types.size.usize;
 use std.types.string;
 use std.types.string.str;
 
-# the interface face, a DejaVu Sans subset (res/fonts/LICENSE-DejaVu)
-#[embed("../res/fonts/DejaVuSans-subset.ttf")]
-val FONT: [_]u8;
-
 # the fixed update step the input and capped stepping run at
 pub val TICK: Duration = SECOND / 60;
 # unscaled pixels the view pans per tick while an arrow key is held
 val PAN_STEP: f32 = 12.0;
 # zoom factor change per scroll notch
 val ZOOM_STEP: f32 = 0.1;
-# unscaled line heights of the two faces
-val BODY_PX:  f32 = 17.0;
-val SMALL_PX: f32 = 14.0;
 
 # everything cellar holds between hooks, reached through ctx.user
 # ---
@@ -109,14 +104,11 @@ val SMALL_PX: f32 = 14.0;
 # shown:       what the interface shows of the world, as of the last
 #              completed generation it saw
 # renderer:    boom's renderer on the window
-# ui:          the interface
+# srgb:        the swapchain encodes sRGB
 # gui:         the interface's blit host
 # gui_ok:      gui is set up
 # world:       what the pointer did to the world this frame, beneath the interface
 # paths:       the data directory
-# body:        the label face
-# small:       the heading and readout face
-# faces_at:    the interface scale the faces were built for, 0 for none
 # snap:        a screenshot being read back
 # capture:     a path to save one screenshot to and quit, or nil
 # open:        a world or pattern file to open at startup, or nil
@@ -149,14 +141,11 @@ pub rec Game {
     runner:      runner.Runner;
     shown:       world.Shown;
     renderer:    gfx.Renderer;
-    ui:          ui.Ui;
+    srgb:        bool;
     gui:         gui.Gui;
     gui_ok:      bool;
     world:       bint.Hit;
     paths:       paths.Paths;
-    body:        gfx.Font;
-    small:       gfx.Font;
-    faces_at:    f32;
     snap:        shot.Shot;
     capture:     str;
     open:        str;
@@ -209,7 +198,6 @@ pub fun on_init(ctx: *Context) {
     g.sim_ok      = false;
     g.renderer_ok = false;
     g.gui_ok      = false;
-    g.faces_at    = 0.0;
     val paged: err[allo.Error] = page.make(?g.a);
     if (sel paged.err) {
         give_up(ctx, "could not make the page allocator");
@@ -255,15 +243,8 @@ pub fun on_init(ctx: *Context) {
         ret;
     }
     g.renderer_ok = true;
-    g.ui.srgb     = gfx.renderer_is_srgb(?g.renderer);
-    g.ui.body     = ?g.body;
-    g.ui.small    = ?g.small;
-    g.ui.s        = app.scale(g.app.scale_idx);
+    g.srgb        = gfx.renderer_is_srgb(?g.renderer);
     sketch.init(?g.sketches, ?g.a, gfx.renderer_device(?g.renderer));
-    if (!faces(g)) {
-        give_up(ctx, "could not load the interface font");
-        ret;
-    }
     g.gui_ok = gui.init(?g.gui, ?g.a, gfx.renderer_device(?g.renderer), ctx);
     if (!g.gui_ok) {
         give_up(ctx, "could not set up the interface");
@@ -273,7 +254,7 @@ pub fun on_init(ctx: *Context) {
     # the palettes are converted once, into the space the window stores
     var heat: [1024]f32;
     var age:  [1024]f32;
-    render.palettes(?heat[0], ?age[0], g.ui.srgb);
+    render.palettes(?heat[0], ?age[0], g.srgb);
     val gr: err[gfx.Error] = gpu.init(?g.gpu, ?g.a, ?g.renderer, g.sim.space.cap, ?heat[0], ?age[0]);
     if (sel gr.err) {
         print.eprintlnf("could not set up the world on the GPU: {}", gfx.error_message(gr.err));
@@ -368,36 +349,6 @@ pub fun start_world(a: *app.App, s: *sim.Sim, open: str, capture: bool, engine: 
     ret true;
 }
 
-# release the faces
-fun faces_dnit(g: *Game) {
-    if (g.faces_at == 0.0) { ret; }
-    val d: *gfx.Device = gfx.renderer_device(?g.renderer);
-    gfx.font_delete(d, ?g.body);
-    gfx.font_delete(d, ?g.small);
-    g.faces_at = 0.0;
-}
-
-# build the faces for the current interface scale, when it changed
-fun faces(g: *Game) bool {
-    val s: f32 = app.scale(g.app.scale_idx);
-    g.ui.s = s;
-    if (g.faces_at == s) { ret true; }
-    faces_dnit(g);
-    val d: *gfx.Device              = gfx.renderer_device(?g.renderer);
-    val b: res[gfx.Font, gfx.Error] = gfx.font_from_bytes(?g.a, d, ?FONT[0], $length_of(FONT), BODY_PX * s);
-    if (sel b.err) { ret false; }
-    val m: res[gfx.Font, gfx.Error] = gfx.font_from_bytes(?g.a, d, ?FONT[0], $length_of(FONT), SMALL_PX * s);
-    if (sel m.err) {
-        var bf: gfx.Font = b.ok;
-        gfx.font_delete(d, ?bf);
-        ret false;
-    }
-    g.body     = b.ok;
-    g.small    = m.ok;
-    g.faces_at = s;
-    ret true;
-}
-
 # flip between windowed and borderless fullscreen on the current monitor
 fun toggle_fullscreen(ctx: *Context) {
     var mode: win.WindowMode = win.WindowMode.borderless{};
@@ -469,15 +420,12 @@ fun paste(ctx: *Context, a: *app.App, rule: bool) {
 # hand the window's queued events, typed text among them, to the interface in
 # order, and open a file dropped on the window. a drop's paths live until the
 # next poll, so the command takes its own copy here
-fun events(q: *EventQueue, u: *ui.Ui, h: *gui.Gui, a: *app.App) {
+fun events(q: *EventQueue, h: *gui.Gui, a: *app.App) {
     for {
         val e: opt[Event] = queue_pop(q);
         if (sel e.none)      { brk; }
         if (sel e.some.drop) { app.drop(a, e.some.drop.paths, e.some.drop.count); }
-        or {
-            ui.feed(u, e.some);
-            gui.fold(h, e.some);
-        }
+        or                   { gui.fold(h, e.some); }
     }
 }
 
@@ -486,11 +434,10 @@ fun tick(ctx: *Context) {
     val g:  *Game      = game_of(ctx);
     val in: *inp.Input = ?ctx.input;
     val a:  *app.App   = ?g.app;
-    val u:  *ui.Ui     = ?g.ui;
 
     # while a field has the keyboard the key bindings stay quiet, including on
     # the tick whose enter or escape gives it back
-    val typing: bool = ui.typing(u) || gui.typing(?g.gui);
+    val typing: bool = gui.typing(?g.gui);
     if (!typing)       { keys(ctx, g); }
     if (a.toast_t > 0) { a.toast_t = a.toast_t - 1; }
     if (g.gpu_ok)      { gpu.display(?g.gpu, win.window_refresh_hz(?ctx.window)); }
@@ -716,11 +663,7 @@ fun shown(p0: f32, c: f32, n: usize, end: f32) Shown {
 # ctx: the running context
 pub fun on_draw(ctx: *Context) {
     val g: *Game = game_of(ctx);
-    if (!g.renderer_ok || !g.gpu_ok || !g.gui_ok || g.faces_at == 0.0) { ret; }
-    if (!faces(g)) {
-        give_up(ctx, "could not load the interface font");
-        ret;
-    }
+    if (!g.renderer_ok || !g.gpu_ok || !g.gui_ok) { ret; }
 
     val br: res[bool, gfx.Error] = gfx.renderer_begin_frame(?g.renderer);
     if (sel br.err) {
@@ -733,10 +676,9 @@ pub fun on_draw(ctx: *Context) {
     # the overlay pass and the cursor are both in framebuffer pixels
     val sw: f32      = gfx.renderer_width(?g.renderer)::f32;
     val sh: f32      = gfx.renderer_height(?g.renderer)::f32;
-    val u:  *ui.Ui   = ?g.ui;
     val a:  *app.App = ?g.app;
     gui.open(?g.gui, ctx);
-    events(?ctx.events, u, ?g.gui, a);
+    events(?ctx.events, ?g.gui, a);
 
     # the frame holds the world only when the thread is not stepping it, or
     # between steps when commands wait, and releases it before drawing
@@ -780,7 +722,7 @@ pub fun on_draw(ctx: *Context) {
     # record the frame's generations and the view, or show the last completed
     # generation while the thread steps the next; edits made after this wait
     # in the queue for a frame that holds the world
-    var look: gpu.Look       = render.look(cam, sw, a.mode::u8, a.gutter, a.solid, u.srgb);
+    var look: gpu.Look       = render.look(cam, sw, a.mode::u8, a.gutter, a.solid, g.srgb);
     var rec:  err[gfx.Error] = err[gfx.Error].ok{};
     if (held) {
         # the capped generations the thread owes the GPU, while it runs
@@ -841,7 +783,7 @@ pub fun on_draw(ctx: *Context) {
     gui.end(?g.gui, ctx);
 
     # the world's overlays, then the interface over everything
-    var d: paint.Paint = paint.Paint{pass: ?pass, srgb: u.srgb};
+    var d: paint.Paint = paint.Paint{pass: ?pass, srgb: g.srgb};
     grid_edge(g, ?d, cam);
     outline(g, ?d, cam);
     hud.selection(?d, a, cam, sc);
@@ -923,7 +865,6 @@ pub fun on_dnit(ctx: *Context) {
         if (g.gpu_ok) { gpu.dnit(?g.gpu); }
         sketch.dnit(?g.sketches);
         if (g.gui_ok) { gui.dnit(?g.gui); }
-        faces_dnit(g);
         val down: err[gfx.Error] = gfx.renderer_dnit(?g.renderer);
         if (sel down.err) {
             print.eprintlnf("renderer refused to shut down: {}", gfx.error_message(down.err));
@@ -1085,9 +1026,8 @@ test events__open_the_first_dropped_file_and_say_the_rest_were_ignored {
     if (sel got.err) { ret 1; }
     val pushed: err[QueueError] = queue_push(?q, Event.drop{got.ok});
     if (sel pushed.err) { ret 1; }
-    var u: ui.Ui;
     var h: gui.Gui;
-    events(?q, ?u, ?h, ?ap);
+    events(?q, ?h, ?ap);
     queue_clear(?q);
     if (ap.queue.items.len != 1) { ret 2; }
 
