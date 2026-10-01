@@ -1,16 +1,41 @@
-# the uncapped stepping thread
+# the simulation thread
 #
-# while the simulation runs uncapped, a worker thread steps it back to back,
-# as fast as the machine allows, decoupled from the frame rate. the world is
-# guarded by one lock. a step runs whole under it, so the UI thread, holding
-# the lock while it reads or edits the world, always sees a completed
-# generation. the worker hands the lock over between steps whenever the UI
-# thread asks for it, so a long run never starves input or drawing, and it
-# sleeps on a condition while there is nothing to step.
+# the world is stepped here, off the interface's thread, on the CPU and
+# HashLife engines, whether capped or uncapped, and capped pacing is a rate this
+# thread keeps: generations come due on its clock, not in the frame. the GPU
+# engine's generations are compute work recorded into the frame, since boom
+# records every dispatch into the frame's one command buffer on the one queue
+# the render thread submits, so there the thread keeps the rate alone and hands
+# the generations it owes to the frame (owed), which records them.
+#
+# the world has one holder at a time (hold). the thread holds it for a step, and
+# the interface takes it (take) for what only the holder may do: applying the
+# command queue (cellar.exec), and recording the GPU's generations. take never
+# waits. it succeeds when the thread is between steps, and otherwise asks the
+# thread to stop at the next one (asked), so commands apply between steps, a
+# frame or so later, and the interface draws on in the meantime. while the
+# thread is not stepping the world, paused, full or on the GPU, the interface
+# takes it every frame and the world runs as if there were no thread.
+#
+# a step is two halves (sim.advance, sim.commit). advance changes nothing a draw
+# reads, so while it runs the interface draws the last completed generation:
+# the CPU's front cells, or the squares of the tree the pool last showed. commit
+# makes the next generation the world's under the publication's lock (view),
+# which the thread holds for nothing else, and posts what the interface shows
+# of the world (world.Shown), with the tree's view rebuilt for the camera the
+# interface last aimed. the interface only ever tries that lock, so a frame
+# that meets a commit moves the camera over the cells it has and takes the new
+# generation with the next.
 
+use cellar.gpu;
 use cellar.sim;
+use cellar.world;
 use allo: std.allocator;
 use std.allocator.page;
+use std.chrono.duration.Duration;
+use std.chrono.duration.SECOND;
+use std.chrono.time;
+use std.chrono.time.Instant;
 use std.sync.atomic;
 use std.sync.condition;
 use std.sync.mutex;
@@ -21,132 +46,345 @@ use std.types.bool.true;
 use std.types.error.err;
 use std.types.size.usize;
 
-# the lock, the worker and what it is asked to do
+# who holds the world: nobody, between steps or idle
+val HOLD_FREE: u8 = 0;
+# the thread, for a step
+val HOLD_SIM: u8 = 1;
+# the interface
+val HOLD_UI: u8 = 2;
+
+# generations capped pacing may fall behind before the backlog is dropped, so
+# a world slower than its rate cannot spiral
+val MAX_BEHIND: u64 = 16;
+
+# the thread, the world's holder and what the thread is asked to do
 # ---
-# lock:    guards the simulation and the fields below
-# wake:    signalled when the worker has something to do or should quit
-# worker:  the stepping thread
-# sim:     the simulation it steps
-# active:  1 while the worker should step, written under lock
-# quit:    1 once the worker should exit, written under lock
-# waiting: how many callers of enter are waiting for the lock
-# started: the worker was spawned and has not been joined
+# lock:     guards the fields below up to view; never held across a step
+# wake:     signalled when the thread may have something to do or should quit
+# worker:   the thread
+# sim:      the world it steps
+# holder:   HOLD_FREE, HOLD_SIM or HOLD_UI
+# asked:    1 while the interface waits for the world at the next step, atomic
+# running:  the world runs, as of its last holder
+# full:     the world is full, as of its last holder
+# on_gpu:   the GPU steps the world, so the frame records its generations
+# uncapped: generations follow each other as fast as they are made
+# speed:    generations a second while capped
+# timed:    the capped clock is running
+# next:     when the next capped generation comes due
+# due:      capped generations owed to the frame, on the GPU
+# quit:     the thread should exit
+# started:  the thread was spawned and has not been joined
+# view:     guards the publication below and what a draw reads of the world
+# look:     the camera the interface last aimed, in cells
+# looked:   look holds one
+# shown:    what the interface shows of the last completed generation
+# posted:   shown holds a generation the interface has not taken
 pub rec Runner {
-    lock:    mutex.Mutex;
-    wake:    condition.Condition;
-    worker:  thread.Thread;
-    sim:     *sim.Sim;
-    active:  i64;
-    quit:    i64;
-    waiting: i64;
-    started: bool;
+    lock:     mutex.Mutex;
+    wake:     condition.Condition;
+    worker:   thread.Thread;
+    sim:      *sim.Sim;
+    holder:   u8;
+    asked:    i64;
+    running:  bool;
+    full:     bool;
+    on_gpu:   bool;
+    uncapped: bool;
+    speed:    f64;
+    timed:    bool;
+    next:     Instant;
+    due:      u64;
+    quit:     bool;
+    started:  bool;
+    view:     mutex.Mutex;
+    look:     gpu.Look;
+    looked:   bool;
+    shown:    world.Shown;
+    posted:   bool;
+}
+
+fun now() Instant {
+    val t: time.InstantClock = time.instant();
+    if (sel t.ok) { ret t.ok; }
+    ret Instant{sec: 0, nsec: 0};
+}
+
+# the time between capped generations
+fun interval(r: *Runner) Duration {
+    var gps: f64 = r.speed;
+    if (gps < 0.001) { gps = 0.001; }
+    ret (SECOND::f64 / gps)::Duration;
+}
+
+# whether a capped generation is due, starting the clock when it is not running
+fun due(r: *Runner) bool {
+    val t: Instant = now();
+    if (!r.timed) {
+        r.timed = true;
+        r.next  = time.instant_add(t, interval(r));
+        ret false;
+    }
+    ret !time.instant_before(t, r.next);
+}
+
+# move the clock past a generation that came due, dropping a backlog past
+# MAX_BEHIND
+fun tick(r: *Runner) {
+    val iv: Duration = interval(r);
+    r.next = time.instant_add(r.next, iv);
+    val behind: Duration = time.instant_sub(now(), r.next);
+    if (behind > iv * MAX_BEHIND::Duration) { r.next = time.instant_add(now(), iv); }
+}
+
+# one step, and its publication: the step entry
+fun step(r: *Runner) {
+    val s:    *sim.Sim = r.sim;
+    val owed: bool     = sim.advance(s);
+    mutex.lock(?r.view);
+    if (owed) { sim.commit(s); }
+    if (!r.posted) {
+        if (r.looked) { sim.show_view(s, r.look); }
+        world.observe(s, ?r.shown);
+        r.posted = true;
+    }
+    mutex.unlock(?r.view);
 }
 
 fun work(arg: *u8) {
     val r: *Runner = arg::*Runner;
     mutex.lock(?r.lock);
-    for (r.quit == 0) {
-        if (r.active == 0) {
+    for (!r.quit) {
+        val pacing:   bool = r.running && !r.full && !r.uncapped;
+        val stepping: bool = r.running && !r.full && !r.on_gpu;
+        if (!pacing) { r.timed = false; }
+        if (pacing && !due(r)) {
+            condition.wait_until(?r.wake, ?r.lock, r.next);
+            cnt;
+        }
+        if (!stepping) {
+            if (pacing) {
+                if (r.due < MAX_BEHIND) { r.due = r.due + 1; }
+                tick(r);
+                cnt;
+            }
             condition.wait(?r.wake, ?r.lock);
             cnt;
         }
-        sim.step(r.sim);
-        if (atomic.load(?r.waiting) != 0) {
-            # hand over: the mutex is unfair, so re-locking at once could
-            # keep winning it from the UI thread indefinitely
-            mutex.unlock(?r.lock);
-            for (atomic.load(?r.waiting) != 0) { atomic.spin_hint(); }
-            mutex.lock(?r.lock);
+        if (atomic.load(?r.asked) != 0 || r.holder != HOLD_FREE) {
+            condition.wait(?r.wake, ?r.lock);
+            cnt;
         }
+        if (pacing) { tick(r); }
+        r.holder = HOLD_SIM;
+        mutex.unlock(?r.lock);
+        step(r);
+        mutex.lock(?r.lock);
+        r.running = r.sim.running != 0;
+        r.full    = r.sim.full;
+        r.holder  = HOLD_FREE;
     }
     mutex.unlock(?r.lock);
 }
 
-# start the worker, idle until leave asks it to step
+# start the thread, idle until the interface first gives the world back
 # ---
 # r:   runner to start
-# s:   the simulation it guards and steps
+# s:   the world it steps
 # ret: ok, or why the thread could not be spawned
 pub fun start(r: *Runner, s: *sim.Sim) err[thread.ThreadError] {
-    r.lock    = mutex.make();
-    r.wake    = condition.make();
-    r.sim     = s;
-    r.active  = 0;
-    r.quit    = 0;
-    r.waiting = 0;
-    r.started = false;
+    r.lock     = mutex.make();
+    r.wake     = condition.make();
+    r.view     = mutex.make();
+    r.sim      = s;
+    r.holder   = HOLD_FREE;
+    r.asked    = 0;
+    r.running  = false;
+    r.full     = false;
+    r.on_gpu   = false;
+    r.uncapped = false;
+    r.speed    = 1.0;
+    r.timed    = false;
+    r.due      = 0;
+    r.quit     = false;
+    r.started  = false;
+    r.looked   = false;
+    r.posted   = false;
     val spawned: thread.Operation = thread.spawn_with(work, r::*u8, ?r.worker);
     if (sel spawned.err) { ret err[thread.ThreadError].err{spawned.err}; }
     r.started = true;
     ret err[thread.ThreadError].ok{};
 }
 
-# take the lock before reading or changing the simulation
-# ---
-# r: the runner
-pub fun enter(r: *Runner) {
-    atomic.fetch_add(?r.waiting, 1);
-    mutex.lock(?r.lock);
-    atomic.fetch_sub(?r.waiting, 1);
-}
-
-# release the lock, telling the worker whether to keep stepping
+# take the world, without waiting, when the thread is not stepping it, or when
+# need asks for it and the thread is between steps. a need that finds the
+# thread stepping asks it to stop at the next step and give the world over
 # ---
 # r:    the runner
-# step: true while the simulation runs uncapped
-pub fun leave(r: *Runner, step: bool) {
-    r.active = 0;
-    if (step) {
-        r.active = 1;
+# need: the interface has commands to apply, or must hold the world this frame
+# ret:  the interface holds the world until give
+pub fun take(r: *Runner, need: bool) bool {
+    mutex.lock(?r.lock);
+    val stepping: bool = r.running && !r.full && !r.on_gpu;
+    val got:      bool = r.holder == HOLD_FREE && (need || !stepping);
+    if (got) {
+        r.holder = HOLD_UI;
+        atomic.store(?r.asked, 0);
+    }
+    or (need) { atomic.store(?r.asked, 1); }
+    mutex.unlock(?r.lock);
+    ret got;
+}
+
+# give the world back after take, and let the thread step it as it now stands
+# ---
+# r: the runner
+pub fun give(r: *Runner) {
+    mutex.lock(?r.lock);
+    val s: *sim.Sim = r.sim;
+    r.running = s.running != 0;
+    r.full    = s.full;
+    r.on_gpu  = sim.on_gpu(s);
+    # the interface saw the world itself, so the next step posts again
+    r.posted = false;
+    r.holder = HOLD_FREE;
+    condition.signal(?r.wake);
+    mutex.unlock(?r.lock);
+}
+
+# whether the interface is waiting for the world, which a step may stop early for
+pub fun asked(r: *Runner) bool {
+    ret atomic.load(?r.asked) != 0;
+}
+
+# set how the world runs while it runs: as fast as it can, or capped at speed
+# generations a second
+# ---
+# r:        the runner
+# uncapped: generations follow each other as fast as they are made
+# speed:    generations a second while capped
+pub fun pace(r: *Runner, uncapped: bool, speed: f64) {
+    mutex.lock(?r.lock);
+    if (r.uncapped != uncapped || r.speed != speed) {
+        r.uncapped = uncapped;
+        r.speed    = speed;
+        r.timed    = false;
         condition.signal(?r.wake);
     }
     mutex.unlock(?r.lock);
 }
 
-# stop the worker and wait for it to exit
+# the capped generations come due since the last call, for the frame to record
+# on the GPU
+pub fun owed(r: *Runner) u64 {
+    mutex.lock(?r.lock);
+    val n: u64 = r.due;
+    r.due = 0;
+    mutex.unlock(?r.lock);
+    ret n;
+}
+
+# try to reach the last completed generation while the thread may be stepping,
+# without waiting: false while a step is committing. on true the draw may read
+# what sim.show reads, until unview
+# ---
+# r:    the runner
+# look: the camera, in cells, the next tree view is built for
+pub fun view(r: *Runner, look: gpu.Look) bool {
+    if (!mutex.try_lock(?r.view)) { ret false; }
+    r.look   = look;
+    r.looked = true;
+    ret true;
+}
+
+# copy what the interface shows of the world, when a step posted it since the
+# last copy; call between view and unview
+# ---
+# r:   the runner
+# out: receives it
+pub fun seen(r: *Runner, out: *world.Shown) {
+    if (!r.posted) { ret; }
+    @out     = r.shown;
+    r.posted = false;
+}
+
+# let the next step commit, after view
+pub fun unview(r: *Runner) {
+    mutex.unlock(?r.view);
+}
+
+# stop the thread once its step ends, and wait for it to exit
 # ---
 # r: the runner
 pub fun stop(r: *Runner) {
     if (!r.started) { ret; }
-    # asked for as enter asks, so a worker stepping back to back hands the
-    # lock over rather than winning it again at once
-    enter(r);
-    r.quit = 1;
+    mutex.lock(?r.lock);
+    r.quit = true;
     condition.signal(?r.wake);
     mutex.unlock(?r.lock);
     thread.join(?r.worker);
     r.started = false;
 }
 
-test runner__steps_while_asked_and_stops {
+test runner__steps_while_running_and_gives_the_world_between_steps {
     var a:    allo.Allocator;
     val made: err[allo.Error] = page.make(?a);
     if (sel made.err) { ret 1; }
-    var s:     sim.Sim;
-    val world: err[allo.Error] = sim.init(?s, ?a);
-    if (sel world.err) { ret 2; }
+    var s:      sim.Sim;
+    val inited: err[allo.Error] = sim.init(?s, ?a);
+    if (sel inited.err) { ret 2; }
+    sim.randomize(?s, sim.DEFAULT_DENSITY, 64);
 
     var r:       Runner;
     val started: err[thread.ThreadError] = start(?r, ?s);
     if (sel started.err) { ret 3; }
-    enter(?r);
-    leave(?r, true);
+    # paused, the interface holds the world whenever it likes
+    if (!take(?r, false)) { ret 4; }
+    s.running = 1;
+    pace(?r, true, 1.0);
+    give(?r);
 
-    # every look at the world is a completed generation taken under the lock
-    var seen:  u64   = 0;
+    # uncapped, the generations posted climb while only the publication is read
+    var look:  gpu.Look;
+    var shown: world.Shown;
+    shown.generation = 0;
     var tries: usize = 0;
-    for (seen < 8 && tries < 100000000) {
-        enter(?r);
-        seen = s.generation;
-        leave(?r, true);
+    for (shown.generation < 8 && tries < 100000000) {
+        if (view(?r, look)) {
+            seen(?r, ?shown);
+            unview(?r);
+        }
         tries = tries + 1;
     }
-    if (seen < 8) { ret 4; }
+    if (shown.generation < 8) { ret 5; }
 
-    enter(?r);
-    leave(?r, false);
+    # a need is met between steps, and the world then stands still
+    var got: bool = false;
+    tries = 0;
+    for (!got && tries < 100000000) {
+        got   = take(?r, true);
+        tries = tries + 1;
+    }
+    if (!got || asked(?r)) { ret 6; }
+    s.running = 0;
+    give(?r);
+
+    # capped, the thread keeps the rate however fast it could step
+    if (!take(?r, false)) { ret 8; }
+    s.running = 1;
+    pace(?r, false, 20.0);
+    val from: u64     = s.generation;
+    val t0:   Instant = now();
+    give(?r);
+    var waited: Duration = 0;
+    for (waited < SECOND / 4) { waited = time.instant_sub(now(), t0); }
+    for (!take(?r, true)) {}
+    val secs: f64 = time.instant_sub(now(), t0)::f64 / SECOND::f64;
+    if ((s.generation - from)::f64 > secs * 20.0 + 2.0) { ret 9; }
+    give(?r);
+
     stop(?r);
-    if (r.started) { ret 5; }
+    if (r.started) { ret 10; }
     sim.dnit(?s);
     ret 0;
 }
