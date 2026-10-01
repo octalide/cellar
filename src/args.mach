@@ -8,17 +8,22 @@
 #
 #   cellar [--version] [--capture <file.png>] [--bench <gpu|cpu> <dense|sparse> [seconds [radius [speed]]]]
 #          [--engine <cpu|gpu|hashlife>] [--] [file]
-#   cellar run <pattern> --gens <n> [--rule <rule>] [--engine <cpu|hashlife>] [--out <file>] [--quiet] [--]
+#   cellar run <pattern> --gens <n> [--rule <rule>] [--engine <cpu|hashlife>] [--out <file>] [--quiet]
+#              [--max-population <n|off>] [--max-chunks <n|off>] [--max-memory <MiB|off>] [--max-step-ms <ms|off>] [--]
 #
 # --engine names the engine the world runs on: the chunk pool stepped by the
 # CPU or by the GPU, or HashLife. left out, the pool runs on the GPU where it
 # can. a batch run has no GPU, and on HashLife --gens goes straight to the
 # generation by powers of two, so it needs no step size of its own.
 #
+# the --max-* options set a batch run's ceilings (cellar.ceiling) to a limit in
+# the ceiling's unit, or off, over what the saved settings keep.
+#
 # a first argument of exactly "run" names the batch command, whose options are
 # its own, and anything else is the session's command line. a file named run is
 # opened as ./run or after --.
 
+use cellar.ceiling;
 use cellar.rules.weighted;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -30,10 +35,10 @@ use std.types.string.str;
 use std.types.string.str_equals;
 
 # the usage printed with a refusal of the session's command line, both forms
-pub val USAGE: str = "usage: cellar [--version] [--capture <file.png>] [--bench <gpu|cpu> <dense|sparse> [seconds [radius [speed]]]]\n              [--engine <cpu|gpu|hashlife>] [--] [file]\n       cellar run <pattern> --gens <n> [--rule <rule>] [--engine <cpu|hashlife>] [--out <file>] [--quiet] [--]";
+pub val USAGE: str = "usage: cellar [--version] [--capture <file.png>] [--bench <gpu|cpu> <dense|sparse> [seconds [radius [speed]]]]\n              [--engine <cpu|gpu|hashlife>] [--] [file]\n       cellar run <pattern> --gens <n> [--rule <rule>] [--engine <cpu|hashlife>] [--out <file>] [--quiet]\n                  [--max-population <n|off>] [--max-chunks <n|off>] [--max-memory <MiB|off>] [--max-step-ms <ms|off>] [--]";
 
 # the usage printed with a refusal of a batch run, its form alone
-pub val RUN_USAGE: str = "usage: cellar run <pattern> --gens <n> [--rule <rule>] [--engine <cpu|hashlife>] [--out <file>] [--quiet] [--]";
+pub val RUN_USAGE: str = "usage: cellar run <pattern> --gens <n> [--rule <rule>] [--engine <cpu|hashlife>] [--out <file>] [--quiet]\n                  [--max-population <n|off>] [--max-chunks <n|off>] [--max-memory <MiB|off>] [--max-step-ms <ms|off>] [--]";
 
 # an interactive session
 pub val COMMAND_APP: u8 = 0;
@@ -71,6 +76,8 @@ pub val BENCH_SECS: f64 = 10.0;
 # out:     the file to write the result to, its format by its extension, or
 #          nil for RLE on stdout
 # quiet:   leave the generation and population off stderr
+# set:     each ceiling an option set
+# limit:   each ceiling's limit as set, 0 for off
 pub rec Run {
     pattern: str;
     rule:    str;
@@ -78,6 +85,8 @@ pub rec Run {
     engine:  u8;
     out:     str;
     quiet:   bool;
+    set:     [4]bool;
+    limit:   [4]u64;
 }
 
 # what the command line asks for
@@ -227,6 +236,16 @@ fun gens(s: str, out: *u64) bool {
     ret true;
 }
 
+# a ceiling's limit, off as 0, or false when s is neither off nor a whole
+# number GENS_MAX holds
+fun limit_of(s: str, out: *u64) bool {
+    if (str_equals(s, "off")) {
+        @out = 0;
+        ret true;
+    }
+    ret gens(s, out) && @out != 0;
+}
+
 # the value after an option taking one, or why there is none
 fun value(argc: i64, argv: *str, i: *i64, taken: bool, name: str, out: *str) opt[Error] {
     if (taken)      { ret opt[Error].some{Error.twice{name}}; }
@@ -266,6 +285,12 @@ fun parse_run(argc: i64, argv: *str, r: *Args) opt[Error] {
     o.engine  = ENGINE_ANY;
     o.out     = nil;
     o.quiet   = false;
+    var k: usize = 0;
+    for (k < ceiling.COUNT) {
+        o.set[k]   = false;
+        o.limit[k] = 0;
+        k          = k + 1;
+    }
     var counted: bool = false;
     var flags:   bool = true;
     var i:       i64  = 2;
@@ -294,6 +319,13 @@ fun parse_run(argc: i64, argv: *str, r: *Args) opt[Error] {
             e = value(argc, argv, ?i, counted, s, ?n);
             if (sel e.none && !gens(n, ?o.gens)) { e = opt[Error].some{Error.value{n}}; }
             counted = true;
+        }
+        or (ceiling.of_flag(s) != ceiling.COUNT) {
+            val c: usize = ceiling.of_flag(s);
+            var n: str   = nil;
+            e = value(argc, argv, ?i, o.set[c], s, ?n);
+            if (sel e.none && !limit_of(n, ?o.limit[c])) { e = opt[Error].some{Error.value{n}}; }
+            o.set[c] = true;
         }
         or              { e = opt[Error].some{Error.unknown{s}}; }
         if (sel e.some) { ret e; }
@@ -493,6 +525,16 @@ test parse__reads_a_batch_run_and_keeps_run_as_a_file_otherwise {
     val d: res[Args, Error] = line("--", "run");
     if (!sel d.ok)                                                    { ret 6; }
     if (d.ok.command != COMMAND_APP || !str_equals(d.ok.open, "run")) { ret 6; }
+    # a ceiling set to a limit or off, the others left to the settings
+    val e: res[Args, Error] = line("run", "gun.rle", "--gens", "9", "--max-population", "5000", "--max-memory", "off");
+    if (!sel e.ok)                                                                       { ret 7; }
+    if (!e.ok.run.set[ceiling.POPULATION] || e.ok.run.limit[ceiling.POPULATION] != 5000) { ret 8; }
+    if (!e.ok.run.set[ceiling.MEMORY] || e.ok.run.limit[ceiling.MEMORY] != 0)            { ret 9; }
+    if (e.ok.run.set[ceiling.POOL] || e.ok.run.set[ceiling.STEP])                        { ret 10; }
+    val f: res[Args, Error] = line("run", "gun.rle", "--gens", "9", "--max-chunks", "0");
+    if (!(sel f.err && sel f.err.value)) { ret 11; }
+    val g: res[Args, Error] = line("run", "gun.rle", "--gens", "9", "--max-step-ms", "5", "--max-step-ms", "6");
+    if (!(sel g.err && sel g.err.twice)) { ret 12; }
     ret 0;
 }
 

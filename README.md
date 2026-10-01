@@ -117,7 +117,7 @@ corner, and the side panel groups every control by task:
 - **run**: play, step, speed, uncapped stepping, randomize and clear, the
   area randomize fills, from 32 to 4096 cells square, and the engine: the chunk
   pool, or HashLife where the rule allows, with its step of 2^k generations
-  and a generation to go straight to
+  and a generation to go straight to, and the ceilings a run pauses at
 - **draw**: the tool, with a rule of more than two states the state the pen
   and the custom pattern's editor paint, each in the rule's colour for it, a
   library of about three hundred classic patterns (still lifes, oscillators,
@@ -148,6 +148,13 @@ run the loaded rule starts on the chunk engine with a message. The first run
 brings over anything an older version left in
 `arrangements/` in the working directory.
 
+A run pauses with a message when it crosses a ceiling: a population, chunks of
+the pool in use (20,000 by default), the memory HashLife's nodes take (500 MiB
+by default, collected before it counts), or the time one step takes. Each is
+switched on or off in the run section and kept with the settings. Playing on
+carries the run past the ceiling it paused at, which stays quiet until the world
+falls back under it.
+
 `cellar <file>` opens a file at startup: a `.cellar` world loads as the world,
 a `.rule` file's rule runs on the world, and a pattern in any format cellar reads (RLE, plaintext `.cells`, Life 1.05
 and 1.06, Golly's Macrocell `.mc`) is stamped onto an empty world centred on the
@@ -172,7 +179,10 @@ a world or pattern headless, with no window and no GPU. The file opens as it
 would at startup, runs under `--rule` or else its own rule for `n`
 generations on the CPU, and is written in the format `--out`'s extension names
 (`.rle`, `.cells`, `.mc`), or as RLE on stdout without one. The
-generation and population go to stderr unless `--quiet`.
+generation and population go to stderr unless `--quiet`. It honours the saved
+ceilings, which `--max-population`, `--max-chunks`, `--max-memory` (MiB) and
+`--max-step-ms` set to a limit or `off` for that run. A run that crosses one
+stops there, writes the world as it stood, says which and exits with status 3.
 
 ## Install
 
