@@ -1,8 +1,8 @@
 # applies the queued commands to the world and its files
 #
-# the one place a command's effect happens. the frame calls run once, before it
-# collects or records anything, so the world a save reads is the world the
-# command was issued against.
+# the one place a command's effect happens. a frame holding the world calls run
+# once, between the simulation thread's steps and before it collects or records
+# anything, so the world a save reads is a completed generation.
 #
 # it also keeps the start reset returns to. play starting from paused, by a
 # toggle or a step, takes a snapshot when none is held. an edit while paused
@@ -405,9 +405,9 @@ fun engine(a: *app.App, s: *sim.Sim, tree: bool) {
 
 # advance the quadtree to a generation, saying why when it cannot
 fun jump(a: *app.App, s: *sim.Sim, gen: u64) {
-    if (!sim.on_tree(s))                                                        { app.say(a, "only HashLife goes to a generation"); }
-    or (gen < world.generation(s))                                              { app.say(a, "HashLife only runs forward; reset to go back"); }
-    or (!sim.jump(s, gen) && !world.full(s) && sim.tripped(s) == ceiling.COUNT) { app.say(a, "that generation is too far ahead"); }
+    if (!sim.on_tree(s))                                                 { app.say(a, "only HashLife goes to a generation"); }
+    or (gen < s.generation)                                              { app.say(a, "HashLife only runs forward; reset to go back"); }
+    or (!sim.jump(s, gen) && !s.full && sim.tripped(s) == ceiling.COUNT) { app.say(a, "that generation is too far ahead"); }
 }
 
 # apply one command
@@ -416,12 +416,12 @@ fun apply(c: *command.Command, a: *app.App, s: *sim.Sim, d: *Deps) {
         back(a, s, sel c.undo);
         ret;
     }
-    val paused: bool = !world.running(s);
+    val paused: bool = s.running == 0;
     # while running, everything recorded joins the run
     val kind: u8 = recorded(c);
-    if (kind != UNRECORDED && !paused)                                                           { journal.begin(?a.log, journal.KIND_RUN, true); }
-    or (kind != UNRECORDED)                                                                      { journal.begin(?a.log, kind, kind == journal.KIND_RUN || sel c.line); }
-    if ((sel c.toggle || sel c.step || sel c.jump) && paused && !world.full(s) && !a.start.held) { take_start(a, s); }
+    if (kind != UNRECORDED && !paused)                                                    { journal.begin(?a.log, journal.KIND_RUN, true); }
+    or (kind != UNRECORDED)                                                               { journal.begin(?a.log, kind, kind == journal.KIND_RUN || sel c.line); }
+    if ((sel c.toggle || sel c.step || sel c.jump) && paused && !s.full && !a.start.held) { take_start(a, s); }
     var change: Change = Change.none{};
     if (sel c.paint || sel c.line || sel c.stamp || sel c.rule) { change = Change.edit{}; }
     if (sel c.clear || sel c.randomize)                         { change = Change.fresh{}; }
@@ -471,7 +471,7 @@ fun apply(c: *command.Command, a: *app.App, s: *sim.Sim, d: *Deps) {
 # apply every waiting command in order and empty the queue
 # ---
 # a: application state, which owns the queue
-# s: the simulation, locked by the caller and not yet recorded into
+# s: the simulation, held by the caller between steps and not yet recorded into
 # d: what the commands need
 pub fun run(a: *app.App, s: *sim.Sim, d: *Deps) {
     journal.bind(?a.log, s);
@@ -758,8 +758,8 @@ test run__reset_returns_to_where_play_started_and_a_paused_edit_moves_it {
     world.step(?s);
     app.submit(?ap, command.Command.reset{});
     run(?ap, ?s, ?d);
-    if (world.running(?s) || world.generation(?s) != 0) { ret 2; }
-    if (!sim.alive(?s, -1, 0) || sim.alive(?s, 0, -1))  { ret 3; }
+    if (s.running != 0 || s.generation != 0)           { ret 2; }
+    if (!sim.alive(?s, -1, 0) || sim.alive(?s, 0, -1)) { ret 3; }
 
     # a step plays from the start, and an edit while paused makes the edited
     # world the start, which a reset then keeps
@@ -767,7 +767,7 @@ test run__reset_returns_to_where_play_started_and_a_paused_edit_moves_it {
     app.submit(?ap, command.Command.paint{command.Paint{x: 10, y: 10, v: 1}});
     app.submit(?ap, command.Command.reset{});
     run(?ap, ?s, ?d);
-    if (world.generation(?s) != 1)                                               { ret 4; }
+    if (s.generation != 1)                                                       { ret 4; }
     if (!sim.alive(?s, 0, -1) || sim.alive(?s, -1, 0) || !sim.alive(?s, 10, 10)) { ret 5; }
 
     # played on, with an edit while running, and reset to the edited world
@@ -780,7 +780,7 @@ test run__reset_returns_to_where_play_started_and_a_paused_edit_moves_it {
     world.step(?s);
     app.submit(?ap, command.Command.reset{});
     run(?ap, ?s, ?d);
-    if (world.generation(?s) != 1)                                                { ret 6; }
+    if (s.generation != 1)                                                        { ret 6; }
     if (!sim.alive(?s, 0, -1) || !sim.alive(?s, 10, 10) || sim.alive(?s, 20, 20)) { ret 7; }
     if (sim.population(?s) != 4)                                                  { ret 8; }
 
