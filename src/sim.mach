@@ -638,19 +638,21 @@ pub fun set_exponent(s: *Sim, k: u32) {
 
 # advance the tree one step of 2^k generations, its two halves at once
 #
-# with descend a step the memory ceiling cancels is taken as two of half the
-# generations instead, down to single generations, as Golly does for a run
-# aiming at a generation, and no step of the run is tried larger again (fit).
+# with descend a step the memory or step ceiling cancels is taken as two of
+# half the generations instead, down to single generations, as Golly does for
+# a run aiming at a generation, and no step of the run is tried larger again
+# (fit). only a single generation that will not fit pauses it.
 # ---
 # s:       simulation on the tree
-# descend: halve a step the memory ceiling cancels
+# descend: halve a step the memory or step ceiling cancels
 # ret:     false when the table filled, a step was cancelled or one crossed a
 #          ceiling
 fun tree_step(s: *Sim, descend: bool) bool {
     val t: *hashlife.Tree = ?s.tree;
     if (!descend || t.k <= s.fit) {
-        if (tree_advance(s, descend))                                                { ret tree_commit(s); }
-        if (!descend || t.k == 0 || hashlife.cancelled(t) != hashlife.CANCEL_BUDGET) { ret false; }
+        if (tree_advance(s, descend)) { ret tree_commit(s); }
+        val why: u8 = hashlife.cancelled(t);
+        if (!descend || t.k == 0 || (why != hashlife.CANCEL_BUDGET && why != hashlife.CANCEL_TIME)) { ret false; }
         s.fit = t.k - 1;
     }
     val k: u32 = t.k;
@@ -670,8 +672,8 @@ fun tree_step(s: *Sim, descend: bool) bool {
 # cancelled by an ask is left to whoever asked.
 # ---
 # s:       simulation on the tree
-# descend: a step the memory ceiling cancels is to be halved, so it neither
-#          retries nor pauses, and cancelled says so
+# descend: a step the memory or step ceiling cancels is to be halved, so it
+#          neither retries nor pauses, and cancelled says so
 # ret:     whether the step was taken, for commit to count
 fun tree_advance(s: *Sim, descend: bool) bool {
     val t: *hashlife.Tree = ?s.tree;
@@ -684,7 +686,7 @@ fun tree_advance(s: *Sim, descend: bool) bool {
     hashlife.set_deadline(t, at);
     var ok:    bool = hashlife.step(t);
     val why:   u8   = hashlife.cancelled(t);
-    val halve: bool = descend && t.k > 0 && why == hashlife.CANCEL_BUDGET;
+    val halve: bool = descend && t.k > 0 && (why == hashlife.CANCEL_BUDGET || why == hashlife.CANCEL_TIME);
     if (!ok && !halve && why != hashlife.CANCEL_TIME && why != hashlife.CANCEL_ASKED) {
         # what earlier steps left behind may be what filled it
         hashlife.collect(t, hashlife.NONE);
@@ -697,8 +699,8 @@ fun tree_advance(s: *Sim, descend: bool) bool {
         hashlife.collect(t, hashlife.NONE);
         if (!halve) { trip(s, ceiling.MEMORY); }
     }
-    or (again == hashlife.CANCEL_TIME) { trip(s, ceiling.STEP); }
-    or (again == hashlife.CANCEL_NONE) { overflow(s); }
+    or (again == hashlife.CANCEL_TIME && !halve) { trip(s, ceiling.STEP); }
+    or (again == hashlife.CANCEL_NONE)           { overflow(s); }
     ret false;
 }
 
@@ -2519,6 +2521,41 @@ test ceiling__a_run_to_a_generation_takes_smaller_steps_where_memory_runs_short 
     }
     if (!jump(?t, 1000) || t.generation != 1000 || t.tripped != ceiling.COUNT) { ret 7; }
     if (!same_as_tree(?p, ?t))                                                 { ret 8; }
+    dnit(?p);
+    dnit(?t);
+    ret 0;
+}
+
+test ceiling__a_run_to_a_generation_takes_smaller_steps_past_the_step_deadline {
+    var a: allo.Allocator;
+    page.make(?a);
+    var c: ceiling.Ceilings = ceiling.defaults();
+    c.on[ceiling.STEP] = true;
+    # a generous deadline is met at every size, and the run gets there as the CPU does
+    c.limit[ceiling.STEP] = 600000;
+    var p:  Sim;
+    var t:  Sim;
+    val m1: err[allo.Error] = init(?p, ?a);
+    if (sel m1.err) { ret 1; }
+    val m2: err[allo.Error] = init(?t, ?a);
+    if (sel m2.err) { ret 2; }
+    seed_world(?p);
+    seed_world(?t);
+    if (!use_hashlife(?t, true)) { ret 3; }
+    set_ceilings(?t, c);
+    var g: usize = 0;
+    for (g < 100) {
+        step(?p);
+        g = g + 1;
+    }
+    if (!jump(?t, 100) || t.generation != 100 || !same_as_tree(?p, ?t)) { ret 4; }
+    # a deadline no step meets retires every size down to single generations,
+    # and pauses only there, with the world where it was
+    c.limit[ceiling.STEP] = 0;
+    set_ceilings(?t, c);
+    if (jump(?t, 1124))                                   { ret 5; }
+    if (t.tripped != ceiling.STEP || t.generation != 100) { ret 6; }
+    if (t.fit != 0 || !same_as_tree(?p, ?t))              { ret 7; }
     dnit(?p);
     dnit(?t);
     ret 0;
