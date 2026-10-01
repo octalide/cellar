@@ -29,6 +29,10 @@
 # where play started, edits made while running and all. undo and redo pause a
 # running world first.
 #
+# a change that translates the world (bounds placed) says how far, and undo
+# and redo say how far they moved it back or on (shift_x, shift_y), so the
+# view can follow and nothing moves on screen.
+#
 # undo swaps a step's image with the world's as it stands, so the step then
 # holds what redo puts back. a new step that changes anything clears every
 # step that was undone, and one that changes nothing is dropped and leaves
@@ -75,6 +79,8 @@ pub val KIND_RUN: u8 = 2;
 # generation: the generation before
 # custom:     the custom pattern before, when kept
 # kept:       custom holds a pattern
+# dx:         columns the change translated the world by from the image
+# dy:         rows the change translated the world by from the image
 # bytes:      what the step holds, once measured
 rec Step {
     whole:      snapshot.Snapshot;
@@ -84,6 +90,8 @@ rec Step {
     generation: u64;
     custom:     pattern.Pattern;
     kept:       bool;
+    dx:         i64;
+    dy:         i64;
     bytes:      usize;
 }
 
@@ -102,6 +110,8 @@ rec Step {
 # busy:    an undo or redo is writing the world, which is not recorded
 # bytes:   what the steps hold
 # limit:   the most bytes the steps may hold
+# shift_x: columns the last undo or redo translated the world by
+# shift_y: rows the last undo or redo translated the world by
 pub rec Journal {
     a:       *allo.Allocator;
     s:       *sim.Sim;
@@ -116,6 +126,8 @@ pub rec Journal {
     busy:    bool;
     bytes:   usize;
     limit:   usize;
+    shift_x: i64;
+    shift_y: i64;
 }
 
 # what an undo or redo did
@@ -134,6 +146,8 @@ fun step_init(st: *Step, a: *allo.Allocator) {
     snapshot.init(?st.chunks, a);
     st.areas = vector.init[space.Box](a);
     st.kept  = false;
+    st.dx    = 0;
+    st.dy    = 0;
     st.bytes = 0;
 }
 
@@ -169,6 +183,8 @@ pub fun init(j: *Journal, a: *allo.Allocator) {
     j.busy    = false;
     j.bytes   = 0;
     j.limit   = LIMIT;
+    j.shift_x = 0;
+    j.shift_y = 0;
 }
 
 # release every step
@@ -382,11 +398,19 @@ pub fun keep_custom(j: *Journal, p: pattern.Pattern) {
     check(j);
 }
 
+# the open step's change translated the world by (dx, dy), on top of any
+# translation it already made
+pub fun moved(j: *Journal, dx: i64, dy: i64) {
+    if (!j.open || j.busy || j.lost) { ret; }
+    j.cur.dx = j.cur.dx + dx;
+    j.cur.dy = j.cur.dy + dy;
+}
+
 # whether the open step changed nothing
 fun unchanged(j: *Journal) bool {
     val st: *Step = ?j.cur;
-    if (st.kept || st.generation != j.s.generation || !rule.same(?st.rule, ?j.s.rule)) { ret false; }
-    if (j.kind == KIND_RUN)                                                            { ret !j.touched; }
+    if (st.kept || st.dx != 0 || st.dy != 0 || st.generation != j.s.generation || !rule.same(?st.rule, ?j.s.rule)) { ret false; }
+    if (j.kind == KIND_RUN)                                                                                        { ret !j.touched; }
     ret !st.whole.held && st.areas.len == 0;
 }
 
@@ -518,6 +542,12 @@ fun swap(j: *Journal, i: usize, custom: *pattern.Pattern) bool {
     }
     sim.set_rule(s, st.rule);
     s.generation = st.generation;
+    # putting the image back undoes its translation, which redoing the image of
+    # the world as it was makes again
+    j.shift_x = 0 - st.dx;
+    j.shift_y = 0 - st.dy;
+    back.dx   = j.shift_x;
+    back.dy   = j.shift_y;
     if (st.kept) {
         back.custom = @custom;
         back.kept   = true;
@@ -541,6 +571,8 @@ fun failed(j: *Journal) Went {
 # pause the world and close the open step, which an undo or redo ends
 fun settle(j: *Journal) {
     j.s.running = 0;
+    j.shift_x   = 0;
+    j.shift_y   = 0;
     close(j);
 }
 

@@ -1457,6 +1457,94 @@ pub fun restore(s: *Sim, sn: *snapshot.Snapshot) bool {
     ret ok;
 }
 
+# what placing the world on a grid did
+# ---
+# ok:      the world is on the grid
+# dropped: live cells, as held, that fell off it
+pub rec Placed {
+    ok:      bool;
+    dropped: u64;
+}
+
+# translate the world by (dx, dy) and put it on a grid, as one change
+#
+# the rule keeps its family and takes the grid. every cell keeps its word,
+# ages and trails included, and the generation, so a flipping background
+# (rule.Caps.b0) keeps its phase. a cell the move takes off the grid is
+# dropped, and counted when it is live as held. the watch is shown the world
+# whole first. a world in the tree leaves it when the grid is bounded or the
+# world moves, since the tree runs only the unbounded plane and never moves.
+# call outside a frame, or in one before gpu frame has recorded anything.
+# ---
+# s:   simulation
+# g:   the grid
+# dx:  columns every cell moves by
+# dy:  rows every cell moves by
+# ret: whether the world moved, false when the rule cannot run on the grid,
+#      the GPU's cells could not be read, the tree's world does not fit the
+#      pool, or the pool could not hold the moved world, which marks it full
+pub fun place(s: *Sim, g: topology.Grid, dx: i64, dy: i64) Placed {
+    var out: Placed    = Placed{ok: false, dropped: 0};
+    var r:   rule.Rule = s.rule;
+    r.grid = g;
+    val why: opt[str] = rule.refusal(?r);
+    if (sel why.some)          { ret out; }
+    if (refusal(s, ?r) != nil) { ret out; }
+    val moves: bool = dx != 0 || dy != 0;
+    if (on_tree(s) && (moves || !rule.caps(?r).hashlife) && !use_hashlife(s, false)) { ret out; }
+    if (on_tree(s)) {
+        out.ok = set_rule(s, r);
+        ret out;
+    }
+    val synced: err[gfx.Error] = sync(s);
+    if (sel synced.err)              { ret out; }
+    if (wanted(s, 0, 0, 0, 0, true)) { kept(s, 0, 0, 0, 0, true, true); }
+    var was: snapshot.Snapshot;
+    snapshot.init(?was, s.space.a);
+    fin { snapshot.dnit(?was); }
+    if (!capture(s, ?was)) { ret out; }
+    val gen: u64 = s.generation;
+    # the world empties first, so the grid changes over nothing, and the
+    # second clear keeps the new grid's rim
+    clear(s);
+    set_rule(s, r);
+    fill_begin(s);
+    val sp: *space.Space = ?s.space;
+    var ok: bool         = true;
+    var i:  usize        = 0;
+    for (ok && i < was.n) {
+        val c:  *u32  = snapshot.cells_of(?was, i);
+        val x0: i64   = was.at[i * 2] * space.SIDE + dx;
+        val y0: i64   = was.at[i * 2 + 1] * space.SIDE + dy;
+        var k:  usize = 0;
+        for (ok && k < space.CELLS) {
+            val w: u32 = c[k];
+            if (w != 0) {
+                val x: i64 = x0 + (k % 64)::i64;
+                val y: i64 = y0 + (k / 64)::i64;
+                if (!space.holds(sp, x, y)) {
+                    if (space.live(sp, w)) { out.dropped = out.dropped + 1; }
+                }
+                or {
+                    val sl: u32 = space.alloc(sp, space.chunk_of(x), space.chunk_of(y));
+                    if (sl == space.NONE) { ok = false; }
+                    or {
+                        sp.cells[sl::usize * space.CELLS + space.local_of(y) * 64 + space.local_of(x)] = w;
+                        space.touch(sp, sl::usize);
+                    }
+                }
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    val settled: bool = fill_end(s);
+    if (!ok) { overflow(s); }
+    s.generation = gen;
+    out.ok       = ok && settled;
+    ret out;
+}
+
 # whether the cells hold the world's complement this generation, which the
 # draw shows inverted and edits and reads see through: the rule's background
 # flips each generation and the generation is odd
@@ -5171,5 +5259,62 @@ test set_rule__refuses_a_family_the_stepping_gpu_cannot_bind {
     s.gpu = nil;
     if (refusal(?s, ?life) != nil) { ret 5; }
     dnit(?s);
+    ret 0;
+}
+
+test place__translates_the_world_onto_each_grid_on_both_engines {
+    # a rule of each family on each shape, the first two flipping their
+    # background on an odd generation, the plane's edge with it
+    val strings: [6]str = [6]str{"B0123/S123", "B0124-k/S1c25", "B3/S23", "345/2/4", "B2-a/S12", rule.sample(3, 0)};
+    val shapes:  [6]u8  = [6]u8{topology.PLANE, topology.TORUS, topology.TORUS, topology.KLEIN, topology.KLEIN, topology.CROSS};
+    var k:       usize  = 0;
+    for (k < 6) {
+        var t:    Rig;
+        val code: i32 = rig_open(?t, rule_named(strings[k]), seed_soup);
+        if (code != 0) { ret code; }
+        rig_step(?t, 7);
+        if (!rig_same(?t)) { ret 10 + k::i32; }
+        # the 40 by 30 box drawn with its top-left at (-25, -12) moves to where
+        # the grid's notation centres it, at (-20, -15)
+        val g:    topology.Grid = topology.Grid{shape: shapes[k], w: 40, h: 30, twist_w: k == 3};
+        val dx:   i64           = 5;
+        val dy:   i64           = -3;
+        var was:  [6400]bool;
+        var lost: u64           = 0;
+        var gg:   topology.Grid = g;
+        var y:    i64           = -40;
+        for (y < 40) {
+            var x: i64 = -40;
+            for (x < 40) {
+                was[((y + 40) * 80 + x + 40)::usize] = alive(?t.cpu, x, y);
+                if (!topology.holds(?gg, x + dx, y + dy) && rule.state(?t.cpu.rule, cell(?t.cpu, x, y)) == 1) { lost = lost + 1; }
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        val pc: Placed = place(?t.cpu, g, dx, dy);
+        val pg: Placed = place(?t.gpu, g, dx, dy);
+        if (!pc.ok || !pg.ok || !topology.same(?t.cpu.rule.grid, ?gg)) { ret 20 + k::i32; }
+        if (t.cpu.generation != 7 || pc.dropped != pg.dropped)         { ret 30 + k::i32; }
+        if (k == 2 && pc.dropped != lost)                              { ret 40 + k::i32; }
+        y = -40;
+        for (y < 40) {
+            var x: i64 = -40;
+            for (x < 40) {
+                if (topology.holds(?gg, x + dx, y + dy) && alive(?t.cpu, x + dx, y + dy) != was[((y + 40) * 80 + x + 40)::usize]) { ret 50 + k::i32; }
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        if (!rig_same(?t)) { ret 60 + k::i32; }
+        # the moved world steps on the grid alike on both engines
+        rig_step(?t, 9);
+        if (!rig_same(?t)) {
+            print.eprintlnf("{} on its grid differs between the engines at generation {}", strings[k], t.cpu.generation);
+            ret 70 + k::i32;
+        }
+        rig_close(?t);
+        k = k + 1;
+    }
     ret 0;
 }
