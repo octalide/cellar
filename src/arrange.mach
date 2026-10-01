@@ -10,18 +10,23 @@
 # the select tool offers the operations on the selection. a large pattern is
 # previewed from a texture (cellar.sketch) rather than a rectangle a cell.
 
+use blit;
+use bctx: blit.context;
+use binp: blit.input;
+use bint: blit.interact;
+use blay: blit.layout;
+use bw:   blit.widget;
 use cellar.app;
 use cellar.command;
 use cellar.library;
+use cellar.look;
 use cellar.pattern;
 use cellar.rule;
 use cellar.sketch;
 use cellar.text;
 use cellar.theme;
-use cellar.ui;
 use cellar.world;
 use std.types.bool.bool;
-use std.types.bool.false;
 use std.types.option.opt;
 use std.types.size.usize;
 use std.types.string.str;
@@ -45,18 +50,23 @@ pub fun stamp_active(a: *app.App, x: i64, y: i64) {
     app.stamp(a, active(a), a.orient, x, y);
 }
 
-# draw a pattern's live cells scaled into a box
-fun preview(u: *ui.Ui, sk: *sketch.Sketches, p: *pattern.Pattern, x0: f32, y0: f32, x1: f32, y1: f32) {
-    ui.rect(u, x0, y0, x1, y1, theme.WORLD, 1.0);
+# a pattern's live cells scaled into a box across the column, PREVIEW tall
+fun preview(ui: *bctx.Context, sk: *sketch.Sketches, p: *pattern.Pattern) {
+    val ph: f32       = bctx.px(ui, PREVIEW);
+    val r:  bctx.Area = bw.place(ui, blay.fill(1.0), blay.fixed(ph), 0.0, ph);
+    bctx.quad(ui, r.x0, r.y0, r.x1, r.y1, look.colour(theme.WORLD, 1.0));
     var span: usize = p.w;
     if (p.h > span) { span = p.h; }
     if (span == 0)  { span = 1; }
-    var cs: f32 = (y1 - y0 - ui.px(u, 12.0)) / span::f32;
-    if ((x1 - x0 - ui.px(u, 12.0)) / span::f32 < cs) { cs = (x1 - x0 - ui.px(u, 12.0)) / span::f32; }
-    val ox: f32 = x0 + (x1 - x0 - p.w::f32 * cs) / 2.0;
-    val oy: f32 = y0 + (y1 - y0 - p.h::f32 * cs) / 2.0;
+    val m:  f32 = bctx.px(ui, 12.0);
+    var cs: f32 = (r.y1 - r.y0 - m) / span::f32;
+    if ((r.x1 - r.x0 - m) / span::f32 < cs) { cs = (r.x1 - r.x0 - m) / span::f32; }
+    val ox:   f32             = r.x0 + (r.x1 - r.x0 - p.w::f32 * cs) / 2.0;
+    val oy:   f32             = r.y0 + (r.y1 - r.y0 - p.h::f32 * cs) / 2.0;
+    val live: blit.draw.Color = look.colour(theme.ACCENT, 1.0);
     if (sketch.large(p.w, p.h)) {
-        sketch.draw(u, sk, ?sk.preview, p, 0, ox, oy, cs, theme.ACCENT, 1.0);
+        val img: opt[blit.draw.Image] = sketch.image(sk, ?sk.preview, p, 0, cs);
+        if (sel img.some) { bctx.image_at(ui, img.some, ox, oy, ox + p.w::f32 * cs, oy + p.h::f32 * cs, live); }
         ret;
     }
     var gap: f32 = 0.0;
@@ -68,7 +78,7 @@ fun preview(u: *ui.Ui, sk: *sketch.Sketches, p: *pattern.Pattern, x0: f32, y0: f
             if (pattern.get(p, x, y) != 0) {
                 val qx: f32 = ox + x::f32 * cs;
                 val qy: f32 = oy + y::f32 * cs;
-                ui.rect(u, qx, qy, qx + cs - gap, qy + cs - gap, theme.ACCENT, 1.0);
+                bctx.quad(ui, qx, qy, qx + cs - gap, qy + cs - gap, live);
             }
             x = x + 1;
         }
@@ -88,42 +98,40 @@ fun ink_colour(a: *app.App, r: *rule.Rule, state: u32) u32 {
     ret a.solid;
 }
 
-# the custom pattern as a clickable grid, each cell in its state's colour; a
-# press paints the cell under it in the ink, or clears it when it holds the ink
-fun editor(u: *ui.Ui, a: *app.App, r: *rule.Rule, p: *pattern.Pattern) {
-    val c:  f32    = u.w / p.w::f32;
-    val x0: f32    = u.x;
-    val y0: f32    = u.y;
-    val x1: f32    = x0 + c * p.w::f32;
-    val y1: f32    = y0 + c * p.h::f32;
-    val hh: ui.Hit = ui.region(u, x0, y0, x1, y1);
-    ui.rect(u, x0, y0, x1, y1, theme.WORLD, 1.0);
+# the custom pattern as a grid across the column, each cell in its state's
+# colour; a press paints the cell under it in the ink, or clears it when it
+# holds the ink
+fun editor(ui: *bctx.Context, a: *app.App, r: *rule.Rule, p: *pattern.Pattern) {
+    val av: bctx.Area = bw.avail(ui);
+    val c:  f32       = (av.x1 - av.x0) / p.w::f32;
+    val g:  bctx.Area = bw.place(ui, blay.fill(1.0), blay.fixed(c * p.h::f32), 0.0, c * p.h::f32);
+    val h:  bint.Hit  = bint.hit(ui, bctx.id_of(ui, "editor"), g.x0, g.y0, g.x0 + c * p.w::f32, g.y1, binp.BUTTON_LEFT);
+    bctx.quad(ui, g.x0, g.y0, g.x0 + c * p.w::f32, g.y1, look.colour(theme.WORLD, 1.0));
     var y: usize = 0;
     for (y < p.h) {
         var x: usize = 0;
         for (x < p.w) {
-            val cx0: f32 = x0 + x::f32 * c;
-            val cy0: f32 = y0 + y::f32 * c;
+            val cx0: f32 = g.x0 + x::f32 * c;
+            val cy0: f32 = g.y0 + y::f32 * c;
             val st:  u8  = pattern.get(p, x, y);
             var col: u32 = theme.CONTROL;
             if (st != 0 && st::u32 < rule.states(r)) { col = ink_colour(a, r, st::u32); }
             or (st != 0)                             { col = theme.ACCENT; }
-            ui.rect(u, cx0 + 1.0, cy0 + 1.0, cx0 + c, cy0 + c, col, 1.0);
+            bctx.quad(ui, cx0 + 1.0, cy0 + 1.0, cx0 + c, cy0 + c, look.colour(col, 1.0));
             x = x + 1;
         }
         y = y + 1;
     }
     # toggle on the press, so one click flips exactly one cell
-    if (hh.hot && u.pressed) {
-        val ux: usize = ((u.mx - x0) / c)::usize;
-        val uy: usize = ((u.my - y0) / c)::usize;
+    if (h.pressed) {
+        val ux: usize = ((h.mx - g.x0) / c)::usize;
+        val uy: usize = ((h.my - g.y0) / c)::usize;
         if (ux < p.w && uy < p.h) {
             var v: u8 = a.ink;
             if (pattern.get(p, ux, uy) == a.ink) { v = 0; }
             pattern.set(p, ux, uy, v);
         }
     }
-    ui.advance(u, y1 - y0);
 }
 
 # pick a pattern to stamp
@@ -133,41 +141,42 @@ fun pick(a: *app.App, i: usize) {
 }
 
 # the categories to browse, and the custom pattern, two to a row
-fun categories(u: *ui.Ui, a: *app.App) {
-    val h: f32   = ui.px(u, ui.ROW);
-    val n: usize = library.CATEGORY_COUNT + 1;
-    var i: usize = 0;
+fun categories(ui: *bctx.Context, a: *app.App) {
+    val h: f32       = bw.control_height(ui);
+    val n: usize     = library.CATEGORY_COUNT + 1;
+    var r: bctx.Area = bctx.Area{x0: 0.0, y0: 0.0, x1: 0.0, y1: 0.0};
+    var i: usize     = 0;
     for (i < n) {
-        val col:  usize = i % 2;
-        var name: str   = "Custom";
-        var on:   bool  = a.pattern_sel == app.CUSTOM && a.tool == app.TOOL_STAMP;
+        val col: usize = i % 2;
+        if (col == 0) { r = bw.place(ui, blay.fill(1.0), blay.fixed(h), 0.0, h); }
+        var name: str  = "Custom";
+        var on:   bool = a.pattern_sel == app.CUSTOM && a.tool == app.TOOL_STAMP;
         if (i < library.CATEGORY_COUNT) {
             name = library.category(i).name;
             on   = a.browse == i;
         }
-        if (ui.button_at(u, name, ui.cell_x0(u, col, 2), u.y, ui.cell_x1(u, col, 2), u.y + h, on)) {
+        if (bw.button_at(ui, name, bw.cell_x0(ui, col, 2), r.y0, bw.cell_x1(ui, col, 2), r.y1, on)) {
             if (i < library.CATEGORY_COUNT) {
                 a.browse = i;
                 a.page   = 0;
             }
             or { pick(a, app.CUSTOM); }
         }
-        if (col == 1 || i + 1 == n) { ui.advance(u, h); }
         i = i + 1;
     }
 }
 
 # the listed patterns, a page at a time, with the pages to turn
-fun list(u: *ui.Ui, a: *app.App, query: str) {
-    val l:     *library.Library = ?a.library;
+fun list(ui: *bctx.Context, l: look.Look, a: *app.App, query: str) {
+    val lib:   *library.Library = ?a.library;
     var total: usize            = 0;
     var i:     usize            = 0;
-    for (i < library.count(l)) {
-        if (library.listed(l, i, query, a.browse)) { total = total + 1; }
+    for (i < library.count(lib)) {
+        if (library.listed(lib, i, query, a.browse)) { total = total + 1; }
         i = i + 1;
     }
     if (total == 0) {
-        ui.note(u, "No pattern has that in its name");
+        look.note(ui, l, "No pattern has that in its name");
         ret;
     }
     val pages: usize = (total + PAGE_ROWS - 1) / PAGE_ROWS;
@@ -175,10 +184,17 @@ fun list(u: *ui.Ui, a: *app.App, query: str) {
     val first: usize = a.page * PAGE_ROWS;
     var k:     usize = 0;
     i = 0;
-    for (i < library.count(l) && k < first + PAGE_ROWS) {
-        if (library.listed(l, i, query, a.browse)) {
-            val on: bool = a.pattern_sel == i && a.tool == app.TOOL_STAMP;
-            if (k >= first && ui.button(u, library.name(l, i), on)) { pick(a, i); }
+    for (i < library.count(lib) && k < first + PAGE_ROWS) {
+        if (library.listed(lib, i, query, a.browse)) {
+            if (k >= first) {
+                var name: [1]str;
+                name[0] = library.name(lib, i);
+                var on: usize = 1;
+                if (a.pattern_sel == i && a.tool == app.TOOL_STAMP) { on = 0; }
+                bctx.push_id_int(ui, i::u64);
+                if (bw.button_grid(ui, ?name[0], 1, 1, on) == 0) { pick(a, i); }
+                bctx.pop_id(ui);
+            }
             k = k + 1;
         }
         i = i + 1;
@@ -190,11 +206,11 @@ fun list(u: *ui.Ui, a: *app.App, query: str) {
     o     = text.buf_str(?at[0], o, " of ");
     o     = text.buf_u64(?at[0], o, pages::u64);
     at[o] = 0;
-    ui.note(u, ?at[0]);
+    look.note(ui, l, ?at[0]);
     var turn: [2]str;
     turn[0] = "Previous";
     turn[1] = "Next";
-    val t: usize = ui.buttons(u, ?turn[0], 2);
+    val t: usize = bw.buttons(ui, ?turn[0], 2);
     if (t == 0 && a.page > 0)         { a.page = a.page - 1; }
     if (t == 1 && a.page + 1 < pages) { a.page = a.page + 1; }
 }
@@ -212,27 +228,25 @@ fun area_label(op: u8) str {
 }
 
 # the operations on the selection, two to a row
-fun selection(u: *ui.Ui, a: *app.App) {
+fun selection(ui: *bctx.Context, l: look.Look, a: *app.App) {
     if (!a.selected) {
-        ui.note(u, "Drag on the world to select");
+        look.note(ui, l, "Drag on the world to select");
         ret;
     }
-    val h:  f32 = ui.px(u, ui.ROW);
-    var op: u8  = 0;
+    var labels: [command.AREA_COUNT]str;
+    var op:     u8 = 0;
     for (op < command.AREA_COUNT) {
-        val col: usize = (op % 2)::usize;
-        if (ui.button_at(u, area_label(op), ui.cell_x0(u, col, 2), u.y, ui.cell_x1(u, col, 2), u.y + h, false)) {
-            app.area(a, op);
-        }
-        if (col == 1 || op + 1 == command.AREA_COUNT) { ui.advance(u, h); }
-        op = op + 1;
+        labels[op] = area_label(op);
+        op         = op + 1;
     }
+    val hit: usize = bw.button_grid(ui, ?labels[0], command.AREA_COUNT::usize, 2, command.AREA_COUNT::usize);
+    if (hit < command.AREA_COUNT::usize) { app.area(a, hit::u8); }
 }
 
 # the rule's live states as swatches, INKS_ROW to a row, the ink framed; a
 # click picks the ink and arms the draw tool. a rule of two states has only
 # the one live state, and shows nothing
-fun inks(u: *ui.Ui, a: *app.App, r: *rule.Rule) {
+fun inks(ui: *bctx.Context, l: look.Look, a: *app.App, r: *rule.Rule) {
     val n: u32 = rule.states(r);
     if (n <= 2) { ret; }
     var rd: [48]u8;
@@ -240,30 +254,38 @@ fun inks(u: *ui.Ui, a: *app.App, r: *rule.Rule) {
     o     = text.buf_u64(?rd[0], o, a.ink::u64);
     o     = text.buf_str(?rd[0], o, ", Q steps");
     rd[o] = 0;
-    ui.note(u, ?rd[0]);
-    val g:  f32 = ui.px(u, 4.0);
-    val sz: f32 = (u.w - g * (INKS_ROW - 1)::f32) / INKS_ROW::f32;
-    var st: u32 = 1;
+    look.note(ui, l, ?rd[0]);
+    val av:  bctx.Area = bw.avail(ui);
+    val g:   f32       = bctx.px(ui, 4.0);
+    val sz:  f32       = (av.x1 - av.x0 - g * (INKS_ROW - 1)::f32) / INKS_ROW::f32;
+    val t:   f32       = bctx.px(ui, 2.0);
+    val in:  f32       = bctx.px(ui, 4.0);
+    var row: bctx.Area = bctx.Area{x0: 0.0, y0: 0.0, x1: 0.0, y1: 0.0};
+    var st:  u32       = 1;
+    bctx.push_style(ui, l.small);
     for (st < n) {
-        val i:  usize  = ((st - 1) % INKS_ROW::u32)::usize;
-        val x0: f32    = u.x + i::f32 * (sz + g);
-        val hh: ui.Hit = ui.region(u, x0, u.y, x0 + sz, u.y + sz);
-        val on: bool   = st == a.ink::u32;
-        if (on)     { ui.frame(u, x0, u.y, x0 + sz, u.y + sz, ui.px(u, 2.0), theme.TEXT, 1.0); }
-        or (hh.hot) { ui.frame(u, x0, u.y, x0 + sz, u.y + sz, ui.px(u, 2.0), theme.TEXT_DIM, 1.0); }
-        val inset: f32 = ui.px(u, 4.0);
-        val c:     u32 = ink_colour(a, r, st);
-        ui.rect(u, x0 + inset, u.y + inset, x0 + sz - inset, u.y + sz - inset, c, 1.0);
+        val i: usize = ((st - 1) % INKS_ROW::u32)::usize;
+        if (i == 0) { row = bw.place(ui, blay.fill(1.0), blay.fixed(sz), 0.0, sz); }
+        val x0: f32 = row.x0 + i::f32 * (sz + g);
+        val y0: f32 = row.y0;
+        bctx.push_id_int(ui, st::u64);
+        val h: bint.Hit = bint.hit(ui, bctx.id_of(ui, "ink"), x0, y0, x0 + sz, y0 + sz, binp.BUTTON_LEFT);
+        bctx.pop_id(ui);
+        val on: bool = st == a.ink::u32;
+        if (on)    { bctx.frame(ui, x0, y0, x0 + sz, y0 + sz, t, look.colour(theme.TEXT, 1.0)); }
+        or (h.hot) { bctx.frame(ui, x0, y0, x0 + sz, y0 + sz, t, look.colour(theme.TEXT_DIM, 1.0)); }
+        val c: u32 = ink_colour(a, r, st);
+        bctx.quad(ui, x0 + in, y0 + in, x0 + sz - in, y0 + sz - in, look.colour(c, 1.0));
         var num: [4]u8;
         num[text.buf_u64(?num[0], 0, st::u64)] = 0;
-        ui.text_centre(u, u.small, ?num[0], x0, u.y, x0 + sz, u.y + sz, label_ink(c), 1.0);
-        if (hh.clicked) {
+        look.text_centre(ui, ?num[0], x0, y0, x0 + sz, y0 + sz, look.colour(label_ink(c), 1.0));
+        if (h.clicked) {
             a.ink  = st::u8;
             a.tool = app.TOOL_DRAW;
         }
-        if (i + 1 == INKS_ROW || st + 1 == n) { ui.advance(u, sz); }
         st = st + 1;
     }
+    bctx.pop_style(ui);
 }
 
 # the text colour that reads over a fill: dark over a light one, light otherwise
@@ -275,35 +297,37 @@ fun label_ink(c: u32) u32 {
 
 # draw the draw section and apply its controls
 # ---
-# u:  the interface
+# ui: the interface
+# l:  cellar's look
 # a:  application state
 # s:  the world as shown, whose rule gives the states
 # sk: the sketches large patterns are previewed from
-pub fun section(u: *ui.Ui, a: *app.App, s: *world.Shown, sk: *sketch.Sketches) {
-    if (!ui.heading(u, "DRAW", ?a.open_draw)) { ret; }
+pub fun section(ui: *bctx.Context, l: look.Look, a: *app.App, s: *world.Shown, sk: *sketch.Sketches) {
+    if (!look.heading(ui, l, "DRAW", ?a.open_draw)) { ret; }
     var tools: [4]str;
     tools[0] = "Draw";
     tools[1] = "Erase";
     tools[2] = "Stamp";
     tools[3] = "Select";
-    ui.segmented(u, ?tools[0], app.TOOL_COUNT, ?a.tool);
-    inks(u, a, ?s.rule);
+    bw.segmented(ui, ?tools[0], app.TOOL_COUNT, ?a.tool);
+    inks(ui, l, a, ?s.rule);
     if (a.tool == app.TOOL_SELECT) {
-        selection(u, a);
+        selection(ui, l, a);
         ret;
     }
 
-    if (ui.text_field(u, ?a.search, "Search patterns") == ui.FIELD_EDITED) { a.page = 0; }
-    val query: str = ui.field_text(?a.search);
-    if (query[0] == 0) { categories(u, a); }
-    list(u, a, query);
+    if ((bw.text_field(ui, "search", ?a.search, "Search patterns") & blit.field.EDITED) != 0) { a.page = 0; }
+    val query: str = blit.field.text(?a.search);
+    if (query[0] == 0) { categories(ui, a); }
+    bctx.push_id_str(ui, "patterns");
+    list(ui, l, a, query);
+    bctx.pop_id(ui);
 
-    val p:  *pattern.Pattern = active(a);
-    val ph: f32              = ui.px(u, PREVIEW);
+    val p: *pattern.Pattern = active(a);
     if (p == ?a.custom) {
         if (editable(p)) {
-            ui.note(u, "Custom pattern, click cells to edit");
-            editor(u, a, ?s.rule, p);
+            look.note(ui, l, "Custom pattern, click cells to edit");
+            editor(ui, a, ?s.rule, p);
         }
         or {
             var at: [128]u8;
@@ -317,14 +341,12 @@ pub fun section(u: *ui.Ui, a: *app.App, s: *world.Shown, sk: *sketch.Sketches) {
             o     = text.buf_u64(?at[0], o, EDIT_SIDE::u64);
             o     = text.buf_str(?at[0], o, " at most");
             at[o] = 0;
-            ui.note(u, ?at[0]);
-            preview(u, sk, p, u.x, u.y, u.x + u.w, u.y + ph);
-            ui.advance(u, ph);
+            look.note(ui, l, ?at[0]);
+            preview(ui, sk, p);
         }
-        if (ui.button(u, "Clear pattern", false)) { pattern.clear(p); }
+        if (bw.button(ui, "Clear pattern")) { pattern.clear(p); }
         ret;
     }
-    ui.note(u, pattern.name(p));
-    preview(u, sk, p, u.x, u.y, u.x + u.w, u.y + ph);
-    ui.advance(u, ph);
+    look.note(ui, l, pattern.name(p));
+    preview(ui, sk, p);
 }

@@ -2,38 +2,54 @@
 #
 # the readout sits in the world's top-left corner in small type: whether the
 # world runs, its generation, population, the size of the box its live cells
-# span, rule and speed. it fades back when
-# the cursor comes near, so it never hides the cells under it. the cell under
-# the cursor and the zoom sit in the bottom-left corner, messages flash at the
-# bottom centre, and the key reference opens over everything.
+# span, rule and speed. it fades back as the cursor comes near, so it never
+# hides the cells under it. the cell under the cursor and the zoom sit in the
+# bottom-left corner, messages flash at the bottom centre of the world, and
+# the key reference opens over everything. each is a blit overlay, which
+# claims nothing of its own, so the world under them stays in reach; the key
+# reference lies over a scrim that takes every press and closes it.
 
+use blit;
+use bctx:   blit.context;
+use binp:   blit.input;
+use bint:   blit.interact;
+use blay:   blit.layout;
+use bov:    blit.overlay;
+use bstyle: blit.style;
+use bw:     blit.widget;
 use cellar.app;
+use cellar.look;
+use cellar.paint;
 use cellar.render;
 use rules: cellar.rule;
 use cellar.space;
 use cellar.text;
 use cellar.theme;
-use cellar.ui;
 use cellar.world;
 use std.types.bool.bool;
 use std.types.option.opt;
 use std.types.size.usize;
 use std.types.string.str;
 
-# one label and value pair of the readout; ret the pen after it
-fun pair(u: *ui.Ui, x: f32, y0: f32, y1: f32, label: str, value: str, alpha: f32) f32 {
-    var pen: f32 = ui.text_mid(u, u.small, label, x, y0, y1, theme.TEXT_FAINT, alpha);
-    pen = ui.text_mid(u, u.small, value, pen + ui.px(u, 5.0), y0, y1, theme.TEXT, alpha);
-    ret pen + ui.px(u, 14.0);
+# the key reference and its scrim stack above every other overlay
+val HELP_ORDER: u32 = 10;
+# ticks a message takes to fade out at the end of its time
+val FADE_TICKS: i32 = 30;
+
+# one label and value pair of the readout in the small face; ret the pen after it
+fun pair(ui: *bctx.Context, x: f32, y0: f32, y1: f32, label: str, value: str) f32 {
+    var pen: f32 = look.text_mid(ui, label, x, y0, y1, look.colour(theme.TEXT_FAINT, 1.0));
+    pen = look.text_mid(ui, value, pen + bctx.px(ui, 5.0), y0, y1, look.colour(theme.TEXT, 1.0));
+    ret pen + bctx.px(ui, 14.0);
 }
 
 # the readout of the world's state
 # ---
-# u:  the interface
+# ui: the interface
+# l:  cellar's look
 # a:  application state
 # s:  the world as shown
-# pt: the world's viewport
-pub fun readout(u: *ui.Ui, a: *app.App, s: *world.Shown, pt: render.Port) {
+pub fun readout(ui: *bctx.Context, l: look.Look, a: *app.App, s: *world.Shown) {
     var gen: [32]u8;
     gen[text.buf_grouped(?gen[0], 0, world.generation(s))] = 0;
     var pop: [32]u8;
@@ -66,53 +82,62 @@ pub fun readout(u: *ui.Ui, a: *app.App, s: *world.Shown, pt: render.Port) {
     if (world.full(s) && world.hashlife(s)) { extra = "table full"; }
     or (world.full(s))                      { extra = "pool full"; }
 
-    val m0: f32 = ui.px(u, 12.0);
-    val h:  f32 = ui.px(u, 30.0);
-    val pd: f32 = ui.px(u, 12.0);
-    val y0: f32 = m0;
-    val y1: f32 = y0 + h;
-    val x0: f32 = m0;
-    var w:  f32 = pd * 2.0 + ui.px(u, 22.0);
-    w = w + ui.measure(u.small, "gen") + ui.measure(u.small, ?gen[0]);
-    w = w + ui.measure(u.small, "pop") + ui.measure(u.small, ?pop[0]);
-    w = w + ui.measure(u.small, "box") + ui.measure(u.small, ?bx[0]);
-    w = w + ui.measure(u.small, rule) + ui.measure(u.small, name);
-    w = w + ui.measure(u.small, "speed") + ui.measure(u.small, ?sp[0]);
-    w = w + ui.px(u, 5.0 * 5.0 + 14.0 * 5.0) - ui.px(u, 14.0);
-    if (world.full(s)) { w = w + ui.measure(u.small, extra) + ui.px(u, 14.0); }
-    val x1: f32 = x0 + w;
+    var o: bov.Overlay = bov.on_surface(bov.TOP_LEFT);
+    o.dx   = bctx.px(ui, 12.0);
+    o.dy   = bctx.px(ui, 12.0);
+    o.fade = bov.Fade{dist: bctx.px(ui, 36.0), near: 0.25, far: 1.0};
+    bstyle.push_class(ui, l.hud);
+    val shown: bov.Shown = bov.begin(ui, "readout", o);
+    bctx.push_style(ui, l.small);
 
-    # fade back while the cursor is near, so the cells under it stay visible
-    var alpha: f32 = 1.0;
-    if (ui.inside(u, x0 - m0, y0 - m0, x1 + m0 * 3.0, y1 + m0 * 3.0)) { alpha = 0.25; }
-    ui.rect(u, x0, y0, x1, y1, theme.PANEL, alpha);
-    ui.frame(u, x0, y0, x1, y1, 1.0, theme.PANEL_EDGE, alpha);
+    val pd: f32 = bctx.px(ui, 12.0);
+    var w:  f32 = pd * 2.0 + bctx.px(ui, 22.0) + bctx.px(ui, 5.0 * 5.0 + 14.0 * 4.0);
+    w = w + bctx.text_width(ui, "gen") + bctx.text_width(ui, ?gen[0]);
+    w = w + bctx.text_width(ui, "pop") + bctx.text_width(ui, ?pop[0]);
+    w = w + bctx.text_width(ui, "box") + bctx.text_width(ui, ?bx[0]);
+    w = w + bctx.text_width(ui, name) + bctx.text_width(ui, rule);
+    w = w + bctx.text_width(ui, "speed") + bctx.text_width(ui, ?sp[0]);
+    if (world.full(s)) { w = w + bctx.text_width(ui, extra) + bctx.px(ui, 14.0); }
+    val h: f32       = bctx.px(ui, 30.0);
+    val r: bctx.Area = bw.place(ui, blay.fixed(w), blay.fixed(h), w, h);
 
-    val cy: f32 = (y0 + y1) / 2.0;
-    val k:  f32 = ui.px(u, 4.0);
-    var x:  f32 = x0 + pd;
-    if (world.running(s)) { ui.tri(u, x, cy - k * 1.2, x, cy + k * 1.2, x + k * 2.0, cy, theme.ACCENT, alpha); }
+    val cy: f32 = (r.y0 + r.y1) / 2.0;
+    val k:  f32 = bctx.px(ui, 4.0);
+    var x:  f32 = r.x0 + pd;
+    if (world.running(s)) { bctx.tri(ui, x, cy - k * 1.2, x, cy + k * 1.2, x + k * 2.0, cy, look.colour(theme.ACCENT, 1.0)); }
     or {
-        ui.rect(u, x, cy - k * 1.1, x + k * 0.7, cy + k * 1.1, theme.TEXT_DIM, alpha);
-        ui.rect(u, x + k * 1.3, cy - k * 1.1, x + k * 2.0, cy + k * 1.1, theme.TEXT_DIM, alpha);
+        val dim: blit.draw.Color = look.colour(theme.TEXT_DIM, 1.0);
+        bctx.quad(ui, x, cy - k * 1.1, x + k * 0.7, cy + k * 1.1, dim);
+        bctx.quad(ui, x + k * 1.3, cy - k * 1.1, x + k * 2.0, cy + k * 1.1, dim);
     }
-    x = x + ui.px(u, 22.0);
-    x = pair(u, x, y0, y1, "gen", ?gen[0], alpha);
-    x = pair(u, x, y0, y1, "pop", ?pop[0], alpha);
-    x = pair(u, x, y0, y1, "box", ?bx[0], alpha);
-    x = pair(u, x, y0, y1, name, rule, alpha);
-    x = pair(u, x, y0, y1, "speed", ?sp[0], alpha);
-    if (world.full(s)) { ui.text_mid(u, u.small, extra, x, y0, y1, theme.ACCENT, alpha); }
+    x = x + bctx.px(ui, 22.0);
+    x = pair(ui, x, r.y0, r.y1, "gen", ?gen[0]);
+    x = pair(ui, x, r.y0, r.y1, "pop", ?pop[0]);
+    x = pair(ui, x, r.y0, r.y1, "box", ?bx[0]);
+    x = pair(ui, x, r.y0, r.y1, name, rule);
+    x = pair(ui, x, r.y0, r.y1, "speed", ?sp[0]);
+    if (world.full(s)) { look.text_mid(ui, extra, x, r.y0, r.y1, look.colour(theme.ACCENT, 1.0)); }
+
+    bctx.pop_style(ui);
+    bov.end(ui, shown);
+    bstyle.pop(ui);
 }
 
 # the cell under the cursor and the zoom, in the bottom-left corner
-pub fun position(u: *ui.Ui, cam: render.Camera, pt: render.Port, over: bool) {
+# ---
+# ui:   the interface
+# l:    cellar's look
+# cam:  the camera the world is drawn through
+# over: the cursor is over the world, at (mx, my)
+# mx:   cursor x in screen pixels
+# my:   cursor y in screen pixels
+pub fun position(ui: *bctx.Context, l: look.Look, cam: render.Camera, over: bool, mx: f32, my: f32) {
     var b: [96]u8;
     var o: usize = 0;
     if (over) {
         var cx: i64 = 0;
         var cy: i64 = 0;
-        render.cell_at(cam, u.mx, u.my, ?cx, ?cy);
+        render.cell_at(cam, mx, my, ?cx, ?cy);
         o = signed(?b[0], o, cx);
         o = text.buf_str(?b[0], o, ", ");
         o = signed(?b[0], o, cy);
@@ -133,14 +158,21 @@ pub fun position(u: *ui.Ui, cam: render.Camera, pt: render.Port, over: bool) {
         o = text.buf_str(?b[0], o, " cells");
     }
     b[o] = 0;
-    val m:  f32 = ui.px(u, 12.0);
-    val pd: f32 = ui.px(u, 6.0);
-    val y1: f32 = pt.h - m + pd;
-    val y0: f32 = y1 - ui.line(u.small) - pd * 2.0;
-    val x1: f32 = m - pd + ui.measure(u.small, ?b[0]) + pd * 2.0;
-    ui.rect(u, m - pd, y0, x1, y1, theme.PANEL, 1.0);
-    ui.frame(u, m - pd, y0, x1, y1, 1.0, theme.PANEL_EDGE, 1.0);
-    ui.text(u, u.small, ?b[0], m, pt.h - m - ui.line(u.small), theme.TEXT_DIM, 1.0);
+
+    var ov: bov.Overlay = bov.on_surface(bov.BOTTOM_LEFT);
+    ov.dx = bctx.px(ui, 6.0);
+    ov.dy = 0.0 - bctx.px(ui, 6.0);
+    bstyle.push_class(ui, l.hud);
+    val shown: bov.Shown = bov.begin(ui, "position", ov);
+    bctx.push_style(ui, l.small);
+    val pd: f32       = bctx.px(ui, 6.0);
+    val w:  f32       = bctx.text_width(ui, ?b[0]) + pd * 2.0;
+    val h:  f32       = bctx.line_height(ui) + pd * 2.0;
+    val r:  bctx.Area = bw.place(ui, blay.fixed(w), blay.fixed(h), w, h);
+    bctx.text_at(ui, ?b[0], r.x0 + pd, r.y0 + pd, look.colour(theme.TEXT_DIM, 1.0));
+    bctx.pop_style(ui);
+    bov.end(ui, shown);
+    bstyle.pop(ui);
 }
 
 # append a signed integer
@@ -152,43 +184,84 @@ fun signed(buf: *u8, off: usize, v: i64) usize {
     ret text.buf_u64(buf, off, v::u64);
 }
 
-# the selection, tinted and outlined over the cells with its size beside it
-pub fun selection(u: *ui.Ui, a: *app.App, cam: render.Camera) {
+# the selection, tinted and outlined over the cells
+# ---
+# d:     the world's pass
+# a:     application state
+# cam:   the camera the world is drawn through
+# scale: the interface scale, which the outline's width follows
+pub fun selection(d: *paint.Paint, a: *app.App, cam: render.Camera, scale: f32) {
     if (!a.selected) { ret; }
     val r: render.Span = render.span(cam, a.area);
-    ui.rect(u, r.x0, r.y0, r.x1, r.y1, theme.ACCENT, 0.12);
-    ui.frame(u, r.x0 - 1.0, r.y0 - 1.0, r.x1 + 1.0, r.y1 + 1.0, ui.px(u, 1.5), theme.ACCENT, 0.9);
+    paint.rect(d, r.x0, r.y0, r.x1, r.y1, theme.ACCENT, 0.12);
+    paint.frame(d, r.x0 - 1.0, r.y0 - 1.0, r.x1 + 1.0, r.y1 + 1.0, 1.5 * scale, theme.ACCENT, 0.9);
+}
+
+# the selection's size, just above its top-left corner
+# ---
+# ui:  the interface
+# l:   cellar's look
+# a:   application state
+# cam: the camera the world is drawn through
+pub fun selection_size(ui: *bctx.Context, l: look.Look, a: *app.App, cam: render.Camera) {
+    if (!a.selected) { ret; }
+    val r: render.Span = render.span(cam, a.area);
     var b: [64]u8;
-    var o: usize = text.buf_u64(?b[0], 0, (a.area.x1 - a.area.x0)::u64);
+    var o: usize       = text.buf_u64(?b[0], 0, (a.area.x1 - a.area.x0)::u64);
     o    = text.buf_str(?b[0], o, " x ");
     o    = text.buf_u64(?b[0], o, (a.area.y1 - a.area.y0)::u64);
     b[o] = 0;
-    val m: f32 = ui.px(u, 4.0);
-    ui.text(u, u.small, ?b[0], r.x0, r.y0 - m - ui.line(u.small), theme.ACCENT, 0.9);
+    var ov: bov.Overlay = bov.on_rect(bctx.Area{x0: r.x0, y0: r.y0, x1: r.x1, y1: r.y1}, bov.TOP_LEFT, bov.BOTTOM_LEFT);
+    ov.dy = 0.0 - bctx.px(ui, 4.0);
+    val shown: bov.Shown = bov.begin(ui, "selection", ov);
+    bctx.push_alpha(ui, 0.9);
+    look.line(ui, l.small, ?b[0], theme.ACCENT);
+    bctx.pop_alpha(ui);
+    bov.end(ui, shown);
 }
 
-# the flashed message, fading out over its last half second
-pub fun toast(u: *ui.Ui, a: *app.App, pt: render.Port) {
+# the flashed message at the bottom centre of the world, fading out over its
+# last half second, as a card in the theme's toast style with an accent edge
+# ---
+# ui: the interface
+# a:  application state
+# pt: the world's viewport
+pub fun toast(ui: *bctx.Context, a: *app.App, pt: render.Port) {
     if (a.toast_t <= 0 || a.toast[0] == 0) { ret; }
     var alpha: f32 = 1.0;
-    if (a.toast_t < 30) { alpha = a.toast_t::f32 / 30.0; }
-    val pd: f32 = ui.px(u, 14.0);
-    val w:  f32 = ui.measure(u.body, a.toast) + pd * 2.0;
-    val h:  f32 = ui.px(u, 34.0);
-    val x0: f32 = (pt.w - w) / 2.0;
-    val y0: f32 = pt.h - h - ui.px(u, 40.0);
-    ui.rect(u, x0, y0, x0 + w, y0 + h, theme.CONTROL, alpha);
-    ui.rect(u, x0, y0, x0 + ui.px(u, 3.0), y0 + h, theme.ACCENT, alpha);
-    ui.text_mid(u, u.body, a.toast, x0 + pd, y0, y0 + h, theme.TEXT, alpha);
+    if (a.toast_t < FADE_TICKS) { alpha = a.toast_t::f32 / FADE_TICKS::f32; }
+    var o: bov.Overlay = bov.on_rect(bctx.Area{x0: 0.0, y0: 0.0, x1: pt.w, y1: pt.h}, bov.BOTTOM, bov.BOTTOM);
+    o.dy = 0.0 - bctx.px(ui, 40.0);
+    val shown: bov.Shown = bov.begin(ui, "toast", o);
+    bctx.push_alpha(ui, alpha);
+    val c: bov.Chrome = bov.chrome(ui, bov.KIND_TOAST);
+    val w: f32        = bctx.text_width(ui, a.toast) + c.pad * 2.0;
+    val h: f32        = bctx.px(ui, 34.0);
+    val r: bctx.Area  = bw.place(ui, blay.fixed(w), blay.fixed(h), w, h);
+    bov.paint(ui, c, r.x0, r.y0, r.x1, r.y1);
+    bctx.quad(ui, r.x0, r.y0, r.x0 + bctx.px(ui, 3.0), r.y1, look.colour(theme.ACCENT, 1.0));
+    look.text_mid(ui, a.toast, r.x0 + c.pad, r.y0, r.y1, c.text);
+    bctx.pop_alpha(ui);
+    bov.end(ui, shown);
 }
 
 # the key reference, over everything; a click anywhere closes it
-pub fun help(u: *ui.Ui, a: *app.App, sw: f32, sh: f32) {
+# ---
+# ui: the interface
+# a:  application state
+# sw: window width in pixels
+# sh: window height in pixels
+pub fun help(ui: *bctx.Context, a: *app.App, sw: f32, sh: f32) {
     if (a.help == 0) { ret; }
-    ui.block(u, 0.0, 0.0, sw, sh);
-    val hh: ui.Hit = ui.region(u, 0.0, 0.0, sw, sh);
-    if (hh.clicked) { a.help = 0; }
-    ui.rect(u, 0.0, 0.0, sw, sh, theme.BG, 0.7);
+    # the scrim takes every press over the window, the reference's included
+    var so: bov.Overlay = bov.on_surface(bov.TOP_LEFT);
+    so.order = HELP_ORDER;
+    val scrim: bov.Shown = bov.begin(ui, "scrim", so);
+    val all:   bctx.Area = bw.place(ui, blay.fixed(sw), blay.fixed(sh), sw, sh);
+    val hit:   bint.Hit  = bint.hit(ui, bctx.id_of(ui, "close"), all.x0, all.y0, all.x1, all.y1, binp.BUTTON_LEFT);
+    bctx.quad(ui, all.x0, all.y0, all.x1, all.y1, look.colour(theme.BG, 0.7));
+    bov.end(ui, scrim);
+    if (hit.clicked) { a.help = 0; }
 
     var keys: [30]str;
     var what: [30]str;
@@ -254,23 +327,28 @@ pub fun help(u: *ui.Ui, a: *app.App, sw: f32, sh: f32) {
     what[29] = "next or previous state to draw";
     val n: usize = 30;
 
-    val lh: f32 = ui.line(u.body) + ui.px(u, 6.0);
-    val pd: f32 = ui.px(u, 24.0);
-    val kw: f32 = ui.px(u, 120.0);
-    val w:  f32 = ui.px(u, 400.0);
-    val h:  f32 = pd * 2.0 + ui.line(u.body) + ui.px(u, 12.0) + lh * n::f32;
-    val x0: f32 = (sw - w) / 2.0;
-    var y0: f32 = (sh - h) / 2.0;
-    if (y0 < 0.0) { y0 = 0.0; }
-    ui.rect(u, x0, y0, x0 + w, y0 + h, theme.PANEL, 1.0);
-    ui.frame(u, x0, y0, x0 + w, y0 + h, 1.0, theme.PANEL_EDGE, 1.0);
-    ui.text(u, u.body, "Keys and mouse", x0 + pd, y0 + pd, theme.TEXT, 1.0);
-    var y: f32   = y0 + pd + ui.line(u.body) + ui.px(u, 12.0);
+    # the reference claims nothing, so a press on it reaches the scrim
+    var co: bov.Overlay = bov.on_surface(bov.CENTER);
+    co.order = HELP_ORDER + 1;
+    co.keep  = 1;
+    val card: bov.Shown = bov.begin(ui, "keys", co);
+    val lh:   f32       = bctx.line_height(ui);
+    val step: f32       = lh + bctx.px(ui, 6.0);
+    val pd:   f32       = bctx.px(ui, 24.0);
+    val kw:   f32       = bctx.px(ui, 120.0);
+    val w:    f32       = bctx.px(ui, 400.0);
+    val h:    f32       = pd * 2.0 + lh + bctx.px(ui, 12.0) + step * n::f32;
+    val r:    bctx.Area = bw.place(ui, blay.fixed(w), blay.fixed(h), w, h);
+    bctx.quad(ui, r.x0, r.y0, r.x1, r.y1, look.colour(theme.PANEL, 1.0));
+    bctx.frame(ui, r.x0, r.y0, r.x1, r.y1, 1.0, look.colour(theme.PANEL_EDGE, 1.0));
+    bctx.text_at(ui, "Keys and mouse", r.x0 + pd, r.y0 + pd, look.colour(theme.TEXT, 1.0));
+    var y: f32   = r.y0 + pd + lh + bctx.px(ui, 12.0);
     var i: usize = 0;
     for (i < n) {
-        ui.text(u, u.body, keys[i], x0 + pd, y, theme.ACCENT, 1.0);
-        ui.text(u, u.body, what[i], x0 + pd + kw, y, theme.TEXT, 1.0);
-        y = y + lh;
+        bctx.text_at(ui, keys[i], r.x0 + pd, y, look.colour(theme.ACCENT, 1.0));
+        bctx.text_at(ui, what[i], r.x0 + pd + kw, y, look.colour(theme.TEXT, 1.0));
+        y = y + step;
         i = i + 1;
     }
+    bov.end(ui, card);
 }

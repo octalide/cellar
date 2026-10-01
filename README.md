@@ -17,8 +17,9 @@ quadtree stepped by Gosper's algorithm, a power of two generations at a time,
 and drawn from the tree at the current zoom, so a Gosper gun reaches
 generation 2^30 in a moment. HashLife keeps no heat or age, so it draws in the
 solid colour. boom owns the window, input, Vulkan renderer and frame loop; the
-interface is drawn over the cells in the same overlay pass by a small
-immediate-mode layer of cellar's own, with text from an embedded TrueType face.
+interface is built with [blit](https://github.com/briar-systems/blit) and drawn
+over the cells in the same overlay pass through boom's blit renderer, with text
+from an embedded TrueType face.
 
 A kernel is a `(2r+1)x(2r+1)` integer-weight footprint, of radius up to 16 and
 negative weights allowed, plus birth and survive sets over the saturated
