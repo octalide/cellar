@@ -19,6 +19,7 @@ use cellar.formats.rle;
 use cellar.hashlife;
 use cellar.pattern;
 use cellar.rule;
+use lenia_word: cellar.rules.lenia.word;
 use cellar.sim;
 use cellar.space;
 use cellar.topology;
@@ -1198,5 +1199,85 @@ test load__a_macrocell_past_the_pool_loads_into_hashlife_and_runs {
     if (!sim.jump(?s, 1000000) || sim.population(?s) != 262144) { ret 9; }
     if (!sim.alive(?s, -16384, -16383))                         { ret 10; }
     sim.dnit(?s);
+    ret 0;
+}
+
+# Chakazul's Orbium unicaudatus, from his Lenia's animals.json, its cells as
+# he writes them, which is Golly's multi-state RLE of the values in 255ths
+#[testing]
+val ORBIUM: str = "x = 20, y = 20, rule = R=13,T=10,b=[1],m=0.15,s=0.015,kn=1,gn=1\n7.MD6.qL$6.pKqEqFURpApBRAqQ$5.VqTrSsBrOpXpWpTpWpUpCrQ$4.CQrQsTsWsApITNPpGqGvL$3.IpIpWrOsGsBqXpJ4.LsFrL$A.DpKpSpJpDqOqUqSqE5.ExD$qL.pBpTT2.qCrGrVrWqM5.sTpP$.pGpWpD3.qUsMtItQtJ6.tL$.uFqGH3.pXtOuR2vFsK5.sM$.tUqL4.GuNwAwVxBwNpC4.qXpA$2.uH5.vBxGyEyMyHtW4.qIpL$2.wV5.tIyG3yOxQqW2.FqHpJ$2.tUS4.rM2yOyJyOyHtVpPMpFqNV$2.HsR4.pUxAyOxLxDxEuVrMqBqGqKJ$3.sLpE3.pEuNxHwRwGvUuLsHrCqTpR$3.TrMS2.pFsLvDvPvEuPtNsGrGqIP$4.pRqRpNpFpTrNtGtVtStGsMrNqNpF$5.pMqKqLqRrIsCsLsIrTrFqJpHE$6.RpSqJqPqVqWqRqKpRXE$8.OpBpIpJpFTK!\n";
+
+# stamp Orbium onto a world at the origin, in the world's rule
+#[testing]
+fun seed_orbium(s: *sim.Sim) {
+    var a: allo.Allocator;
+    page.make(?a);
+    var f: format.Format;
+    if (!by_id("rle", ?f)) { ret; }
+    var ws:   adapt.WorldSink;
+    var info: format.Info;
+    format.info_init(?info, ?a);
+    load(?a, ?f, ORBIUM::*u8, string.str_len(ORBIUM), adapt.world_sink(?ws, s, 0, 0), ?info);
+    format.info_dnit(?info);
+}
+
+# the sum of a world's values, each word over the value 1
+#[testing]
+fun mass(s: *sim.Sim) f64 {
+    var m:  f64   = 0.0;
+    var sl: usize = 0;
+    for (sl < s.space.hi) {
+        if (space.used(?s.space, sl)) {
+            var i: usize = 0;
+            for (i < space.CELLS) {
+                m = m + s.space.cells[sl * space.CELLS + i]::f64;
+                i = i + 1;
+            }
+        }
+        sl = sl + 1;
+    }
+    ret m / lenia_word.ONE::f64;
+}
+
+test lenia__orbium_glides_on_unchanged_for_300_generations_on_both_engines {
+    val r: res[rule.Rule, str] = rule.parse("R=13,T=10,b=[1],m=0.15,s=0.015,kn=1,gn=1");
+    if (sel r.err) { ret 1; }
+    var t:    sim.Rig;
+    val code: i32 = sim.rig_open(?t, r.ok, seed_orbium);
+    if (code != 0) { ret 2; }
+    # the RLE's levels are the cells' values in 255ths: the brightest is 1
+    var top: u32 = 0;
+    var y:   i64 = 0;
+    for (y < 20) {
+        var x: i64 = 0;
+        for (x < 20) {
+            val c: u32 = sim.cell(?t.cpu, x, y);
+            if (c > top) { top = c; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    if (top != lenia_word.ONE) { ret 3; }
+    # a hundred generations to settle from the rounding to 255ths, then two
+    # hundred more, over which it keeps its mass and its size and glides on
+    sim.rig_step(?t, 100);
+    val m1: f64            = mass(?t.cpu);
+    val b1: opt[space.Box] = sim.bounds(?t.cpu);
+    sim.rig_step(?t, 200);
+    val m2: f64            = mass(?t.cpu);
+    val b2: opt[space.Box] = sim.bounds(?t.cpu);
+    if (sel b1.none)                                   { ret 4; }
+    if (sel b2.none)                                   { ret 4; }
+    if (m1 < 60.0 || m2 < m1 * 0.97 || m2 > m1 * 1.03) { ret 5; }
+    val w1: i64 = b1.some.x1 - b1.some.x0;
+    val h1: i64 = b1.some.y1 - b1.some.y0;
+    val w2: i64 = b2.some.x1 - b2.some.x0;
+    val h2: i64 = b2.some.y1 - b2.some.y0;
+    if (w2 < w1 - 3 || w2 > w1 + 3 || h2 < h1 - 3 || h2 > h1 + 3 || w2 > 30 || h2 > 30) { ret 6; }
+    val dx: i64 = b2.some.x0 - b1.some.x0;
+    val dy: i64 = b2.some.y0 - b1.some.y0;
+    if (dx * dx + dy * dy < 50 * 50) { ret 7; }
+    if (!sim.rig_same(?t))           { ret 8; }
+    sim.rig_close(?t);
     ret 0;
 }
