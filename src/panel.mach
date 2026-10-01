@@ -4,15 +4,16 @@
 # a panel is data: a title, which is also its window's key, where the default
 # layout puts it, whether it starts closed, the size it floats at and the
 # page it draws. each one docks, floats, tabs with another and closes through
-# blit, and the panels menu (cellar.toolbar) reopens a closed one. the left and
-# right dock spaces are carved from the window below the toolbar only while
-# they hold an open panel, and what they leave is the world's port.
+# blit, and the panels menu (cellar.toolbar) reopens a closed one. one dock
+# space fills the window below the toolbar, and its central node is the
+# world's: it holds no panel, shows the world through and takes its share of
+# the space as the panels around it give theirs up or are dragged wider.
 #
 # the layout lives in blit's state store, which the settings keep (persist,
-# keep) and restore at startup (restore). with no layout to restore, or on
-# reset, the default one is built: patterns and files tabbed at the left, rule,
-# world and view tabbed at the right over the stats, and the settings floating,
-# closed.
+# keep) and restore at startup (restore), the docks' sizes with it. with no
+# layout to restore, or on reset, the default one is built: patterns and files
+# tabbed left of the world, rule, world and view tabbed right of it over the
+# stats, and the settings floating, closed.
 
 use blit;
 use bctx:  blit.context;
@@ -36,20 +37,20 @@ use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string;
 use std.types.string.str;
 
-# unscaled width of a side dock
+# unscaled width of a side of the default layout
 val WIDTH: f32 = 300.0;
-# the most of the window's width a side dock takes
+# the most of the space's width a side of the default layout takes
 val WIDTH_SHARE: f32 = 0.3;
-# the stats' share of the right dock's height in the default layout
+# the stats' share of the right side's height in the default layout
 val STATS_SHARE: f32 = 0.3;
-# the dock spaces' keys
-val LEFT:  str = "left dock";
-val RIGHT: str = "right dock";
+# the dock space's key
+val SPACE: str = "dock";
 
 # where a panel goes in the default layout
 pub val HOME_LEFT:  u8 = 0;
@@ -159,17 +160,6 @@ pub fun show(ui: *bctx.Context, a: *app.App, i: usize, on: bool) {
     bctx.redraw(ui);
 }
 
-# whether a dock space holds an open panel, so it takes room
-fun live(ui: *bctx.Context, sid: u64) bool {
-    var i: usize = 0;
-    for (i < COUNT) {
-        val n: *bdock.Node = bst.find[bdock.Node](ui, bdock.node_of(ui, id(i)));
-        if (n != nil && n.space == sid && shown(ui, i)) { ret true; }
-        i = i + 1;
-    }
-    ret false;
-}
-
 # keep every panel's window state while the panels are hidden, so the layout
 # the settings save holds them all
 fun hold(ui: *bctx.Context) {
@@ -180,21 +170,9 @@ fun hold(ui: *bctx.Context) {
     }
 }
 
-# dock a panel into a leaf at a place among its tabs
-fun dock_at(ui: *bctx.Context, leaf: u64, i: usize, rank: f64) {
-    bdock.add(ui, leaf, id(i));
-    val dk: *bw.Docked = bst.find[bw.Docked](ui, id(i));
-    if (dk != nil) { dk.rank = rank; }
-}
-
-# show the first of a leaf's tabs
-fun front(ui: *bctx.Context, leaf: u64, i: usize) {
-    val n: *bdock.Node = bst.find[bdock.Node](ui, leaf);
-    if (n != nil) { n.front = id(i); }
-}
-
-# build the default layout, undocking every panel and opening each as it starts
-fun relayout(ui: *bctx.Context) {
+# build the default layout in a space laid over an area, undocking every
+# panel and opening each as it starts
+fun relayout(ui: *bctx.Context, sid: u64, area: bctx.Area) {
     var i: usize = 0;
     for (i < COUNT) {
         bdock.remove(ui, id(i));
@@ -206,32 +184,44 @@ fun relayout(ui: *bctx.Context) {
         i = i + 1;
     }
     hold(ui);
-    val left:  u64 = bdock.root(ui, bctx.id_of(ui, LEFT));
-    val right: u64 = bdock.root(ui, bctx.id_of(ui, RIGHT));
-    val stats: u64 = bdock.split(ui, right, bctx.Side.bottom{}, STATS_SHARE);
-    var ranks: [3]f64;
-    ranks[0] = 0.0;
-    ranks[1] = 0.0;
-    ranks[2] = 0.0;
+    # every leaf but the central node collapsed as its last panel left, so the
+    # central node is all the tree holds, unless a layout from elsewhere had
+    # none: then the space starts over from a new root
+    var mid: u64 = bdock.central(ui, sid);
+    if (mid == 0) {
+        val sp: *bdock.SpaceState = bst.get[bdock.SpaceState](ui, sid);
+        sp.root    = 0;
+        sp.central = 0;
+        mid        = bdock.central(ui, sid);
+    }
+    val aw:     f32 = area.x1 - area.x0;
+    val w:      f32 = side_width(bctx.scale_of(ui), aw);
+    val left:   u64 = bdock.split(ui, mid, bctx.Side.left{}, w / aw);
+    val right:  u64 = bdock.split(ui, mid, bctx.Side.right{}, w / (aw - w));
+    val stats:  u64 = bdock.split(ui, right, bctx.Side.bottom{}, STATS_SHARE);
     var leaves: [3]u64;
     leaves[HOME_LEFT]  = left;
     leaves[HOME_RIGHT] = right;
     leaves[HOME_STATS] = stats;
-    i                  = 0;
+    var first: [3]bool;
+    first[0] = true;
+    first[1] = true;
+    first[2] = true;
+    i        = 0;
     for (i < COUNT) {
         val h: u8 = panel(i).home;
-        if (h != HOME_FLOAT) {
-            dock_at(ui, leaves[h], i, ranks[h]);
-            ranks[h] = ranks[h] + 1.0;
-        }
+        if (h != HOME_FLOAT) { bdock.add(ui, leaves[h], id(i)); }
         i = i + 1;
     }
-    # each leaf shows its first tab, which docking the rest moved off
-    i = COUNT;
-    for (i > 0) {
-        i = i - 1;
+    # each leaf shows its first tab, which adding the rest moved off
+    i = 0;
+    for (i < COUNT) {
         val h: u8 = panel(i).home;
-        if (h != HOME_FLOAT) { front(ui, leaves[h], i); }
+        if (h != HOME_FLOAT && first[h]) {
+            bdock.select(ui, id(i));
+            first[h] = false;
+        }
+        i = i + 1;
     }
 }
 
@@ -273,7 +263,8 @@ pub fun keep(ui: *bctx.Context, a: *app.App) {
     app.keep_layout(a, doc.ok::*u8, string.str_len(doc.ok));
 }
 
-# the width of a side dock at interface scale s in a window sw wide
+# the width of a side of the default layout at interface scale s in a space
+# sw wide
 fun side_width(s: f32, sw: f32) f32 {
     var w: f32 = WIDTH * s;
     if (w > sw * WIDTH_SHARE) { w = sw * WIDTH_SHARE; }
@@ -291,23 +282,25 @@ fun inside(r: bctx.Area) render.Port {
     ret render.Port{x0: x0, y0: y0, w: w, h: h};
 }
 
-# carve the dock spaces from what the toolbar left, and give what they leave
-# to the world; call at the interface's root after the toolbar
+# lay the dock space over what the toolbar left, and give its central node to
+# the world; call at the interface's root after the toolbar. while Tab hides
+# the panels the world takes all the toolbar left
 # ---
 # ui:  the interface, its frame begun
 # a:   application state
 # ret: the world's port
 pub fun docks(ui: *bctx.Context, a: *app.App) render.Port {
+    val free: bctx.Area = bctx.free_area(ui);
+    val sid:  u64       = bctx.id_of(ui, SPACE);
     if (a.relayout) {
-        relayout(ui);
+        relayout(ui, sid, free);
         a.relayout = false;
     }
-    if (a.panel != 0) {
-        val w: f32 = side_width(bctx.scale_of(ui), ui.sw);
-        if (live(ui, bctx.id_of(ui, LEFT)))  { bdock.space(ui, LEFT, bctx.carve(ui, bctx.Side.left{}, w)); }
-        if (live(ui, bctx.id_of(ui, RIGHT))) { bdock.space(ui, RIGHT, bctx.carve(ui, bctx.Side.right{}, w)); }
-    }
-    ret inside(bctx.free_area(ui));
+    if (a.panel == 0) { ret inside(free); }
+    bdock.space(ui, SPACE, free);
+    val mid: opt[bctx.Area] = bdock.central_area(ui, sid);
+    if (sel mid.some) { ret inside(mid.some); }
+    ret inside(free);
 }
 
 # draw the panels and apply their controls; call after docks
