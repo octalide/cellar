@@ -249,6 +249,8 @@ pub rec Watch {
 # past:       each ceiling the run was carried past, until it falls back under
 # tripped:    the ceiling the run last paused at, ceiling.COUNT for none
 # began:      when the step under way began, if the step ceiling times it
+# fit:        the largest step exponent the run to a generation under way found
+#             fits the memory ceiling
 pub rec Sim {
     space:      space.Space;
     rule:       rule.Rule;
@@ -274,6 +276,7 @@ pub rec Sim {
     past:       [4]bool;
     tripped:    usize;
     began:      opt[time.Instant];
+    fit:        u32;
 }
 
 # an empty world stepped by the CPU, with the first preset's rule
@@ -306,6 +309,7 @@ pub fun init(s: *Sim, a: *allo.Allocator) err[allo.Error] {
     history.clear(?s.history);
     s.ceil  = ceiling.defaults();
     s.began = opt[time.Instant].none{};
+    s.fit   = hashlife.MAX_EXPONENT;
     disarm(s);
     ret e;
 }
@@ -636,16 +640,19 @@ pub fun set_exponent(s: *Sim, k: u32) {
 #
 # with descend a step the memory ceiling cancels is taken as two of half the
 # generations instead, down to single generations, as Golly does for a run
-# aiming at a generation.
+# aiming at a generation, and no step of the run is tried larger again (fit).
 # ---
 # s:       simulation on the tree
 # descend: halve a step the memory ceiling cancels
 # ret:     false when the table filled, a step was cancelled or one crossed a
 #          ceiling
 fun tree_step(s: *Sim, descend: bool) bool {
-    if (tree_advance(s, descend)) { ret tree_commit(s); }
     val t: *hashlife.Tree = ?s.tree;
-    if (!descend || t.k == 0 || hashlife.cancelled(t) != hashlife.CANCEL_BUDGET) { ret false; }
+    if (!descend || t.k <= s.fit) {
+        if (tree_advance(s, descend))                                                { ret tree_commit(s); }
+        if (!descend || t.k == 0 || hashlife.cancelled(t) != hashlife.CANCEL_BUDGET) { ret false; }
+        s.fit = t.k - 1;
+    }
     val k: u32 = t.k;
     hashlife.set_exponent(t, k - 1);
     val done: bool = tree_step(s, true) && tree_step(s, true);
@@ -886,8 +893,9 @@ pub fun jump(s: *Sim, gen: u64) bool {
     if (!on_tree(s) || s.full || s.tripped != ceiling.COUNT || gen < s.generation) { ret false; }
     val d: u64 = gen - s.generation;
     if ((d >> (hashlife.MAX_EXPONENT + 1)::u64) != 0) { ret false; }
-    val k0: u32  = s.tree.k;
-    var b:  u32  = hashlife.MAX_EXPONENT + 1;
+    val k0: u32 = s.tree.k;
+    var b:  u32 = hashlife.MAX_EXPONENT + 1;
+    s.fit = hashlife.MAX_EXPONENT;
     var ok: bool = true;
     for (b > 0 && ok) {
         b = b - 1;
