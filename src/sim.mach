@@ -2860,8 +2860,14 @@ fun bulk_edit(s: *Sim) {
     edit_end(s);
 }
 
+# the slots a rig's GPU steps a frame, so every generation of any pool past a
+# few chunks is split across frames in ranges
+#[testing]
+pub val RIG_SPAN: usize = 3;
+
 # a world the CPU steps and, where a GPU can step one, the same world on the GPU
-# beside it, for tests that hold the two engines to the same result
+# beside it, for tests that hold the two engines to the same result, the GPU's
+# generations split across frames (RIG_SPAN)
 # ---
 # a:    allocator behind both worlds
 # cpu:  the world the CPU steps
@@ -2929,6 +2935,7 @@ pub fun rig_open(t: *Rig, r: rule.Rule, seed: fun(*Sim)) i32 {
         ret 0;
     }
     attach(?t.gpu, ?t.g);
+    gpu.fix_span(?t.g, RIG_SPAN);
     t.on = true;
     ret 0;
 }
@@ -2952,6 +2959,28 @@ pub fun rig_settle(t: *Rig) bool {
     if (!settle_frames(?t.r, ?t.gpu, t.cpu.generation)) { ret false; }
     gfx.renderer_wait_idle(?t.r);
     ret true;
+}
+
+# record one frame of the GPU's world, which may leave a generation part way
+#[testing]
+pub fun rig_frame(t: *Rig) bool {
+    var look: gpu.Look;
+    look.ppc    = 1.0;
+    look.half_w = 32.0;
+    look.half_h = 32.0;
+    look.win_w  = 64.0;
+    var drawn: bool = false;
+    for (!drawn) {
+        window.window_poll();
+        val br: res[bool, gfx.Error] = gfx.renderer_begin_frame(?t.r);
+        if (sel br.err) { ret false; }
+        drawn = br.ok;
+    }
+    collect(?t.gpu);
+    val rec: err[gfx.Error] = record(?t.gpu, false, ?look);
+    if (sel rec.err) { ret false; }
+    val ended: err[gfx.Error] = gfx.renderer_end_frame(?t.r);
+    ret sel ended.ok;
 }
 
 # settle the GPU and whether its world is the CPU's, cell for cell
@@ -2990,6 +3019,8 @@ fun engines_agree(f: usize) i32 {
         rig_close(?t);
         ret -1;
     }
+    # a pool of hundreds of chunks splits each generation over a few frames
+    gpu.fix_span(?t.g, 64);
 
     # blocks painted far apart grow the pool past what the GPU was built for
     var b: i64 = 0;
@@ -3013,8 +3044,14 @@ fun engines_agree(f: usize) i32 {
             # pulls the chunks it covers before writing them whole
             rig_step(?t, 5);
             if (!rig_settle(?t)) { ret 4; }
+            # an edit while the next generation is part way starts it over
+            # from the edited world
+            step(?t.gpu);
+            if (!rig_frame(?t) || !t.g.going) { ret 5; }
             bulk_edit(?t.cpu);
             bulk_edit(?t.gpu);
+            step(?t.cpu);
+            if (!rig_settle(?t)) { ret 6; }
             n = 30;
             set_rule(?t.cpu, sample_rule(f, phase));
             set_rule(?t.gpu, sample_rule(f, phase));
@@ -3523,9 +3560,9 @@ fun uncapped_frames(r: *gfx.Renderer, s: *Sim, want: u64, wide: *bool) usize {
         if (sel br.err) { ret 0; }
         if (br.ok) {
             collect(s);
-            # pacing would shrink the stride, and a slow machine keep the halo
+            # pacing would shrink the span, and a slow machine keep the halo
             # from widening; here the budget alone limits the frames
-            s.gpu.pace = gpu.MAX_STEPS;
+            gpu.fix_span(s.gpu, gpu.MAX_SPAN);
             s.gpu.want = true;
             val before: u64            = s.generation;
             val rec:    err[gfx.Error] = record(s, true, ?look);
