@@ -29,7 +29,9 @@
 # the root's result as the new root.
 #
 # the table holds at most max nodes. collect frees every node the root and the
-# empty squares do not reach, and forgets the results that named one. a node
+# empty squares do not reach, and forgets the results that named one. tidy
+# collects as the nodes in use near a budget, the max unless a ceiling on the
+# tree's memory sets a lower one (set_budget). a node
 # the table cannot make is NONE, which every function passes up, so a step or
 # an edit that fills the table stops whole and says so rather than going wrong.
 #
@@ -64,8 +66,9 @@ pub val MAX_STATES: u32 = 256;
 pub val MAX_LEVEL: u32 = 60;
 # the largest step exponent, which leaves the root room to be padded for it
 pub val MAX_EXPONENT: u32 = 48;
-# nodes a table may hold unless told otherwise, 48 bytes each
-pub val DEFAULT_MAX: usize = 4194304;
+# nodes a table may hold unless told otherwise, NODE_BYTES each: room for a
+# memory ceiling well past the default to be run past
+pub val DEFAULT_MAX: usize = 134217728;
 # the level of a chunk, 64 cells on a side
 pub val CHUNK: u32 = 6;
 # the shallowest root, so every chunk is a node below it
@@ -102,6 +105,9 @@ rec Node {
     live:  u64;
 }
 
+# the memory a node in use takes: itself and its share of the buckets
+pub val NODE_BYTES: usize = $size_of(Node) + $size_of(u32);
+
 # Node.flags
 val USED: u8 = 1;
 val MARK: u8 = 2;
@@ -128,6 +134,7 @@ rec Cache {
 # a:      allocator behind the table and the cache
 # made:   the table is allocated
 # max:    the most nodes the table may hold
+# budget: nodes tidy collects as the table nears, at most max
 # nodes:  the table
 # cap:    nodes allocated
 # hi:     ids in use lie below this
@@ -152,6 +159,7 @@ pub rec Tree {
     a:      *allo.Allocator;
     made:   bool;
     max:    usize;
+    budget: usize;
     nodes:  *Node;
     cap:    usize;
     hi:     usize;
@@ -179,12 +187,13 @@ pub rec Tree {
 # a:   allocator for the table
 # max: the most nodes, at least a few thousand
 pub fun init(t: *Tree, a: *allo.Allocator, max: usize) {
-    t.a    = a;
-    t.made = false;
-    t.max  = max;
-    t.cap  = 0;
-    t.k    = 0;
-    t.full = false;
+    t.a      = a;
+    t.made   = false;
+    t.max    = max;
+    t.budget = max;
+    t.cap    = 0;
+    t.k      = 0;
+    t.full   = false;
     # until a rule is set, every state but 0 shows as a live cell at full heat
     var i: usize = 0;
     for (i < MAX_STATES::usize) {
@@ -734,9 +743,22 @@ pub fun collect(t: *Tree, extra: u32) {
     t.full = false;
 }
 
-# collect when the table is three quarters full
+# collect when the nodes in use reach three quarters of the budget or the table
 pub fun tidy(t: *Tree, extra: u32) {
-    if (t.used >= t.max - t.max / 4) { collect(t, extra); }
+    var b: usize = t.budget;
+    if (b > t.max)           { b = t.max; }
+    if (t.used >= b - b / 4) { collect(t, extra); }
+}
+
+# set the nodes tidy keeps the table within, the table's max for none
+pub fun set_budget(t: *Tree, nodes: usize) {
+    t.budget = nodes;
+}
+
+# the bytes the nodes in use take, the cells' included
+pub fun memory(t: *Tree) usize {
+    if (!t.made) { ret 0; }
+    ret t.used * NODE_BYTES;
 }
 
 # whether the root's live cells all lie in its centre quarter
