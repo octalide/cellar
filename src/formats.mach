@@ -191,6 +191,9 @@ fun pass(a: *allo.Allocator, f: *format.Format, p: *u8, n: usize, sink: *format.
 }
 
 # encode a source to bytes
+#
+# a continuous rule's cells are refused by a format holding fewer states than
+# the levels they are traded in, rather than written with their values lost.
 # ---
 # a:    allocator for the encoder's scratch
 # f:    the format
@@ -199,7 +202,8 @@ fun pass(a: *allo.Allocator, f: *format.Format, p: *u8, n: usize, sink: *format.
 # out:  receives the file's bytes, appended
 # ret:  ok, or why it could not be written
 pub fun save(a: *allo.Allocator, f: *format.Format, src: *format.Source, info: *format.Info, out: *Vector[u8]) err[format.Error] {
-    if (f.encode == nil) { ret err[format.Error].err{format.Error.unsupported{}}; }
+    if (f.encode == nil)                         { ret err[format.Error].err{format.Error.unsupported{}}; }
+    if (src.continuous && src.states > f.states) { ret err[format.Error].err{format.Error.levels{}}; }
     ret f.encode(a, src, info, out);
 }
 
@@ -1279,5 +1283,66 @@ test lenia__orbium_glides_on_unchanged_for_300_generations_on_both_engines {
     if (dx * dx + dy * dy < 50 * 50) { ret 7; }
     if (!sim.rig_same(?t))           { ret 8; }
     sim.rig_close(?t);
+    ret 0;
+}
+
+test save__a_lenia_world_writes_its_255ths_and_a_two_state_format_refuses_it {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    val r: res[rule.Rule, str] = rule.parse("R=13,T=10,b=[1],m=0.15,s=0.015,kn=1,gn=1");
+    if (sel r.err) { ret 1; }
+    sim.set_rule(?s, r.ok);
+    seed_orbium(?s);
+    val ids: [3]str = [3]str{"rle", "plaintext", "custom"};
+    var i:   usize  = 0;
+    for (i < 3) {
+        var f: format.Format;
+        if (!by_id(ids[i], ?f)) { ret 2; }
+        var src:  adapt.WorldSource;
+        var info: format.Info;
+        format.info_init(?info, ?a);
+        var out: Vector[u8]                        = vector.init[u8](?a);
+        val w:   res[*format.Source, format.Error] = adapt.world_source(?src, ?s, ?a);
+        if (sel w.err) { ret 3; }
+        var e: err[format.Error] = err[format.Error].ok{};
+        if (sel w.ok) { e = save(?a, ?f, w.ok, ?info, ?out); }
+        adapt.world_source_dnit(?src);
+        format.info_dnit(?info);
+        # RLE keeps the 255ths Chakazul's cells are written in, so Orbium's
+        # cells come back as they were loaded; the others hold two states
+        if (i == 0) {
+            if (sel e.err) { ret 4; }
+            var back: sim.Sim;
+            val m2:   err[allo.Error] = sim.init(?back, ?a);
+            if (sel m2.err) { ret 5; }
+            sim.set_rule(?back, r.ok);
+            var ws:  adapt.WorldSink;
+            var got: format.Info;
+            format.info_init(?got, ?a);
+            val l: err[format.Error] = load(?a, ?f, out.data, out.len, adapt.world_sink(?ws, ?back, 0, 0), ?got);
+            format.info_dnit(?got);
+            if (sel l.err) { ret 6; }
+            var y: i64 = 0;
+            for (y < 20) {
+                var x: i64 = 0;
+                for (x < 20) {
+                    if (sim.cell(?back, x, y) != sim.cell(?s, x, y)) { ret 7; }
+                    x = x + 1;
+                }
+                y = y + 1;
+            }
+            sim.dnit(?back);
+        }
+        or {
+            if (!sel e.err)        { ret 8; }
+            if (!sel e.err.levels) { ret 8; }
+        }
+        vector.dnit[u8](?out);
+        i = i + 1;
+    }
+    sim.dnit(?s);
     ret 0;
 }
