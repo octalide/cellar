@@ -62,8 +62,11 @@
 # and the tree after each step and on the GPU after each census, and a run
 # that crossed one is paused with it tripped: step and jump refuse until pass
 # carries the run past it. HashLife's memory is counted after a collection, so
-# the garbage a step leaves behind never trips it, and its budget holds tidy
-# to the ceiling while it is armed.
+# the garbage a step leaves behind never trips it. while the memory and step
+# ceilings are armed the tree holds a step to them as it runs: one that would
+# take a node past the memory budget, or run past the step's time, is cancelled
+# part way (hashlife's cancel point) with the world as it was, and the run
+# pauses at that ceiling, after one more try on a collected tree for memory.
 #
 # the world is unbounded unless the rule names a bounded grid
 # (cellar.topology), and then a cell written off the grid is dropped, as
@@ -622,18 +625,40 @@ pub fun set_exponent(s: *Sim, k: u32) {
 }
 
 # advance the tree one step of 2^k generations, collecting and trying once
-# more when its table fills
+# more when its table or the memory ceiling's budget fills part way
+#
+# the step is cancelled part way as it would pass the memory ceiling's budget
+# or the step ceiling's time, leaving the world as it was, and the run pauses
+# at that ceiling. a step cancelled by an ask is left to whoever asked.
 # ---
-# ret: false when the table filled or the step crossed a ceiling
+# ret: false when the table filled, the step was cancelled or it crossed a
+#      ceiling
 fun tree_step(s: *Sim) bool {
     val t:  *hashlife.Tree    = ?s.tree;
     val t0: opt[time.Instant] = clock(s);
-    if (!hashlife.step(t)) {
+    val k:  usize             = ceiling.STEP;
+    var at: opt[time.Instant] = opt[time.Instant].none{};
+    if (sel t0.some) {
+        if (!s.past[k]) { at = opt[time.Instant].some{hashlife.deadline_after(t0.some, s.ceil.limit[k])}; }
+    }
+    hashlife.set_deadline(t, at);
+    var ok:  bool = hashlife.step(t);
+    val why: u8   = hashlife.cancelled(t);
+    if (!ok && why != hashlife.CANCEL_TIME && why != hashlife.CANCEL_ASKED) {
+        # what earlier steps left behind may be what filled it
         hashlife.collect(t, hashlife.NONE);
-        if (!hashlife.step(t)) {
-            overflow(s);
-            ret false;
+        ok = hashlife.step(t);
+    }
+    if (!ok) {
+        val again: u8 = hashlife.cancelled(t);
+        if (again == hashlife.CANCEL_BUDGET) {
+            # what the cancelled step made is garbage
+            hashlife.collect(t, hashlife.NONE);
+            trip(s, ceiling.MEMORY);
         }
+        or (again == hashlife.CANCEL_TIME) { trip(s, ceiling.STEP); }
+        or (again == hashlife.CANCEL_NONE) { overflow(s); }
+        ret false;
     }
     s.generation = s.generation + ((1::u64) << t.k::u64);
     touched(s);
@@ -722,10 +747,7 @@ fun check(s: *Sim, pop: u64, step_ns: opt[u64]) bool {
         }
         if (!ceiling.over(?s.ceil, k, m)) { s.past[k] = false; }
         or (!s.past[k]) {
-            s.tripped = k;
-            s.running = 0;
-            s.pending = 0;
-            rearm(s);
+            trip(s, k);
             ret false;
         }
         k = k + 1;
@@ -734,7 +756,15 @@ fun check(s: *Sim, pop: u64, step_ns: opt[u64]) bool {
     ret true;
 }
 
-# hold the tree's collections to the memory ceiling while it is armed
+# pause the run at a ceiling
+fun trip(s: *Sim, k: usize) {
+    s.tripped = k;
+    s.running = 0;
+    s.pending = 0;
+    rearm(s);
+}
+
+# hold the tree's collections and steps to the memory ceiling while it is armed
 fun rearm(s: *Sim) {
     val k: usize = ceiling.MEMORY;
     if (s.ceil.on[k] && !s.past[k]) { hashlife.set_budget(?s.tree, (ceiling.raw(?s.ceil, k) / hashlife.NODE_BYTES::u64)::usize); }
@@ -2248,25 +2278,75 @@ test ceiling__hashlife_collects_before_its_memory_ceiling_pauses_it {
         i = i + 1;
     }
     dnit(?g);
-    # a soup needs more than the ceiling once collected, so it pauses
+    # a soup's step needs more nodes than the ceiling holds, so it is
+    # cancelled part way with the world as it was, and the run pauses
     var t:     Sim;
     val made2: err[allo.Error] = init(?t, ?a);
     if (sel made2.err) { ret 6; }
-    randomize(?t, 0.4, 1024);
+    randomize(?t, 0.4, 512);
     if (!use_hashlife(?t, true)) { ret 7; }
+    set_exponent(?t, 8);
+    var was: snapshot.Snapshot;
+    snapshot.init(?was, ?a);
+    if (!take(?t, ?was)) { ret 8; }
+    val pop: usize = population(?t);
     set_ceilings(?t, c);
-    i = 0;
-    for (i < 4 && t.tripped == ceiling.COUNT && !t.full) {
-        step(?t);
-        i = i + 1;
+    step(?t);
+    if (t.tripped != ceiling.MEMORY || t.full || t.generation != 0) { ret 9; }
+    if (hashlife.cancelled(?t.tree) != hashlife.CANCEL_BUDGET)      { ret 10; }
+    var r:     Sim;
+    val made3: err[allo.Error] = init(?r, ?a);
+    if (sel made3.err)                                 { ret 12; }
+    if (!use_hashlife(?r, true) || !restore(?r, ?was)) { ret 13; }
+    if (population(?t) != pop || !same_live(?t, ?r))   { ret 14; }
+    # carried past it, it steps as a world with no ceiling does
+    var off: ceiling.Ceilings = c;
+    var k:   usize            = 0;
+    for (k < ceiling.COUNT) {
+        off.on[k] = false;
+        k         = k + 1;
     }
-    if (t.tripped != ceiling.MEMORY || t.full) { ret 8; }
-    if (hashlife.memory(?t.tree) <= limit)     { ret 9; }
-    # carried past it, it runs on
-    val gen: u64 = t.generation;
+    set_ceilings(?r, off);
+    set_exponent(?r, 8);
     pass(?t);
     step(?t);
-    if (t.generation == gen || t.tripped != ceiling.COUNT) { ret 10; }
+    step(?r);
+    if (t.tripped != ceiling.COUNT || t.generation != 256 || r.generation != 256) { ret 15; }
+    if (!same_live(?t, ?r))                                                       { ret 16; }
+    snapshot.dnit(?was);
+    dnit(?r);
+    dnit(?t);
+    ret 0;
+}
+
+test ceiling__hashlife_cancels_a_step_past_its_deadline_or_when_asked {
+    var a: allo.Allocator;
+    page.make(?a);
+    var t:    Sim;
+    val made: err[allo.Error] = init(?t, ?a);
+    if (sel made.err) { ret 1; }
+    randomize(?t, 0.4, 128);
+    if (!use_hashlife(?t, true)) { ret 2; }
+    set_exponent(?t, 6);
+    val tr:  *hashlife.Tree    = ?t.tree;
+    val pop: u64               = hashlife.population(tr);
+    val now: time.InstantClock = time.instant();
+    if (sel now.err) { ret 3; }
+    hashlife.set_deadline(tr, opt[time.Instant].some{hashlife.deadline_after(now.ok, 0)});
+    if (hashlife.step(tr) || hashlife.cancelled(tr) != hashlife.CANCEL_TIME || hashlife.population(tr) != pop) { ret 4; }
+    hashlife.set_deadline(tr, opt[time.Instant].none{});
+    hashlife.ask_cancel(tr);
+    if (hashlife.step(tr) || hashlife.cancelled(tr) != hashlife.CANCEL_ASKED || hashlife.population(tr) != pop) { ret 5; }
+    # an ask cancels one step, and the next runs
+    if (!hashlife.step(tr) || hashlife.cancelled(tr) != hashlife.CANCEL_NONE) { ret 6; }
+    # the step ceiling pauses the run on the same cancel
+    var c: ceiling.Ceilings = ceiling.defaults();
+    c.on[ceiling.STEP]    = true;
+    c.limit[ceiling.STEP] = 0;
+    set_ceilings(?t, c);
+    val gen: u64 = t.generation;
+    step(?t);
+    if (t.tripped != ceiling.STEP || t.generation != gen) { ret 7; }
     dnit(?t);
     ret 0;
 }
