@@ -17,6 +17,10 @@
 # generation the thread published, and the panels read what it posted of it
 # (world.Shown), never the world itself.
 
+use blit;
+use bctx: blit.context;
+use binp: blit.input;
+use bint: blit.interact;
 use boom.context.Context;
 use boom.context.context_fail;
 use boom.context.context_stop;
@@ -92,8 +96,6 @@ pub val TICK: Duration = SECOND / 60;
 val PAN_STEP: f32 = 12.0;
 # zoom factor change per scroll notch
 val ZOOM_STEP: f32 = 0.1;
-# unscaled pixels the panel scrolls per notch
-val SCROLL_STEP: f32 = 48.0;
 # unscaled line heights of the two faces
 val BODY_PX:  f32 = 17.0;
 val SMALL_PX: f32 = 14.0;
@@ -110,6 +112,7 @@ val SMALL_PX: f32 = 14.0;
 # ui:          the interface
 # gui:         the interface's blit host
 # gui_ok:      gui is set up
+# world:       what the pointer did to the world this frame, beneath the interface
 # paths:       the data directory
 # body:        the label face
 # small:       the heading and readout face
@@ -149,6 +152,7 @@ pub rec Game {
     ui:          ui.Ui;
     gui:         gui.Gui;
     gui_ok:      bool;
+    world:       bint.Hit;
     paths:       paths.Paths;
     body:        gfx.Font;
     small:       gfx.Font;
@@ -477,7 +481,7 @@ fun events(q: *EventQueue, u: *ui.Ui, h: *gui.Gui, a: *app.App) {
     }
 }
 
-# read the keyboard, scroll and pan
+# read the keyboard and pan
 fun tick(ctx: *Context) {
     val g:  *Game      = game_of(ctx);
     val in: *inp.Input = ?ctx.input;
@@ -491,21 +495,9 @@ fun tick(ctx: *Context) {
     if (a.toast_t > 0) { a.toast_t = a.toast_t - 1; }
     if (g.gpu_ok)      { gpu.display(?g.gpu, win.window_refresh_hz(?ctx.window)); }
 
-    val sw: f32         = ctx.window.width::f32;
-    val sh: f32         = ctx.window.height::f32;
-    val pt: render.Port = panel.port(u, a, sw, sh);
-    val mx: f32         = in.mouse_x::f32;
-    val my: f32         = in.mouse_y::f32;
-    if (in.scroll_y != 0.0) {
-        if (a.panel != 0 && mx >= a.side_x0) {
-            a.scroll = a.scroll - in.scroll_y::f32 * ui.px(u, SCROLL_STEP);
-        }
-        or (a.help == 0) { zoom_at(a, pt, mx, my, in.scroll_y::f32); }
-    }
-
     # the pan is the view centre in cells, moved by pixels at the current zoom
     val ppc:  f32 = render.BASE_PPC * a.zoom;
-    val step: f32 = ui.px(u, PAN_STEP) / ppc;
+    val step: f32 = PAN_STEP * app.scale(a.scale_idx) / ppc;
     if (!typing) {
         if (inp.key_down(in, inp.KEY_LEFT))  { a.pan_x = a.pan_x - step::f64; }
         if (inp.key_down(in, inp.KEY_RIGHT)) { a.pan_x = a.pan_x + step::f64; }
@@ -567,32 +559,39 @@ pub fun on_tick(ctx: *Context) {
     tick(ctx);
 }
 
-# apply the tool under the cursor when nothing of the interface is in the way
-fun edit_world(g: *Game, pt: render.Port, cam: render.Camera) {
-    val u: *ui.Ui   = ?g.ui;
-    val a: *app.App = ?g.app;
-    if (u.over || u.active != 0 || !ui.inside(u, 0.0, 0.0, pt.w, pt.h)) {
+# whether the pointer is over the world with nothing of the interface on top
+fun over_world(g: *Game) bool {
+    ret g.world.hot && g.app.help == 0;
+}
+
+# apply the tool under the cursor when nothing of the interface is in the way;
+# the world takes the pointer only where no interface claim is on top, and a
+# press that began on a control stays the control's
+fun edit_world(g: *Game, cam: render.Camera) {
+    val h: *bint.Hit = ?g.world;
+    val a: *app.App  = ?g.app;
+    if (!over_world(g)) {
         a.stroke = false;
         ret;
     }
     var cx: i64 = 0;
     var cy: i64 = 0;
-    render.cell_at(cam, u.mx, u.my, ?cx, ?cy);
+    render.cell_at(cam, h.mx, h.my, ?cx, ?cy);
     if (a.tool == app.TOOL_STAMP) {
-        if (u.pressed) { arrange.stamp_active(a, cx, cy); }
+        if (h.pressed) { arrange.stamp_active(a, cx, cy); }
         ret;
     }
     if (a.tool == app.TOOL_SELECT) {
-        if (u.pressed) {
+        if (h.pressed) {
             a.dragging = true;
             a.anchor_x = cx;
             a.anchor_y = cy;
         }
-        if (a.dragging && u.down) { app.select(a, a.anchor_x, a.anchor_y, cx, cy); }
-        if (!u.down)              { a.dragging = false; }
+        if (a.dragging && h.held) { app.select(a, a.anchor_x, a.anchor_y, cx, cy); }
+        if (!h.held)              { a.dragging = false; }
         ret;
     }
-    if (!u.down) {
+    if (!h.held) {
         a.stroke = false;
         ret;
     }
@@ -638,14 +637,12 @@ fun outline(g: *Game, d: *paint.Paint, cam: render.Camera) {
 }
 
 # outline the cell under the cursor when it is big enough to point at
-fun hover(g: *Game, d: *paint.Paint, pt: render.Port, cam: render.Camera) {
-    val u: *ui.Ui   = ?g.ui;
+fun hover(g: *Game, d: *paint.Paint, cam: render.Camera) {
     val a: *app.App = ?g.app;
-    if (a.help != 0 || u.mx >= a.side_x0 || !ui.inside(u, 0.0, 0.0, pt.w, pt.h)) { ret; }
-    if (cam.ppc < 4.0 || a.tool == app.TOOL_STAMP)                               { ret; }
+    if (!over_world(g) || cam.ppc < 4.0 || a.tool == app.TOOL_STAMP) { ret; }
     var cx: i64 = 0;
     var cy: i64 = 0;
-    render.cell_at(cam, u.mx, u.my, ?cx, ?cy);
+    render.cell_at(cam, g.world.mx, g.world.my, ?cx, ?cy);
     val x0: f32 = render.screen_x(cam, cx::f64);
     val y0: f32 = render.screen_y(cam, cy::f64);
     paint.frame(d, x0, y0, x0 + cam.ppc, y0 + cam.ppc, 1.0, theme.HOVER_CELL, 0.6);
@@ -656,13 +653,11 @@ fun hover(g: *Game, d: *paint.Paint, pt: render.Port, cam: render.Camera) {
 # only the cells on screen are drawn, a rectangle each while there are few of
 # them and from the pattern's texture (cellar.sketch) otherwise
 fun ghost(g: *Game, d: *paint.Paint, pt: render.Port, cam: render.Camera) {
-    val u: *ui.Ui   = ?g.ui;
     val a: *app.App = ?g.app;
-    if (a.tool != app.TOOL_STAMP || a.help != 0 || u.mx >= a.side_x0) { ret; }
-    if (!ui.inside(u, 0.0, 0.0, pt.w, pt.h))                          { ret; }
+    if (a.tool != app.TOOL_STAMP || !over_world(g)) { ret; }
     var cx: i64 = 0;
     var cy: i64 = 0;
-    render.cell_at(cam, u.mx, u.my, ?cx, ?cy);
+    render.cell_at(cam, g.world.mx, g.world.my, ?cx, ?cy);
     val p:  *pattern.Pattern = arrange.active(a);
     val o:  u8               = a.orient;
     val pw: usize            = pattern.width(p, o);
@@ -774,8 +769,8 @@ pub fun on_draw(ctx: *Context) {
     }
     app.identify_poll(a);
     app.note_full(a, world.full(?g.shown), world.full_reason(?g.shown));
-    a.side_x0 = panel.left(u, a, sw);
-    val pt: render.Port = panel.port(u, a, sw, sh);
+    val sc: f32         = app.scale(a.scale_idx);
+    val pt: render.Port = panel.port(a, sc, sw, sh);
     if (a.refit) {
         frame(a, pt);
         a.refit = false;
@@ -825,26 +820,35 @@ pub fun on_draw(ctx: *Context) {
     var pass: gfx.Pass = gfx.pass_begin(?g.renderer, ?desc);
     gpu.draw(?g.gpu, ?pass);
 
+    # the interface's frame: the world claims its port beneath everything else,
+    # so the pointer reaches it only where no control is on top
     # a capture has no user, so any pointer over its window is not one
-    val pointer: bool = ctx.input.pointer_in && g.capture == nil;
+    val pointer: bool          = ctx.input.pointer_in && g.capture == nil;
+    val bu:      *bctx.Context = ?g.gui.ui;
+    gui.begin(?g.gui, sw, sh, sc, pointer);
+    g.world = bint.hit(bu, bctx.id_of(bu, "world"), 0.0, 0.0, pt.w, pt.h, binp.BUTTON_LEFT);
+    if (g.bench == args.BENCH_NONE) {
+        panel.draw(bu, g.gui.look, a, ?g.shown, ?g.paths, ?g.sketches, sw);
+        val notches: f32 = gui.notches(?g.gui);
+        if (notches != 0.0 && over_world(g)) { zoom_at(a, pt, g.world.mx, g.world.my, notches); }
+        edit_world(g, cam);
+    }
+    gui.end(?g.gui, ctx);
+
     ui.begin(u, ?pass, pointer, ctx.input.mouse_x::f32, ctx.input.mouse_y::f32, inp.button_down(?ctx.input, inp.BUTTON_LEFT));
     var d: paint.Paint = paint.Paint{pass: ?pass, srgb: u.srgb};
     grid_edge(g, ?d, cam);
     outline(g, ?d, cam);
     hud.selection(u, ?d, a, cam);
-    hover(g, ?d, pt, cam);
+    hover(g, ?d, cam);
     ghost(g, ?d, pt, cam);
     if (g.bench == args.BENCH_NONE) {
         hud.readout(u, a, ?g.shown, pt);
-        hud.position(u, cam, pt, u.mx < a.side_x0 && ui.inside(u, 0.0, 0.0, pt.w, pt.h));
-        panel.draw(u, a, ?g.shown, ?g.paths, ?g.sketches, sw, sh);
+        hud.position(u, cam, pt, over_world(g));
         hud.toast(u, a, pt);
         hud.help(u, a, sw, sh);
-        edit_world(g, pt, cam);
     }
     ui.end(u);
-    gui.begin(?g.gui, sw, sh, app.scale(a.scale_idx));
-    gui.end(?g.gui, ctx);
     val drew: err[gfx.Error] = gui.draw(?g.gui, ?pass);
     if (sel drew.err) { print.eprintlnf("could not draw the interface: {}", gfx.error_message(drew.err)); }
 
