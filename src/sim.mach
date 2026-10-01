@@ -5,6 +5,9 @@
 # on the world below goes to the member that holds it:
 #
 #   step, collect, record, sync      advance the world and show it
+#   advance, commit, show            step in two halves, the first of which
+#                                    changes nothing a draw reads, and draw
+#                                    the last completed generation meanwhile
 #   clear, fill_*, randomize         replace it
 #   read_*, edit_*, paint,           read and write cells by area, or lay
 #   clear_outside, merge_*           the tree's own squares over it
@@ -608,6 +611,13 @@ pub fun set_exponent(s: *Sim, k: u32) {
 # advance the tree one step of 2^k generations, collecting and trying once
 # more when its table fills
 fun tree_step(s: *Sim) bool {
+    if (!tree_advance(s)) { ret false; }
+    tree_commit(s);
+    ret true;
+}
+
+# the tree's step itself, which leaves the generation and the drawn pool alone
+fun tree_advance(s: *Sim) bool {
     val t: *hashlife.Tree = ?s.tree;
     if (!hashlife.step(t)) {
         hashlife.collect(t, hashlife.NONE);
@@ -616,10 +626,14 @@ fun tree_step(s: *Sim) bool {
             ret false;
         }
     }
-    s.generation = s.generation + ((1::u64) << t.k::u64);
+    ret true;
+}
+
+# count the tree's step
+fun tree_commit(s: *Sim) {
+    s.generation = s.generation + ((1::u64) << s.tree.k::u64);
     touched(s);
     history.add(?s.history, s.generation, population(s)::u64);
-    ret true;
 }
 
 # advance one generation, or 2^k on the tree, or ask the GPU for one. a step
@@ -627,16 +641,38 @@ fun tree_step(s: *Sim) bool {
 # ---
 # s: simulation
 pub fun step(s: *Sim) {
-    if (s.full) { ret; }
-    if (on_tree(s)) {
-        tree_step(s);
-        ret;
-    }
+    if (advance(s)) { commit(s); }
+}
+
+# the first half of a step, which changes nothing a draw reads: the CPU steps
+# into the back cells, the tree steps, and the GPU is asked for a generation
+# (see cellar.runner, which runs it where the interface's draw may read the
+# world at once)
+#
+# a step the pool or the tree could not hold stops the world, uncounted.
+# ---
+# s:   simulation
+# ret: whether commit is owed to finish the step
+pub fun advance(s: *Sim) bool {
+    if (s.full)     { ret false; }
+    if (on_tree(s)) { ret tree_advance(s); }
     if (on_gpu(s)) {
         if (s.pending < MAX_PENDING) { s.pending = s.pending + 1; }
+        ret false;
+    }
+    cpu.compute(?s.space, ?s.rule, s.generation, ?s.team);
+    ret true;
+}
+
+# the second half of a step advance began: make its generation the world's
+# ---
+# s: simulation, after advance asked for it
+pub fun commit(s: *Sim) {
+    if (on_tree(s)) {
+        tree_commit(s);
         ret;
     }
-    if (!cpu.step(?s.space, ?s.rule, s.generation, ?s.team)) {
+    if (!cpu.commit(?s.space)) {
         overflow(s);
         ret;
     }
@@ -777,25 +813,13 @@ fun show_tree(s: *Sim, look: *gpu.Look) {
         ppc   = ppc * 2.0;
         shift = shift + 1;
     }
-    val scale: f64 = pow2(shift);
-    val wx:    f64 = ((look.base_cx::i64 - space.BIAS) * space.SIDE)::f64 + look.frac_x::f64;
-    val wy:    f64 = ((look.base_cy::i64 - space.BIAS) * space.SIDE)::f64 + look.frac_y::f64;
-    val dx:    f64 = wx / scale;
-    val dy:    f64 = wy / scale;
-    val bx:    i64 = floor64(dx / 64.0);
-    val by:    i64 = floor64(dy / 64.0);
-    look.base_cx = (bx + space.BIAS)::u32;
-    look.base_cy = (by + space.BIAS)::u32;
-    look.frac_x  = (dx - (bx * 64)::f64)::f32;
-    look.frac_y  = (dy - (by * 64)::f64)::f32;
-    look.ppc     = ppc;
-    look.shift   = shift;
-    if (look.mode == render.MODE_AGE::u32) { look.mode = render.MODE_SOLID::u32; }
-    if (shift != 0)                        { look.gutter = 0; }
+    tree_look(look, shift);
+    val dx: f64 = ((look.base_cx::i64 - space.BIAS) * 64)::f64 + look.frac_x::f64;
+    val dy: f64 = ((look.base_cy::i64 - space.BIAS) * 64)::f64 + look.frac_y::f64;
 
     # the drawn cells in view, a chunk beyond each side
-    val hw:  f64 = (look.half_w / ppc)::f64 + 64.0;
-    val hh:  f64 = (look.half_h / ppc)::f64 + 64.0;
+    val hw:  f64 = (look.half_w / look.ppc)::f64 + 64.0;
+    val hh:  f64 = (look.half_h / look.ppc)::f64 + 64.0;
     var box: [4]i64;
     box[0] = floor64(dx - hw);
     box[1] = floor64(dy - hh);
@@ -816,6 +840,65 @@ fun show_tree(s: *Sim, look: *gpu.Look) {
     }
     space.reset(?s.space);
     hashlife.squares(?s.tree, shift, ?b[0], show_square, s::*u8);
+}
+
+# move a look in cells into the units of drawn cells 2^shift cells on a side,
+# the squares of the tree the pool shows. the look keeps its colour mode, but
+# for age, which the tree does not keep and is drawn solid
+# ---
+# look:  the camera and colours, in cells, changed in place
+# shift: the level of the squares a drawn cell stands for
+pub fun tree_look(look: *gpu.Look, shift: u32) {
+    val scale: f64 = pow2(shift);
+    val wx:    f64 = ((look.base_cx::i64 - space.BIAS) * space.SIDE)::f64 + look.frac_x::f64;
+    val wy:    f64 = ((look.base_cy::i64 - space.BIAS) * space.SIDE)::f64 + look.frac_y::f64;
+    val dx:    f64 = wx / scale;
+    val dy:    f64 = wy / scale;
+    val bx:    i64 = floor64(dx / 64.0);
+    val by:    i64 = floor64(dy / 64.0);
+    look.base_cx = (bx + space.BIAS)::u32;
+    look.base_cy = (by + space.BIAS)::u32;
+    look.frac_x  = (dx - (bx * 64)::f64)::f32;
+    look.frac_y  = (dy - (by * 64)::f64)::f32;
+    look.ppc     = (look.ppc::f64 * scale)::f32;
+    look.shift   = shift;
+    if (look.mode == render.MODE_AGE::u32) { look.mode = render.MODE_SOLID::u32; }
+    if (shift != 0)                        { look.gutter = 0; }
+}
+
+# the level of the squares of the tree the pool last showed
+pub fun shown_shift(s: *Sim) u32 {
+    ret s.seen.shift;
+}
+
+# fill the pool with the tree as the look sees it, where the pool is what the
+# GPU draws of it, for a draw from another thread to show (cellar.runner)
+# ---
+# s:    simulation
+# look: the camera, in cells
+pub fun show_view(s: *Sim, look: gpu.Look) {
+    if (!on_tree(s)) { ret; }
+    var l: gpu.Look = look;
+    show_tree(s, ?l);
+}
+
+# ready the draw of the last completed generation without stepping or reading
+# anything a step changes: the cells the CPU last committed, or the squares of
+# the tree show_view last put in the pool. the GPU's own steps are recorded by
+# record, on the thread that owns the world
+# ---
+# s:    simulation, whose step may be running on another thread
+# look: the camera and colours for the draw, in cells
+# ret:  ok, or why the frame could not be recorded
+pub fun show(s: *Sim, look: *gpu.Look) err[gfx.Error] {
+    if (on_tree(s)) {
+        tree_look(look, s.seen.shift);
+        ret gpu.show(s.gpu, ?s.space, ?s.rule, s.generation, look);
+    }
+    if (on_gpu(s)) { ret gpu.aim(s.gpu, look); }
+    val done: res[usize, gfx.Error] = gpu.frame(s.gpu, ?s.space, ?s.rule, s.generation, 0, look);
+    if (sel done.err) { ret err[gfx.Error].err{done.err}; }
+    ret err[gfx.Error].ok{};
 }
 
 # record the frame's generations on the GPU, or on the tree draw it
@@ -2979,7 +3062,7 @@ pub fun same_snapshot(a: *snapshot.Snapshot, b: *snapshot.Snapshot) bool {
 # advance a world n generations, and on the GPU until they are recorded and
 # the device is idle
 #[testing]
-fun advance(r: *gfx.Renderer, s: *Sim, n: u64) bool {
+fun advance_frames(r: *gfx.Renderer, s: *Sim, n: u64) bool {
     var i: u64 = 0;
     for (i < n) {
         step(s);
@@ -3001,21 +3084,21 @@ fun run_reset_run(r: *gfx.Renderer, s: *Sim, a: *allo.Allocator, runs: *snapshot
     seed_world(s);
     # on the GPU the device runs on past the host's staging cells before the
     # start is taken, so taking it must pull
-    if (!advance(r, s, 5)) { ret 1; }
+    if (!advance_frames(r, s, 5)) { ret 1; }
     var start: snapshot.Snapshot;
     snapshot.init(?start, a);
     if (!take(s, ?start)) { ret 2; }
     var pass: usize = 0;
     for (pass < 2) {
-        if (!advance(r, s, 40))    { ret 3; }
-        if (!take(s, ?runs[pass])) { ret 4; }
+        if (!advance_frames(r, s, 40)) { ret 3; }
+        if (!take(s, ?runs[pass]))     { ret 4; }
         if (pass == 0) {
             # the weighted family's radius-2 sample
             set_rule(s, sample_rule(0, 1));
             if (!restore(s, ?start) || s.generation != 5 || s.running != 0) { ret 5; }
             var life: rule.Rule = rule.preset_rule(0);
             if (!rule.same(?s.rule, ?life)) { ret 6; }
-            if (!advance(r, s, 0))          { ret 7; }
+            if (!advance_frames(r, s, 0))   { ret 7; }
             var back: snapshot.Snapshot;
             snapshot.init(?back, a);
             if (!take(s, ?back) || !same_snapshot(?back, ?start)) { ret 8; }

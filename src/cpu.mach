@@ -18,6 +18,12 @@
 #
 # a chunk whose cells the step changed is marked space.DIRTY_CELLS, since the
 # host's cells are the world's, so a GPU that only draws sends only those.
+#
+# a step is two halves. compute writes only the back cells and the census, so
+# the front cells, the page table and the dirty marks stay the last completed
+# generation while it runs, and a draw may read them from another thread.
+# commit then marks what changed, swaps the buffers and settles the pool, and
+# is the only half that changes what a draw reads.
 
 use cellar.layout;
 use cellar.rule;
@@ -67,18 +73,21 @@ fun step_slot(arg: *u8, s: usize) {
     if (!b.busy && sp.before[s * space.CENSUS + 1] == 0) { mem.zero[u32](out, space.CELLS); }
     or                                                   { rule.step_chunk(rd.r, ?b, ?t); }
     space.tally_census(?t, cn, e[layout.INCARNATION_AT::usize]);
-    note_change(sp, s, ?t);
 }
 
-# mark a stepped chunk DIRTY_CELLS unless its cells were all zero and stay so,
-# so only a changed chunk is sent to the draw again
-# ---
-# sp: the pool
-# s:  the slot
-# t:  the tally of the cells the step wrote
-fun note_change(sp: *space.Space, s: usize, t: *space.Tally) {
-    val was: *u32 = ?sp.before[s * space.CENSUS];
-    if (was[0] != 0 || was[1] != 0 || t.live != 0 || t.warm != 0) { sp.dirty[s] = sp.dirty[s] | space.DIRTY_CELLS; }
+# mark every stepped chunk DIRTY_CELLS unless its cells were all zero and stay
+# so, from its census before and after the step, so only a changed chunk is
+# sent to the draw again
+fun note_changes(sp: *space.Space) {
+    var s: usize = 0;
+    for (s < sp.hi) {
+        val was: *u32 = ?sp.before[s * space.CENSUS];
+        val now: *u32 = ?sp.census[s * space.CENSUS];
+        if (space.used(sp, s) && (was[0] != 0 || was[1] != 0 || now[0] != 0 || now[1] != 0)) {
+            sp.dirty[s] = sp.dirty[s] | space.DIRTY_CELLS;
+        }
+        s = s + 1;
+    }
 }
 
 # the frames of a seamed chunk's block, gathered one chunk at a time
@@ -126,7 +135,6 @@ fun step_seamed(rd: *Round, s: usize, fr: *u32) {
         i = i + 1;
     }
     space.tally_census(?u, ?sp.census[s * space.CENSUS], space.incarnation(sp, s));
-    note_change(sp, s, ?u);
 }
 
 # step every seamed chunk of the pool, after the rest
@@ -152,6 +160,18 @@ fun step_seams(rd: *Round) {
 # t:   the team to split the chunks across
 # ret: false when the pool could not hold a chunk the world grew into
 pub fun step(sp: *space.Space, r: *rule.Rule, gen: u64, t: *team.Team) bool {
+    compute(sp, r, gen, t);
+    ret commit(sp);
+}
+
+# the first half of a step: every chunk steps into its back cells and writes
+# its census, leaving the front cells, the page table and the dirty marks alone
+# ---
+# sp:  the pool, with back cells, whose sense is the rule's
+# r:   the rule
+# gen: the generation the pool's cells hold
+# t:   the team to split the chunks across
+pub fun compute(sp: *space.Space, r: *rule.Rule, gen: u64, t: *team.Team) {
     var rd: Round;
     rd.sp   = sp;
     rd.r    = r;
@@ -160,6 +180,15 @@ pub fun step(sp: *space.Space, r: *rule.Rule, gen: u64, t: *team.Team) bool {
     mem.copy[u32](sp.before, sp.census, sp.hi * space.CENSUS);
     team.run(t, step_slot, (?rd)::*u8, sp.hi);
     if (topology.bounded(?sp.grid)) { step_seams(?rd); }
+}
+
+# the second half of a step: the back cells compute wrote become the front, and
+# the census settles the pool around them
+# ---
+# sp:  the pool compute stepped
+# ret: false when the pool could not hold a chunk the world grew into
+pub fun commit(sp: *space.Space) bool {
+    note_changes(sp);
     val front: *u32 = sp.cells;
     sp.cells = sp.back;
     sp.back  = front;
