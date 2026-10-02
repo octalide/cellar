@@ -1,0 +1,132 @@
+# the lenia family's cell word, its window of the meta head and the growth
+# step, one source for the host and the family's step stage
+#
+# a cell holds a value in [0, 1] as a fixed-point word, the value times ONE, so
+# zero is the quiescent background and every word is a whole number of
+# 2^-24ths, which an f32 holds exactly. the value's top bits are the heat the
+# draw reads, so the palette shades a cell by its value.
+#
+# a step reads the potential, the kernel's weighted sum of the words around a
+# cell, and moves the cell's value by dt times the growth of that potential,
+# clipped to [0, 1] and rounded to the nearest word. the arithmetic here is
+# adds, multiplies and conversions alone, which Vulkan rounds as IEEE does, so
+# the host and the stage compute the same function, and the exponential the
+# gaussian growth needs is built from them rather than taken from a driver.
+# what can still part the engines is a device fusing a multiply and an add,
+# which SPIR-V permits, and the family's slack allows for it.
+
+use cellar.layout;
+
+# the word of the value 1
+pub val ONE: u32 = 16777216;
+# the value of a word of 1, 2^-24
+pub val UNIT: f32 = 0.000000059604644775390625;
+# where the heat display channel starts: a word's value in 256ths, which
+# layout.texel_heat clamps to its last entry at the value 1
+pub val HEAT_SHIFT: u32 = 16;
+pub val HEAT_MASK:  u32 = 0x1ff;
+
+# the growth functions, Chakazul's gn: a quartic bump, a gaussian and a step
+pub val POLYNOMIAL: u32 = 1;
+pub val GAUSSIAN:   u32 = 2;
+pub val STEP:       u32 = 3;
+
+# the window's words: the kernel's radius, the growth function, the growth's
+# centre m and its scale k as an f32's bits, and dt, the step in time, as an
+# f32's bits. k is 1 / (9 s^2) for the polynomial, log2(e) / (2 s^2) for the
+# gaussian and s for the step (see growth)
+pub val RADIUS_AT: u32 = 0;
+pub val GROWTH_AT: u32 = 1;
+pub val M_AT:      u32 = 2;
+pub val K_AT:      u32 = 3;
+pub val DT_AT:     u32 = 4;
+
+# the rule buffer holds the kernel's (2r+1)^2 weights as f32 bits, row-major
+# from (-r, -r), each already divided by the kernel's total, then for each row
+# dy from -r the half-width of the disc it crosses, as an i32: the row's
+# weights lie at |dx| <= the half-width, -1 for a row the disc misses
+
+# the value a word holds, in units of the word: the word as an f32
+#[inline]
+pub fun level(c: u32) f32 {
+    ret c::f32;
+}
+
+# 2^-x for x at least 0, from adds, multiplies and an exponent built by hand,
+# to about one part in 10^7
+pub fun exp2_neg(x: f32) f32 {
+    if (x >= 125.0) { ret 0.0; }
+    val n: u32 = x::u32;
+    val t: f32 = (x - n::f32) * 0.6931472;
+    # e^-t for t in [0, ln 2), by its series to the ninth term
+    var p: f32 = 1.0 - t * 0.11111111;
+    p = 1.0 - t * 0.125 * p;
+    p = 1.0 - t * 0.14285715 * p;
+    p = 1.0 - t * 0.16666667 * p;
+    p = 1.0 - t * 0.2 * p;
+    p = 1.0 - t * 0.25 * p;
+    p = 1.0 - t * 0.33333334 * p;
+    p = 1.0 - t * 0.5 * p;
+    p = 1.0 - t * p;
+    val scale: f32 = ((127 - n) << 23):~f32;
+    ret p * scale;
+}
+
+# the growth of a potential, in [-1, 1]
+# ---
+# u:  the potential, in [0, 1]
+# gn: the growth function
+# m:  its centre
+# k:  its scale, as the window keeps it
+pub fun growth(u: f32, gn: u32, m: f32, k: f32) f32 {
+    var d: f32 = u - m;
+    if (gn == STEP) {
+        if (d < 0.0) { d = 0.0 - d; }
+        if (d <= k)  { ret 1.0; }
+        ret -1.0;
+    }
+    if (gn == GAUSSIAN) { ret exp2_neg(d * d * k) * 2.0 - 1.0; }
+    var q: f32 = 1.0 - d * d * k;
+    if (q < 0.0) { q = 0.0; }
+    val q2: f32 = q * q;
+    ret q2 * q2 * 2.0 - 1.0;
+}
+
+# the word nearest a value in [0, 1]
+pub fun of_value(v: f32) u32 {
+    val x: f32 = v * 16777216.0;
+    var t: u32 = x::u32;
+    if (x - t::f32 >= 0.5) { t = t + 1; }
+    ret t;
+}
+
+# the word a cell becomes one generation on
+# ---
+# c:   the cell's word
+# sum: the kernel's weighted sum of the words around it, in units of the word
+# gn:  the growth function
+# m:   the growth's centre
+# k:   the growth's scale
+# dt:  the step in time
+pub fun next(c: u32, sum: f32, gn: u32, m: f32, k: f32, dt: f32) u32 {
+    val g: f32 = growth(sum * UNIT, gn, m, k);
+    var v: f32 = c::f32 * UNIT + dt * g;
+    if (v <= 0.0) { ret 0; }
+    if (v >= 1.0) { ret ONE; }
+    ret of_value(v);
+}
+
+# how the shared stages read the word: any value above zero is live and keeps
+# its chunk, and the value is the heat
+pub fun sense() layout.Sense {
+    ret layout.Sense{
+        live_mask:  0xffffffff,
+        live_lo:    1,
+        live_hi:    ONE,
+        warm_mask:  0xffffffff,
+        heat_shift: HEAT_SHIFT,
+        heat_mask:  HEAT_MASK,
+        age_shift:  0,
+        age_mask:   0,
+    };
+}

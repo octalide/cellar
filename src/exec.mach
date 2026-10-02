@@ -67,8 +67,11 @@ fun view_of(a: *app.App) persist.View {
     ret persist.View{pan_x: a.pan_x, pan_y: a.pan_y, zoom: a.zoom, mode: a.mode::u8};
 }
 
-# show a world file's view, its zoom brought within the app's limits
+# show a world file's view, its zoom brought within the app's limits. the view
+# is the file's own, so a framing still waiting is dropped rather than left to
+# replace it on the next frame
 fun take_view(a: *app.App, v: *persist.View) {
+    a.refit = false;
     a.pan_x = v.pan_x;
     a.pan_y = v.pan_y;
     a.zoom  = app.clamp_zoom(a, v.zoom);
@@ -207,8 +210,10 @@ fun open(a: *app.App, s: *sim.Sim, d: *Deps, path: str) Change {
 }
 
 # put a pattern on the clipboard as RLE, with its rule, for the frame to hand
-# the window
+# the window. RLE holds states, which other apps read, so a pattern holding
+# words is remembered beside the text, and a paste of that same text takes it
 fun clip(a: *app.App, d: *Deps, p: *pattern.Pattern) bool {
+    pattern.resize(?a.copied, 0, 0);
     var f: format.Format;
     if (!formats.by_id("rle", ?f)) { ret false; }
     vector.clear[u8](?a.clip);
@@ -216,7 +221,26 @@ fun clip(a: *app.App, d: *Deps, p: *pattern.Pattern) bool {
     if (sel enc.err) { ret false; }
     val end: res[usize, allo.Error] = vector.push[u8](?a.clip, 0);
     if (sel end.err) { ret false; }
+    if (pattern.exact(p)) {
+        var kept: pattern.Pattern;
+        val made: err[allo.Error] = pattern.clone(?kept, a.alloc, p);
+        if (sel made.ok) {
+            pattern.dnit(?a.copied);
+            a.copied = kept;
+        }
+    }
     a.clip_ready = true;
+    ret true;
+}
+
+# whether clipboard text is what clip last wrote for a pattern it remembered
+fun recalled(a: *app.App, c: *command.Paste) bool {
+    if (!pattern.exact(?a.copied) || a.clip.len != c.text.len + 1) { ret false; }
+    var i: usize = 0;
+    for (i < c.text.len) {
+        if (a.clip.data[i] != c.text.data[i]) { ret false; }
+        i = i + 1;
+    }
     ret true;
 }
 
@@ -252,15 +276,19 @@ fun take(a: *app.App, s: *sim.Sim, d: *Deps, b: space.Box, cut: bool) {
 }
 
 # read clipboard text as a pattern and make it the stamp, taking its rule when
-# asked. the stamp only changes when the whole text is a pattern that fits
+# asked. the stamp only changes when the whole text is a pattern that fits.
+# text cellar wrote for a pattern holding words is that pattern, words and all
 fun paste(a: *app.App, s: *sim.Sim, d: *Deps, c: *command.Paste) Change {
     var p:    pattern.Pattern;
-    val made: err[allo.Error] = pattern.init(?p, a.alloc, 0, 0, "clipboard");
+    var made: err[allo.Error] = err[allo.Error].ok{};
+    if (recalled(a, c)) { made = pattern.clone(?p, a.alloc, ?a.copied); }
+    or                  { made = pattern.init(?p, a.alloc, 0, 0, "clipboard"); }
     if (sel made.err) {
         app.say(a, "out of memory");
         ret Change.none{};
     }
-    val got: err[persist.Error] = persist.pattern_from(d.a, ?p, c.text.data, c.text.len);
+    var got: err[persist.Error] = err[persist.Error].ok{};
+    if (!pattern.exact(?p)) { got = persist.pattern_from(d.a, ?p, c.text.data, c.text.len); }
     if (sel got.err) {
         pattern.dnit(?p);
         if (sel got.err.format) {
@@ -555,7 +583,8 @@ fun left(a: *app.App, s: *sim.Sim, c: *command.Command, was: bool, told: u32) {
 # d: what the commands need
 pub fun run(a: *app.App, s: *sim.Sim, d: *Deps) {
     journal.bind(?a.log, s);
-    var i: usize = 0;
+    val family: usize = rule.family_of(?s.rule);
+    var i:      usize = 0;
     for (i < a.queue.items.len) {
         val was:  bool = sim.on_tree(s);
         val told: u32  = a.told;
@@ -564,7 +593,9 @@ pub fun run(a: *app.App, s: *sim.Sim, d: *Deps) {
         i = i + 1;
     }
     command.clear(?a.queue);
-    # any of them may have changed the rule, to one of fewer states
+    # any of them may have changed the rule: to another family, whose own ink
+    # the pen takes up, or to one of fewer states
+    if (rule.family_of(?s.rule) != family) { a.ink = rule.ink(?s.rule)::u8; }
     app.fit_ink(a, rule.states(?s.rule));
     # a step since the last frame may have paused the run at a ceiling
     var c:       ceiling.Ceilings = sim.ceilings(s);
@@ -663,6 +694,43 @@ test run__applies_in_order_and_a_save_sees_the_edits_before_it {
     fs.remove_file("out/test/exec/soup.cellar");
     fs.remove_file("out/test/exec/empty.cellar");
     fs.remove_file("out/test/exec/mine.rle");
+    app.dnit(?ap);
+    sim.dnit(?s);
+    ret 0;
+}
+
+test run__opening_a_world_keeps_its_saved_camera_over_the_start_framing {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    var ap: app.App;
+    app.init(?ap);
+    val shown: err[format.Error] = app.attach(?ap, ?a);
+    if (sel shown.err) { ret 1; }
+    var d:   Deps            = Deps{a: ?a};
+    val dir: err[fs.FsError] = persist.make_parent(?a, "out/test/camera/x");
+    if (sel dir.err) { ret 1; }
+    world.paint(?s, 3, 4, 1);
+    ap.pan_x = -12.5;
+    ap.pan_y = 7.25;
+    ap.zoom  = 2.5;
+    app.submit(?ap, command.Command.save_world{file(?ap, "out/test/camera/view.cellar")});
+    run(?ap, ?s, ?d);
+
+    # a fresh app, as a launch has it: waiting to frame the randomize area
+    app.dnit(?ap);
+    app.init(?ap);
+    val again: err[format.Error] = app.attach(?ap, ?a);
+    if (sel again.err) { ret 1; }
+    if (!ap.refit)     { ret 2; }
+    app.submit(?ap, command.Command.open{file(?ap, "out/test/camera/view.cellar")});
+    run(?ap, ?s, ?d);
+    if (ap.pan_x != -12.5 || ap.pan_y != 7.25 || ap.zoom != 2.5) { ret 3; }
+    if (ap.refit)                                                { ret 4; }
+
+    fs.remove_file("out/test/camera/view.cellar");
     app.dnit(?ap);
     sim.dnit(?s);
     ret 0;
@@ -784,8 +852,103 @@ test run__pastes_a_pattern_as_the_stamp_and_a_copy_pastes_back_exactly {
         i = i + 1;
     }
     if (pattern.get(?ap.custom, 1, 1) != 1 || pattern.get(?ap.custom, 2, 3) != 1) { ret 15; }
+    # a rule of states alone copies states, as the clipboard does
+    if (pattern.exact(?copied)) { ret 16; }
 
     pattern.dnit(?copied);
+    app.dnit(?ap);
+    sim.dnit(?s);
+    ret 0;
+}
+
+test run__a_lenia_selection_copies_pastes_and_stamps_back_its_exact_values {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    var ap: app.App;
+    app.init(?ap);
+    val shown: err[format.Error] = app.attach(?ap, ?a);
+    if (sel shown.err) { ret 1; }
+    var d: Deps                = Deps{a: ?a};
+    val r: res[rule.Rule, str] = rule.parse(rule.sample(4, 0));
+    if (sel r.err)               { ret 1; }
+    if (!sim.set_rule(?s, r.ok)) { ret 1; }
+
+    # values between the 255ths, and two too small to have a state but 0
+    var vals: [12]u32 = [12]u32{1, 12345, 5592405, 16777216, 0, 7, 8388608, 0, 3, 9999999, 0, 16777215};
+    if (!sim.edit_begin(?s, 0, 0, 4, 3)) { ret 2; }
+    var y: usize = 0;
+    for (y < 3) {
+        sim.edit_words(?s, 0, y::i64, 4, ?vals[y * 4]);
+        y = y + 1;
+    }
+    if (!sim.edit_end(?s)) { ret 2; }
+    app.select(?ap, 0, 0, 3, 2);
+    app.area(?ap, command.AREA_COPY);
+    run(?ap, ?s, ?d);
+    if (!pattern.exact(?ap.custom) || ap.custom.w != 4 || ap.custom.h != 3) { ret 3; }
+    if (!ap.clip_ready)                                                     { ret 3; }
+
+    # the clipboard's text, pasted back, is the copy, words and all
+    pattern.clear(?ap.custom);
+    app.paste(?ap, clipboard(?ap, ap.clip.data::str), false);
+    run(?ap, ?s, ?d);
+    if (!pattern.exact(?ap.custom) || ap.custom.w != 4 || ap.custom.h != 3) { ret 6; }
+
+    # stamped as copied with its top-left at (100, 50), and turned a quarter
+    # clockwise with its top-left at (200, 50)
+    app.stamp(?ap, ?ap.custom, 0, 102, 51);
+    app.stamp(?ap, ?ap.custom, 1, 201, 52);
+    run(?ap, ?s, ?d);
+    y = 0;
+    for (y < 3) {
+        var x: usize = 0;
+        for (x < 4) {
+            val c: u32 = vals[y * 4 + x];
+            if (sim.cell(?s, 100 + x::i64, 50 + y::i64) != c) { ret 4; }
+            # turned clockwise, the old (x, y) lies at (h - 1 - y, x)
+            if (sim.cell(?s, 200 + (2 - y)::i64, 50 + x::i64) != c) { ret 5; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+
+    # saved under a typed name it is written as RLW, and loads back exact
+    var fname: [saves.FILE_MAX]u8;
+    var path:  [128]u8;
+    val named: str   = saves.file_name("lenia", saves.KIND_PATTERN, pattern.exact(?ap.custom), ?fname[0]);
+    var at:    usize = text.buf_str(?path[0], 0, "out/test/exec_rlw/");
+    at       = text.buf_str(?path[0], at, named);
+    path[at] = 0;
+    if (!string.str_equals(named, "lenia.rlw")) { ret 8; }
+    app.submit(?ap, command.Command.save_pattern{file(?ap, ?path[0])});
+    run(?ap, ?s, ?d);
+    pattern.clear(?ap.custom);
+    app.submit(?ap, command.Command.load_pattern{file(?ap, ?path[0])});
+    run(?ap, ?s, ?d);
+    fs.remove_file(?path[0]);
+    if (!pattern.exact(?ap.custom) || ap.custom.w != 4 || ap.custom.h != 3) { ret 9; }
+    y = 0;
+    for (y < 3) {
+        var x: usize = 0;
+        for (x < 4) {
+            if (pattern.word(?ap.custom, x, y) != vals[y * 4 + x]) { ret 10; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+
+    # text another app changed is read as the RLE it is, in 255ths
+    var other: [512]u8;
+    var o:     usize = text.buf_str(?other[0], 0, "#C edited\n");
+    o        = text.buf_str(?other[0], o, ap.clip.data::str);
+    other[o] = 0;
+    app.paste(?ap, clipboard(?ap, ?other[0]), false);
+    run(?ap, ?s, ?d);
+    if (pattern.exact(?ap.custom) || ap.custom.w != 4) { ret 7; }
+
     app.dnit(?ap);
     sim.dnit(?s);
     ret 0;
@@ -1129,10 +1292,10 @@ test run__a_rule_change_off_hashlife_says_why_whichever_way_it_came {
     app.submit(?ap, command.Command.rule{life});
     run(?ap, ?s, ?d);
     if (!sim.use_hashlife(?s, true)) { ret 5; }
-    ap.toast_t = 0;
+    val told: u32 = ap.told;
     app.submit(?ap, command.Command.engine{false});
     run(?ap, ?s, ?d);
-    if (sim.on_tree(?s) || ap.toast_t != 0) { ret 6; }
+    if (sim.on_tree(?s) || ap.told != told) { ret 6; }
 
     # undo back to the rule it left
     app.submit(?ap, command.Command.engine{true});

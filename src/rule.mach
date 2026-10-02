@@ -20,8 +20,15 @@
 #   states(r: *R) u32                how many states a cell can be in
 #   word_of(r: *R, state: u32) u32   the word a fresh cell of a state holds
 #   state_of(c: u32) u32             the state a word holds
+#   ink(r: *R) u32                   the state painted or seeded when none is
+#                                    chosen, the fully live one
+#   slack(r: *R) u32                 how far the GPU's word for a cell may lie
+#                                    from the CPU's a generation on from the
+#                                    same cells, 0 for a family the engines
+#                                    step bit for bit
 #   sense() layout.Sense             how shared code reads the word
-#   radius(r: *R) usize              how far one generation reaches
+#   radius(r: *R) usize              how far one generation reaches, at most
+#                                    layout.REACH_MAX
 #   caps(r: *R) Caps                 what the rule can do (see Caps)
 #   step_chunk(r, b, t)              one chunk's CPU step from generation
 #                                    b.gen (see space.Block)
@@ -89,7 +96,9 @@
 
 use cellar.layout;
 use cellar.rules.generations;
+use cellar.rules.lenia;
 use cellar.rules.nontotalistic;
+use cellar.rules.reaction;
 use ruletable: cellar.rules.table;
 use cellar.rules.weighted;
 use cellar.space;
@@ -116,11 +125,15 @@ use std.types.string.str;
 # nontotalistic: a two-state rule that sees how the eight neighbours are
 #                arranged, Hensel's isotropic notation and Golly's MAP strings
 # table:         a rule table or tree of up to 256 states, Golly's .rule files
+# lenia:         a continuous rule, Bert Chan's Lenia
+# reaction:      a reaction-diffusion rule of two continuous fields, Gray-Scott's
 pub tag Kind: u8 {
     weighted:      weighted.Kernel;
     generations:   generations.Rule;
     nontotalistic: nontotalistic.Rule;
     table:         ruletable.Rule;
+    lenia:         lenia.Rule;
+    reaction:      reaction.Rule;
 }
 
 # a rule: a family's rule and the grid it runs on
@@ -138,7 +151,7 @@ pub fun of(k: Kind) Rule {
 }
 
 # rule families this version runs
-pub val FAMILIES: usize = 4;
+pub val FAMILIES: usize = 6;
 
 # the longest rule string any family's format writes, less its NUL, the
 # weighted family's being the longest (see dispatch__every_function_handles_every_family)
@@ -148,27 +161,33 @@ pub val FORMAT_MAX: usize = FAMILY_MAX + topology.FORMAT_MAX;
 
 # what a rule can do, which engines and features ask before taking it on
 # ---
-# b0:        a dead cell with no live neighbour is born and the background
-#            flips each generation: odd generations' cells hold the world's
-#            complement, drawn and edited inverted
-# isotropic: it treats every rotation and reflection of a pattern alike
-# no_tree:   why a quadtree engine cannot run it, nil when it can, as "a B0
-#            rule" or "a bounded grid"
-# bounded:   it can run on a bounded grid
-# life_like: it is a Life-like rule, two states on the radius-1 Moore
-#            neighbourhood, outer totalistic, the rules whose patterns
-#            Catagolue's apgcodes name, and not one that births on 0, whose
-#            held cells are the world's complement
+# b0:         a dead cell with no live neighbour is born and the background
+#             flips each generation: odd generations' cells hold the world's
+#             complement, drawn and edited inverted
+# isotropic:  it treats every rotation and reflection of a pattern alike
+# no_tree:    why a quadtree engine cannot run it, nil when it can, as "a B0
+#             rule" or "a bounded grid"
+# bounded:    it can run on a bounded grid
+# life_like:  it is a Life-like rule, two states on the radius-1 Moore
+#             neighbourhood, outer totalistic, the rules whose patterns
+#             Catagolue's apgcodes name, and not one that births on 0, whose
+#             held cells are the world's complement
+# continuous: a cell holds a value its state only approximates, a level of
+#             it: a world file keeps the words, a pattern format the levels,
+#             and a format that holds fewer states than the rule refuses it
 pub rec Caps {
-    b0:        bool;
-    isotropic: bool;
-    no_tree:   str;
-    bounded:   bool;
-    life_like: bool;
+    b0:         bool;
+    isotropic:  bool;
+    no_tree:    str;
+    bounded:    bool;
+    life_like:  bool;
+    continuous: bool;
 }
 
 # the id family i's rule strings are recorded under, in world and settings files
 pub fun family_id(i: usize) str {
+    if (i == 5) { ret "reaction"; }
+    if (i == 4) { ret "lenia"; }
     if (i == 3) { ret "table"; }
     if (i == 2) { ret "nontotalistic"; }
     if (i == 1) { ret "generations"; }
@@ -194,6 +213,8 @@ pub fun family_of(r: *Rule) usize {
     if (sel r.kind.generations)   { ret 1; }
     if (sel r.kind.nontotalistic) { ret 2; }
     if (sel r.kind.table)         { ret 3; }
+    if (sel r.kind.lenia)         { ret 4; }
+    if (sel r.kind.reaction)      { ret 5; }
     unmatched();
     ret 0;
 }
@@ -209,6 +230,8 @@ fun unmatched() {
 # len: receives its length in bytes
 # ret: its first byte
 pub fun stage(i: usize, len: *usize) *u8 {
+    if (i == 5) { ret reaction.stage(len); }
+    if (i == 4) { ret lenia.stage(len); }
     if (i == 3) { ret ruletable.stage(len); }
     if (i == 2) { ret nontotalistic.stage(len); }
     if (i == 1) { ret generations.stage(len); }
@@ -217,6 +240,8 @@ pub fun stage(i: usize, len: *usize) *u8 {
 
 # whether family i's step stage binds a rule buffer
 pub fun table(i: usize) bool {
+    if (i == 5) { ret reaction.TABLE; }
+    if (i == 4) { ret lenia.TABLE; }
     if (i == 3) { ret ruletable.TABLE; }
     if (i == 2) { ret nontotalistic.TABLE; }
     if (i == 1) { ret generations.TABLE; }
@@ -231,6 +256,8 @@ pub fun bindings(i: usize) usize {
 
 # how many sample rule strings family i gives its tests
 pub fun sample_count(i: usize) usize {
+    if (i == 5) { ret reaction.SAMPLE_COUNT; }
+    if (i == 4) { ret lenia.SAMPLE_COUNT; }
     if (i == 3) { ret ruletable.SAMPLE_COUNT; }
     if (i == 2) { ret nontotalistic.SAMPLE_COUNT; }
     if (i == 1) { ret generations.SAMPLE_COUNT; }
@@ -239,6 +266,8 @@ pub fun sample_count(i: usize) usize {
 
 # family i's sample rule string n
 pub fun sample(i: usize, n: usize) str {
+    if (i == 5) { ret reaction.sample(n); }
+    if (i == 4) { ret lenia.sample(n); }
     if (i == 3) { ret ruletable.sample(n); }
     if (i == 2) { ret nontotalistic.sample(n); }
     if (i == 1) { ret generations.sample(n); }
@@ -247,6 +276,16 @@ pub fun sample(i: usize, n: usize) str {
 
 # read family i's part of a rule string
 fun parse_kind(i: usize, s: str) res[Kind, str] {
+    if (i == 5) {
+        val d: res[reaction.Rule, str] = reaction.parse(s);
+        if (sel d.err) { ret res[Kind, str].err{d.err}; }
+        ret res[Kind, str].ok{Kind.reaction{d.ok}};
+    }
+    if (i == 4) {
+        val l: res[lenia.Rule, str] = lenia.parse(s);
+        if (sel l.err) { ret res[Kind, str].err{l.err}; }
+        ret res[Kind, str].ok{Kind.lenia{l.ok}};
+    }
     if (i == 3) {
         val t: res[ruletable.Rule, str] = ruletable.parse(s);
         if (sel t.err) { ret res[Kind, str].err{t.err}; }
@@ -324,6 +363,8 @@ pub fun parse_as(i: usize, s: str) res[Rule, str] {
 
 # whether family i plausibly meant a rule string
 fun claims(i: usize, s: str) bool {
+    if (i == 5) { ret reaction.claims(s); }
+    if (i == 4) { ret lenia.claims(s); }
     if (i == 3) { ret ruletable.claims(s); }
     if (i == 2) { ret nontotalistic.claims(s); }
     if (i == 1) { ret generations.claims(s); }
@@ -368,6 +409,8 @@ pub fun format(r: *Rule, buf: *u8) str {
     or (sel r.kind.generations)   { generations.format(?r.kind.generations, buf); }
     or (sel r.kind.nontotalistic) { nontotalistic.format(?r.kind.nontotalistic, buf); }
     or (sel r.kind.table)         { ruletable.format(?r.kind.table, buf); }
+    or (sel r.kind.lenia)         { lenia.format(?r.kind.lenia, buf); }
+    or (sel r.kind.reaction)      { reaction.format(?r.kind.reaction, buf); }
     or                            { unmatched(); }
     topology.format(?r.grid, buf, string.str_len(buf));
     ret buf;
@@ -388,6 +431,8 @@ pub fun display(r: *Rule, buf: *u8) str {
     or (sel r.kind.generations)   { generations.display(?r.kind.generations, buf); }
     or (sel r.kind.nontotalistic) { nontotalistic.display(?r.kind.nontotalistic, buf); }
     or (sel r.kind.table)         { ruletable.display(?r.kind.table, buf); }
+    or (sel r.kind.lenia)         { lenia.display(?r.kind.lenia, buf); }
+    or (sel r.kind.reaction)      { reaction.display(?r.kind.reaction, buf); }
     or                            { unmatched(); }
     topology.format(?r.grid, buf, string.str_len(buf));
     ret buf;
@@ -412,7 +457,25 @@ fun same_kind(a: *Kind, b: *Kind) bool {
     if (sel a.table) {
         if (sel b.table) { ret ruletable.same_rule(?a.table, ?b.table); }
     }
+    if (sel a.lenia) {
+        if (sel b.lenia) { ret lenia.same_rule(?a.lenia, ?b.lenia); }
+    }
+    if (sel a.reaction) {
+        if (sel b.reaction) { ret reaction.same_rule(?a.reaction, ?b.reaction); }
+    }
     ret false;
+}
+
+# whether two rules write every state as the same word, so cells of one read
+# alike under the other: a cell's word, not only its state, carries between them
+pub fun alike(a: *Rule, b: *Rule) bool {
+    if (family_of(a) != family_of(b) || states(a) != states(b)) { ret false; }
+    var st: u32 = 0;
+    for (st < states(a)) {
+        if (word(a, st) != word(b, st)) { ret false; }
+        st = st + 1;
+    }
+    ret true;
 }
 
 # how many states a cell of the rule can be in
@@ -421,6 +484,8 @@ pub fun states(r: *Rule) u32 {
     if (sel r.kind.generations)   { ret generations.states(?r.kind.generations); }
     if (sel r.kind.nontotalistic) { ret nontotalistic.states(?r.kind.nontotalistic); }
     if (sel r.kind.table)         { ret ruletable.states(?r.kind.table); }
+    if (sel r.kind.lenia)         { ret lenia.states(?r.kind.lenia); }
+    if (sel r.kind.reaction)      { ret reaction.states(?r.kind.reaction); }
     unmatched();
     ret 0;
 }
@@ -435,6 +500,8 @@ pub fun word(r: *Rule, state: u32) u32 {
     if (sel r.kind.generations)   { ret generations.word_of(?r.kind.generations, state); }
     if (sel r.kind.nontotalistic) { ret nontotalistic.word_of(?r.kind.nontotalistic, state); }
     if (sel r.kind.table)         { ret ruletable.word_of(?r.kind.table, state); }
+    if (sel r.kind.lenia)         { ret lenia.word_of(?r.kind.lenia, state); }
+    if (sel r.kind.reaction)      { ret reaction.word_of(?r.kind.reaction, state); }
     unmatched();
     ret 0;
 }
@@ -445,6 +512,36 @@ pub fun state(r: *Rule, c: u32) u32 {
     if (sel r.kind.generations)   { ret generations.state_of(c); }
     if (sel r.kind.nontotalistic) { ret nontotalistic.state_of(c); }
     if (sel r.kind.table)         { ret ruletable.state_of(c); }
+    if (sel r.kind.lenia)         { ret lenia.state_of(c); }
+    if (sel r.kind.reaction)      { ret reaction.state_of(c); }
+    unmatched();
+    ret 0;
+}
+
+# the state painted or seeded when none is chosen: the fully live one
+pub fun ink(r: *Rule) u32 {
+    if (sel r.kind.weighted)      { ret weighted.ink(?r.kind.weighted); }
+    if (sel r.kind.generations)   { ret generations.ink(?r.kind.generations); }
+    if (sel r.kind.nontotalistic) { ret nontotalistic.ink(?r.kind.nontotalistic); }
+    if (sel r.kind.table)         { ret ruletable.ink(?r.kind.table); }
+    if (sel r.kind.lenia)         { ret lenia.ink(?r.kind.lenia); }
+    if (sel r.kind.reaction)      { ret reaction.ink(?r.kind.reaction); }
+    unmatched();
+    ret 0;
+}
+
+# how far apart the GPU's and the CPU's words for a cell may lie a generation
+# on from the same cells, in the word's units: 0 for a family whose engines
+# step bit for bit, which a continuous family's floating point need not. a
+# difference within it is not carried on: a chaotic rule amplifies any, so the
+# engines are held to it one generation at a time (cellar.sim Rig)
+pub fun slack(r: *Rule) u32 {
+    if (sel r.kind.weighted)      { ret weighted.slack(?r.kind.weighted); }
+    if (sel r.kind.generations)   { ret generations.slack(?r.kind.generations); }
+    if (sel r.kind.nontotalistic) { ret nontotalistic.slack(?r.kind.nontotalistic); }
+    if (sel r.kind.table)         { ret ruletable.slack(?r.kind.table); }
+    if (sel r.kind.lenia)         { ret lenia.slack(?r.kind.lenia); }
+    if (sel r.kind.reaction)      { ret reaction.slack(?r.kind.reaction); }
     unmatched();
     ret 0;
 }
@@ -456,6 +553,8 @@ pub fun sense(r: *Rule) layout.Sense {
     if (sel r.kind.generations)   { ret generations.sense(); }
     if (sel r.kind.nontotalistic) { ret nontotalistic.sense(); }
     if (sel r.kind.table)         { ret ruletable.sense(); }
+    if (sel r.kind.lenia)         { ret lenia.sense(); }
+    if (sel r.kind.reaction)      { ret reaction.sense(); }
     unmatched();
     ret none;
 }
@@ -466,6 +565,8 @@ pub fun radius(r: *Rule) usize {
     if (sel r.kind.generations)   { ret generations.radius(?r.kind.generations); }
     if (sel r.kind.nontotalistic) { ret nontotalistic.radius(?r.kind.nontotalistic); }
     if (sel r.kind.table)         { ret ruletable.radius(?r.kind.table); }
+    if (sel r.kind.lenia)         { ret lenia.radius(?r.kind.lenia); }
+    if (sel r.kind.reaction)      { ret reaction.radius(?r.kind.reaction); }
     unmatched();
     ret 0;
 }
@@ -496,19 +597,27 @@ pub fun rimmed(r: *Rule) bool {
 fun kind_caps(k: *Kind) Caps {
     if (sel k.weighted) {
         val c: weighted.Caps = weighted.caps(?k.weighted);
-        ret Caps{b0: c.b0, isotropic: c.isotropic, no_tree: c.no_tree, bounded: c.bounded, life_like: c.life_like};
+        ret Caps{b0: c.b0, isotropic: c.isotropic, no_tree: c.no_tree, bounded: c.bounded, life_like: c.life_like, continuous: c.continuous};
     }
     if (sel k.generations) {
         val c: generations.Caps = generations.caps(?k.generations);
-        ret Caps{b0: c.b0, isotropic: c.isotropic, no_tree: c.no_tree, bounded: c.bounded, life_like: c.life_like};
+        ret Caps{b0: c.b0, isotropic: c.isotropic, no_tree: c.no_tree, bounded: c.bounded, life_like: c.life_like, continuous: c.continuous};
     }
     if (sel k.nontotalistic) {
         val c: nontotalistic.Caps = nontotalistic.caps(?k.nontotalistic);
-        ret Caps{b0: c.b0, isotropic: c.isotropic, no_tree: c.no_tree, bounded: c.bounded, life_like: c.life_like};
+        ret Caps{b0: c.b0, isotropic: c.isotropic, no_tree: c.no_tree, bounded: c.bounded, life_like: c.life_like, continuous: c.continuous};
     }
     if (sel k.table) {
         val c: ruletable.Caps = ruletable.caps(?k.table);
-        ret Caps{b0: c.b0, isotropic: c.isotropic, no_tree: c.no_tree, bounded: c.bounded, life_like: c.life_like};
+        ret Caps{b0: c.b0, isotropic: c.isotropic, no_tree: c.no_tree, bounded: c.bounded, life_like: c.life_like, continuous: c.continuous};
+    }
+    if (sel k.lenia) {
+        val c: lenia.Caps = lenia.caps(?k.lenia);
+        ret Caps{b0: c.b0, isotropic: c.isotropic, no_tree: c.no_tree, bounded: c.bounded, life_like: c.life_like, continuous: c.continuous};
+    }
+    if (sel k.reaction) {
+        val c: reaction.Caps = reaction.caps(?k.reaction);
+        ret Caps{b0: c.b0, isotropic: c.isotropic, no_tree: c.no_tree, bounded: c.bounded, life_like: c.life_like, continuous: c.continuous};
     }
     unmatched();
     var none: Caps;
@@ -537,6 +646,14 @@ pub fun step_chunk(r: *Rule, b: *space.Block, t: *space.Tally) {
         ruletable.step_chunk(?r.kind.table, b, t);
         ret;
     }
+    if (sel r.kind.lenia) {
+        lenia.step_chunk(?r.kind.lenia, b, t);
+        ret;
+    }
+    if (sel r.kind.reaction) {
+        reaction.step_chunk(?r.kind.reaction, b, t);
+        ret;
+    }
     unmatched();
 }
 
@@ -550,6 +667,8 @@ pub fun next(r: *Rule, nb: *u32) u32 {
     if (sel r.kind.generations)   { ret generations.next_of(?r.kind.generations, nb); }
     if (sel r.kind.nontotalistic) { ret nontotalistic.next_of(?r.kind.nontotalistic, nb); }
     if (sel r.kind.table)         { ret ruletable.next_of(?r.kind.table, nb); }
+    if (sel r.kind.lenia)         { ret lenia.next_of(?r.kind.lenia, nb); }
+    if (sel r.kind.reaction)      { ret reaction.next_of(?r.kind.reaction, nb); }
     unmatched();
     ret 0;
 }
@@ -575,6 +694,14 @@ pub fun pack(r: *Rule, w: *u32) {
         ruletable.pack(?r.kind.table, w);
         ret;
     }
+    if (sel r.kind.lenia) {
+        lenia.pack(?r.kind.lenia, w);
+        ret;
+    }
+    if (sel r.kind.reaction) {
+        reaction.pack(?r.kind.reaction, w);
+        ret;
+    }
     unmatched();
 }
 
@@ -584,6 +711,8 @@ pub fun table_words(r: *Rule) usize {
     if (sel r.kind.generations)   { ret generations.table_words(?r.kind.generations); }
     if (sel r.kind.nontotalistic) { ret nontotalistic.table_words(?r.kind.nontotalistic); }
     if (sel r.kind.table)         { ret ruletable.table_words(?r.kind.table); }
+    if (sel r.kind.lenia)         { ret lenia.table_words(?r.kind.lenia); }
+    if (sel r.kind.reaction)      { ret reaction.table_words(?r.kind.reaction); }
     unmatched();
     ret 0;
 }
@@ -609,6 +738,14 @@ pub fun pack_table(r: *Rule, w: *u32) {
         ruletable.pack_table(?r.kind.table, w);
         ret;
     }
+    if (sel r.kind.lenia) {
+        lenia.pack_table(?r.kind.lenia, w);
+        ret;
+    }
+    if (sel r.kind.reaction) {
+        reaction.pack_table(?r.kind.reaction, w);
+        ret;
+    }
     unmatched();
 }
 
@@ -622,6 +759,8 @@ pub fun colour(r: *Rule, state: u32) opt[u32] {
     if (sel r.kind.generations)   { ret generations.colour(?r.kind.generations, state); }
     if (sel r.kind.nontotalistic) { ret nontotalistic.colour(?r.kind.nontotalistic, state); }
     if (sel r.kind.table)         { ret ruletable.colour(?r.kind.table, state); }
+    if (sel r.kind.lenia)         { ret lenia.colour(?r.kind.lenia, state); }
+    if (sel r.kind.reaction)      { ret reaction.colour(?r.kind.reaction, state); }
     unmatched();
     ret opt[u32].none{};
 }
@@ -636,9 +775,9 @@ pub rec Preset {
 }
 
 # built-in rules
-pub val PRESET_COUNT: usize = 8;
+pub val PRESET_COUNT: usize = 11;
 
-val PRESETS: [8]Preset = [8]Preset{
+val PRESETS: [11]Preset = [11]Preset{
     Preset{label: "Life", rulestring: "B3/S23"},
     Preset{label: "HighLife", rulestring: "B36/S23"},
     Preset{label: "Seeds", rulestring: "B2/S"},
@@ -647,6 +786,9 @@ val PRESETS: [8]Preset = [8]Preset{
     Preset{label: "Star Wars", rulestring: "B2/S345/C4"},
     Preset{label: "tlife", rulestring: "B3/S2-i34q"},
     Preset{label: "Just Friends", rulestring: "B2-a/S12"},
+    Preset{label: "Gray-Scott spots", rulestring: "F=0.03,k=0.062"},
+    Preset{label: "Gray-Scott stripes", rulestring: "F=0.029,k=0.057"},
+    Preset{label: "Gray-Scott mitosis", rulestring: "F=0.0367,k=0.0649"},
 };
 
 # built-in rule i
@@ -781,7 +923,11 @@ test dispatch__every_function_handles_every_family {
             }
             val sn: layout.Sense = sense(?r);
             if (layout.live(0, sn.live_mask, sn.live_lo, sn.live_hi) != 0) { ret 9; }
-            if (radius(?r) == 0)                                           { ret 10; }
+            # the ink is a live state
+            if (ink(?r) == 0 || ink(?r) >= states(?r))                                     { ret 9; }
+            if (layout.live(word(?r, ink(?r)), sn.live_mask, sn.live_lo, sn.live_hi) == 0) { ret 9; }
+            slack(?r);
+            if (radius(?r) == 0) { ret 10; }
             caps(?r);
             pack(?r, ?win[0]);
             # a family with a rule buffer packs its rule there, and one without packs none

@@ -19,8 +19,8 @@
 # the last census the pool was settled from.
 #
 # a frame steps no more than its span of slots, counting every generation's
-# slots, so one generation over a large pool is dispatched in ranges of slots
-# across several frames. the span follows the frame time against the display's
+# slots, so one generation over a large pool is dispatched in ranges of its
+# active list across several frames. the span follows the frame time against the display's
 # refresh interval: the time a frame's dispatches take shows as the next
 # frames arriving late, which cuts the span, and frames on time that the span
 # cut short let it grow. while a generation is part way through, its finished
@@ -29,17 +29,60 @@
 # one counts and reduces it again. an edit, a growth or another rule since the
 # generation began starts it over from the front, under the same serial.
 #
-# the halo is the ring of adjacent chunks, 32 cells of reach, unless uncapped
-# stepping keeps running into the budget, when it widens to chunks two away and
-# 96 cells, at nearly three times the slots. the budget rises only once a
-# census taken with the wide halo has settled, so every live chunk holds it,
-# and before the ring's first census can free the far chunks the budget drops
-# to what the ring holds.
+# the halo is the rule's ring of adjacent chunks (cellar.space.ring), the
+# chunks its live cells lean toward and 32 cells of reach for a rule reaching
+# no further, every adjacent chunk and 64 cells for one reaching further,
+# unless uncapped stepping keeps running into the budget, when it widens by a
+# chunk, toward chunks two away, at nearly three times the slots. the budget
+# rises only once a census taken with the wider halo has settled, so every live
+# chunk holds it, and before the first census of a narrower halo, the ring's
+# or a rule's reaching less, can free the far chunks the budget drops to what
+# that halo holds.
+#
+# on the unbounded plane the GPU allocates and frees chunks itself, and the
+# census round trip no longer bounds the generations a frame may record. while
+# it steps there it owns the pool: the page table, the hash from coordinates to
+# slots, the free slots and the incarnations are written by its stages alone
+# (cellar.layout.Status), and the host's pool is a mirror of them that take
+# brings level, once the device is idle, before the host reads or changes it.
+# the host hands it back by changing it: the next flush uploads what it wrote
+# and seeds the GPU's hash and free bits from the table again. between the two
+# the host writes only its own words of the status head, in order with the
+# GPU's work, so the two never write the same word at once.
+#
+# a pass runs between generations, before the spread recorded since the last
+# would pass what the halo it left holds: each live chunk asks for the rule's
+# ring of chunks and claims a slot for any missing (mark_comp), the
+# first pass of a frame frees the chunks nothing asked for (free_comp), twins
+# claimed for one chunk give way to the lowest and the rest are linked in
+# (settle_comp), and the new chunks are cleared. so no generation outruns the halo the last pass
+# left, and only the dispatches a frame may record bound the generations it
+# records. every slot below a top the host keeps above the GPU's highest is
+# covered by the stages; a pass that finds no free slot below it closes a gate
+# that stops every pass and step after it (mark_comp, gate_comp), and the host,
+# seeing it in a census, takes the pool, rewinds its count of the generations
+# to where the gate closed, makes room and reopens it. a bounded grid's seams
+# are the host's to link, so there the host allocates, as below, unless the
+# grid fits the pool whole: then every chunk of it was allocated when it was
+# set (cellar.space.cover), nothing is allocated or freed as it steps, and no
+# budget bounds the generations a frame records.
 #
 # a chunk allocated empty is cleared on the GPU by a stage of its own rather
 # than uploaded, and each step stamps which chunks it left alive or warm, so the
 # next can skip the chunks with nothing alive nearby. whatever the host uploads
 # is stamped alive and warm, so it is stepped in full at least once.
+#
+# the steps are dispatched over an active list rather than every slot below
+# the top: a gather stage lists, from the stamps, the slots live or warm and
+# those a live one is within reach of, through the seams too, and the steps
+# read their slots from it (gather_comp, cellar.layout.Flags). a list holds
+# every slot that can change before the spread since it was gathered passes
+# layout.LIST_SPREAD, so a gather runs ahead of the first generation after the
+# host changed the pool or the rule, after every pass, and once the spread
+# would pass that, on the unbounded plane and on a grid alike. the host never
+# reads a list's length in time to plan by it, so a step covers the list to
+# its end, its workgroups past the end leaving at once, and the span counts
+# what the last census found the list held.
 #
 # below a pixel per cell the draw reads each chunk's coverage pyramid
 # (cellar.layout.Mip), which a reduce stage builds after the frame's last
@@ -67,6 +110,7 @@ use cellar.layout;
 use cellar.rule;
 use cellar.space;
 use cellar.theme;
+use cellar.topology;
 use allo: std.allocator;
 use std.chrono.time;
 use std.chrono.time.Instant;
@@ -90,6 +134,20 @@ val GROW_SPV:   [_]u8;
 val CENSUS_SPV: [_]u8;
 #[embed("{artifact.stage-reduce_comp.out}")]
 val REDUCE_SPV: [_]u8;
+#[embed("{artifact.stage-mark_comp.out}")]
+val MARK_SPV:   [_]u8;
+#[embed("{artifact.stage-free_comp.out}")]
+val FREE_SPV:   [_]u8;
+#[embed("{artifact.stage-settle_comp.out}")]
+val SETTLE_SPV: [_]u8;
+#[embed("{artifact.stage-gate_comp.out}")]
+val GATE_SPV:   [_]u8;
+#[embed("{artifact.stage-wipe_comp.out}")]
+val WIPE_SPV:   [_]u8;
+#[embed("{artifact.stage-seed_comp.out}")]
+val SEED_SPV:   [_]u8;
+#[embed("{artifact.stage-gather_comp.out}")]
+val GATHER_SPV: [_]u8;
 #[embed("{artifact.stage-cells_vert.out}")]
 val VERT_SPV:   [_]u8;
 #[embed("{artifact.stage-cells_frag.out}")]
@@ -109,10 +167,16 @@ val INLINE_MAX: usize = 65536;
 pub val MIP: usize = layout.MIP::usize;
 # entries in each palette
 pub val SHADES: usize = 256;
-# step dispatches one frame may record, leaving storage binding sets for the
-# clear, the growth, the census, the reduction and the draw, which also bounds
-# the generations it records
-pub val MAX_STEPS: usize = 240;
+# storage binding sets a frame keeps for the dispatches and draws besides its
+# generations': the clear, the growth, the seeding's two, the gate, the census,
+# the reduction and the draw
+val FRAME_SETS: usize = 8;
+# dispatches one frame's generations may record, its steps, its passes and its
+# gathers, in the storage binding sets the frame has left besides FRAME_SETS,
+# which also bounds the generations it records
+pub val MAX_STEPS: usize = 248;
+# dispatches a pass records, and one more for the first of a frame, which frees
+pub val PASS_CALLS: usize = 3;
 # the span a frame starts with, before the frame time has adapted it
 val FIRST_SPAN: usize = 4096;
 # the least a span shrinks to
@@ -151,6 +215,9 @@ val SENT_CELLS: u8 = 2;
 # a held slot's pyramid on the host was built from its cells, so it is sent
 # as it stands rather than built in the frame
 val BUILT: u8 = 4;
+# a list length no census has found since the pool or the world was replaced,
+# which counts as every slot below the top
+val UNKNOWN: usize = 0xffffffffffffffff;
 
 # the camera and colours the draw reads, uploaded each frame
 # ---
@@ -205,7 +272,8 @@ pub rec Look {
 # edits:  the edit count then
 # cap:    slots the readback covers
 # hi:     slots the census counted
-# wide:   the halo settling it asks for is the wide one
+# span:   cells of spread the halo settling it asks for holds
+# owned:  the GPU owned the pool, so the host's settles nothing from it
 rec Snap {
     id:     u32;
     seq:    u64;
@@ -215,7 +283,39 @@ rec Snap {
     edits:  u64;
     cap:    usize;
     hi:     usize;
-    wide:   bool;
+    span:   u32;
+    owned:  bool;
+}
+
+# a dispatch a frame planned, recorded in order once its planning is done
+# ---
+# pass:   a pass rather than a step
+# gather: a gather rather than a step
+# free:   the pass frees, as the frame's first does
+# tail:   the step covers the list from lo to its end, whatever its length,
+#         rather than n entries
+# src:    the cells the step reads, or the pass marks from
+# lo:     a step's first entry of the list
+# n:      a step's entries, when it is no tail
+# now:    a step's serial, for a pass the serial of the step that left the
+#         front, and for a gather the serial of the step after it
+# id:     a pass's id
+# gens:   generations recorded before a pass, low bits
+# span:   cells of spread the halo a pass leaves holds
+# bits:   a gather's header bits (layout.GATHER_GATED, layout.GATHER_RIM)
+rec Op {
+    pass:   bool;
+    gather: bool;
+    free:   bool;
+    tail:   bool;
+    src:    usize;
+    lo:     u32;
+    n:      u32;
+    now:    u32;
+    id:     u32;
+    gens:   u32;
+    span:   u32;
+    bits:   u32;
 }
 
 # a painted cell waiting to be uploaded
@@ -231,7 +331,8 @@ rec Write {
 # ---
 # cells:  the two cell pools stepped between
 # meta:   the rule and the page table
-# flags:  per slot the serials of the last step that left it alive and warm
+# flags:  per slot the serials of the last step that left it alive and warm,
+#         then the active list the steps are dispatched over
 # list:   the slots the clear stage empties
 # mip:    every slot's coverage pyramid
 # status: the census stage's output
@@ -301,6 +402,7 @@ rec Pool {
 # limit:    the spread the last settled census allows
 # wide:     censuses are recorded asking for the wide halo
 # want:     the halo the next census should ask for is the wide one
+# halo:     cells of spread the halo censuses are recorded asking for holds
 # streak:   consecutive uncapped frames that argue for changing the halo
 # patience: budget-bound frames in a row the halo next widens after
 # hold:     the most limit may be until a census recorded since the halo
@@ -335,6 +437,40 @@ rec Pool {
 # cursor:   the slot the next frame's upload of the CPU's chunks starts from
 # head:     the meta header staged for upload
 # built:    a pyramid built on the host, staged for upload
+# mark:     a pass's stage that asks for halos and claims slots
+# free:     a pass's stage that frees what nothing asked for
+# settle:   a pass's stage that keeps one twin and links it in
+# gate:     the stage that zeroes the frame's steps while the gate is closed
+# wipe:     the stage that empties the GPU's hash and free bits
+# seed:     the stage that fills them again from the page table
+# sp:       the host's pool this mirrors, once attached
+# owns:     the GPU allocates and frees chunks itself, while it steps the
+#           unbounded plane, and the host's page table mirrors its own
+# moved:    a pass was recorded since the host last took the pool back
+# reseed:   the next flush hands the pool back: the host changed it or reopens
+#           the gate, so the allocator's words are written and the hash seeded
+# rehash:   tombstones piled up in the hash, which the next flush seeds again
+# top:      while owned, the slots every stage covers and below which a pass claims
+# pass:     the last pass id
+# grouped:  cells of spread recorded since the last pass
+# passed:   cells of spread the halo the last pass left holds
+# rewound:  generations a closed gate voided, not yet taken from the world's count
+# pop:      live cells the newest census found while owned
+# box:      the box around them
+# boxed:    box holds one
+# used:     slots in use the newest census found while owned
+# tallied:  pop, box and used are the world's, no edit having come since
+# squeeze:  a test's hold on the top, until the pool is next taken, 0 for none
+# listed:   the active list holds every slot the next generation may change,
+#           gathered since the pool and the rule last changed
+# gathered: cells of spread recorded since the list was gathered
+# est:      the list's length as the newest census found it, UNKNOWN before one
+# parts:    a test's hold on the span, a share of the next generation's
+#           estimate, 0 for none
+# gather:   the stage that gathers the active list
+# ops:      the frame's planned dispatches
+# nops:     how many
+# ctl:      the status head's first words, as take read them
 pub rec Gpu {
     a:        *allo.Allocator;
     r:        *gfx.Renderer;
@@ -377,6 +513,7 @@ pub rec Gpu {
     limit:    u64;
     wide:     bool;
     want:     bool;
+    halo:     u32;
     streak:   u32;
     patience: u32;
     hold:     u64;
@@ -409,6 +546,36 @@ pub rec Gpu {
     cursor:   usize;
     head:     [128]u32;
     built:    [layout.MIP]u32;
+    mark:     gfx.Compute;
+    free:     gfx.Compute;
+    settle:   gfx.Compute;
+    gate:     gfx.Compute;
+    wipe:     gfx.Compute;
+    seed:     gfx.Compute;
+    sp:       *space.Space;
+    owns:     bool;
+    moved:    bool;
+    reseed:   bool;
+    rehash:   bool;
+    top:      usize;
+    pass:     u32;
+    grouped:  usize;
+    passed:   usize;
+    rewound:  u64;
+    pop:      usize;
+    box:      space.Box;
+    boxed:    bool;
+    used:     usize;
+    tallied:  bool;
+    squeeze:  usize;
+    listed:   bool;
+    gathered: usize;
+    est:      usize;
+    parts:    usize;
+    gather:   gfx.Compute;
+    ops:      [MAX_STEPS]Op;
+    nops:     usize;
+    ctl:      [16]u32;
 }
 
 # how long frames may take against the display's refresh interval
@@ -443,19 +610,17 @@ pub fun display(g: *Gpu, hz: f32) {
     g.pace_us = pace_for(hz);
 }
 
-# the census id's four words, then a packed word and an extent per slot
+# the status buffer's head and the census rows of cap slots, what a frame reads back
 fun status_bytes(cap: usize) usize {
-    ret 16 + cap * 8;
+    ret (layout.STATUS_HEAD::usize + cap * layout.ROW::usize) * 4;
 }
 
-# cells of spread a pool settled to a halo holds room for
-fun reach(wide: bool) u64 {
-    if (wide) { ret space.SPREAD_WIDE::u64; }
-    ret space.SPREAD_RING::u64;
+# slots kept above n in use, so the GPU seldom runs out below the top
+fun slack(n: usize) usize {
+    val q: usize = n / 4;
+    if (q < 64) { ret 64; }
+    ret q;
 }
-
-# a packed census word's incarnation bits
-val TAG: u32 = 0x3ffff;
 
 fun make(d: *gfx.Device, size: usize, out: *gfx.StorageBuffer) err[gfx.Error] {
     val made: res[gfx.StorageBuffer, gfx.Error] = gfx.storage_buffer(d, size);
@@ -477,20 +642,20 @@ fun fit(n: usize, words: usize, head: usize, per: usize) usize {
 #
 # every storage buffer make_pool creates is bound whole, so each must fit the
 # device's storage buffer range, and the tightest sets the ceiling, which is
-# the cells' at space.CELLS words a slot. the stages' arrays are declared for
-# layout.MAX_SLOTS, which caps it on a device that allows more.
+# the cells' at space.CELLS words a slot. the status and flags buffers are the
+# same size for every pool, and a device too small for them holds none. the stages' arrays
+# are declared for layout.MAX_SLOTS, which caps it on a device that allows more.
 # ---
 # l:   the device's limits
 # ret: the ceiling, zero when the limits were never read
 pub fun ceiling(l: gfx.Limits) usize {
     val words: usize = l.max_storage_buffer_range / 4;
     var n:     usize = layout.MAX_SLOTS::usize;
-    # the cells, the pyramids, the meta, the status, the flags and the list
+    # the cells, the pyramids, the meta, the status and flags, and the list
     n = fit(n, words, 0, space.CELLS);
     n = fit(n, words, 0, MIP);
     n = fit(n, words, HEAD, space.ENTRY);
-    n = fit(n, words, status_bytes(0) / 4, 2);
-    n = fit(n, words, 0, 2);
+    if (words < layout.STATUS_WORDS::usize || words < layout.FLAGS_WORDS::usize) { ret 0; }
     n = fit(n, words, 0, 1);
     ret n;
 }
@@ -524,7 +689,7 @@ fun make_pool(g: *Gpu, pp: *Pool, cap: usize) err[gfx.Error] {
         gfx.storage_buffer_delete(g.d, ?pp.cells[1]);
         ret e3;
     }
-    val e4: err[gfx.Error] = make(g.d, status_bytes(cap), ?pp.status);
+    val e4: err[gfx.Error] = make(g.d, layout.STATUS_WORDS::usize * 4, ?pp.status);
     if (sel e4.err) {
         gfx.storage_buffer_delete(g.d, ?pp.cells[0]);
         gfx.storage_buffer_delete(g.d, ?pp.cells[1]);
@@ -539,7 +704,7 @@ fun make_pool(g: *Gpu, pp: *Pool, cap: usize) err[gfx.Error] {
         gfx.storage_buffer_delete(g.d, ?pp.status);
         ret e5;
     }
-    val e5f: err[gfx.Error] = make(g.d, cap * 8, ?pp.flags);
+    val e5f: err[gfx.Error] = make(g.d, layout.FLAGS_WORDS::usize * 4, ?pp.flags);
     if (sel e5f.err) {
         gfx.readback_delete(?pp.rb, g.d);
         gfx.storage_buffer_delete(g.d, ?pp.cells[0]);
@@ -575,7 +740,7 @@ fun make_pool(g: *Gpu, pp: *Pool, cap: usize) err[gfx.Error] {
         ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.empty{}}};
     }
     pp.got = rg.ok;
-    val ru: res[*u32, allo.Error] = allo.allocate[u32](g.a, cap * space.CENSUS);
+    val ru: res[*u32, allo.Error] = allo.zallocate[u32](g.a, cap * space.CENSUS);
     if (sel ru.err) {
         drop_pool(g, pp);
         ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.empty{}}};
@@ -640,9 +805,10 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     g.id       = 0;
     g.spread   = 0;
     g.gens     = 0;
-    g.limit    = reach(false);
+    g.limit    = space.SPREAD_RING::u64;
     g.wide     = false;
     g.want     = false;
+    g.halo     = space.SPREAD_RING;
     g.streak   = 0;
     g.patience = WIDEN_AFTER;
     g.hold     = NO_HOLD;
@@ -672,6 +838,26 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     g.counted  = false;
     g.pace_us  = pace_for(0.0);
     g.cursor   = 0;
+    g.sp       = nil;
+    g.owns     = false;
+    g.moved    = false;
+    g.reseed   = false;
+    g.rehash   = false;
+    g.top      = 0;
+    g.pass     = 0;
+    g.grouped  = 0;
+    g.passed   = 0;
+    g.rewound  = 0;
+    g.pop      = 0;
+    g.boxed    = false;
+    g.used     = 0;
+    g.tallied  = false;
+    g.squeeze  = 0;
+    g.listed   = false;
+    g.gathered = 0;
+    g.est      = UNKNOWN;
+    g.parts    = 0;
+    g.nops     = 0;
     g.words    = 0;
     g.tabled   = false;
     g.packed   = vector.init[u32](a);
@@ -687,21 +873,8 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
 
     g.stepping = false;
     if (build_steps(g)) {
-        val zc: err[gfx.Error] = gfx.compute(?g.clear, g.d, ?CLEAR_SPV[0], $length_of(CLEAR_SPV));
-        if (sel zc.ok) {
-            val gc: err[gfx.Error] = gfx.compute(?g.grow, g.d, ?GROW_SPV[0], $length_of(GROW_SPV));
-            if (sel gc.ok) {
-                val cc: err[gfx.Error] = gfx.compute(?g.census, g.d, ?CENSUS_SPV[0], $length_of(CENSUS_SPV));
-                if (sel cc.ok) {
-                    val rc: err[gfx.Error] = gfx.compute(?g.reduce, g.d, ?REDUCE_SPV[0], $length_of(REDUCE_SPV));
-                    if (sel rc.ok) { g.stepping = true; }
-                    or             { gfx.compute_delete(?g.census, g.d); }
-                }
-                if (!g.stepping) { gfx.compute_delete(?g.grow, g.d); }
-            }
-            if (!g.stepping) { gfx.compute_delete(?g.clear, g.d); }
-        }
-        if (!g.stepping) { drop_steps(g, rule.FAMILIES); }
+        if (build_stages(g)) { g.stepping = true; }
+        or                   { drop_steps(g, rule.FAMILIES); }
     }
 
     val e7: err[gfx.Error] = make(g.d, (INK_AT + SHADES * 4) * 4, ?g.view);
@@ -713,6 +886,94 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     if (cap > g.slots) { ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.overrun{(cap * space.CELLS * 4)::u64}}}; }
     forget_censuses(g);
     ret make_pool(g, ?g.p, cap);
+}
+
+# the shared compute stages, in the order build_stages makes them
+fun stage_of(g: *Gpu, i: usize, spv: **u8, len: *usize) *gfx.Compute {
+    if (i == 0) {
+        @spv = ?CLEAR_SPV[0];
+        @len = $length_of(CLEAR_SPV);
+        ret ?g.clear;
+    }
+    if (i == 1) {
+        @spv = ?GROW_SPV[0];
+        @len = $length_of(GROW_SPV);
+        ret ?g.grow;
+    }
+    if (i == 2) {
+        @spv = ?CENSUS_SPV[0];
+        @len = $length_of(CENSUS_SPV);
+        ret ?g.census;
+    }
+    if (i == 3) {
+        @spv = ?REDUCE_SPV[0];
+        @len = $length_of(REDUCE_SPV);
+        ret ?g.reduce;
+    }
+    if (i == 4) {
+        @spv = ?MARK_SPV[0];
+        @len = $length_of(MARK_SPV);
+        ret ?g.mark;
+    }
+    if (i == 5) {
+        @spv = ?FREE_SPV[0];
+        @len = $length_of(FREE_SPV);
+        ret ?g.free;
+    }
+    if (i == 6) {
+        @spv = ?SETTLE_SPV[0];
+        @len = $length_of(SETTLE_SPV);
+        ret ?g.settle;
+    }
+    if (i == 7) {
+        @spv = ?GATE_SPV[0];
+        @len = $length_of(GATE_SPV);
+        ret ?g.gate;
+    }
+    if (i == 8) {
+        @spv = ?WIPE_SPV[0];
+        @len = $length_of(WIPE_SPV);
+        ret ?g.wipe;
+    }
+    if (i == 9) {
+        @spv = ?SEED_SPV[0];
+        @len = $length_of(SEED_SPV);
+        ret ?g.seed;
+    }
+    @spv = ?GATHER_SPV[0];
+    @len = $length_of(GATHER_SPV);
+    ret ?g.gather;
+}
+
+# the shared compute stages
+val STAGES: usize = 11;
+
+# build every shared compute stage, all of them or none
+fun build_stages(g: *Gpu) bool {
+    var i: usize = 0;
+    for (i < STAGES) {
+        var spv: *u8            = nil;
+        var len: usize          = 0;
+        val c:   *gfx.Compute   = stage_of(g, i, ?spv, ?len);
+        val e:   err[gfx.Error] = gfx.compute(c, g.d, spv, len);
+        if (sel e.err) {
+            drop_stages(g, i);
+            ret false;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# delete the first n shared compute stages
+fun drop_stages(g: *Gpu, n: usize) {
+    var spv: *u8   = nil;
+    var len: usize = 0;
+    var i:   usize = 0;
+    for (i < n) {
+        gfx.compute_delete(stage_of(g, i, ?spv, ?len), g.d);
+        i = i + 1;
+    }
 }
 
 # build the step stage of every rule family whose bindings the device's
@@ -839,6 +1100,7 @@ fun sync_ink(g: *Gpu, r: *rule.Rule, look: *Look) err[gfx.Error] {
             st = st + 1;
         }
         if (ink) {
+            fill_shades(?pal[0]);
             val up: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.view, INK_AT * 4, (?pal[0])::*u8, SHADES * 16);
             if (sel up.err) { ret up; }
         }
@@ -849,6 +1111,27 @@ fun sync_ink(g: *Gpu, r: *rule.Rule, look: *Look) err[gfx.Error] {
     look.ink = 0;
     if (g.ink) { look.ink = 1; }
     ret err[gfx.Error].ok{};
+}
+
+# give every heat of a rule palette no state's word lands on the colour of the
+# nearest heat below it that one does, or the lowest one's below them all, so a
+# continuous rule's cell between its states' levels, a faint one under the
+# first included, is drawn in its neighbour's colour
+fun fill_shades(pal: *f32) {
+    var first: usize = SHADES;
+    var h:     usize = 0;
+    for (h < SHADES) {
+        if (pal[h * 4 + 3] != 0.0) {
+            if (first == SHADES) { first = h; }
+        }
+        or (first != SHADES) { mem.copy[f32](?pal[h * 4], ?pal[(h - 1) * 4], 4); }
+        h = h + 1;
+    }
+    h = 0;
+    for (h < first && first < SHADES) {
+        mem.copy[f32](?pal[h * 4], ?pal[first * 4], 4);
+        h = h + 1;
+    }
 }
 
 # make room for a pool of cap slots, ahead of the host's pool growing to it
@@ -890,9 +1173,19 @@ fun reserve_for(ctx: *u8, cap: usize) bool {
     ret reserve(ctx::*Gpu, cap);
 }
 
-# the GPU side as the host pool's mirror, which makes room before the pool grows
-pub fun mirror(g: *Gpu) space.Mirror {
-    ret space.Mirror{ctx: g::*u8, reserve: reserve_for};
+fun own_for(ctx: *u8) {
+    val g: *Gpu = ctx::*Gpu;
+    if (g.sp != nil) { take(g, g.sp); }
+}
+
+# the GPU side as the host pool's mirror, which makes room before the pool
+# grows and hands the pool back before the host reads or changes it
+# ---
+# g:  the GPU side
+# sp: the host's pool, which must not move while it is mirrored
+pub fun mirror(g: *Gpu, sp: *space.Space) space.Mirror {
+    g.sp = sp;
+    ret space.Mirror{ctx: g::*u8, reserve: reserve_for, own: own_for};
 }
 
 # leave stepping to the CPU even though the compute stages were built, to
@@ -900,10 +1193,7 @@ pub fun mirror(g: *Gpu) space.Mirror {
 pub fun forgo_compute(g: *Gpu) {
     if (!g.stepping) { ret; }
     drop_steps(g, rule.FAMILIES);
-    gfx.compute_delete(?g.clear, g.d);
-    gfx.compute_delete(?g.grow, g.d);
-    gfx.compute_delete(?g.census, g.d);
-    gfx.compute_delete(?g.reduce, g.d);
+    drop_stages(g, STAGES);
     g.stepping = false;
 }
 
@@ -919,10 +1209,7 @@ pub fun dnit(g: *Gpu) {
     vector.dnit[u32](?g.packed);
     if (g.stepping) {
         drop_steps(g, rule.FAMILIES);
-        gfx.compute_delete(?g.clear, g.d);
-        gfx.compute_delete(?g.grow, g.d);
-        gfx.compute_delete(?g.census, g.d);
-        gfx.compute_delete(?g.reduce, g.d);
+        drop_stages(g, STAGES);
     }
     vector.dnit[Write](?g.writes);
     vector.dnit[u32](?g.zeros);
@@ -931,7 +1218,8 @@ pub fun dnit(g: *Gpu) {
 
 # note an edit, which a census recorded before it cannot free chunks around
 pub fun note_edit(g: *Gpu) {
-    g.edits = g.edits + 1;
+    g.edits   = g.edits + 1;
+    g.tallied = false;
 }
 
 # note a clear or fill: the pool was rebuilt whole and settled on the host,
@@ -940,9 +1228,12 @@ pub fun note_edit(g: *Gpu) {
 pub fun note_bulk(g: *Gpu) {
     g.bulk    = g.bulk + 1;
     g.edits   = g.edits + 1;
-    g.limit   = g.spread + reach(g.wide);
+    g.tallied = false;
+    g.halo    = space.span(g.sp);
+    g.limit   = g.spread + g.halo::u64;
     g.hold    = NO_HOLD;
     g.settled = g.seq;
+    g.est     = UNKNOWN;
     vector.clear[Write](?g.writes);
     vector.clear[u32](?g.stamped);
 }
@@ -961,6 +1252,23 @@ pub fun note_write(g: *Gpu, sp: *space.Space, s: usize, i: usize) {
 pub fun fix_span(g: *Gpu, slots: usize) {
     g.span  = slots;
     g.fixed = true;
+}
+
+# hold the span at a share of what the next generation is estimated to step,
+# rather than following the frame time, so a test can force a generation
+# across about parts frames however few slots its list holds
+#[testing]
+pub fun split_span(g: *Gpu, parts: usize) {
+    g.parts = parts;
+    g.fixed = true;
+}
+
+# hold the top at slots, no lower than the slots in use, until the pool is
+# next taken back, so a test can run the passes out of free slots and close
+# the gate
+#[testing]
+pub fun squeeze(g: *Gpu, slots: usize) {
+    g.squeeze = slots;
 }
 
 # time the frame against the last, and follow the span to it
@@ -1009,14 +1317,15 @@ fun follow(g: *Gpu) {
 #
 # the halo widens once the budget cut several frames in a row short that kept
 # up with the display, reach rather than frame time bounding them, and narrows
-# once several in a row fell behind the display or would have fit the ring.
+# once several in a row fell behind the display or would have fit the rule's
+# ring.
 # each such narrowing doubles how many frames the next widening waits for,
 # until stepping stops being uncapped.
 # ---
 # g: the GPU side, after the frame
 pub fun tune(g: *Gpu) {
     var argues: bool = g.cut && g.quick;
-    if (g.wide) { argues = !g.quick || (!g.cut && g.lag + g.stepped <= reach(false)); }
+    if (g.wide) { argues = !g.quick || (!g.cut && g.lag + g.stepped <= space.ring(g.sp.reach)::u64); }
     if (argues) { g.streak = g.streak + 1; }
     or          { g.streak = 0; }
     if (!g.wide && g.streak >= g.patience) {
@@ -1040,11 +1349,13 @@ pub fun rest(g: *Gpu) {
     g.patience = WIDEN_AFTER;
 }
 
-# how many generations may be recorded before the next census lands
+# how many generations may be recorded before the next census lands: any
+# number over a pool held whole (cellar.space.cover), where no census makes room
 # ---
 # g:      the GPU side
 # radius: the rule's radius, the spread of one generation
 pub fun budget(g: *Gpu, radius: usize) usize {
+    if (g.sp != nil && g.sp.whole) { ret MAX_STEPS; }
     val r: u64 = radius::u64;
     if (r == 0 || g.spread + r > g.limit) { ret 0; }
     val n: u64 = (g.limit - g.spread) / r;
@@ -1054,7 +1365,8 @@ pub fun budget(g: *Gpu, radius: usize) usize {
 
 # what collect found
 # ---
-# fresh:  a census landed and the host's pool was settled from it
+# fresh:  a census landed and the host's pool was settled from it, or while
+#         the GPU owns the pool, its count taken
 # fits:   the pool held every chunk the world grew into
 # behind: generations recorded since that census was taken
 pub rec Landed {
@@ -1063,10 +1375,12 @@ pub rec Landed {
     behind: u64;
 }
 
-# settle the host's pool from the newest census that has landed
+# settle the host's pool from the newest census that has landed, or while the
+# GPU owns the pool, count what it found and make the room it needs
 #
 # call once a frame after the frame begins and before anything is recorded, so
-# a finished copy is taken before the frame's own readback reuses its slot.
+# a finished copy is taken before the frame's own readback reuses its slot,
+# and so a pool taken back here is taken with the device idle.
 # ---
 # g:   the GPU side
 # sp:  the host's pool
@@ -1076,41 +1390,177 @@ pub fun collect(g: *Gpu, sp: *space.Space) Landed {
     if (!g.stepping || g.p.cap == 0) { ret none; }
     val len: usize = status_bytes(g.p.cap);
     if (!gfx.renderer_readback_take(g.r, ?g.p.rb, g.p.got::*u8, len)) { ret none; }
-    val id:   u32   = g.p.got[0];
+    val id:   u32   = g.p.got[layout.CTL_CENSUS::usize];
     val snap: *Snap = ?g.ring[id::usize % RING];
     if (snap.id != id || id == 0 || snap.cap != g.p.cap || snap.bulk != g.bulk || snap.seq < g.settled) { ret none; }
-    var n: usize = sp.hi;
-    if (n > snap.hi) { n = snap.hi; }
+    if (snap.owned != g.owns)                                                                           { ret none; }
+    g.est = g.p.got[layout.CTL_LISTED::usize]::usize;
+    var n: usize = snap.hi;
+    if (!snap.owned && n > sp.hi) { n = sp.hi; }
+    val rows: *u32  = ?g.p.got[layout.STATUS_HEAD::usize];
+    val row:  usize = layout.ROW::usize;
     # a slot matches its report when the incarnation bits agree. fewer than
     # 2^18 allocations happen between a census and its landing, since no frame
     # makes more than the pool holds, so bits that agree name the same chunk
-    var s: usize = 0;
+    var pop:  usize = 0;
+    var used: usize = 0;
+    var high: usize = 0;
+    var box:  space.Box;
+    var any:  bool  = false;
+    var s:    usize = 0;
     for (s < n) {
-        val w:   u32  = g.p.got[4 + s * 2];
-        val c:   *u32 = ?g.p.landed[s * space.CENSUS];
-        val inc: u32  = space.incarnation(sp, s);
+        val w: u32  = rows[s * row];
+        val c: *u32 = ?g.p.landed[s * space.CENSUS];
         c[0] = w & 0x1fff;
         c[1] = (w >> 13) & 1;
-        c[2] = 0;
-        if (inc != 0 && (w >> 14) == (inc & TAG)) { c[2] = inc; }
-        c[4] = g.p.got[5 + s * 2];
+        c[2] = w >> 14;
+        c[4] = rows[s * row + 1];
         c[3] = 0;
-        if (c[0] != 0) { c[3] = space.halo_of(c[4], snap.wide); }
+        if (c[0] != 0) { c[3] = space.halo_of(c[4], snap.span); }
+        if (!snap.owned) {
+            val inc: u32 = space.incarnation(sp, s);
+            c[2] = 0;
+            if (inc != 0 && (w >> 14) == (inc & space.TAG)) { c[2] = inc; }
+        }
+        or (rows[s * row + 2] != 0) {
+            used = used + 1;
+            high = s + 1;
+            pop  = pop + c[0]::usize;
+            if (c[0] != 0) {
+                val ox: i64 = (rows[s * row + 2]::i64 - space.BIAS) * space.SIDE;
+                val oy: i64 = (rows[s * row + 3]::i64 - space.BIAS) * space.SIDE;
+                val x0: i64 = ox + (c[4] & 63)::i64;
+                val y0: i64 = oy + ((c[4] >> layout.EXTENT_Y0) & 63)::i64;
+                val x1: i64 = ox + ((c[4] >> layout.EXTENT_X1) & 63)::i64 + 1;
+                val y1: i64 = oy + ((c[4] >> layout.EXTENT_Y1) & 63)::i64 + 1;
+                if (!any || x0 < box.x0) { box.x0 = x0; }
+                if (!any || y0 < box.y0) { box.y0 = y0; }
+                if (!any || x1 > box.x1) { box.x1 = x1; }
+                if (!any || y1 > box.y1) { box.y1 = y1; }
+                any = true;
+            }
+        }
         s = s + 1;
+    }
+    if (snap.owned) {
+        val gate: bool = g.p.got[layout.CTL_GATE::usize] != 0;
+        if (g.p.got[layout.CTL_TOMBS::usize] > layout.HASH / 8) { g.rehash = true; }
+        # a census taken while the gate was closed read cells no step since
+        # has touched, so it is no count of the world
+        if (gate) {
+            take(g, sp);
+            make_room(g, sp, g.top + slack(g.top));
+            # a pool at its ceiling with no slot free below the top cannot hold the world
+            ret Landed{fresh: false, fits: sp.live < g.top, behind: 0};
+        }
+        # a census taken before an edit is no count of the world after it
+        if (snap.edits == g.edits) {
+            g.pop     = pop;
+            g.used    = used;
+            g.box     = box;
+            g.boxed   = any;
+            g.tallied = true;
+        }
+        g.settled = snap.seq;
+        if (high + slack(high) / 2 > g.top) { make_room(g, sp, high + slack(high)); }
+        ret Landed{fresh: true, fits: true, behind: g.gens - snap.gens};
     }
     val ok: bool = space.settle(sp, g.p.landed, n, snap.edits == g.edits);
     g.settled = snap.seq;
     g.lag     = g.spread - snap.spread;
-    # a census recorded since the halo narrowed has freed what the ring leaves out
+    # a census recorded since the halo narrowed has freed what the narrower
+    # halo leaves out
     if (snap.seq >= g.held) { g.hold = NO_HOLD; }
     # a census the pool could not be settled from leaves the limit where it was
-    var to: u64 = snap.spread + reach(snap.wide);
+    var to: u64 = snap.spread + snap.span::u64;
     if (to > g.hold)        { to = g.hold; }
     if (ok && to > g.limit) { g.limit = to; }
     ret Landed{fresh: true, fits: ok, behind: g.gens - snap.gens};
 }
 
-# read the GPU's cells into the host's staging cells
+# raise the top to want slots while the GPU owns the pool, taking the pool
+# back and growing it when its buffers hold fewer
+#
+# a raised top only lets the passes claim higher, since every free slot of the
+# capacity has its free bit, so it takes no seeding. a pool growing moves into
+# larger buffers, which takes the device idle.
+fun make_room(g: *Gpu, sp: *space.Space, want: usize) {
+    var top: usize = want;
+    if (top > g.p.cap) {
+        take(g, sp);
+        var cap: usize = g.p.cap;
+        for (cap < top && cap < sp.max_slots) { cap = cap * 2; }
+        if (cap > sp.max_slots)   { cap = sp.max_slots; }
+        if (!space.grow(sp, cap)) { cap = g.p.cap; }
+        if (top > cap)            { top = cap; }
+        g.reseed = true;
+    }
+    if (top > g.top) { g.top = top; }
+}
+
+# take the pool back from the GPU while it owns it, so the host's page table
+# is the GPU's: a stall, which reads the page table and the allocator's words
+#
+# a closed gate voided every step recorded after the pass that closed it, so
+# the count of generations, the serial and the front go back to that pass,
+# and the generations taken back wait in rewound for the world's count. the
+# GPU keeps owning the pool until the host changes it.
+# call outside a frame, or in one before frame has recorded anything.
+# ---
+# g:  the GPU side
+# sp: the host's pool
+pub fun take(g: *Gpu, sp: *space.Space) {
+    if (!g.owns || !g.moved) { ret; }
+    val eh: err[gfx.Error] = gfx.storage_buffer_read(g.d, ?g.p.status, 0, (?g.ctl[0])::*u8, 64);
+    if (sel eh.err) { ret; }
+    var n: usize = g.top;
+    if (n > sp.cap) { n = sp.cap; }
+    if (n != 0) {
+        val et: err[gfx.Error] = gfx.storage_buffer_read(g.d, ?g.p.meta, HEAD * 4, sp.table::*u8, n * space.ENTRY * 4);
+        if (sel et.err) { ret; }
+    }
+    if (g.ctl[layout.CTL_GATE::usize] != 0) {
+        val v: u64 = ((g.gens & 0xffffffff) + 0x100000000 - g.ctl[layout.CTL_HALT::usize]::u64) & 0xffffffff;
+        g.gens    = g.gens - v;
+        g.serial  = ((g.serial::u64 + 0x100000000 - (v & 0xffffffff)) & 0xffffffff)::u32;
+        g.rewound = g.rewound + v;
+        if ((v & 1) != 0) { g.front = 1 - g.front; }
+        g.going   = false;
+        g.counted = false;
+        g.listed  = false;
+        g.reseed  = true;
+    }
+    sp.serial = g.ctl[layout.CTL_SERIAL::usize];
+    space.adopt(sp, n, g.p.landed);
+    g.moved   = false;
+    g.squeeze = 0;
+    g.top     = sp.hi + slack(sp.hi);
+    if (g.top > g.p.cap) { g.top = g.p.cap; }
+}
+
+# generations a closed gate voided since this was last asked, which the
+# world's count goes back by
+pub fun rewound(g: *Gpu) u64 {
+    val v: u64 = g.rewound;
+    g.rewound = 0;
+    ret v;
+}
+
+# whether the GPU owns the pool, so the host's census is not the world's and
+# the counts come from it
+pub fun owned(g: *Gpu) bool {
+    ret g.stepping && g.owns;
+}
+
+# whether the counts the newest census found while the GPU owns the pool are
+# the world's: none was taken since the last edit, when the host's census is
+# the world's instead
+pub fun tallied(g: *Gpu) bool {
+    ret owned(g) && g.tallied;
+}
+
+# read the GPU's cells into the host's staging cells, taking the pool back
+# first while the GPU owns it
 #
 # a stall. chunks whose staging is newer than the GPU's, filled or painted and
 # not yet uploaded, keep their staging. call outside a frame, or in one before
@@ -1121,6 +1571,7 @@ pub fun collect(g: *Gpu, sp: *space.Space) Landed {
 # ret: ok, or why the read failed
 pub fun pull(g: *Gpu, sp: *space.Space) err[gfx.Error] {
     if (!g.stepping) { ret err[gfx.Error].ok{}; }
+    take(g, sp);
     # one read per run of slots whose staging is not newer; a free slot's
     # staging is unused, so it may ride along in a run
     var top: usize = g.hi;
@@ -1150,7 +1601,8 @@ pub fun pull(g: *Gpu, sp: *space.Space) err[gfx.Error] {
 }
 
 # read the GPU's cells of a run of slots into the host's staging cells, ahead
-# of reading or editing them there
+# of reading or editing them there, taking the pool back first while the GPU
+# owns it, so the slots are the host's to name
 #
 # a stall. a slot whose staging is newer than the GPU's keeps it, and painted
 # cells not yet uploaded for the run's slots are applied to the staging and
@@ -1164,6 +1616,7 @@ pub fun pull(g: *Gpu, sp: *space.Space) err[gfx.Error] {
 # ret: ok, or why the read failed
 pub fun pull_chunks(g: *Gpu, sp: *space.Space, lo: usize, n: usize) err[gfx.Error] {
     if (!g.stepping) { ret err[gfx.Error].ok{}; }
+    take(g, sp);
     var top: usize = lo + n;
     if (g.hi < top)  { top = g.hi; }
     if (sp.hi < top) { top = sp.hi; }
@@ -1223,13 +1676,30 @@ fun upload_cells(g: *Gpu, sp: *space.Space, s: usize, n: usize, stall: bool) err
 
 # bring the GPU's pool level with the host's: grow it, then upload changed
 # page-table entries, whole chunks and painted cells. chunks are uploaded where
-# the GPU steps, or with whole where the host fills them for the draw
-fun flush(g: *Gpu, sp: *space.Space, whole: bool) err[gfx.Error] {
+# the GPU steps, or with whole where the host fills them for the draw. owns
+# says whether the GPU is to own the pool from here on: taking it on, or the
+# host having changed it, hands it back (hand_back)
+fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
     # buffers a growth replaced are freed once the frame that copied out of
     # them has run, which deleting waits for
     if (g.retired) {
         drop_pool(g, ?g.old);
         g.retired = false;
+    }
+    if (g.owns && !owns) {
+        take(g, sp);
+        g.owns = false;
+    }
+    if (!g.owns && owns) {
+        # the host's halo is the rule's ring from here on, as the passes keep it
+        g.owns   = true;
+        g.moved  = false;
+        g.reseed = true;
+        g.top    = 0;
+        g.want   = false;
+        g.wide   = false;
+        sp.wide  = false;
+        g.listed = false;
     }
     if (g.owed > g.p.cap && !(g.reserved && g.owed <= g.next.cap) && !make_next(g, g.owed)) {
         ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.overrun{(g.owed * space.CELLS * 4)::u64}}};
@@ -1243,6 +1713,7 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool) err[gfx.Error] {
         g.retired  = true;
         g.p        = g.next;
         g.reserved = false;
+        g.est      = UNKNOWN;
         forget_censuses(g);
         if (g.hi != 0 && g.stepping) {
             var gb: [4]*gfx.StorageBuffer;
@@ -1258,6 +1729,7 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool) err[gfx.Error] {
             sp.dirty[t] = sp.dirty[t] | space.DIRTY_ENTRY;
             t           = t + 1;
         }
+        if (g.owns) { g.reseed = true; }
     }
 
     var top: usize = sp.hi;
@@ -1274,8 +1746,11 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool) err[gfx.Error] {
     # part way through already stepped, and a growth leaves its back cells
     # behind, so it starts over. chunks a census settled are not among them:
     # the budget keeps any generation from reaching one it allocates or frees
+    if (entries != 0 && g.owns)                                   { g.reseed = true; }
     if (grew || chunks != 0 || g.writes.len != 0)                 { g.going = false; }
     if (grew || chunks != 0 || entries != 0 || g.writes.len != 0) { g.counted = false; }
+    # a list gathered before read the page table and the stamps as they were
+    if (grew || chunks != 0 || entries != 0 || g.writes.len != 0 || g.stamped.len != 0) { g.listed = false; }
 
     if (entries > BULK) {
         # one recorded write of the span the dirty entries lie in, which never
@@ -1395,6 +1870,56 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool) err[gfx.Error] {
         s           = s + 1;
     }
     g.hi = sp.hi;
+    if (g.owns) {
+        val want: usize = sp.hi + slack(sp.hi);
+        if (g.top < want)                                              { g.top = want; }
+        if (g.top > g.p.cap)                                           { g.top = g.p.cap; }
+        if (g.squeeze != 0 && g.top > g.squeeze && g.squeeze >= sp.hi) { g.top = g.squeeze; }
+        g.hi = g.top;
+        if (g.reseed) {
+            val eb: err[gfx.Error] = hand_back(g, sp);
+            if (sel eb.err) { ret eb; }
+        }
+        or (g.rehash) {
+            val er: err[gfx.Error] = rehash(g);
+            if (sel er.err) { ret er; }
+        }
+    }
+    ret err[gfx.Error].ok{};
+}
+
+# hand the pool the host changed back to the GPU: the gate reopened, the
+# incarnations going on from the host's, the top and the capacity written, and
+# the hash and the free bits seeded from the page table just uploaded. the next
+# generation waits for a pass, which gives the host's chunks their halo
+fun hand_back(g: *Gpu, sp: *space.Space) err[gfx.Error] {
+    var w: [6]u32;
+    w[0] = 0;
+    w[1] = 0;
+    w[2] = 0;
+    w[3] = sp.serial;
+    w[4] = g.top::u32;
+    w[5] = g.p.cap::u32;
+    val ew: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.status, layout.CTL_GATE::usize * 4, (?w[0])::*u8, 24);
+    if (sel ew.err) { ret ew; }
+    g.reseed  = false;
+    g.grouped = MAX_SPAN;
+    ret rehash(g);
+}
+
+# seed the GPU's hash and free bits from its page table again, which also
+# clears the tombstones out of the hash
+fun rehash(g: *Gpu) err[gfx.Error] {
+    var wb: [1]*gfx.StorageBuffer;
+    wb[0] = ?g.p.status;
+    val ew: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.wipe, ?wb[0], 1, layout.HASH / 64, 1, 1);
+    if (sel ew.err) { ret ew; }
+    var sb: [2]*gfx.StorageBuffer;
+    sb[0] = ?g.p.meta;
+    sb[1] = ?g.p.status;
+    val es: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.seed, ?sb[0], 2, ((g.p.cap + 63) / 64)::u32, 1, 1);
+    if (sel es.err) { ret es; }
+    g.rehash = false;
     ret err[gfx.Error].ok{};
 }
 
@@ -1524,22 +2049,171 @@ fun write_head(g: *Gpu, r: *rule.Rule, gen: u64) {
     rule.pack(r, ?g.head[layout.SHARED]);
 }
 
-# record one step of the generation going over a range of slots: the step
-# serial past the last completed one, and the range's first slot
-fun step_range(g: *Gpu, step: *gfx.Compute, bound: usize, lo: usize, n: usize) err[gfx.Error] {
-    val serial: u32            = g.serial + 1;
-    val base:   u32            = lo::u32;
-    val es:     err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.meta, layout.SERIAL_AT::usize * 4, (?serial)::*u8, 4);
+# plan a step of the generation going over the list from entry lo: n entries,
+# or to its end when tail. the step serial is the one past the last completed,
+# reading the front
+fun plan_step(g: *Gpu, lo: usize, n: usize, tail: bool) {
+    val op: *Op = ?g.ops[g.nops];
+    op.pass   = false;
+    op.gather = false;
+    op.free   = false;
+    op.tail   = tail;
+    op.src    = g.front;
+    op.lo     = lo::u32;
+    op.n      = n::u32;
+    op.now    = g.serial + 1;
+    g.nops    = g.nops + 1;
+}
+
+# plan a pass ahead of the next generation, over the front, leaving every live
+# chunk a halo holding span cells of spread
+fun plan_pass(g: *Gpu, free: bool, span: u32) {
+    g.pass = g.pass + 1;
+    if (g.pass == 0) { g.pass = 1; }
+    val op: *Op = ?g.ops[g.nops];
+    op.pass   = true;
+    op.gather = false;
+    op.free   = free;
+    op.src    = g.front;
+    op.now    = g.serial;
+    op.id     = g.pass;
+    op.gens   = (g.gens & 0xffffffff)::u32;
+    op.span   = span;
+    g.nops    = g.nops + 1;
+    g.moved   = true;
+}
+
+# plan a gather of the active list ahead of the next generation, under rule r
+fun plan_gather(g: *Gpu, r: *rule.Rule) {
+    val op: *Op = ?g.ops[g.nops];
+    op.pass   = false;
+    op.gather = true;
+    op.now    = g.serial + 1;
+    op.bits   = 0;
+    if (g.owns)         { op.bits = op.bits | layout.GATHER_GATED; }
+    if (rule.rimmed(r)) { op.bits = op.bits | layout.GATHER_RIM; }
+    g.nops = g.nops + 1;
+}
+
+# record a planned step: its serial and first entry into the head, then the
+# dispatch, over the list's length from the arguments its gather left for a
+# tail, else over its n entries
+fun record_step(g: *Gpu, step: *gfx.Compute, bound: usize, op: *Op) err[gfx.Error] {
+    val es: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.meta, layout.SERIAL_AT::usize * 4, (?op.now)::*u8, 4);
     if (sel es.err) { ret es; }
-    val eb: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.meta, layout.BASE_AT::usize * 4, (?base)::*u8, 4);
+    val eb: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.meta, layout.BASE_AT::usize * 4, (?op.lo)::*u8, 4);
     if (sel eb.err) { ret eb; }
     var bufs: [5]*gfx.StorageBuffer;
-    bufs[0]                           = ?g.p.cells[g.front];
-    bufs[1]                           = ?g.p.cells[1 - g.front];
+    bufs[0]                           = ?g.p.cells[op.src];
+    bufs[1]                           = ?g.p.cells[1 - op.src];
     bufs[2]                           = ?g.p.meta;
     bufs[3]                           = ?g.p.flags;
     bufs[layout.TABLE_BINDING::usize] = ?g.table;
-    ret gfx.renderer_dispatch(g.r, step, ?bufs[0], bound, 8, n::u32, 1);
+    if (op.tail) { ret gfx.renderer_dispatch_indirect(g.r, step, ?bufs[0], bound, ?g.p.flags, layout.FLAGS_ARGS::usize * 4); }
+    ret gfx.renderer_dispatch(g.r, step, ?bufs[0], bound, 8, op.n, 1);
+}
+
+# record a planned gather: the list emptied and its header bits set, the meta
+# serial the next step's, then a slot an invocation below the top
+fun record_gather(g: *Gpu, op: *Op) err[gfx.Error] {
+    var args: [4]u32;
+    args[0] = 8;
+    args[1] = 0;
+    args[2] = 1;
+    args[3] = op.bits;
+    val ea: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.flags, layout.FLAGS_ARGS::usize * 4, (?args[0])::*u8, 16);
+    if (sel ea.err) { ret ea; }
+    val es: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.meta, layout.SERIAL_AT::usize * 4, (?op.now)::*u8, 4);
+    if (sel es.err) { ret es; }
+    var bufs: [3]*gfx.StorageBuffer;
+    bufs[0] = ?g.p.meta;
+    bufs[1] = ?g.p.flags;
+    bufs[2] = ?g.p.status;
+    var groups: u32 = ((g.hi + 63) / 64)::u32;
+    if (groups == 0) { groups = 1; }
+    ret gfx.renderer_dispatch(g.r, ?g.gather, ?bufs[0], 3, groups, 1, 1);
+}
+
+# record a planned pass: its header into the status head, then the mark, the
+# free in the frame's first, the settle and the clear (cellar.layout.Status)
+fun record_pass(g: *Gpu, op: *Op) err[gfx.Error] {
+    var h: [17]u32;
+    mem.zero[u32](?h[0], 17);
+    h[0]  = g.top::u32;
+    h[1]  = g.p.cap::u32;
+    h[3]  = 0;
+    h[4]  = op.id;
+    h[5]  = op.now;
+    h[6]  = op.gens;
+    h[8]  = op.span;
+    h[11] = 0;
+    h[12] = 1;
+    h[13] = 1;
+    h[14] = 64;
+    h[15] = 0;
+    h[16] = 1;
+    val eh: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.status, layout.CTL_TOP::usize * 4, (?h[0])::*u8, 17 * 4);
+    if (sel eh.err) { ret eh; }
+    var mb: [4]*gfx.StorageBuffer;
+    mb[0] = ?g.p.cells[op.src];
+    mb[1] = ?g.p.meta;
+    mb[2] = ?g.p.status;
+    mb[3] = ?g.p.flags;
+    val em: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.mark, ?mb[0], 4, 1, g.top::u32, 1);
+    if (sel em.err) { ret em; }
+    if (op.free) {
+        var fb: [3]*gfx.StorageBuffer;
+        fb[0] = ?g.p.meta;
+        fb[1] = ?g.p.status;
+        fb[2] = ?g.p.flags;
+        val ef: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.free, ?fb[0], 3, ((g.top + 63) / 64)::u32, 1, 1);
+        if (sel ef.err) { ret ef; }
+    }
+    var sb: [3]*gfx.StorageBuffer;
+    sb[0] = ?g.p.meta;
+    sb[1] = ?g.p.status;
+    sb[2] = ?g.p.list;
+    val es: err[gfx.Error] = gfx.renderer_dispatch_indirect(g.r, ?g.settle, ?sb[0], 3, ?g.p.status, layout.ARGS_SETTLE::usize * 4);
+    if (sel es.err) { ret es; }
+    var zb: [4]*gfx.StorageBuffer;
+    zb[0] = ?g.p.cells[0];
+    zb[1] = ?g.p.cells[1];
+    zb[2] = ?g.p.list;
+    zb[3] = ?g.p.flags;
+    ret gfx.renderer_dispatch_indirect(g.r, ?g.clear, ?zb[0], 4, ?g.p.status, layout.ARGS_CLEAR::usize * 4);
+}
+
+# record the frame's planned dispatches: the gate stage first while the GPU
+# owns the pool, which empties the list while the gate is closed, then each in
+# turn
+fun record_ops(g: *Gpu, step: *gfx.Compute, bound: usize) err[gfx.Error] {
+    if (g.nops == 0) { ret err[gfx.Error].ok{}; }
+    if (g.owns) {
+        var gb: [2]*gfx.StorageBuffer;
+        gb[0] = ?g.p.status;
+        gb[1] = ?g.p.flags;
+        val eg: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.gate, ?gb[0], 2, 1, 1, 1);
+        if (sel eg.err) { ret eg; }
+    }
+    var k: usize = 0;
+    for (k < g.nops) {
+        val op: *Op = ?g.ops[k];
+        if (op.pass) {
+            val ep: err[gfx.Error] = record_pass(g, op);
+            if (sel ep.err) { ret ep; }
+        }
+        or (op.gather) {
+            val eg: err[gfx.Error] = record_gather(g, op);
+            if (sel eg.err) { ret eg; }
+        }
+        or {
+            val es: err[gfx.Error] = record_step(g, step, bound, op);
+            if (sel es.err) { ret es; }
+        }
+        k = k + 1;
+    }
+    g.nops = 0;
+    ret err[gfx.Error].ok{};
 }
 
 # record a frame's work: bring the pool level, step, count, and set the view
@@ -1551,12 +2225,13 @@ fun step_range(g: *Gpu, step: *gfx.Compute, bound: usize, lo: usize, n: usize) e
 # sp:    the host's pool
 # r:     the rule
 # gen:   the generation the cells hold as the frame begins
-# steps: generations wanted; fewer are completed when the budget or the span
-#        is short, and the last may be left part way for the next frame
+# steps: generations wanted; fewer are completed when the budget, the
+#        dispatches or the span is short, and the last may be left part way
+#        for the next frame
 # look:  the camera and colours for the draw
 # ret:   the generations completed, or why recording failed
 pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, look: *Look) res[usize, gfx.Error] {
-    val e14: err[gfx.Error] = flush(g, sp, false);
+    val e14: err[gfx.Error] = flush(g, sp, false, g.stepping && !topology.bounded(?sp.grid));
     if (sel e14.err) { ret res[usize, gfx.Error].err{e14.err}; }
     val ei: err[gfx.Error] = sync_ink(g, r, look);
     if (sel ei.err) { ret res[usize, gfx.Error].err{ei.err}; }
@@ -1588,21 +2263,59 @@ pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, 
     }
     val step:  *gfx.Compute = ?g.steps[fam];
     val bound: usize        = rule.bindings(fam);
-    var room:  usize        = g.span;
-    var calls: usize        = 0;
-    var n:     usize        = 0;
+    # the list holds no more than the slots below the top, and what the newest
+    # census found it held is what a generation is expected to step
+    var est: usize = g.est;
+    if (est > g.hi) { est = g.hi; }
+    var room: usize = g.span;
+    if (g.parts != 0) { room = est / g.parts + 1; }
+    var calls: usize = 0;
+    var first: bool  = true;
+    var n:     usize = 0;
     g.cut     = false;
     g.limited = false;
     g.worked  = 0;
+    g.nops    = 0;
     for (n < steps) {
         if (!g.going) {
             # a family the device could not build a stage for is refused before
             # it runs (cellar.sim), so it is never asked to step here
             if (!g.ready[fam]) { brk; }
-            if (budget(g, radius) == 0) {
+            if (!g.owns && budget(g, radius) == 0) {
                 g.cut = true;
                 brk;
             }
+            # no live cell reaches a chunk the last pass left out within the
+            # spread its halo holds, whatever the radius of the rules on the
+            # way, and a pass leaves the ring of the rule about to step, which
+            # holds a generation of it
+            val pass: bool = g.owns && g.grouped + radius > g.passed;
+            # a list holds what the generations within its spread may change,
+            # under the rule it was gathered for, and a pass reshapes the pool
+            if (g.listed && !rule.same(r, ?g.rule)) { g.listed = false; }
+            val gather: bool  = pass || !g.listed || g.gathered + radius > layout.LIST_SPREAD::usize;
+            var cost:   usize = 0;
+            if (pass) {
+                cost = PASS_CALLS;
+                if (first) { cost = cost + 1; }
+            }
+            if (gather) { cost = cost + 1; }
+            if (calls + cost >= MAX_STEPS) {
+                g.limited = true;
+                brk;
+            }
+            if (pass) {
+                plan_pass(g, first, space.ring(radius));
+                first     = false;
+                g.grouped = 0;
+                g.passed  = space.ring(radius)::usize;
+            }
+            if (gather) {
+                plan_gather(g, r);
+                g.listed   = true;
+                g.gathered = 0;
+            }
+            calls = calls + cost;
             if (g.hi != 0 && rule.table(fam)) {
                 val et: err[gfx.Error] = sync_table(g, r);
                 if (sel et.err) { ret res[usize, gfx.Error].err{et.err}; }
@@ -1613,17 +2326,25 @@ pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, 
             g.rule  = @r;
         }
         if (g.at < g.hi) {
-            if (room == 0 || calls >= MAX_STEPS) {
+            # the entries past the list's end find no slot and leave, so the
+            # span is spent on what the list is expected to hold, and a step
+            # the span does not cut covers the list to its end, however long
+            var left: usize = 0;
+            if (g.at < est) { left = est - g.at; }
+            if ((room == 0 && left != 0) || calls >= MAX_STEPS) {
                 g.limited = true;
                 brk;
             }
-            var run: usize = g.hi - g.at;
-            if (run > room) { run = room; }
-            val es: err[gfx.Error] = step_range(g, step, bound, g.at, run);
-            if (sel es.err) { ret res[usize, gfx.Error].err{es.err}; }
+            var run:  usize = g.hi - g.at;
+            var paid: usize = left;
+            if (left > room) {
+                run  = room;
+                paid = room;
+            }
+            plan_step(g, g.at, run, g.at + run == g.hi);
             g.at     = g.at + run;
-            g.worked = g.worked + run;
-            room     = room - run;
+            g.worked = g.worked + paid;
+            room     = room - paid;
             calls    = calls + 1;
             if (g.at < g.hi) {
                 g.limited = true;
@@ -1635,35 +2356,42 @@ pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, 
             g.serial = g.serial + 1;
             g.front  = 1 - g.front;
         }
-        g.going   = false;
-        g.counted = false;
-        g.spread  = g.spread + radius::u64;
-        g.gens    = g.gens + 1;
-        n         = n + 1;
+        g.going    = false;
+        g.counted  = false;
+        g.spread   = g.spread + radius::u64;
+        g.gens     = g.gens + 1;
+        g.grouped  = g.grouped + radius;
+        g.gathered = g.gathered + radius;
+        n          = n + 1;
     }
     g.stepped = n::u64 * radius::u64;
+    val eo: err[gfx.Error] = record_ops(g, step, bound);
+    if (sel eo.err) { ret res[usize, gfx.Error].err{eo.err}; }
     if (g.going) {
         # the census, the reduction and the draw read the completed generation
         val ec: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.meta, layout.SERIAL_AT::usize * 4, (?g.serial)::*u8, 4);
         if (sel ec.err) { ret res[usize, gfx.Error].err{ec.err}; }
     }
 
-    # a narrower halo frees chunks the budget may already have spread into, so
-    # the budget drops to what the ring holds from this census on, and stays
-    # there until a census recorded from now on has settled
-    if (g.want != g.wide) {
-        g.wide  = g.want;
-        sp.wide = g.wide;
-        if (!g.wide) {
-            g.hold = g.spread + reach(false);
-            g.held = g.seq;
-            if (g.limit > g.hold) { g.limit = g.hold; }
-        }
+    # a narrower halo, the ring after the wide one or the ring of a rule
+    # reaching less, frees chunks the budget may already have spread into, so
+    # the budget drops to what it holds from this census on, and stays there
+    # until a census recorded from now on has settled. while the GPU owns the
+    # pool the halo is always the ring its passes keep
+    if (g.owns) { g.want = false; }
+    g.wide  = g.want;
+    sp.wide = g.wide;
+    val halo: u32 = space.span(sp);
+    if (halo < g.halo) {
+        g.hold = g.spread + halo::u64;
+        g.held = g.seq;
+        if (g.limit > g.hold) { g.limit = g.hold; }
     }
+    g.halo = halo;
 
     # while a generation is part way through, the front is counted and reduced
     # again only once it changed
-    if (g.going && g.counted) { ret res[usize, gfx.Error].ok{0}; }
+    if (g.going && g.counted) { ret res[usize, gfx.Error].ok{n}; }
     g.counted = true;
     if (g.hi != 0) {
         var rb: [4]*gfx.StorageBuffer;
@@ -1675,14 +2403,15 @@ pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, 
         if (sel er.err) { ret res[usize, gfx.Error].err{er.err}; }
     }
 
-    var groups: u32 = ((g.hi + 63) / 64)::u32;
+    # a workgroup a slot, and one even with none, to write the census id
+    var groups: u32 = g.hi::u32;
     if (groups == 0) { groups = 1; }
     var cb: [4]*gfx.StorageBuffer;
     cb[0] = ?g.p.cells[g.front];
     cb[1] = ?g.p.meta;
     cb[2] = ?g.p.status;
     cb[3] = ?g.p.flags;
-    val e19: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.census, ?cb[0], 4, groups, 1, 1);
+    val e19: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.census, ?cb[0], 4, 1, groups, 1);
     if (sel e19.err) { ret res[usize, gfx.Error].err{e19.err}; }
     val e20: err[gfx.Error] = gfx.renderer_readback(g.r, ?g.p.rb, ?g.p.status, 0);
     if (sel e20.err) { ret res[usize, gfx.Error].err{e20.err}; }
@@ -1695,7 +2424,8 @@ pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, 
     snap.edits  = g.edits;
     snap.cap    = g.p.cap;
     snap.hi     = g.hi;
-    snap.wide   = g.wide;
+    snap.span   = g.halo;
+    snap.owned  = g.owns;
     ret res[usize, gfx.Error].ok{n};
 }
 
@@ -1711,7 +2441,7 @@ pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, 
 # look: the camera and colours
 # ret:  ok, or why the upload failed
 pub fun show(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, look: *Look) err[gfx.Error] {
-    val ef: err[gfx.Error] = flush(g, sp, true);
+    val ef: err[gfx.Error] = flush(g, sp, true, false);
     if (sel ef.err) { ret ef; }
     val ei: err[gfx.Error] = sync_ink(g, r, look);
     if (sel ei.err) { ret ei; }
@@ -1751,6 +2481,11 @@ test pace_for__follows_the_refresh_interval_and_falls_back_to_sixty {
     if (fast.quick_us != 7499 || fast.slow_us != 9999) { ret 3; }
     val none: Pace = pace_for(0.0);
     if (none.quick_us != base.quick_us || none.slow_us != base.slow_us) { ret 4; }
+    ret 0;
+}
+
+test max_steps__fills_the_frames_storage_binding_sets {
+    if (MAX_STEPS + FRAME_SETS != gfx.MAX_STORAGE_SETS) { ret 1; }
     ret 0;
 }
 

@@ -16,9 +16,11 @@ use cellar.formats.life;
 use cellar.formats.macrocell;
 use cellar.formats.plaintext;
 use cellar.formats.rle;
+use cellar.formats.rlw;
 use cellar.hashlife;
 use cellar.pattern;
 use cellar.rule;
+use lenia_word: cellar.rules.lenia.word;
 use cellar.sim;
 use cellar.space;
 use cellar.topology;
@@ -38,7 +40,7 @@ use std.types.string;
 use std.types.string.str;
 
 # number of formats reachable through at()
-pub val COUNT: usize = 5;
+pub val COUNT: usize = 6;
 
 # the i-th registered format, for i in [0, COUNT)
 pub fun at(i: usize) format.Format {
@@ -46,6 +48,16 @@ pub fun at(i: usize) format.Format {
     if (i == 2) { ret plaintext.make(); }
     if (i == 3) { ret life.make(); }
     if (i == 4) { ret macrocell.make(); }
+    if (i == 5) { ret rlw.make(); }
+    ret rle.make();
+}
+
+# the format a pattern is written in when nothing names one: RLW for a pattern
+# holding words, which keeps them, and RLE, which other programs read, otherwise
+# ---
+# words: the pattern holds its cells' words
+pub fun default_for(words: bool) format.Format {
+    if (words) { ret rlw.make(); }
     ret rle.make();
 }
 
@@ -125,10 +137,11 @@ pub fun by_bytes(p: *u8, n: usize, out: *format.Format) bool {
 # ret:  ok, or why the bytes were refused
 pub fun validate(a: *allo.Allocator, f: *format.Format, p: *u8, n: usize, info: *format.Info) err[format.Error] {
     var e: format.Emit;
-    e.sink = nil;
-    e.info = info;
-    e.fits = false;
-    e.tree = nil;
+    e.sink  = nil;
+    e.info  = info;
+    e.fits  = false;
+    e.tree  = nil;
+    e.words = f.words;
     val r: err[format.Error] = f.decode(a, p, n, ?e);
     if (sel r.err) { ret r; }
     format.settle(info);
@@ -180,16 +193,21 @@ fun pass(a: *allo.Allocator, f: *format.Format, p: *u8, n: usize, sink: *format.
     var again: format.Info;
     format.info_init(?again, a);
     var e: format.Emit;
-    e.sink = sink;
-    e.info = ?again;
-    e.fits = fits;
-    e.tree = tree;
+    e.sink  = sink;
+    e.info  = ?again;
+    e.fits  = fits;
+    e.tree  = tree;
+    e.words = f.words && sink.words != nil;
     val r: err[format.Error] = f.decode(a, p, n, ?e);
     format.info_dnit(?again);
     ret r;
 }
 
 # encode a source to bytes
+#
+# a continuous rule's cells are refused by a format holding fewer states than
+# the levels they are traded in, rather than written with their values lost,
+# unless the format records the words the source offers.
 # ---
 # a:    allocator for the encoder's scratch
 # f:    the format
@@ -199,6 +217,8 @@ fun pass(a: *allo.Allocator, f: *format.Format, p: *u8, n: usize, sink: *format.
 # ret:  ok, or why it could not be written
 pub fun save(a: *allo.Allocator, f: *format.Format, src: *format.Source, info: *format.Info, out: *Vector[u8]) err[format.Error] {
     if (f.encode == nil) { ret err[format.Error].err{format.Error.unsupported{}}; }
+    val exact: bool = f.words && src.words != nil;
+    if (src.continuous && src.states > f.states && !exact) { ret err[format.Error].err{format.Error.levels{}}; }
     ret f.encode(a, src, info, out);
 }
 
@@ -800,6 +820,7 @@ fun write_runs(a: *allo.Allocator, runs: *format.Run, n: usize, out: *Vector[u8]
     rs.source.states = 2;
     rs.source.tree   = nil;
     rs.source.rewind = runs_rewind;
+    rs.source.words  = nil;
     rs.source.next   = runs_next;
     var f: format.Format;
     if (!by_id("macrocell", ?f)) { ret false; }
@@ -821,9 +842,9 @@ test load__takes_a_sparse_giant_and_refuses_what_the_world_cannot_hold {
     # handful of chunks in the world
     val far:  i64 = 17179869184;
     var runs: [3]format.Run;
-    runs[0] = format.Run{x: -5, y: 0 - far, n: 3, v: 1};
-    runs[1] = format.Run{x: far, y: 7, n: 1, v: 1};
-    runs[2] = format.Run{x: far - 1, y: far, n: 2, v: 1};
+    runs[0] = format.Run{x: -5, y: 0 - far, n: 3, v: 1, w: nil};
+    runs[1] = format.Run{x: far, y: 7, n: 1, v: 1, w: nil};
+    runs[2] = format.Run{x: far - 1, y: far, n: 2, v: 1, w: nil};
     var out: Vector[u8] = vector.init[u8](?a);
     if (!write_runs(?a, ?runs[0], 3, ?out)) { ret 2; }
     var live: u64 = 0;
@@ -840,8 +861,8 @@ test load__takes_a_sparse_giant_and_refuses_what_the_world_cannot_hold {
 
     # a cell past the world's reach is refused whole too
     vector.clear[u8](?out);
-    runs[0] = format.Run{x: 0, y: 0, n: 1, v: 1};
-    runs[1] = format.Run{x: space.REACH, y: 0, n: 1, v: 1};
+    runs[0] = format.Run{x: 0, y: 0, n: 1, v: 1, w: nil};
+    runs[1] = format.Run{x: space.REACH, y: 0, n: 1, v: 1, w: nil};
     if (!write_runs(?a, ?runs[0], 2, ?out))                         { ret 8; }
     if (world_takes(?a, ?s, "macrocell", out.data, out.len, ?live)) { ret 9; }
     if (sim.population(?s) != 0 || s.full)                          { ret 10; }
@@ -874,7 +895,7 @@ fun tree_load(a: *allo.Allocator, text: str, dx: i64, dy: i64, runs: bool, out: 
     var src: adapt.WorldSource;
     var got: format.Info;
     format.info_init(?got, a);
-    val w: res[*format.Source, format.Error] = adapt.world_source(?src, ?s, a);
+    val w: res[*format.Source, format.Error] = adapt.world_source(?src, ?s, a, f.words);
     if (sel w.err) { ok = false; }
     if (sel w.ok) {
         if (ok) {
@@ -894,11 +915,11 @@ test load__a_macrocell_built_into_the_tree_holds_the_cells_its_runs_would {
     # a sparse spread wide enough that the tree's squares straddle the file's
     val far:  i64 = 1000;
     var runs: [5]format.Run;
-    runs[0] = format.Run{x: -40, y: -70, n: 3, v: 1};
-    runs[1] = format.Run{x: -38, y: -69, n: 1, v: 1};
-    runs[2] = format.Run{x: 5, y: 0, n: 20, v: 1};
-    runs[3] = format.Run{x: far, y: 3, n: 1, v: 1};
-    runs[4] = format.Run{x: -far, y: far, n: 2, v: 1};
+    runs[0] = format.Run{x: -40, y: -70, n: 3, v: 1, w: nil};
+    runs[1] = format.Run{x: -38, y: -69, n: 1, v: 1, w: nil};
+    runs[2] = format.Run{x: 5, y: 0, n: 20, v: 1, w: nil};
+    runs[3] = format.Run{x: far, y: 3, n: 1, v: 1, w: nil};
+    runs[4] = format.Run{x: -far, y: far, n: 2, v: 1, w: nil};
     var sparse: Vector[u8] = vector.init[u8](?a);
     if (!write_runs(?a, ?runs[0], 5, ?sparse)) { ret 1; }
     val nul: res[usize, allo.Error] = vector.push[u8](?sparse, 0);
@@ -1021,7 +1042,7 @@ fun save_world(a: *allo.Allocator, s: *sim.Sim, reads: *allo.Allocator, out: *Ve
     format.info_init(?info, a);
     var ws:  adapt.WorldSource;
     var r:   err[format.Error]                 = err[format.Error].ok{};
-    val src: res[*format.Source, format.Error] = adapt.world_source(?ws, s, reads);
+    val src: res[*format.Source, format.Error] = adapt.world_source(?ws, s, reads, f.words);
     if (sel src.err) { r = err[format.Error].err{src.err}; }
     if (sel src.ok)  { r = save(a, ?f, src.ok, ?info, out); }
     adapt.world_source_dnit(?ws);
@@ -1162,15 +1183,16 @@ test registry__finds_formats_by_id_extension_and_content {
     if (!by_path("g.MC", ?f) || !string.str_equals(f.id, "macrocell"))        { ret 16; }
     if (!string.str_equals(sniffs("\n[M2] (golly 2.0)\n$*$\n"), "macrocell")) { ret 17; }
 
-    if (!string.str_equals(sniffs("#C x\nX = 1, y = 1\no!"), "rle"))     { ret 7; }
-    if (!string.str_equals(sniffs("!Name: glider\n.O.\n"), "plaintext")) { ret 8; }
-    if (!string.str_equals(sniffs("!made by hand\n.O.\n"), "plaintext")) { ret 9; }
-    if (!string.str_equals(sniffs("\n.O.\n..O\nOOO\n"), "plaintext"))    { ret 10; }
-    if (!string.str_equals(sniffs("#Life 1.05\n#P 0 0\n.*\n"), "life"))  { ret 11; }
-    if (!string.str_equals(sniffs("#Life 1.06\n0 0\n"), "life"))         { ret 12; }
-    if (!string.str_equals(sniffs("3 1\n101\n"), "custom"))              { ret 13; }
-    if (!string.str_equals(sniffs("#N x\nbo$obo!"), ""))                 { ret 14; }
-    if (!string.str_equals(sniffs("hello"), ""))                         { ret 15; }
+    if (!string.str_equals(sniffs("#C x\nX = 1, y = 1\no!"), "rle"))                     { ret 7; }
+    if (!string.str_equals(sniffs("!Name: glider\n.O.\n"), "plaintext"))                 { ret 8; }
+    if (!string.str_equals(sniffs("!made by hand\n.O.\n"), "plaintext"))                 { ret 9; }
+    if (!string.str_equals(sniffs("\n.O.\n..O\nOOO\n"), "plaintext"))                    { ret 10; }
+    if (!string.str_equals(sniffs("#Life 1.05\n#P 0 0\n.*\n"), "life"))                  { ret 11; }
+    if (!string.str_equals(sniffs("#Life 1.06\n0 0\n"), "life"))                         { ret 12; }
+    if (!string.str_equals(sniffs("3 1\n101\n"), "custom"))                              { ret 13; }
+    if (!string.str_equals(sniffs("#N x\nbo$obo!"), ""))                                 { ret 14; }
+    if (!string.str_equals(sniffs("hello"), ""))                                         { ret 15; }
+    if (!string.str_equals(sniffs("\n[RLW 1]\nx = 1, y = 1, rule = B3/S23\nB!"), "rlw")) { ret 18; }
     ret 0;
 }
 
@@ -1198,5 +1220,476 @@ test load__a_macrocell_past_the_pool_loads_into_hashlife_and_runs {
     if (!sim.jump(?s, 1000000) || sim.population(?s) != 262144) { ret 9; }
     if (!sim.alive(?s, -16384, -16383))                         { ret 10; }
     sim.dnit(?s);
+    ret 0;
+}
+
+# Chakazul's Orbium unicaudatus, from his Lenia's animals.json, its cells as
+# he writes them, which is Golly's multi-state RLE of the values in 255ths
+#[testing]
+val ORBIUM: str = "x = 20, y = 20, rule = R=13,T=10,b=[1],m=0.15,s=0.015,kn=1,gn=1\n7.MD6.qL$6.pKqEqFURpApBRAqQ$5.VqTrSsBrOpXpWpTpWpUpCrQ$4.CQrQsTsWsApITNPpGqGvL$3.IpIpWrOsGsBqXpJ4.LsFrL$A.DpKpSpJpDqOqUqSqE5.ExD$qL.pBpTT2.qCrGrVrWqM5.sTpP$.pGpWpD3.qUsMtItQtJ6.tL$.uFqGH3.pXtOuR2vFsK5.sM$.tUqL4.GuNwAwVxBwNpC4.qXpA$2.uH5.vBxGyEyMyHtW4.qIpL$2.wV5.tIyG3yOxQqW2.FqHpJ$2.tUS4.rM2yOyJyOyHtVpPMpFqNV$2.HsR4.pUxAyOxLxDxEuVrMqBqGqKJ$3.sLpE3.pEuNxHwRwGvUuLsHrCqTpR$3.TrMS2.pFsLvDvPvEuPtNsGrGqIP$4.pRqRpNpFpTrNtGtVtStGsMrNqNpF$5.pMqKqLqRrIsCsLsIrTrFqJpHE$6.RpSqJqPqVqWqRqKpRXE$8.OpBpIpJpFTK!\n";
+
+# Chakazul's Trigonium lithos, a still life of R=36 from his Lenia's
+# animals.json, its cells as he writes them
+#[testing]
+val TRIGONIUM: str = "x = 43, y = 41, rule = R=36,T=10,b=[1,1/2,1/4,3/4],m=0.23,s=0.014,kn=1,gn=1\n17.BtJ5.sKxMqW$14.uK5yOvO2.uC5yO$13.17yOrG$12.19yOtQ$12.6yOuPtQvM11yO$11.pP5yOtT7.yL6yO$12.6yO8.6yO$13.6yO7.6yO$14.16yO$14.16yO$13.17yO$12.rI8yO2.8yO$12.9yOyL10yO$11.4yO2.10yO2.3yO$11.4yO2.9yOuI2.4yO$10.17yOvR5yO$9.25yO$9.25yO$8.27yO$7.T27yO$7.3yO.pS24yO$2.yOtJ2.qR3yO2.8yO3.8yO2.3yO$.18yOxM3.8yO.B4yO2.2yO$20yO3.19yO$21yO.21yO$43yO$5yOsM37yO$4yO3.4yO2.17yOxUwF4yO2.5yO$4yO4.3yOpFJ17yO2.3yO3.5yO$qC4yO3.27yO3.5yO$.wI3yO4.16yOuP8yO4.4yO$2.rV3yO3.B6yO2.7yO2.7yO3.4yO$3.vT3yO3.6yO2.tG6yO.pD6yO3.sF3yO$4.4yO2.23yO2.pK3yO$4.29yO.5yO$4.34yOwS$4.9yO16.9yOuF$5.8yO16.O8yO$6.7yO17.7yO$8.4yO18.6yO$31.uKyI!\n";
+
+# stamp an RLE pattern onto a world at the origin, in the world's rule
+# ---
+# info: receives what the file says of itself
+#[testing]
+fun stamp(s: *sim.Sim, text: str, info: *format.Info) {
+    var f: format.Format;
+    if (!by_id("rle", ?f)) { ret; }
+    var ws: adapt.WorldSink;
+    load(info.a, ?f, text::*u8, string.str_len(text), adapt.world_sink(?ws, s, 0, 0), info);
+}
+
+# stamp Orbium onto a world at the origin, in the world's rule
+#[testing]
+fun seed_orbium(s: *sim.Sim) {
+    var a: allo.Allocator;
+    page.make(?a);
+    var info: format.Info;
+    format.info_init(?info, ?a);
+    stamp(s, ORBIUM, ?info);
+    format.info_dnit(?info);
+}
+
+# stamp Trigonium onto a world at the origin, in the world's rule
+#[testing]
+fun seed_trigonium(s: *sim.Sim) {
+    var a: allo.Allocator;
+    page.make(?a);
+    var info: format.Info;
+    format.info_init(?info, ?a);
+    stamp(s, TRIGONIUM, ?info);
+    format.info_dnit(?info);
+}
+
+# the sum of a world's values, each word over the value 1
+#[testing]
+fun mass(s: *sim.Sim) f64 {
+    var m:  f64   = 0.0;
+    var sl: usize = 0;
+    for (sl < s.space.hi) {
+        if (space.used(?s.space, sl)) {
+            var i: usize = 0;
+            for (i < space.CELLS) {
+                m = m + s.space.cells[sl * space.CELLS + i]::f64;
+                i = i + 1;
+            }
+        }
+        sl = sl + 1;
+    }
+    ret m / lenia_word.ONE::f64;
+}
+
+test lenia__orbium_glides_on_unchanged_for_300_generations_on_both_engines {
+    val r: res[rule.Rule, str] = rule.parse("R=13,T=10,b=[1],m=0.15,s=0.015,kn=1,gn=1");
+    if (sel r.err) { ret 1; }
+    var t:    sim.Rig;
+    val code: i32 = sim.rig_open(?t, r.ok, seed_orbium);
+    if (code != 0) { ret 2; }
+    # the RLE's levels are the cells' values in 255ths: the brightest is 1
+    var top: u32 = 0;
+    var y:   i64 = 0;
+    for (y < 20) {
+        var x: i64 = 0;
+        for (x < 20) {
+            val c: u32 = sim.cell(?t.cpu, x, y);
+            if (c > top) { top = c; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    if (top != lenia_word.ONE) { ret 3; }
+    # a hundred generations to settle from the rounding to 255ths, then two
+    # hundred more, over which it keeps its mass and its size and glides on
+    sim.rig_step(?t, 100);
+    val m1: f64            = mass(?t.cpu);
+    val b1: opt[space.Box] = sim.bounds(?t.cpu);
+    sim.rig_step(?t, 200);
+    val m2: f64            = mass(?t.cpu);
+    val b2: opt[space.Box] = sim.bounds(?t.cpu);
+    if (sel b1.none)                                   { ret 4; }
+    if (sel b2.none)                                   { ret 4; }
+    if (m1 < 60.0 || m2 < m1 * 0.97 || m2 > m1 * 1.03) { ret 5; }
+    val w1: i64 = b1.some.x1 - b1.some.x0;
+    val h1: i64 = b1.some.y1 - b1.some.y0;
+    val w2: i64 = b2.some.x1 - b2.some.x0;
+    val h2: i64 = b2.some.y1 - b2.some.y0;
+    if (w2 < w1 - 3 || w2 > w1 + 3 || h2 < h1 - 3 || h2 > h1 + 3 || w2 > 30 || h2 > 30) { ret 6; }
+    val dx: i64 = b2.some.x0 - b1.some.x0;
+    val dy: i64 = b2.some.y0 - b1.some.y0;
+    if (dx * dx + dy * dy < 50 * 50) { ret 7; }
+    if (!sim.rig_same(?t))           { ret 8; }
+    sim.rig_close(?t);
+    ret 0;
+}
+
+test lenia__trigonium_loads_at_its_radius_of_36_and_runs_alike_on_both_engines {
+    # the file's own rule, at the radius it gives
+    var a: allo.Allocator;
+    page.make(?a);
+    var f: format.Format;
+    if (!by_id("rle", ?f)) { ret 1; }
+    var info: format.Info;
+    format.info_init(?info, ?a);
+    val read: err[format.Error]   = validate(?a, ?f, TRIGONIUM::*u8, string.str_len(TRIGONIUM), ?info);
+    val r:    res[rule.Rule, str] = rule.parse(format.text_of(?info.rule));
+    format.info_dnit(?info);
+    if (sel read.err)             { ret 2; }
+    if (sel r.err)                { ret 2; }
+    if (rule.radius(?r.ok) != 36) { ret 3; }
+    # on the plane, where the GPU's passes keep the halo, and on a bounded one,
+    # where the host settles it from the censuses
+    var k: usize = 0;
+    for (k < 2) {
+        var g: rule.Rule = r.ok;
+        if (k == 1) {
+            val p: res[rule.Rule, str] = rule.parse("R=36,T=10,b=[1,1/2,1/4,3/4],m=0.23,s=0.014,kn=1,gn=1:P300,300");
+            if (sel p.err) { ret 4; }
+            g = p.ok;
+        }
+        var t:    sim.Rig;
+        val code: i32 = sim.rig_open(?t, g, seed_trigonium);
+        if (code != 0) { ret 5; }
+        # it settles from the rounding to 255ths, then keeps its mass and its
+        # place, a stone
+        sim.rig_step(?t, 20);
+        val m1: f64            = mass(?t.cpu);
+        val b1: opt[space.Box] = sim.bounds(?t.cpu);
+        sim.rig_step(?t, 20);
+        val m2: f64            = mass(?t.cpu);
+        val b2: opt[space.Box] = sim.bounds(?t.cpu);
+        if (sel b1.none)                                                                                                              { ret 10 + k::i32; }
+        if (sel b2.none)                                                                                                              { ret 10 + k::i32; }
+        if (m1 < 100.0 || m2 < m1 * 0.97 || m2 > m1 * 1.03)                                                                           { ret 20 + k::i32; }
+        if (b2.some.x0 < b1.some.x0 - 3 || b2.some.x1 > b1.some.x1 + 3 || b2.some.y0 < b1.some.y0 - 3 || b2.some.y1 > b1.some.y1 + 3) { ret 30 + k::i32; }
+        if (!sim.rig_same(?t))                                                                                                        { ret 40 + k::i32; }
+        sim.rig_close(?t);
+        k = k + 1;
+    }
+    ret 0;
+}
+
+test lenia__a_radius_64_rule_spreads_alike_on_both_engines {
+    # Trigonium's cells under a kernel of the widest radius, which grows them
+    # past the chunks two away from where they began, on the plane and on a
+    # bounded one
+    val strings: [2]str = [2]str{"R=64,T=10,b=[1],m=0.1,s=0.03,kn=1,gn=1", "R=64,T=10,b=[1],m=0.1,s=0.03,kn=1,gn=1:P400,400"};
+    var k:       usize  = 0;
+    for (k < 2) {
+        val r: res[rule.Rule, str] = rule.parse(strings[k]);
+        if (sel r.err) { ret 1; }
+        var t:    sim.Rig;
+        val code: i32 = sim.rig_open(?t, r.ok, seed_trigonium);
+        if (code != 0) { ret 2; }
+        sim.rig_step(?t, 12);
+        val b: opt[space.Box] = sim.bounds(?t.cpu);
+        if (sel b.none)                                                 { ret 10 + k::i32; }
+        if (b.some.x0 >= 0 - space.SIDE || b.some.y0 >= 0 - space.SIDE) { ret 20 + k::i32; }
+        if (!sim.rig_same(?t))                                          { ret 30 + k::i32; }
+        sim.rig_close(?t);
+        k = k + 1;
+    }
+    ret 0;
+}
+
+test save__a_lenia_world_writes_its_255ths_and_a_two_state_format_refuses_it {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    val r: res[rule.Rule, str] = rule.parse("R=13,T=10,b=[1],m=0.15,s=0.015,kn=1,gn=1");
+    if (sel r.err) { ret 1; }
+    sim.set_rule(?s, r.ok);
+    seed_orbium(?s);
+    val ids: [3]str = [3]str{"rle", "plaintext", "custom"};
+    var i:   usize  = 0;
+    for (i < 3) {
+        var f: format.Format;
+        if (!by_id(ids[i], ?f)) { ret 2; }
+        var src:  adapt.WorldSource;
+        var info: format.Info;
+        format.info_init(?info, ?a);
+        var out: Vector[u8]                        = vector.init[u8](?a);
+        val w:   res[*format.Source, format.Error] = adapt.world_source(?src, ?s, ?a, f.words);
+        if (sel w.err) { ret 3; }
+        var e: err[format.Error] = err[format.Error].ok{};
+        if (sel w.ok) { e = save(?a, ?f, w.ok, ?info, ?out); }
+        adapt.world_source_dnit(?src);
+        format.info_dnit(?info);
+        # RLE keeps the 255ths Chakazul's cells are written in, so Orbium's
+        # cells come back as they were loaded; the others hold two states
+        if (i == 0) {
+            if (sel e.err) { ret 4; }
+            var back: sim.Sim;
+            val m2:   err[allo.Error] = sim.init(?back, ?a);
+            if (sel m2.err) { ret 5; }
+            sim.set_rule(?back, r.ok);
+            var ws:  adapt.WorldSink;
+            var got: format.Info;
+            format.info_init(?got, ?a);
+            val l: err[format.Error] = load(?a, ?f, out.data, out.len, adapt.world_sink(?ws, ?back, 0, 0), ?got);
+            format.info_dnit(?got);
+            if (sel l.err) { ret 6; }
+            var y: i64 = 0;
+            for (y < 20) {
+                var x: i64 = 0;
+                for (x < 20) {
+                    if (sim.cell(?back, x, y) != sim.cell(?s, x, y)) { ret 7; }
+                    x = x + 1;
+                }
+                y = y + 1;
+            }
+            sim.dnit(?back);
+        }
+        or {
+            if (!sel e.err)        { ret 8; }
+            if (!sel e.err.levels) { ret 8; }
+        }
+        vector.dnit[u8](?out);
+        i = i + 1;
+    }
+    sim.dnit(?s);
+    ret 0;
+}
+
+test rlw__carries_a_lenia_pattern_exactly {
+    var a: allo.Allocator;
+    page.make(?a);
+    val lenia: str                 = "R=13,T=10,b=[1],m=0.15,s=0.015,kn=1,gn=1";
+    val r:     res[rule.Rule, str] = rule.parse(lenia);
+    if (sel r.err) { ret 1; }
+    var f: format.Format;
+    if (!by_id("rlw", ?f)) { ret 1; }
+
+    # values between the 255ths, and two too small to have a state but 0
+    var vals: [8]u32          = [8]u32{1, 12345, lenia_word.ONE / 3, lenia_word.ONE, 0, 7, lenia_word.ONE / 2, 0};
+    var p:    pattern.Pattern;
+    val made: err[allo.Error] = pattern.init(?p, ?a, 4, 2, "values");
+    if (sel made.err) { ret 1; }
+    pattern.set_rule(?p, lenia);
+    val held: err[allo.Error] = pattern.hold_words(?p);
+    if (sel held.err) { ret 1; }
+    var i: usize = 0;
+    for (i < 8) {
+        pattern.set_word(?p, i % 4, i / 4, vals[i], rule.state(?r.ok, vals[i])::u8);
+        i = i + 1;
+    }
+    p.x = -2;
+    p.y = 5;
+    var src:  adapt.PatternSource;
+    var info: format.Info;
+    format.info_init(?info, ?a);
+    format.set_str(?a, ?info.rule, lenia);
+    var out: Vector[u8]        = vector.init[u8](?a);
+    val w:   err[format.Error] = save(?a, ?f, adapt.pattern_source(?src, ?p), ?info, ?out);
+    format.info_dnit(?info);
+    var g: format.Format;
+    if (sel w.err)                                                           { ret 2; }
+    if (!by_bytes(out.data, out.len, ?g) || !string.str_equals(g.id, "rlw")) { ret 2; }
+
+    # a pattern takes the words back
+    var q:  pattern.Pattern;
+    val mq: err[allo.Error] = pattern.init(?q, ?a, 0, 0, "back");
+    if (sel mq.err) { ret 1; }
+    var ps:  adapt.PatternSink;
+    var got: format.Info;
+    format.info_init(?got, ?a);
+    val l: err[format.Error] = load(?a, ?f, out.data, out.len, adapt.pattern_sink(?ps, ?q), ?got);
+    format.info_dnit(?got);
+    if (sel l.err)                                                           { ret 3; }
+    if (!pattern.exact(?q) || q.w != 4 || q.h != 2 || q.x != -2 || q.y != 5) { ret 4; }
+    i = 0;
+    for (i < 8) {
+        if (q.words[i] != p.words[i] || q.cells[i] != p.cells[i]) { ret 5; }
+        i = i + 1;
+    }
+    # and writes the same file again
+    var again: Vector[u8] = vector.init[u8](?a);
+    var qs:    adapt.PatternSource;
+    var qi:    format.Info;
+    format.info_init(?qi, ?a);
+    format.set_str(?a, ?qi.rule, lenia);
+    val w2: err[format.Error] = save(?a, ?f, adapt.pattern_source(?qs, ?q), ?qi, ?again);
+    format.info_dnit(?qi);
+    if (sel w2.err || again.len != out.len) { ret 5; }
+    i = 0;
+    for (i < out.len) {
+        if (again.data[i] != out.data[i]) { ret 5; }
+        i = i + 1;
+    }
+    vector.dnit[u8](?again);
+
+    # the world takes them as they are under a rule that reads them alike, and
+    # their states under one that does not
+    var s:  sim.Sim;
+    val ms: err[allo.Error] = sim.init(?s, ?a);
+    if (sel ms.err) { ret 1; }
+    var k: usize = 0;
+    for (k < 2) {
+        sim.clear(?s);
+        if (k == 0) { sim.set_rule(?s, r.ok); }
+        or          { sim.set_rule(?s, rule.preset_rule(0)); }
+        var ws:   adapt.WorldSink;
+        var back: format.Info;
+        format.info_init(?back, ?a);
+        val lw: err[format.Error] = load(?a, ?f, out.data, out.len, adapt.world_sink(?ws, ?s, 0, 0), ?back);
+        format.info_dnit(?back);
+        if (sel lw.err) { ret 6; }
+        i = 0;
+        for (i < 8) {
+            val c: u32 = sim.cell(?s, -2 + (i % 4)::i64, 5 + (i / 4)::i64);
+            if (k == 0 && c != vals[i])                                                            { ret 7; }
+            if (k == 1 && sim.alive(?s, -2 + (i % 4)::i64, 5 + (i / 4)::i64) != (p.cells[i] != 0)) { ret 8; }
+            i = i + 1;
+        }
+        k = k + 1;
+    }
+
+    sim.dnit(?s);
+    vector.dnit[u8](?out);
+    pattern.dnit(?p);
+    pattern.dnit(?q);
+    ret 0;
+}
+
+test rlw__writes_a_pattern_of_states_as_its_rules_words_and_refuses_bad_files {
+    var a: allo.Allocator;
+    page.make(?a);
+    var f: format.Format;
+    if (!by_id("rlw", ?f) || !by_path("orbium.RLW", ?f) || !string.str_equals(f.id, "rlw"))                  { ret 1; }
+    if (!string.str_equals(default_for(true).id, "rlw") || !string.str_equals(default_for(false).id, "rle")) { ret 1; }
+
+    # a glider holds no words, so its states are written as Life's words
+    var p:  pattern.Pattern;
+    var q:  pattern.Pattern;
+    val mp: err[allo.Error] = pattern.init(?p, ?a, 0, 0, "");
+    val mq: err[allo.Error] = pattern.init(?q, ?a, 0, 0, "");
+    if (sel mp.err || sel mq.err) { ret 1; }
+    var info: format.Info;
+    format.info_init(?info, ?a);
+    if (!pattern_takes(?a, "rle", "#N glider\nx = 3, y = 3, rule = B3/S23\nbo$2bo$3o!\n", ?p, ?info)) { ret 2; }
+    format.info_dnit(?info);
+    var out: Vector[u8] = vector.init[u8](?a);
+    var src: adapt.PatternSource;
+    format.info_init(?info, ?a);
+    format.set_str(?a, ?info.name, "glider");
+    format.set_str(?a, ?info.rule, "B3/S23");
+    val w: err[format.Error] = save(?a, ?f, adapt.pattern_source(?src, ?p), ?info, ?out);
+    format.info_dnit(?info);
+    if (sel w.err) { ret 3; }
+    val want: str = "[RLW 1]\n#N glider\nx = 3, y = 3, rule = B3/S23\n.tR$2.tR$3tR!\n";
+    if (out.len != string.str_len(want) || !string.str_region_equals(out.data, 0, out.len, want)) { ret 4; }
+    if (roundtrip(?a, ?p, "rlw", 70) != 0)                                                        { ret 5; }
+    format.info_init(?info, ?a);
+    if (!pattern_takes(?a, "rle", GUN, ?q, ?info) || roundtrip(?a, ?q, "rlw", 70) != 0) { ret 5; }
+    format.info_dnit(?info);
+
+    # a pattern of states whose rule cellar cannot read has no words to write
+    format.info_init(?info, ?a);
+    format.set_str(?a, ?info.rule, "no such rule");
+    vector.clear[u8](?out);
+    val u: err[format.Error] = save(?a, ?f, adapt.pattern_source(?src, ?p), ?info, ?out);
+    format.info_dnit(?info);
+    if (!sel u.err)         { ret 6; }
+    if (!sel u.err.unruled) { ret 6; }
+
+    # a word under a rule cellar cannot read is live
+    format.info_init(?info, ?a);
+    if (!pattern_takes(?a, "rlw", "[RLW 1]\nx = 2, y = 1, rule = no such rule\nsgVH!", ?q, ?info)) { ret 7; }
+    format.info_dnit(?info);
+    if (!pattern.exact(?q) || pattern.word(?q, 0, 0) != 12345 || pattern.get(?q, 1, 0) != 1) { ret 8; }
+
+    # no rule, a word of 0, a leading zero digit, a word past 32 bits, a state
+    # Life does not have, a cell outside the box, and a body cut short
+    var bad: [7]str;
+    bad[0] = "[RLW 1]\nx = 1, y = 1\nB!";
+    bad[1] = "[RLW 1]\nx = 1, y = 1, rule = B3/S23\nA!";
+    bad[2] = "[RLW 1]\nx = 1, y = 1, rule = B3/S23\naB!";
+    bad[3] = "[RLW 1]\nx = 1, y = 1, rule = R=13,T=10,b=[1],m=0.15,s=0.015,kn=1,gn=1\nnxmrlxW!";
+    bad[4] = "[RLW 1]\nx = 1, y = 1, rule = B2/S/C3\nE!";
+    bad[5] = "[RLW 1]\nx = 1, y = 1, rule = B3/S23\n2B!";
+    bad[6] = "[RLW 1]\nx = 2, y = 1, rule = B3/S23\nBB";
+    var i: usize = 0;
+    for (i < 7) {
+        format.info_init(?info, ?a);
+        val v: err[format.Error] = validate(?a, ?f, bad[i]::*u8, string.str_len(bad[i]), ?info);
+        format.info_dnit(?info);
+        if (sel v.ok) { ret 10 + i::i32; }
+        i = i + 1;
+    }
+    vector.dnit[u8](?out);
+    pattern.dnit(?p);
+    pattern.dnit(?q);
+    ret 0;
+}
+
+test rlw__a_lenia_world_run_on_saves_and_loads_back_every_word {
+    var a: allo.Allocator;
+    page.make(?a);
+    val lenia: str                 = "R=13,T=10,b=[1],m=0.15,s=0.015,kn=1,gn=1";
+    val r:     res[rule.Rule, str] = rule.parse(lenia);
+    if (sel r.err) { ret 1; }
+    var f: format.Format;
+    if (!by_id("rlw", ?f)) { ret 1; }
+    var s:  sim.Sim;
+    var t:  sim.Sim;
+    val ms: err[allo.Error] = sim.init(?s, ?a);
+    val mt: err[allo.Error] = sim.init(?t, ?a);
+    if (sel ms.err || sel mt.err) { ret 1; }
+    sim.set_rule(?s, r.ok);
+    sim.set_rule(?t, r.ok);
+    seed_orbium(?s);
+    var g: usize = 0;
+    for (g < 20) {
+        sim.step(?s);
+        g = g + 1;
+    }
+    # a value too small to have a state but 0, in a chunk of its own
+    var speck: u32 = 7;
+    if (!sim.edit_begin(?s, 100, 90, 101, 91)) { ret 1; }
+    sim.edit_words(?s, 100, 90, 1, ?speck);
+    if (!sim.edit_end(?s)) { ret 1; }
+
+    var info: format.Info;
+    format.info_init(?info, ?a);
+    format.set_str(?a, ?info.rule, lenia);
+    var ws:  adapt.WorldSource;
+    var out: Vector[u8]                        = vector.init[u8](?a);
+    var e:   err[format.Error]                 = err[format.Error].ok{};
+    val src: res[*format.Source, format.Error] = adapt.world_source(?ws, ?s, ?a, f.words);
+    if (sel src.err) { ret 2; }
+    if (sel src.ok)  { e = save(?a, ?f, src.ok, ?info, ?out); }
+    adapt.world_source_dnit(?ws);
+    format.info_dnit(?info);
+    if (sel e.err) { ret 3; }
+
+    var sink: adapt.WorldSink;
+    var got:  format.Info;
+    format.info_init(?got, ?a);
+    val l: err[format.Error] = load(?a, ?f, out.data, out.len, adapt.world_sink(?sink, ?t, 0, 0), ?got);
+    format.info_dnit(?got);
+    if (sel l.err) { ret 4; }
+    # every word comes back, the speck among them
+    var faint: usize = 0;
+    var y:     i64   = -64;
+    for (y < 128) {
+        var x: i64 = -64;
+        for (x < 128) {
+            val c: u32 = sim.cell(?s, x, y);
+            if (sim.cell(?t, x, y) != c)               { ret 5; }
+            if (c != 0 && rule.state(?s.rule, c) == 0) { faint = faint + 1; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    if (faint != 1 || sim.cell(?t, 100, 90) != speck) { ret 6; }
+    vector.dnit[u8](?out);
+    sim.dnit(?s);
+    sim.dnit(?t);
     ret 0;
 }

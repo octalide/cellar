@@ -109,6 +109,7 @@ val ZOOM_STEP: f32 = 0.1;
 # srgb:        the swapchain encodes sRGB
 # gui:         the interface's blit host
 # gui_ok:      gui is set up
+# msgs:        the flashed message as the interface shows it, kept while gui is
 # world:       what the pointer did to the world this frame, beneath the interface
 # paths:       the data directory
 # snap:        a screenshot being read back
@@ -123,7 +124,8 @@ val ZOOM_STEP: f32 = 0.1;
 # bench:       the measurement being run, args.BENCH_NONE for a normal session
 # bench_cpu:   the measurement steps on the CPU
 # bench_secs:  seconds the measurement runs for
-# bench_r:     the radius the measured rule reads, Life's weights widened to it
+# bench_r:     the radius the measured rule reads, Life's weights widened to it, or
+#              the radius of the footprint world's kernel
 # bench_gps:   generations a second the measurement is capped at, 0 uncapped
 # engine:      the args.ENGINE_* the command line named
 # saved_tree:  HashLife was wanted by the settings, not the command line, so a
@@ -131,8 +133,11 @@ val ZOOM_STEP: f32 = 0.1;
 # want_tree:   the world is to move onto HashLife with the first frame, and
 #              the run stops if it cannot
 # started:     when the measurement began
-# frames:      frames drawn since it began
+# frames:      frames drawn since it began, the warmup's included
 # gen0:        the generation it began at
+# gen_seen:    the generation the last measured frame showed
+# cell_gens:   the cells of the chunks the pool held, summed over each
+#              generation completed since it began
 # pausing:     a measured pause was asked for and has not applied
 # pauses:      measured pauses applied
 # worst:       the longest a measured pause took to apply, in nanoseconds
@@ -146,6 +151,7 @@ pub rec Game {
     srgb:        bool;
     gui:         gui.Gui;
     gui_ok:      bool;
+    msgs:        hud.Messages;
     world:       bint.Hit;
     paths:       paths.Paths;
     snap:        shot.Shot;
@@ -168,6 +174,8 @@ pub rec Game {
     started:     Instant;
     frames:      u64;
     gen0:        u64;
+    gen_seen:    u64;
+    cell_gens:   f64;
     pausing:     bool;
     pauses:      u64;
     worst:       i64;
@@ -175,6 +183,9 @@ pub rec Game {
 
 # frames a measurement lets pass before it starts the clock
 val WARMUP: u64 = 30;
+# the side of the footprint measurement's square, wide enough that the step
+# stage's work outweighs the frame's fixed cost
+val FOOTPRINT_SIDE: usize = 1024;
 # pauses the pause measurement times
 val PAUSES: u64 = 10;
 
@@ -258,11 +269,16 @@ pub fun on_init(ctx: *Context) {
         ret;
     }
     panel.restore(?g.gui.ui, ?g.app);
+    hud.messages_init(?g.msgs, ?g.a);
 
     # the palettes are converted once, into the space the window stores
     var heat: [1024]f32;
     var age:  [1024]f32;
     render.palettes(?heat[0], ?age[0], g.srgb);
+    # a bounded grid the settings put the world on was held whole to the host's
+    # ceiling, which the device's may lie below
+    val slots: usize = gpu.ceiling(gfx.renderer_limits(?g.renderer));
+    if (slots != 0) { space.limit(?g.sim.space, slots); }
     val gr: err[gfx.Error] = gpu.init(?g.gpu, ?g.a, ?g.renderer, g.sim.space.cap, ?heat[0], ?age[0]);
     if (sel gr.err) {
         print.eprintlnf("could not set up the world on the GPU: {}", gfx.error_message(gr.err));
@@ -448,9 +464,8 @@ fun tick(ctx: *Context) {
     # while a field has the keyboard the key bindings stay quiet, including on
     # the tick whose enter or escape gives it back
     val typing: bool = gui.typing(?g.gui);
-    if (!typing)       { keys(ctx, g); }
-    if (a.toast_t > 0) { a.toast_t = a.toast_t - 1; }
-    if (g.gpu_ok)      { gpu.display(?g.gpu, win.window_refresh_hz(?ctx.window)); }
+    if (!typing)  { keys(ctx, g); }
+    if (g.gpu_ok) { gpu.display(?g.gpu, win.window_refresh_hz(?ctx.window)); }
 
     # the pan is the view centre in cells, moved by pixels at the current zoom
     val ppc:  f32 = render.BASE_PPC * a.zoom;
@@ -751,12 +766,12 @@ pub fun on_draw(ctx: *Context) {
     }
     val seen: render.Camera = camera(a, pt);
     g.world = bint.hit(bu, bctx.id_of(bu, "world"), pt.x0, pt.y0, pt.x0 + pt.w, pt.y0 + pt.h, binp.BUTTON_LEFT);
-    hud.selection_size(bu, g.gui.look, a, seen);
-    bounds.label(bu, g.gui.look, a, seen);
+    hud.selection_size(bu, g.gui.look, a, seen, pt);
+    bounds.label(bu, g.gui.look, a, seen, pt);
     if (g.bench == args.BENCH_NONE) {
         hud.readout(bu, g.gui.look, a, ?g.shown, pt);
         hud.position(bu, g.gui.look, seen, pt, over_world(g), g.world.mx, g.world.my);
-        hud.toast(bu, a, pt);
+        hud.toast(bu, ?g.msgs, a, pt);
         hud.help(bu, a, sw, sh);
         val notches: f32 = gui.notches(?g.gui);
         if (notches != 0.0 && over_world(g)) { zoom_at(a, pt, g.world.mx, g.world.my, notches); }
@@ -892,7 +907,11 @@ pub fun on_dnit(ctx: *Context) {
         gfx.renderer_wait_idle(?g.renderer);
         if (g.gpu_ok) { gpu.dnit(?g.gpu); }
         sketch.dnit(?g.sketches);
-        if (g.gui_ok) { gui.dnit(?g.gui); }
+        if (g.gui_ok) {
+            val freed: err[allo.Error] = hud.messages_dnit(?g.msgs);
+            if (sel freed.err) { print.eprintln("the messages' text was not released"); }
+            gui.dnit(?g.gui);
+        }
         val down: err[gfx.Error] = gfx.renderer_dnit(?g.renderer);
         if (sel down.err) {
             print.eprintlnf("renderer refused to shut down: {}", gfx.error_message(down.err));
@@ -906,10 +925,14 @@ pub fun on_dnit(ctx: *Context) {
 # seed the measured world and frame it, running uncapped or at the speed asked
 #
 # a wider radius keeps Life's weights, so the world evolves as Life does while
-# each generation costs the wider footprint and is budgeted its wider spread
+# each generation spreads by the wider radius, except in the footprint world,
+# whose kernel weighs its whole square so the step stage reads all of it
 fun bench_world(g: *Game) {
     val s: *sim.Sim = ?g.sim;
-    if (sel s.rule.kind.weighted) {
+    if (g.bench == args.BENCH_FOOTPRINT) {
+        sim.set_rule(s, rule.of(rule.Kind.weighted{weighted.vote(g.bench_r)}));
+    }
+    or (sel s.rule.kind.weighted) {
         var k: weighted.Kernel = s.rule.kind.weighted;
         weighted.set_radius(?k, g.bench_r);
         sim.set_rule(s, rule.of(rule.Kind.weighted{k}));
@@ -921,8 +944,31 @@ fun bench_world(g: *Game) {
         if (g.engine == args.ENGINE_HASHLIFE) { sim.use_hashlife(s, true); }
         g.app.zoom = 900.0 / 512.0 / render.BASE_PPC;
     }
+    or (g.bench == args.BENCH_FOOTPRINT) {
+        sim.randomize(s, 1.0, FOOTPRINT_SIDE);
+        g.app.zoom = 900.0 / FOOTPRINT_SIDE::f32 / render.BASE_PPC;
+    }
     or (g.bench == args.BENCH_DENSE) {
         sim.randomize(s, sim.DEFAULT_DENSITY, 512);
+        g.app.zoom = 900.0 / 512.0 / render.BASE_PPC;
+    }
+    or (g.bench == args.BENCH_GUN) {
+        sim.seed_gun(s);
+        g.app.zoom = 900.0 / 512.0 / render.BASE_PPC;
+    }
+    or (g.bench == args.BENCH_TORUS) {
+        bench_grid(s, "T512,512");
+        sim.randomize(s, sim.DEFAULT_DENSITY, 512);
+        g.app.zoom = 900.0 / 512.0 / render.BASE_PPC;
+    }
+    or (g.bench == args.BENCH_PLANE) {
+        bench_grid(s, "P1024,512");
+        sim.seed_gun(s);
+        g.app.zoom = 900.0 / 1024.0 / render.BASE_PPC;
+    }
+    or (g.bench == args.BENCH_BOX) {
+        bench_grid(s, "T8192,8192");
+        sim.seed_glider_at(s, -1, -1);
         g.app.zoom = 900.0 / 512.0 / render.BASE_PPC;
     }
     or {
@@ -956,11 +1002,22 @@ fun bench_world(g: *Game) {
     # journal holds the world from where the run began, not from the first pause
     if (g.bench == args.BENCH_PAUSE) { app.submit(?g.app, command.Command.toggle{}); }
     or                               { s.running = 1; }
-    g.frames  = 0;
-    g.gen0    = 0;
-    g.pausing = false;
-    g.pauses  = 0;
-    g.worst   = 0;
+    g.frames    = 0;
+    g.gen0      = 0;
+    g.gen_seen  = 0;
+    g.cell_gens = 0.0;
+    g.pausing   = false;
+    g.pauses    = 0;
+    g.worst     = 0;
+}
+
+# put the measured world's rule on the grid a suffix names
+fun bench_grid(s: *sim.Sim, suffix: str) {
+    val g: res[topology.Grid, str] = topology.parse(suffix);
+    if (sel g.err) { ret; }
+    var r: rule.Rule = s.rule;
+    r.grid = g.ok;
+    sim.set_rule(s, r);
 }
 
 # count a measured frame, and report and stop once the time is up
@@ -971,22 +1028,33 @@ fun bench_frame(ctx: *Context, g: *Game) {
     g.frames = g.frames + 1;
     if (g.frames <= WARMUP) { ret; }
     if (g.frames == WARMUP + 1) {
-        g.started = now.ok;
-        g.gen0    = g.shown.generation;
+        g.started  = now.ok;
+        g.gen0     = g.shown.generation;
+        g.gen_seen = g.gen0;
     }
     if (g.bench == args.BENCH_PAUSE) {
         bench_pause(ctx, g, now.ok);
         ret;
     }
+    # the generations a frame completed are counted at the pool it shows after them
+    val done: u64 = g.shown.generation - g.gen_seen;
+    g.cell_gens = g.cell_gens + done::f64 * g.shown.chunks::f64 * space.CELLS::f64;
+    g.gen_seen  = g.shown.generation;
     val secs: f64 = time.instant_sub(now.ok, g.started)::f64 / SECOND::f64;
     if (secs < g.bench_secs) { ret; }
-    val gens:   f64 = (g.shown.generation - g.gen0)::f64;
-    val frame:  f64 = secs * 1000000.0 / g.frames::f64;
+    val gens: f64 = (g.shown.generation - g.gen0)::f64;
+    # the clock started with the first measured frame, so the frames after it span the seconds
+    var spans: u64 = g.frames - WARMUP - 1;
+    if (spans == 0) { spans = 1; }
+    val frame: f64 = secs * 1000000.0 / spans::f64;
+    var step:  f64 = 0.0;
+    if (gens > 0.0) { step = secs * 1000000.0 / gens; }
     var engine: str = "gpu";
     if (!g.gpu.stepping)          { engine = "cpu"; }
     if (world.hashlife(?g.shown)) { engine = "hashlife"; }
-    print.printlnf("bench {} radius {} chunks {} population {} gens/s {} frame us {}", engine, rule.radius(?g.shown.rule)::u64,
-        g.shown.chunks::u64, g.shown.population::u64, (gens / secs)::u64, frame::u64);
+    print.printlnf("bench {} radius {} chunks {} population {} gens/s {} step us {} cells/s {} frame us {}", engine,
+        rule.radius(?g.shown.rule)::u64, g.shown.chunks::u64, g.shown.population::u64, (gens / secs)::u64, step::u64,
+        (g.cell_gens / secs)::u64, frame::u64);
     context_stop(ctx);
 }
 
@@ -1156,7 +1224,7 @@ test pick_engine__the_command_line_overrides_the_saved_engine_and_a_rule_hashlif
     a.engine_tree = true;
     if (pick_engine(?a, ?s, args.ENGINE_GPU) != args.ENGINE_GPU)      { ret 4; }
     if (pick_engine(?a, ?s, args.ENGINE_ANY) != args.ENGINE_HASHLIFE) { ret 5; }
-    if (a.toast_t != 0)                                               { ret 6; }
+    if (a.told != 0)                                                  { ret 6; }
     # the command line's choice is not the saved one
     if (!a.engine_tree || !a.engine_cpu) { ret 7; }
 
@@ -1164,11 +1232,12 @@ test pick_engine__the_command_line_overrides_the_saved_engine_and_a_rule_hashlif
     val b0: res[rule.Rule, str] = rule.parse("B0/S");
     if (sel b0.err) { ret 11; }
     sim.set_rule(?s, b0.ok);
-    if (rule.caps(?s.rule).no_tree == nil)                                         { ret 8; }
-    if (pick_engine(?a, ?s, args.ENGINE_ANY) != args.ENGINE_ANY || a.toast_t == 0) { ret 9; }
+    if (rule.caps(?s.rule).no_tree == nil) { ret 8; }
+    val told: u32 = a.told;
+    if (pick_engine(?a, ?s, args.ENGINE_ANY) != args.ENGINE_ANY || a.told == told) { ret 9; }
     # a named engine is left to the run, which stops when it cannot
-    a.toast_t = 0;
-    if (pick_engine(?a, ?s, args.ENGINE_HASHLIFE) != args.ENGINE_HASHLIFE || a.toast_t != 0) { ret 10; }
+    val again: u32 = a.told;
+    if (pick_engine(?a, ?s, args.ENGINE_HASHLIFE) != args.ENGINE_HASHLIFE || a.told != again) { ret 10; }
 
     app.dnit(?a);
     sim.dnit(?s);

@@ -34,7 +34,14 @@
 # steps, asking for the adjacent chunks, since it settles every generation;
 # the GPU's is read back once a frame and asks for the ring or the wide halo,
 # whichever its budget runs within, and a chunk counted on the host asks for
-# the same.
+# the same. on the unbounded plane the GPU settles its pool itself instead,
+# and the pool here mirrors it (see Mirror and adopt).
+#
+# a grid bounded both ways whose chunks fit the pool's ceiling is held whole
+# instead (cover): every chunk on it is allocated and linked when the pool takes
+# the grid or is emptied, and stays, so settling neither surrounds nor frees
+# anything and no census need make room before a step. its census still counts
+# the live cells, and its empty chunks stay allocated.
 
 use cellar.layout;
 use cellar.topology;
@@ -49,6 +56,7 @@ use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
+use std.types.string.str;
 
 # side of a chunk in cells
 pub val SIDE: i64 = layout.SIDE::i64;
@@ -65,56 +73,47 @@ pub val MASK_RING: u32 = 0x729c0;
 # a halo mask asking for every chunk up to two away, the widest halo
 pub val MASK_HALO: u32 = 0x1ffefff;
 # a live chunk's halo, the chunks around it its live cells may spread into
-# before the next census settles the pool, as a mask with a bit per chunk of
-# the 5 by 5 block around it, row-major with the chunk itself at HALO_SELF
-pub val HALO_SIDE: u32 = 5;
-pub val HALO_SELF: u32 = 12;
-# cells of spread a pool holds room for once every live chunk has the ring
-# halo: an adjacent chunk is asked for when a live cell lies in the half of its
-# chunk toward it, so a chunk left out is more than half a chunk away
-pub val SPREAD_RING: u32 = 32;
-# cells of spread a pool holds room for once every live chunk has the wide
-# halo: the adjacent chunks always, and the second chunk on a side when a live
-# cell lies in the half toward it, so a chunk left out is more than a chunk and
-# a half away
+# before the next census settles the pool (cellar.layout.halo)
+pub val HALO_SIDE: u32 = layout.HALO_SIDE;
+pub val HALO_SELF: u32 = layout.HALO_SELF;
+# cells of spread the narrowest ring holds: an adjacent chunk is asked for when
+# a live cell lies in the half of its chunk toward it, so a chunk left out is
+# more than half a chunk away
+pub val SPREAD_RING: u32 = layout.SIDE / 2;
+# cells of spread the wide halo of a rule reaching no further than the
+# narrowest ring holds: the adjacent chunks always, and the second chunk on a
+# side when a live cell lies in the half toward it, so a chunk left out is more
+# than a chunk and a half away
 pub val SPREAD_WIDE: u32 = 96;
 
-# the halo row or column bits a live cell in the low or the high half of its
-# chunk along one axis needs, the chunk's own at bit 2
-fun halo_axis(high: u32, wide: bool) u32 {
-    if (wide) {
-        if (high != 0) { ret 0x1e; }
-        ret 0xf;
-    }
-    if (high != 0) { ret 0xc; }
-    ret 0x6;
+# cells of spread the ring of a rule reaching reach cells a generation holds,
+# so one generation never outruns it: the narrowest ring, or reach rounded up
+# to half a chunk, which at the farthest reach is every adjacent chunk
+pub fun ring(reach: usize) u32 {
+    val half: usize = SPREAD_RING::usize;
+    var r:    usize = (reach + half - 1) / half * half;
+    if (r < half) { r = half; }
+    ret r::u32;
+}
+
+# cells of spread the halo of a rule reaching reach cells holds: its ring, or
+# while wide a chunk more, up to every chunk two away
+pub fun halo_span(reach: usize, wide: bool) u32 {
+    var s: u32 = ring(reach);
+    if (wide)                  { s = s + layout.SIDE; }
+    if (s > layout.SPREAD_MAX) { s = layout.SPREAD_MAX; }
+    ret s;
 }
 
 # the halo mask for live cells in the quadrants of a chunk quads names
-# (cellar.layout.quadrant)
-# ---
-# wide: the wide halo, else the ring
-pub fun halo(quads: u32, wide: bool) u32 {
-    var m: u32 = 0;
-    var q: u32 = 0;
-    for (q < 4) {
-        if (((quads >> q) & 1) != 0) {
-            val xs: u32 = halo_axis(q & 1, wide);
-            val ys: u32 = halo_axis(q >> 1, wide);
-            var r:  u32 = 0;
-            for (r < HALO_SIDE) {
-                if (((ys >> r) & 1) != 0) { m = m | (xs << (r * HALO_SIDE)); }
-                r = r + 1;
-            }
-        }
-        q = q + 1;
-    }
-    ret m & ~(1 << HALO_SELF);
+# (cellar.layout.quadrant), holding span cells of spread
+pub fun halo(quads: u32, span: u32) u32 {
+    ret layout.halo(quads, span);
 }
 
 # the halo mask for the live cells an extent word describes
-pub fun halo_of(ext: u32, wide: bool) u32 {
-    ret halo(ext >> layout.EXTENT_QUADS, wide);
+pub fun halo_of(ext: u32, span: u32) u32 {
+    ret layout.halo(ext >> layout.EXTENT_QUADS, span);
 }
 
 # a neighbour that does not exist
@@ -142,13 +141,19 @@ pub val DIRTY_ZERO: u8 = 4;
 pub val DIRTY_MIP: u8 = 8;
 
 # a copy of the pool kept elsewhere, a device's, which must make room before
-# the pool grows
+# the pool grows, and which may own the page table for a while
+#
+# a device that allocates and frees chunks itself owns the pool between the
+# times the host takes it back, and own brings the host's page table level
+# with the device's before anything here reads or changes it.
 # ---
-# ctx:     the mirror's own state, passed back to reserve
+# ctx:     the mirror's own state, passed back to reserve and own
 # reserve: make room for a pool of the given slots; false refuses the growth
+# own:     hand the pool to the host, bringing its page table level first
 pub rec Mirror {
     ctx:     *u8;
     reserve: fun(*u8, usize) bool;
+    own:     fun(*u8);
 }
 
 # the pool
@@ -173,7 +178,8 @@ pub rec Mirror {
 #            last step
 # dirty:     per slot DIRTY_ENTRY, DIRTY_CELLS, DIRTY_ZERO and DIRTY_MIP, for
 #            a mirror to upload
-# asked:     per slot whether a live chunk's mask asked for it, while settling
+# asked:     per slot whether a live chunk's mask asked for it, while settling,
+#            or on a pool held whole whether it is due
 # frees:     free slots below hi
 # nfree:     how many frees holds
 # hash:      slot per bucket, NONE when empty, linear probing
@@ -181,11 +187,22 @@ pub rec Mirror {
 # serial:    the last incarnation handed out
 # stepped:   whether back is kept
 # sense:     how the census reads a cell, the running rule's
+# reach:     cells the running rule reaches a generation, whose ring a chunk
+#            counted or painted on the host asks for (span)
 # wide:      a chunk counted or painted on the host asks for the wide halo,
 #            as the GPU's census does while it steps uncapped
 # grid:      the grid the world runs on
 # rim:       every chunk along the grid's plane edge is kept, for a rule whose
 #            step reads the edge live (see keep_rim)
+# whole:     every chunk on the grid is held and stays, so nothing is allocated
+#            or freed while the world steps (cover)
+# awake:     on a pool held whole, the slots whose cells or back cells may hold
+#            something; every other slot holds zeros in both and a zero census
+# nawake:    how many awake holds
+# woke:      per slot whether awake holds it
+# due:       on a pool held whole, the slots the CPU's step steps (plan): the
+#            awake ones, the chunks their live cells may spread into and the rim
+# ndue:      how many due holds
 pub rec Space {
     a:         *allo.Allocator;
     cap:       usize;
@@ -212,9 +229,16 @@ pub rec Space {
     serial:    u32;
     stepped:   bool;
     sense:     layout.Sense;
+    reach:     usize;
     wide:      bool;
     grid:      topology.Grid;
     rim:       bool;
+    whole:     bool;
+    awake:     *u32;
+    nawake:    usize;
+    woke:      *u8;
+    due:       *u32;
+    ndue:      usize;
 }
 
 # one chunk's step, as a rule family's CPU step sees it
@@ -461,9 +485,14 @@ fun alloc_arrays(sp: *Space, cap: usize) err[allo.Error] {
     var asked: *u8                  = nil;
     val ra:    res[*u8, allo.Error] = allo.zallocate[u8](a, cap);
     if (sel ra.ok) { asked = ra.ok; }
+    var woke: *u8                  = nil;
+    val rw:   res[*u8, allo.Error] = allo.zallocate[u8](a, cap);
+    if (sel rw.ok) { woke = rw.ok; }
+    val awake: *u32 = zwords(a, cap);
+    val due:   *u32 = zwords(a, cap);
     if (table == nil || cells == nil || (sp.stepped && back == nil) || census == nil
         || before == nil || frees == nil || hash == nil || dirty == nil || asked == nil
-        || (pyr && (mips == nil || mback == nil))) {
+        || woke == nil || awake == nil || due == nil || (pyr && (mips == nil || mback == nil))) {
         if (table != nil)  { allo.deallocate[u32](a, table, cap * ENTRY); }
         if (cells != nil)  { allo.deallocate[u32](a, cells, cap * CELLS); }
         if (back != nil)   { allo.deallocate[u32](a, back, cap * CELLS); }
@@ -475,6 +504,9 @@ fun alloc_arrays(sp: *Space, cap: usize) err[allo.Error] {
         if (hash != nil)   { allo.deallocate[u32](a, hash, hcap); }
         if (dirty != nil)  { allo.deallocate[u8](a, dirty, cap); }
         if (asked != nil)  { allo.deallocate[u8](a, asked, cap); }
+        if (woke != nil)   { allo.deallocate[u8](a, woke, cap); }
+        if (awake != nil)  { allo.deallocate[u32](a, awake, cap); }
+        if (due != nil)    { allo.deallocate[u32](a, due, cap); }
         ret err[allo.Error].err{allo.Error.exhausted{}};
     }
     # carry the old pool over, then rebuild the hash at its new size
@@ -486,6 +518,9 @@ fun alloc_arrays(sp: *Space, cap: usize) err[allo.Error] {
         mem.copy[u32](census, sp.census, sp.hi * CENSUS);
         mem.copy[u8](dirty, sp.dirty, sp.hi);
         mem.copy[u8](asked, sp.asked, sp.hi);
+        mem.copy[u8](woke, sp.woke, sp.hi);
+        mem.copy[u32](awake, sp.awake, sp.nawake);
+        mem.copy[u32](due, sp.due, sp.ndue);
         mem.copy[u32](frees, sp.frees, sp.nfree);
         free_arrays(sp);
     }
@@ -498,6 +533,9 @@ fun alloc_arrays(sp: *Space, cap: usize) err[allo.Error] {
     sp.before    = before;
     sp.dirty     = dirty;
     sp.asked     = asked;
+    sp.woke      = woke;
+    sp.awake     = awake;
+    sp.due       = due;
     sp.frees     = frees;
     sp.hash      = hash;
     sp.cap       = cap;
@@ -524,6 +562,9 @@ fun free_arrays(sp: *Space) {
     allo.deallocate[u32](a, sp.before, sp.cap * CENSUS);
     allo.deallocate[u8](a, sp.dirty, sp.cap);
     allo.deallocate[u8](a, sp.asked, sp.cap);
+    allo.deallocate[u8](a, sp.woke, sp.cap);
+    allo.deallocate[u32](a, sp.awake, sp.cap);
+    allo.deallocate[u32](a, sp.due, sp.cap);
     allo.deallocate[u32](a, sp.frees, sp.cap);
     allo.deallocate[u32](a, sp.hash, sp.hcap);
 }
@@ -548,22 +589,65 @@ pub fun init(sp: *Space, a: *allo.Allocator, stepped: bool) err[allo.Error] {
     sp.mips_back = nil;
     sp.mip_on    = false;
     mem.zero[u8]((?sp.sense)::*u8, $size_of(layout.Sense));
-    sp.wide = false;
-    sp.grid = topology.open();
-    sp.rim  = false;
+    sp.reach  = 1;
+    sp.wide   = false;
+    sp.grid   = topology.open();
+    sp.rim    = false;
+    sp.whole  = false;
+    sp.nawake = 0;
+    sp.ndue   = 0;
     ret alloc_arrays(sp, FIRST_CAP);
 }
 
 # hand the pool a mirror that must make room before it grows, and the ceiling
-# the mirror holds it to
+# the mirror holds it to (limit)
 # ---
 # sp:        the pool, holding no more than max_slots
 # m:         the mirror, already holding the pool's capacity
 # max_slots: the most slots the mirror can hold
 pub fun set_mirror(sp: *Space, m: Mirror, max_slots: usize) {
+    limit(sp, max_slots);
     sp.mirror   = m;
     sp.mirrored = true;
-    if (max_slots < sp.max_slots) { sp.max_slots = max_slots; }
+}
+
+# hold the pool to a ceiling of slots, where that is below its own, ahead of a
+# mirror that holds no more
+#
+# a grid held whole with more chunks than that lets them go: its empty chunks
+# are freed, its live ones counted and surrounded and its rim kept as on any
+# grid that does not fit, and the arrays shrink to what is left. a pool whose
+# chunks in use still do not fit keeps its capacity, which a mirror then
+# refuses.
+# ---
+# sp:    the pool
+# slots: the ceiling
+pub fun limit(sp: *Space, slots: usize) {
+    if (slots < sp.max_slots)                               { sp.max_slots = slots; }
+    if (!sp.whole || grid_chunks(?sp.grid) <= sp.max_slots) { ret; }
+    own(sp);
+    sp.whole = false;
+    var s: usize = 0;
+    for (s < sp.hi) {
+        if (used(sp, s)) {
+            val c:   *u32  = ?sp.cells[s * CELLS];
+            var any: bool  = false;
+            var i:   usize = 0;
+            for (!any && i < CELLS) {
+                any = c[i] != 0;
+                i   = i + 1;
+            }
+            if (any) { recount(sp, s); }
+            or       { release(sp, s); }
+        }
+        s = s + 1;
+    }
+    compact(sp);
+    settle(sp, sp.census, sp.hi, false);
+    var cap: usize = FIRST_CAP;
+    for (cap < sp.hi) { cap = cap * 2; }
+    if (cap > sp.max_slots)           { cap = sp.max_slots; }
+    if (cap < sp.cap && sp.hi <= cap) { alloc_arrays(sp, cap); }
 }
 
 # release every array
@@ -725,10 +809,22 @@ pub fun builds_pyramid(sp: *Space, s: usize) bool {
 # its pyramid is no longer the one they give
 pub fun touch(sp: *Space, s: usize) {
     sp.dirty[s] = (sp.dirty[s] | DIRTY_CELLS) & ~DIRTY_MIP;
+    wake(sp, s);
 }
 
-# free every slot, keeping the capacity
+# note that a slot of a pool held whole may hold something now, so the CPU's
+# step takes it up (awake)
+pub fun wake(sp: *Space, s: usize) {
+    if (!sp.whole || sp.woke[s] != 0) { ret; }
+    sp.woke[s]          = 1;
+    sp.awake[sp.nawake] = s::u32;
+    sp.nawake           = sp.nawake + 1;
+}
+
+# free every slot, keeping the capacity, and on a grid held whole hold every
+# chunk again, empty
 pub fun reset(sp: *Space) {
+    own(sp);
     mem.zero[u32](sp.table, sp.hi * ENTRY);
     mem.zero[u32](sp.census, sp.hi * CENSUS);
     mem.fill[u32](sp.hash, NONE, sp.hcap);
@@ -740,6 +836,7 @@ pub fun reset(sp: *Space) {
     sp.live  = 0;
     sp.nfree = 0;
     sp.hi    = 0;
+    cover(sp);
 }
 
 # whether a slot's chunk is read through its links (cellar.layout.seamed)
@@ -823,12 +920,13 @@ pub fun mask(sp: *Space, s: usize) {
 }
 
 # put the world on a grid: the chunks off it are freed, every other chunk is
-# relinked and its cells off it cleared. the census is left as it was, for the
-# caller to recount.
+# relinked and its cells off it cleared, and a grid that fits the pool is held
+# whole (cover). the census is left as it was, for the caller to recount.
 # ---
 # sp: the pool
 # g:  the grid
 pub fun set_grid(sp: *Space, g: topology.Grid) {
+    own(sp);
     sp.grid = g;
     var s: usize = 0;
     for (s < sp.hi) {
@@ -844,6 +942,72 @@ pub fun set_grid(sp: *Space, g: topology.Grid) {
         s = s + 1;
     }
     compact(sp);
+    cover(sp);
+}
+
+# the chunks holding a cell of a grid bounded both ways, 0 for any other grid
+pub fun grid_chunks(g: *topology.Grid) usize {
+    if (!topology.finite(g)) { ret 0; }
+    val w: i64 = chunk_of(topology.left(g) + g.w - 1) - chunk_of(topology.left(g)) + 1;
+    val h: i64 = chunk_of(topology.top(g) + g.h - 1) - chunk_of(topology.top(g)) + 1;
+    ret (w * h)::usize;
+}
+
+# hold every chunk of a grid bounded both ways, when they fit the pool's
+# ceiling, so stepping it never allocates or frees one (whole)
+#
+# the pool grows once to the grid's chunks, the mirror making room first, each
+# chunk missing is allocated empty, and every slot is linked through the seams.
+# a grid with an unbounded axis or more chunks than the ceiling, or a growth
+# either side refuses, is left to allocate around its live cells.
+fun cover(sp: *Space) {
+    # a settle on another grid may have left slots asked for
+    sp.whole = false;
+    mem.zero[u8](sp.woke, sp.cap);
+    mem.zero[u8](sp.asked, sp.cap);
+    sp.nawake = 0;
+    sp.ndue   = 0;
+    val g: *topology.Grid = ?sp.grid;
+    val n: usize          = grid_chunks(g);
+    if (n == 0 || n > sp.max_slots || !grow(sp, n)) { ret; }
+    # a chunk held before may hold anything, in either cells; a new one holds zeros
+    var s: usize = 0;
+    for (s < sp.hi) {
+        if (used(sp, s)) {
+            sp.woke[s]          = 1;
+            sp.awake[sp.nawake] = s::u32;
+            sp.nawake           = sp.nawake + 1;
+        }
+        s = s + 1;
+    }
+    val cx0: i64 = chunk_of(topology.left(g));
+    val cx1: i64 = chunk_of(topology.left(g) + g.w - 1);
+    val cy0: i64 = chunk_of(topology.top(g));
+    val cy1: i64 = chunk_of(topology.top(g) + g.h - 1);
+    var cy:  i64 = cy0;
+    for (cy <= cy1) {
+        var cx: i64 = cx0;
+        for (cx <= cx1) {
+            if (find(sp, cx, cy) == NONE) { quiet(sp, claim(sp, cx, cy)::usize); }
+            cx = cx + 1;
+        }
+        cy = cy + 1;
+    }
+    s = 0;
+    for (s < sp.hi) {
+        if (used(sp, s)) { link(sp, s); }
+        s = s + 1;
+    }
+    sp.whole = true;
+}
+
+# zero what a slot just claimed for a pool held whole holds beyond its cells,
+# so it need not be awake: its back cells and pyramid, and the census a step
+# began from
+fun quiet(sp: *Space, s: usize) {
+    mem.zero[u32](?sp.before[s * CENSUS], CENSUS);
+    if (sp.back != nil)      { mem.zero[u32](?sp.back[s * CELLS], CELLS); }
+    if (sp.mips_back != nil) { mem.zero[u32](?sp.mips_back[s * MIP], MIP); }
 }
 
 # the word of the cell at (x, y) of a slot's frame, taken through the links
@@ -871,6 +1035,65 @@ pub fun resolve(sp: *Space, s: usize, x: i32, y: i32, past: u32) u32 {
     ret 0;
 }
 
+# take the pool back from a mirror that owns it, so the host's page table is
+# the one to read and change
+pub fun own(sp: *Space) {
+    if (sp.mirrored) { sp.mirror.own(sp.mirror.ctx); }
+}
+
+# the incarnation bits a mirror's census carries
+pub val TAG: u32 = 0x3ffff;
+
+# take up a page table a mirror wrote into the first n slots' entries, as the
+# pool from now on
+#
+# every slot at or past n is free. hi, the count, the hash and the free slots
+# follow the table, and a slot's census is kept where its incarnation is the
+# one counted, else taken from the mirror's census when its incarnation bits
+# (TAG) name it, else zeroed. nothing is dirty, since the mirror holds the
+# table as it stands.
+# ---
+# sp:     the pool, whose table holds the mirror's entries below n
+# n:      slots the mirror's table covers, at most the capacity
+# landed: CENSUS words per slot below n from the mirror's last census, or nil
+pub fun adopt(sp: *Space, n: usize, landed: *u32) {
+    if (sp.hi > n) { mem.zero[u32](?sp.table[n * ENTRY], (sp.hi - n) * ENTRY); }
+    sp.hi   = n;
+    sp.live = 0;
+    mem.fill[u32](sp.hash, NONE, sp.hcap);
+    var s: usize = 0;
+    for (s < n) {
+        val c: *u32 = ?sp.census[s * CENSUS];
+        if (!used(sp, s)) { mem.zero[u32](c, CENSUS); }
+        or {
+            sp.live = sp.live + 1;
+            hash_put(sp, s);
+            val inc: u32 = incarnation(sp, s);
+            if (c[2] != inc) {
+                mem.zero[u32](c, CENSUS);
+                if (landed != nil && landed[s * CENSUS + 2] == (inc & TAG)) {
+                    mem.copy[u32](c, ?landed[s * CENSUS], CENSUS);
+                    c[2] = inc;
+                }
+            }
+        }
+        sp.dirty[s] = 0;
+        s           = s + 1;
+    }
+    compact(sp);
+}
+
+# grow the pool to hold cap slots, the mirror making room first
+# ---
+# ret: false when cap is past the pool's ceiling or either side refused
+pub fun grow(sp: *Space, cap: usize) bool {
+    if (cap <= sp.cap)                                         { ret true; }
+    if (cap > sp.max_slots)                                    { ret false; }
+    if (sp.mirrored && !sp.mirror.reserve(sp.mirror.ctx, cap)) { ret false; }
+    val grown: err[allo.Error] = alloc_arrays(sp, cap);
+    ret sel grown.ok;
+}
+
 # the slot of the chunk at (cx, cy), allocating it empty when it does not exist
 #
 # a new chunk is linked into its neighbours' entries, and its own entry and
@@ -882,43 +1105,15 @@ pub fun resolve(sp: *Space, s: usize, x: i32, y: i32, past: u32) u32 {
 # ret: the slot, or NONE when the chunk lies off the grid or the pool is at its
 #      ceiling, or the allocator or the mirror refused to grow it
 pub fun alloc(sp: *Space, cx: i64, cy: i64) u32 {
+    own(sp);
     val have: u32 = find(sp, cx, cy);
     if (have != NONE) { ret have; }
     val bounded: bool = topology.bounded(?sp.grid);
     if (bounded && !topology.inside(?sp.grid, cx, cy)) { ret NONE; }
-    var s: usize = 0;
-    if (sp.nfree != 0) {
-        sp.nfree = sp.nfree - 1;
-        s        = sp.frees[sp.nfree]::usize;
-    }
-    or {
-        if (sp.hi >= sp.max_slots) { ret NONE; }
-        if (sp.hi == sp.cap) {
-            var cap: usize = sp.cap * 2;
-            if (cap > sp.max_slots)                                    { cap = sp.max_slots; }
-            if (sp.mirrored && !sp.mirror.reserve(sp.mirror.ctx, cap)) { ret NONE; }
-            val grown: err[allo.Error] = alloc_arrays(sp, cap);
-            if (sel grown.err) { ret NONE; }
-        }
-        s     = sp.hi;
-        sp.hi = sp.hi + 1;
-    }
-    sp.serial = sp.serial + 1;
-    if (sp.serial == 0) { sp.serial = 1; }
-    val e: *u32 = ?sp.table[s * ENTRY];
-    e[9]  = (cx + BIAS)::u32;
-    e[10] = (cy + BIAS)::u32;
-    e[11] = sp.serial;
-    mem.zero[u32](?sp.cells[s * CELLS], CELLS);
-    mem.zero[u32](?sp.census[s * CENSUS], CENSUS);
-    hash_put(sp, s);
-    sp.live     = sp.live + 1;
-    sp.dirty[s] = DIRTY_ENTRY | DIRTY_ZERO;
-    if (sp.mips != nil) {
-        mem.zero[u32](?sp.mips[s * MIP], MIP);
-        sp.dirty[s] = sp.dirty[s] | DIRTY_MIP;
-    }
-
+    val t: u32 = claim(sp, cx, cy);
+    if (t == NONE) { ret NONE; }
+    val s: usize = t::usize;
+    val e: *u32  = ?sp.table[s * ENTRY];
     if (bounded) {
         link(sp, s);
         var j: usize = 0;
@@ -951,8 +1146,50 @@ pub fun alloc(sp: *Space, cx: i64, cy: i64) u32 {
     ret s::u32;
 }
 
+# take a free slot for the chunk at (cx, cy), which does not exist yet, growing
+# the pool when none is free, and make it there empty and unlinked, marked dirty
+# ---
+# ret: the slot, or NONE when the pool is at its ceiling, or the allocator or
+#      the mirror refused to grow it
+fun claim(sp: *Space, cx: i64, cy: i64) u32 {
+    var s: usize = 0;
+    if (sp.nfree != 0) {
+        sp.nfree = sp.nfree - 1;
+        s        = sp.frees[sp.nfree]::usize;
+    }
+    or {
+        if (sp.hi >= sp.max_slots) { ret NONE; }
+        if (sp.hi == sp.cap) {
+            var cap: usize = sp.cap * 2;
+            if (cap > sp.max_slots)                                    { cap = sp.max_slots; }
+            if (sp.mirrored && !sp.mirror.reserve(sp.mirror.ctx, cap)) { ret NONE; }
+            val grown: err[allo.Error] = alloc_arrays(sp, cap);
+            if (sel grown.err) { ret NONE; }
+        }
+        s     = sp.hi;
+        sp.hi = sp.hi + 1;
+    }
+    sp.serial = sp.serial + 1;
+    if (sp.serial == 0) { sp.serial = 1; }
+    val e: *u32 = ?sp.table[s * ENTRY];
+    e[9]  = (cx + BIAS)::u32;
+    e[10] = (cy + BIAS)::u32;
+    e[11] = sp.serial;
+    mem.zero[u32](?sp.cells[s * CELLS], CELLS);
+    mem.zero[u32](?sp.census[s * CENSUS], CENSUS);
+    hash_put(sp, s);
+    sp.live     = sp.live + 1;
+    sp.dirty[s] = DIRTY_ENTRY | DIRTY_ZERO;
+    if (sp.mips != nil) {
+        mem.zero[u32](?sp.mips[s * MIP], MIP);
+        sp.dirty[s] = sp.dirty[s] | DIRTY_MIP;
+    }
+    ret s::u32;
+}
+
 # free a slot, unlinking it from its neighbours
 pub fun release(sp: *Space, s: usize) {
+    own(sp);
     if (!used(sp, s)) { ret; }
     hash_remove(sp, s);
     val e:    *u32  = ?sp.table[s * ENTRY];
@@ -996,7 +1233,58 @@ pub fun compact(sp: *Space) {
     }
 }
 
-# give a chunk the chunks a halo mask asks for, and mark each asked for
+# mark a slot asked for, and on a pool held whole due
+fun ask(sp: *Space, s: usize) {
+    if (sp.asked[s] != 0) { ret; }
+    sp.asked[s] = 1;
+    if (sp.whole) {
+        sp.due[sp.ndue] = s::u32;
+        sp.ndue         = sp.ndue + 1;
+    }
+}
+
+# the slots the CPU's next step of a pool held whole steps, into due: every
+# awake one, the chunks the halo of each live one asks for, and the rim where
+# it is kept. every other slot holds zeros in both cells and nothing near it
+# lives, so its step would write the zeros its back cells hold already
+pub fun plan(sp: *Space) {
+    var i: usize = 0;
+    for (i < sp.ndue) {
+        sp.asked[sp.due[i]::usize] = 0;
+        i                          = i + 1;
+    }
+    sp.ndue = 0;
+    i       = 0;
+    for (i < sp.nawake) {
+        val s: usize = sp.awake[i]::usize;
+        ask(sp, s);
+        if (sp.census[s * CENSUS] != 0) { surround_by(sp, s, sp.census[s * CENSUS + 3]); }
+        i = i + 1;
+    }
+    keep_rim(sp);
+}
+
+# after the CPU's step of a pool held whole, keep awake only the slots it
+# stepped whose new cells or back cells, the old front, hold something
+pub fun doze(sp: *Space) {
+    var i: usize = 0;
+    for (i < sp.nawake) {
+        sp.woke[sp.awake[i]::usize] = 0;
+        i                           = i + 1;
+    }
+    sp.nawake = 0;
+    i         = 0;
+    for (i < sp.ndue) {
+        val s: usize = sp.due[i]::usize;
+        val c: *u32  = ?sp.census[s * CENSUS];
+        val b: *u32  = ?sp.before[s * CENSUS];
+        if ((c[0] | c[1] | b[0] | b[1]) != 0) { wake(sp, s); }
+        i = i + 1;
+    }
+}
+
+# give a chunk the chunks a halo mask asks for, and mark each asked for; a
+# pool held whole has every one already, and they are only marked due
 # ---
 # mask: a bit per chunk of the 5 by 5 block around it, its own ignored
 # ret:  false when the pool could not hold them
@@ -1016,7 +1304,7 @@ pub fun surround_by(sp: *Space, s: usize, mask: u32) bool {
             if (dx >= -1 && dx <= 1 && dy >= -1 && dy <= 1) { n = sp.table[s * ENTRY + ((dy + 1) * 3 + dx + 1)::usize]; }
             if (n == NONE)                                  { n = alloc(sp, cx + dx, cy + dy); }
             if (n == NONE)                                  { ok = false; }
-            or                                              { sp.asked[n::usize] = 1; }
+            or                                              { ask(sp, n::usize); }
         }
         k = k + 1;
     }
@@ -1050,7 +1338,7 @@ fun surround_grid(sp: *Space, s: usize, mask: u32) bool {
             for (i < n) {
                 val t: u32 = alloc(sp, at[i * 2], at[i * 2 + 1]);
                 if (t == NONE) { ok = false; }
-                or             { sp.asked[t::usize] = 1; }
+                or             { ask(sp, t::usize); }
                 i = i + 1;
             }
         }
@@ -1059,12 +1347,18 @@ fun surround_grid(sp: *Space, s: usize, mask: u32) bool {
     ret ok;
 }
 
-# give a chunk every chunk of the halo the host asks for, the ring or the wide one
+# cells of spread the halo the host asks for holds: the running rule's ring,
+# or the wide halo
+pub fun span(sp: *Space) u32 {
+    ret halo_span(sp.reach, sp.wide);
+}
+
+# give a chunk every chunk the halo the host asks for could ask for, whichever
+# quadrants hold its live cells
 # ---
 # ret: false when the pool could not hold them
 pub fun surround(sp: *Space, s: usize) bool {
-    if (sp.wide) { ret surround_by(sp, s, MASK_HALO); }
-    ret surround_by(sp, s, MASK_RING);
+    ret surround_by(sp, s, halo(0xf, span(sp)));
 }
 
 # give a pool keeping its rim every seamed chunk on its grid, each marked asked
@@ -1074,6 +1368,7 @@ pub fun surround(sp: *Space, s: usize) bool {
 # step reads the edge from is kept, and stepped, as seamed chunks always are.
 # only a chunk within one of a chunk not whole on the grid is seamed, so the
 # rim is the two chunk rows and columns at each end of a plane bounded both ways.
+# a pool held whole has it already, and it is only marked due.
 # ---
 # ret: false when the pool could not hold them
 pub fun keep_rim(sp: *Space) bool {
@@ -1092,7 +1387,7 @@ pub fun keep_rim(sp: *Space) bool {
             if (topology.seamed(g, cx, cy)) {
                 val t: u32 = alloc(sp, cx, cy);
                 if (t == NONE) { ret false; }
-                sp.asked[t::usize] = 1;
+                ask(sp, t::usize);
             }
             cx = cx + 1;
         }
@@ -1113,8 +1408,8 @@ fun current(sp: *Space, census: *u32, n: usize, s: usize) bool {
 # for. then, when frees is set, every chunk the census saw empty and cold that
 # no such mask asked for is freed; a chunk allocated since the census was taken
 # did not exist then, so it counts as empty. a pool keeping its rim gets it
-# and keeps it (keep_rim). the census is copied into the pool's own for the
-# slots it describes.
+# and keeps it (keep_rim). a pool held whole has nothing to give and frees
+# nothing. the census is copied into the pool's own for the slots it describes.
 # ---
 # sp:     the pool
 # census: CENSUS words per slot
@@ -1122,21 +1417,23 @@ fun current(sp: *Space, census: *u32, n: usize, s: usize) bool {
 # frees:  whether empty chunks may be freed
 # ret:    false when the pool could not hold a needed chunk
 pub fun settle(sp: *Space, census: *u32, n: usize, frees: bool) bool {
+    own(sp);
+    if (sp.whole) { ret settle_whole(sp, census, n); }
     # the pool's own census moves when surrounding a chunk grows the pool
-    val own: bool = census == sp.census;
-    var c:   *u32 = census;
-    var ok:  bool = true;
+    val mine: bool = census == sp.census;
+    var c:    *u32 = census;
+    var ok:   bool = true;
     mem.zero[u8](sp.asked, sp.hi);
     var s: usize = 0;
     for (s < n && s < sp.hi) {
-        if (own) { c = sp.census; }
+        if (mine) { c = sp.census; }
         if (current(sp, c, n, s) && c[s * CENSUS] != 0) {
             if (!surround_by(sp, s, c[s * CENSUS + 3])) { ok = false; }
         }
         s = s + 1;
     }
     if (!keep_rim(sp)) { ok = false; }
-    if (own)           { c = sp.census; }
+    if (mine)          { c = sp.census; }
     if (frees) {
         val had: usize = sp.nfree;
         s = 0;
@@ -1148,13 +1445,30 @@ pub fun settle(sp: *Space, census: *u32, n: usize, frees: bool) bool {
         }
         if (sp.nfree != had) { compact(sp); }
     }
-    if (own) { ret ok; }
+    if (mine) { ret ok; }
     s = 0;
     for (s < n && s < sp.hi) {
         if (current(sp, c, n, s)) { mem.copy[u32](?sp.census[s * CENSUS], ?c[s * CENSUS], CENSUS); }
         s = s + 1;
     }
     ret ok;
+}
+
+# settle on a pool held whole, which has every chunk and frees none: a census
+# from elsewhere is taken in for the slots it describes, waking those it found
+# anything in
+fun settle_whole(sp: *Space, census: *u32, n: usize) bool {
+    if (census == sp.census) { ret true; }
+    var s: usize = 0;
+    for (s < n && s < sp.hi) {
+        if (current(sp, census, n, s)) {
+            val c: *u32 = ?census[s * CENSUS];
+            mem.copy[u32](?sp.census[s * CENSUS], c, CENSUS);
+            if ((c[0] | c[1]) != 0) { wake(sp, s); }
+        }
+        s = s + 1;
+    }
+    ret true;
 }
 
 # a rectangle of cells, from (x0, y0) up to but not including (x1, y1)
@@ -1172,9 +1486,10 @@ pub rec Box {
 pub fun bounds(sp: *Space) opt[Box] {
     var b:   Box   = Box{x0: 0, y0: 0, x1: 0, y1: 0};
     var any: bool  = false;
-    var s:   usize = 0;
-    for (s < sp.hi) {
-        val c: *u32 = ?sp.census[s * CENSUS];
+    var i:   usize = 0;
+    for (i < counted(sp)) {
+        val s: usize = slot_counted(sp, i);
+        val c: *u32  = ?sp.census[s * CENSUS];
         if (c[0] != 0) {
             val ox: i64 = slot_x(sp, s) * SIDE;
             val oy: i64 = slot_y(sp, s) * SIDE;
@@ -1188,7 +1503,7 @@ pub fun bounds(sp: *Space) opt[Box] {
             if (!any || y1 > b.y1) { b.y1 = y1; }
             any = true;
         }
-        s = s + 1;
+        i = i + 1;
     }
     if (!any) { ret opt[Box].none{}; }
     ret opt[Box].some{b};
@@ -1197,12 +1512,25 @@ pub fun bounds(sp: *Space) opt[Box] {
 # the live cells the census counted
 pub fun population(sp: *Space) usize {
     var n: usize = 0;
-    var s: usize = 0;
-    for (s < sp.hi) {
-        n = n + sp.census[s * CENSUS]::usize;
-        s = s + 1;
+    var i: usize = 0;
+    for (i < counted(sp)) {
+        n = n + sp.census[slot_counted(sp, i) * CENSUS]::usize;
+        i = i + 1;
     }
     ret n;
+}
+
+# how many slots a count of the census reads: on a pool held whole only the
+# awake ones, since every other slot's census is zero
+fun counted(sp: *Space) usize {
+    if (sp.whole) { ret sp.nawake; }
+    ret sp.hi;
+}
+
+# the slot a count of the census reads i-th
+fun slot_counted(sp: *Space, i: usize) usize {
+    if (sp.whole) { ret sp.awake[i]::usize; }
+    ret i;
 }
 
 # count a slot's live and warm cells into its census from its front cells
@@ -1215,7 +1543,8 @@ pub fun recount(sp: *Space, s: usize) {
         i = i + 1;
     }
     tally_census(?t, ?sp.census[s * CENSUS], incarnation(sp, s));
-    if (t.live != 0) { sp.census[s * CENSUS + 3] = halo(t.quads, sp.wide); }
+    if (t.live != 0) { sp.census[s * CENSUS + 3] = halo(t.quads, span(sp)); }
+    wake(sp, s);
 }
 
 test alloc__links_neighbours_both_ways_and_release_unlinks {
@@ -1271,11 +1600,17 @@ test alloc__grows_the_pool_and_keeps_every_chunk_findable {
 test halo__asks_toward_the_quadrants_holding_live_cells {
     # a live cell in the north-west quadrant: west, north and north-west, and
     # with the wide halo the 4 by 4 block reaching two chunks that way
-    if (halo(1, false) != ((1 << 6) | (1 << 7) | (1 << 11))) { ret 1; }
-    if (halo(1, true) != (0x7bdef & ~(1 << HALO_SELF)))      { ret 2; }
-    if (halo(0xf, false) != MASK_RING)                       { ret 3; }
-    if (halo(0xf, true) != MASK_HALO)                        { ret 4; }
-    if (halo(0, true) != 0)                                  { ret 5; }
+    val wide: u32 = halo_span(1, true);
+    if (halo(1, SPREAD_RING) != ((1 << 6) | (1 << 7) | (1 << 11)))             { ret 1; }
+    if (wide != SPREAD_WIDE || halo(1, wide) != (0x7bdef & ~(1 << HALO_SELF))) { ret 2; }
+    if (halo(0xf, SPREAD_RING) != MASK_RING)                                   { ret 3; }
+    if (halo(0xf, wide) != MASK_HALO)                                          { ret 4; }
+    if (halo(0, wide) != 0)                                                    { ret 5; }
+    # a rule reaching past half a chunk rings every adjacent chunk whatever its
+    # quadrants, and widens to every chunk two away
+    if (ring(32) != SPREAD_RING || ring(33) != 64 || ring(layout.REACH_MAX::usize) != 64)      { ret 6; }
+    if (halo(1, ring(33)) != MASK_RING)                                                        { ret 7; }
+    if (halo_span(64, true) != layout.SPREAD_MAX || halo(1, halo_span(64, true)) != MASK_HALO) { ret 8; }
     ret 0;
 }
 
@@ -1326,6 +1661,46 @@ test settle__gives_a_live_chunk_only_the_neighbours_its_mask_asks_for {
     sp.census[s * CENSUS]     = 0;
     sp.census[s * CENSUS + 1] = 0;
     if (!settle(?sp, sp.census, sp.hi, true)) { ret 5; }
+    dnit(?sp);
+    ret 0;
+}
+
+test cover__holds_every_chunk_of_a_grid_that_fits_until_its_ceiling_drops {
+    var a: allo.Allocator;
+    page.make(?a);
+    var sp:   Space;
+    val made: err[allo.Error] = init(?sp, ?a, true);
+    if (sel made.err) { ret 1; }
+    # a 200 by 120 torus spans 4 by 2 chunks, every one linked across the seams
+    val t: res[topology.Grid, str] = topology.parse("T200,120");
+    if (sel t.err) { ret 2; }
+    set_grid(?sp, t.ok);
+    if (!sp.whole || sp.live != 8 || grid_chunks(?sp.grid) != 8) { ret 3; }
+    val w: u32 = find(?sp, -2, 0);
+    if (w == NONE || sp.table[w::usize * ENTRY + 3] != find(?sp, 1, 0)) { ret 4; }
+    # an empty census frees nothing, and a clear holds every chunk again
+    val serial: u32 = sp.serial;
+    if (!settle(?sp, sp.census, sp.hi, true) || sp.live != 8 || sp.serial != serial) { ret 5; }
+    reset(?sp);
+    if (!sp.whole || sp.live != 8) { ret 6; }
+    # a ceiling lowered below the grid lets go of every chunk but the live one
+    # and its halo, and shrinks the pool to it
+    sp.sense.live_mask                            = 1;
+    sp.sense.live_lo                              = 1;
+    sp.sense.live_hi                              = 1;
+    sp.sense.warm_mask                            = 1;
+    sp.cells[find(?sp, 0, 0)::usize * CELLS + 65] = 1;
+    limit(?sp, 7);
+    val o: u32 = find(?sp, 0, 0);
+    if (sp.whole || sp.live >= 8 || sp.cap != 7 || o == NONE || sp.cells[o::usize * CELLS + 65] != 1) { ret 7; }
+    # a grid past the ceiling, or with an unbounded axis, is not held whole
+    set_grid(?sp, t.ok);
+    if (sp.whole) { ret 10; }
+    sp.max_slots = HOST_SLOTS;
+    val p: res[topology.Grid, str] = topology.parse("P200,0");
+    if (sel p.err) { ret 8; }
+    set_grid(?sp, p.ok);
+    if (sp.whole || grid_chunks(?sp.grid) != 0) { ret 9; }
     dnit(?sp);
     ret 0;
 }

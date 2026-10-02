@@ -1,0 +1,733 @@
+# the lenia family: Bert Chan's continuous automata, whose cells hold a value
+# in [0, 1] and move a step in time each generation by the growth of a smooth
+# kernel's weighted sum around them
+#
+# a rule is Chakazul's parameters. the kernel is a disc of radius R cells cut
+# into as many rings as b has peaks, ring i weighted by its peak b[i] and
+# shaped by the kernel core kn (a quartic bump, an exponential bump, a step or
+# a staircase), then divided by its total. the potential u of a cell is that
+# kernel's sum over the values around it, and the cell's value moves by
+# dt = 1/T times the growth gn(u) (a quartic bump, a gaussian or a step of
+# centre m and width s, each running from -1 to 1), clipped to [0, 1]. the
+# kernel and growth functions are those of Chakazul's Lenia, numbered as his
+# kn and gn are.
+#
+# its rule string is the parameters as Chakazul writes them,
+# "R=13,T=10,b=[1],m=0.15,s=0.015,kn=1,gn=1" for Orbium's, keys in any order,
+# kn and gn 1 when left out, and b a single peak bare or a bracketed list of
+# fractions. m and s are kept as decimals to the ninth place, so a rule string
+# round-trips exactly. its cell word is cellar.rules.lenia.word's, and its step
+# stage is lenia_comp.
+#
+# the value is continuous, but a cell still has states, for everything in
+# cellar that trades in them: state n is the value n/255, the levels
+# Chakazul's own pattern format records a cell in, which is Golly's
+# multi-state RLE. so a Lenia pattern round-trips through RLE at the precision
+# Lenia's own files keep, and a format that holds fewer states refuses the
+# rule (format.Error.levels). a world file keeps the words themselves (caps
+# continuous).
+#
+# a kernel reaches R cells, and R runs to MAX_RADIUS, the farthest a step
+# reads (cellar.layout.REACH_MAX), so Chakazul's patterns run at the R he
+# gives them. the quadtree engine cannot run a
+# continuous rule, and an empty world must stay empty, so a rule whose growth
+# at zero potential is not negative is refused.
+
+use cellar.layout;
+use cellar.rules.lenia.word;
+use cellar.space;
+use cellar.text;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+#[embed("{artifact.stage-lenia_comp.out}")]
+val STAGE: [_]u8;
+
+# the largest kernel radius
+pub val MAX_RADIUS: u32 = layout.REACH_MAX;
+# the most peaks b may have
+pub val PEAKS_MAX: usize = 8;
+# the largest numerator or denominator of a peak
+val PEAK_MAX: u32 = 99;
+# the largest T
+val T_MAX: u32 = 100000;
+# a row of the kernel's quarter, |dx| from 0 to MAX_RADIUS
+val QUARTER: usize = MAX_RADIUS::usize + 1;
+
+# what the family's capabilities come to for one rule
+# ---
+# b0:         a dead cell with no live neighbour is born, which no rule does
+# isotropic:  the kernel is a disc, so every rotation and reflection steps alike
+# no_tree:    why a quadtree engine cannot run it: no rule, a cell's value
+#             being continuous
+# bounded:    it can run on a bounded grid
+# life_like:  no rule is Life-like
+# continuous: a cell's value is continuous, which its state only approximates
+pub rec Caps {
+    b0:         bool;
+    isotropic:  bool;
+    no_tree:    str;
+    bounded:    bool;
+    life_like:  bool;
+    continuous: bool;
+}
+
+# a lenia rule, and its kernel worked out from it
+# ---
+# radius:  R, the kernel's radius in cells, 1 to MAX_RADIUS
+# t:       T, generations to a unit of time, so dt = 1/T
+# peaks:   how many peaks b has, 1 to PEAKS_MAX
+# num:     each peak's numerator
+# den:     each peak's denominator, at least the numerator
+# m:       the growth's centre, in units of 10^-9
+# s:       the growth's width, in units of 10^-9, above zero
+# core:    kn, the kernel core, 1 to 4
+# gn:      the growth function, word.POLYNOMIAL to word.STEP
+# weights: the kernel's weight at (dx, dy) at [|dy| * QUARTER + |dx|], already
+#          divided by the kernel's total, zero off the disc
+# widths:  the half-width of the disc in row |dy|, -1 where it misses
+pub rec Rule {
+    radius:  u32;
+    t:       u32;
+    peaks:   usize;
+    num:     [PEAKS_MAX]u32;
+    den:     [PEAKS_MAX]u32;
+    m:       u64;
+    s:       u64;
+    core:    u32;
+    gn:      u32;
+    weights: [QUARTER * QUARTER]f32;
+    widths:  [QUARTER]i32;
+}
+
+# the square root of x at least 0, by Newton's method
+fun sqrt64(x: f64) f64 {
+    if (x <= 0.0) { ret 0.0; }
+    var g: f64 = x;
+    if (g < 1.0) { g = 1.0; }
+    var i: usize = 0;
+    for (i < 64) {
+        val n: f64 = (g + x / g) * 0.5;
+        if (n >= g) { brk; }
+        g = n;
+        i = i + 1;
+    }
+    ret g;
+}
+
+# e^x for x at most 0, by halving into the series' range and squaring back
+fun exp64(x: f64) f64 {
+    if (x < -700.0) { ret 0.0; }
+    var y: f64   = x;
+    var k: usize = 0;
+    for (y < -0.5) {
+        y = y * 0.5;
+        k = k + 1;
+    }
+    var p:    f64   = 1.0;
+    var term: f64   = 1.0;
+    var n:    usize = 1;
+    for (n < 30) {
+        term = term * y / n::f64;
+        p    = p + term;
+        n    = n + 1;
+    }
+    for (k > 0) {
+        p = p * p;
+        k = k - 1;
+    }
+    ret p;
+}
+
+# the kernel core kn at r in [0, 1], as Chakazul's kernel_core
+fun core_at(kn: u32, r: f64) f64 {
+    if (kn == 2) {
+        if (r <= 0.0 || r >= 1.0) { ret 0.0; }
+        ret exp64(4.0 - 1.0 / (r * (1.0 - r)));
+    }
+    if (kn == 3) {
+        if (r >= 0.25 && r <= 0.75) { ret 1.0; }
+        ret 0.0;
+    }
+    if (kn == 4) {
+        if (r >= 0.25 && r <= 0.75) { ret 1.0; }
+        if (r < 0.25)               { ret 0.5; }
+        ret 0.0;
+    }
+    val q:  f64 = 4.0 * r * (1.0 - r);
+    val q2: f64 = q * q;
+    ret q2 * q2;
+}
+
+# the kernel's raw weight at distance d, in radii, below 1: the core of the
+# ring d falls in, times its peak, as Chakazul's kernel_shell
+fun shell(r: *Rule, d: f64) f64 {
+    val br: f64   = r.peaks::f64 * d;
+    var i:  usize = br::usize;
+    var f:  f64   = br - i::f64;
+    if (i >= r.peaks) {
+        i = r.peaks - 1;
+        f = 1.0;
+    }
+    ret core_at(r.core, f) * r.num[i]::f64 / r.den[i]::f64;
+}
+
+# work out a rule's kernel from its parameters
+# ---
+# ret: false when the kernel has no weight
+fun build(r: *Rule) bool {
+    val rad: i64 = r.radius::i64;
+    var raw: [QUARTER * QUARTER]f64;
+    var sum: f64 = 0.0;
+    var y:   i64 = 0;
+    for (y < QUARTER::i64) {
+        r.widths[y::usize] = -1;
+        var x: i64 = 0;
+        for (x < QUARTER::i64) {
+            var w: f64 = 0.0;
+            if (y <= rad && x <= rad && x * x + y * y < rad * rad) {
+                w                  = shell(r, sqrt64((x * x + y * y)::f64) / rad::f64);
+                r.widths[y::usize] = x::i32;
+            }
+            raw[(y * QUARTER::i64 + x)::usize] = w;
+            # a weight off the axes stands for two cells, or four
+            var times: f64 = 4.0;
+            if (x == 0 && y == 0) { times = 1.0; }
+            or (x == 0 || y == 0) { times = 2.0; }
+            sum = sum + w * times;
+            x   = x + 1;
+        }
+        y = y + 1;
+    }
+    if (sum <= 0.0) { ret false; }
+    var i: usize = 0;
+    for (i < QUARTER * QUARTER) {
+        r.weights[i] = (raw[i] / sum)::f32;
+        i            = i + 1;
+    }
+    ret true;
+}
+
+# the growth's centre as an f32
+fun m_of(r: *Rule) f32 {
+    ret (r.m::f64 / text.DECIMAL::f64)::f32;
+}
+
+# the growth's scale as the window keeps it (cellar.rules.lenia.word)
+fun k_of(r: *Rule) f32 {
+    val s: f64 = r.s::f64 / text.DECIMAL::f64;
+    if (r.gn == word.STEP)     { ret s::f32; }
+    if (r.gn == word.GAUSSIAN) { ret (1.4426950408889634 / (2.0 * s * s))::f32; }
+    ret (1.0 / (9.0 * s * s))::f32;
+}
+
+# dt, the step in time, as an f32
+fun dt_of(r: *Rule) f32 {
+    ret (1.0 / r.t::f64)::f32;
+}
+
+# skip blanks
+fun blanks(s: str, i: *usize) {
+    for (s[@i] == ' ' || s[@i] == '\t') { @i = @i + 1; }
+}
+
+# read a peak, a fraction num[/den] in [0, 1]
+fun peak(s: str, i: *usize, num: *u32, den: *u32) bool {
+    var n: u64 = 0;
+    var d: u64 = 1;
+    if (!text.read_u64(s, i, PEAK_MAX::u64, ?n)) { ret false; }
+    if (s[@i] == '/') {
+        @i = @i + 1;
+        if (!text.read_u64(s, i, PEAK_MAX::u64, ?d)) { ret false; }
+    }
+    if (d == 0 || n > d) { ret false; }
+    @num = n::u32;
+    @den = d::u32;
+    ret true;
+}
+
+# the parameter a key at s[@i] names, its index in KEYS, past its '='
+fun key(s: str, i: *usize) opt[usize] {
+    var k: usize = 0;
+    for (k < KEY_COUNT) {
+        val name: str   = KEYS[k];
+        var n:    usize = 0;
+        for (name[n] != 0 && s[@i + n] == name[n]) { n = n + 1; }
+        if (name[n] == 0 && s[@i + n] == '=') {
+            @i = @i + n + 1;
+            ret opt[usize].some{k};
+        }
+        k = k + 1;
+    }
+    ret opt[usize].none{};
+}
+
+val KEY_COUNT: usize = 7;
+# Chakazul's parameters, in the order format writes them
+val KEYS: [7]str = [7]str{"R", "T", "b", "m", "s", "kn", "gn"};
+
+# whether a rule string is plausibly this family's: one that starts with one
+# of its keys and an '='
+# ---
+# s: NUL-terminated rule text
+pub fun claims(s: str) bool {
+    var i: usize = 0;
+    blanks(s, ?i);
+    val k: opt[usize] = key(s, ?i);
+    ret sel k.some;
+}
+
+# read the family's rule string, Chakazul's "R=13,T=10,b=[1],m=0.15,s=0.015,kn=1,gn=1"
+# ---
+# s:   NUL-terminated rule text
+# ret: the rule, or what is wrong with s
+pub fun parse(s: str) res[Rule, str] {
+    var r:    Rule;
+    var seen: [7]bool;
+    r.core = 1;
+    r.gn   = word.POLYNOMIAL;
+    var i: usize = 0;
+    blanks(s, ?i);
+    for {
+        val k: opt[usize] = key(s, ?i);
+        if (sel k.none)   { ret res[Rule, str].err{"not a Lenia rule: a parameter is not R, T, b, m, s, kn or gn followed by ="}; }
+        if (seen[k.some]) { ret res[Rule, str].err{"a parameter is given twice"}; }
+        seen[k.some] = true;
+        var v: u64 = 0;
+        if (k.some == 0) {
+            if (!text.read_u64(s, ?i, MAX_RADIUS::u64, ?v) || v == 0) { ret res[Rule, str].err{"R is not a radius of 1 to 64 cells"}; }
+            r.radius = v::u32;
+        }
+        or (k.some == 1) {
+            if (!text.read_u64(s, ?i, T_MAX::u64, ?v) || v == 0) { ret res[Rule, str].err{"T is not a whole number of 1 to 100000"}; }
+            r.t = v::u32;
+        }
+        or (k.some == 2) {
+            r.peaks = 0;
+            val list: bool = s[i] == '[';
+            if (list) { i = i + 1; }
+            for {
+                if (r.peaks == PEAKS_MAX)                           { ret res[Rule, str].err{"b has more than 8 peaks"}; }
+                if (!peak(s, ?i, ?r.num[r.peaks], ?r.den[r.peaks])) { ret res[Rule, str].err{"a peak of b is not a fraction of 0 to 1 with terms up to 99"}; }
+                r.peaks = r.peaks + 1;
+                if (!list || s[i] != ',') { brk; }
+                i = i + 1;
+            }
+            if (list) {
+                if (s[i] != ']') { ret res[Rule, str].err{"b's list of peaks is not closed by ]"}; }
+                i = i + 1;
+            }
+        }
+        or (k.some == 3) {
+            if (!text.read_decimal(s, ?i, text.DECIMAL, ?r.m)) { ret res[Rule, str].err{"m is not a decimal of 0 to 1, to at most nine places"}; }
+        }
+        or (k.some == 4) {
+            if (!text.read_decimal(s, ?i, text.DECIMAL, ?r.s) || r.s == 0) { ret res[Rule, str].err{"s is not a decimal above 0 and up to 1, to at most nine places"}; }
+        }
+        or (k.some == 5) {
+            if (!text.read_u64(s, ?i, 4, ?v) || v == 0) { ret res[Rule, str].err{"kn is not a kernel core of 1 to 4"}; }
+            r.core = v::u32;
+        }
+        or {
+            if (!text.read_u64(s, ?i, 3, ?v) || v == 0) { ret res[Rule, str].err{"gn is not a growth function of 1 to 3"}; }
+            r.gn = v::u32;
+        }
+        blanks(s, ?i);
+        if (s[i] == 0)   { brk; }
+        if (s[i] != ',') { ret res[Rule, str].err{"parameters are not separated by commas"}; }
+        i = i + 1;
+        blanks(s, ?i);
+    }
+    var need: usize = 0;
+    for (need < 5) {
+        if (!seen[need]) { ret res[Rule, str].err{"a Lenia rule needs R, T, b, m and s"}; }
+        need = need + 1;
+    }
+    if (!build(?r)) { ret res[Rule, str].err{"the kernel has no weight"}; }
+    # an empty world steps to itself only when nothing grows from nothing
+    if (word.growth(0.0, r.gn, m_of(?r), k_of(?r)) >= 0.0) { ret res[Rule, str].err{"the growth at zero potential is not negative, so empty space would grow"}; }
+    ret res[Rule, str].ok{r};
+}
+
+# the longest rule string format writes, less its NUL: R and T, eight peaks of
+# two-digit terms, m and s to nine places and the two functions
+pub val FORMAT_MAX: usize = 120;
+
+# write the family's rule string as Chakazul writes the parameters
+# ---
+# r:   the rule
+# buf: at least FORMAT_MAX + 1 bytes
+# ret: buf, which parse reads back as r
+pub fun format(r: *Rule, buf: *u8) str {
+    var o: usize = text.buf_str(buf, 0, "R=");
+    o = text.buf_u64(buf, o, r.radius::u64);
+    o = text.buf_str(buf, o, ",T=");
+    o = text.buf_u64(buf, o, r.t::u64);
+    o = text.buf_str(buf, o, ",b=[");
+    var p: usize = 0;
+    for (p < r.peaks) {
+        if (p != 0) { o = text.buf_str(buf, o, ","); }
+        o = text.buf_u64(buf, o, r.num[p]::u64);
+        if (r.den[p] != 1) {
+            o = text.buf_str(buf, o, "/");
+            o = text.buf_u64(buf, o, r.den[p]::u64);
+        }
+        p = p + 1;
+    }
+    o      = text.buf_str(buf, o, "],m=");
+    o      = text.buf_decimal(buf, o, r.m);
+    o      = text.buf_str(buf, o, ",s=");
+    o      = text.buf_decimal(buf, o, r.s);
+    o      = text.buf_str(buf, o, ",kn=");
+    o      = text.buf_u64(buf, o, r.core::u64);
+    o      = text.buf_str(buf, o, ",gn=");
+    o      = text.buf_u64(buf, o, r.gn::u64);
+    buf[o] = 0;
+    ret buf;
+}
+
+# write a rule's short form for the readout, its whole rule string
+pub fun display(r: *Rule, buf: *u8) str {
+    ret format(r, buf);
+}
+
+# whether two rules step alike: the same parameters, from which the kernel follows
+pub fun same_rule(a: *Rule, b: *Rule) bool {
+    if (a.radius != b.radius || a.t != b.t || a.peaks != b.peaks || a.m != b.m || a.s != b.s) { ret false; }
+    if (a.core != b.core || a.gn != b.gn)                                                     { ret false; }
+    var p: usize = 0;
+    for (p < a.peaks) {
+        # a peak is compared as the fraction it is, so 2/4 is 1/2
+        if (a.num[p] * b.den[p] != b.num[p] * a.den[p]) { ret false; }
+        p = p + 1;
+    }
+    ret true;
+}
+
+# the levels a cell's value is traded in, Chakazul's 0 to 255
+pub val STATES: u32 = 256;
+
+# how many states a cell of the rule can be in: the value's levels
+pub fun states(r: *Rule) u32 {
+    ret STATES;
+}
+
+# the word of a cell of a state, the value state/255
+pub fun word_of(r: *Rule, state: u32) u32 {
+    ret (state * word.ONE + 127) / 255;
+}
+
+# the state a word holds, its value to the nearest 255th
+pub fun state_of(c: u32) u32 {
+    ret (c * 255 + word.ONE / 2) >> 24;
+}
+
+# the state painted or seeded when none is chosen: the value 1
+pub fun ink(r: *Rule) u32 {
+    ret STATES - 1;
+}
+
+# how far the engines' words for a cell may lie apart a generation on from
+# the same cells: a device may fuse a multiply and an add that the host rounds
+# twice (cellar.rules.lenia.word), a few of the word's 2^-24ths, held to 64
+pub fun slack(r: *Rule) u32 {
+    ret 64;
+}
+
+# how shared code reads the family's cell word
+pub fun sense() layout.Sense {
+    ret word.sense();
+}
+
+# how far one generation reaches: the kernel's radius
+pub fun radius(r: *Rule) usize {
+    ret r.radius::usize;
+}
+
+# the capabilities the family has for a rule
+pub fun caps(r: *Rule) Caps {
+    ret Caps{b0: false, isotropic: true, no_tree: "a continuous rule", bounded: true, life_like: false, continuous: true};
+}
+
+# the state a cell becomes from its 3 by 3 block, which no rule's quadtree
+# asks for (caps no_tree): the kernel reaches past the block, so the cell is
+# left as it is
+pub fun next_of(r: *Rule, nb: *u32) u32 {
+    ret nb[4];
+}
+
+# the kernel's weight at (dx, dy), each at most the radius
+#[inline]
+fun weight(r: *Rule, dx: i64, dy: i64) f32 {
+    var x: i64 = dx;
+    var y: i64 = dy;
+    if (x < 0) { x = 0 - x; }
+    if (y < 0) { y = 0 - y; }
+    ret r.weights[(y * QUARTER::i64 + x)::usize];
+}
+
+# step one chunk on the CPU, the function the family's stage applies
+#
+# the potential is gathered by scattering each nonzero cell of the block over
+# the cells of the chunk it reaches, which skips the empty space a gather would
+# read. a cell's terms are added in the order the stage adds them, the block's
+# cells row by row, so the sums are the stage's own.
+# ---
+# r: the rule
+# b: the chunk's block and back cells
+# t: the tally of the cells written
+pub fun step_chunk(r: *Rule, b: *space.Block, t: *space.Tally) {
+    val own: *u32 = b.nb[4];
+    val out: *u32 = b.out;
+    var acc: [4096]f32;
+    if (b.busy) {
+        val rad: i64 = r.radius::i64;
+        var sy:  i64 = 0 - rad;
+        for (sy < 64 + rad) {
+            var sx: i64 = 0 - rad;
+            for (sx < 64 + rad) {
+                var c: u32 = 0;
+                if (sx >= 0 && sx < 64 && sy >= 0 && sy < 64) { c = own[(sy * 64 + sx)::usize]; }
+                or                                            { c = space.block_cell(b, sx, sy); }
+                if (c != 0) {
+                    val a:  f32 = word.level(c);
+                    var ty: i64 = sy - rad;
+                    if (ty < 0) { ty = 0; }
+                    for (ty < 64 && ty <= sy + rad) {
+                        var dy: i64 = sy - ty;
+                        if (dy < 0) { dy = 0 - dy; }
+                        val h: i64 = r.widths[dy::usize]::i64;
+                        if (h >= 0) {
+                            var tx: i64 = sx - h;
+                            if (tx < 0) { tx = 0; }
+                            for (tx < 64 && tx <= sx + h) {
+                                val at: usize = (ty * 64 + tx)::usize;
+                                acc[at] = acc[at] + weight(r, sx - tx, dy) * a;
+                                tx      = tx + 1;
+                            }
+                        }
+                        ty = ty + 1;
+                    }
+                }
+                sx = sx + 1;
+            }
+            sy = sy + 1;
+        }
+    }
+    val m:  f32   = m_of(r);
+    val k:  f32   = k_of(r);
+    val dt: f32   = dt_of(r);
+    var i:  usize = 0;
+    for (i < 4096) {
+        val v: u32 = word.next(own[i], acc[i], r.gn, m, k, dt);
+        out[i] = v;
+        space.note(t, v, (i % 64)::u32, (i / 64)::u32);
+        i = i + 1;
+    }
+}
+
+# pack a rule into the family's window of the meta head, as its stage reads it
+# ---
+# r: the rule
+# w: layout.RULE words
+pub fun pack(r: *Rule, w: *u32) {
+    var i: usize = 0;
+    for (i < layout.RULE::usize) {
+        w[i] = 0;
+        i    = i + 1;
+    }
+    w[word.RADIUS_AT] = r.radius;
+    w[word.GROWTH_AT] = r.gn;
+    w[word.M_AT]      = m_of(r):~u32;
+    w[word.K_AT]      = k_of(r):~u32;
+    w[word.DT_AT]     = dt_of(r):~u32;
+}
+
+# the family's stage binds a rule buffer, for the kernel
+pub val TABLE: bool = true;
+
+# the words of the rule buffer a rule needs: the kernel's weights and its rows' half-widths
+pub fun table_words(r: *Rule) usize {
+    val side: usize = 2 * r.radius::usize + 1;
+    ret side * side + side;
+}
+
+# pack a rule's kernel into its rule buffer, the whole disc's square of
+# weights and then each row's half-width (cellar.rules.lenia.word)
+# ---
+# r: the rule
+# w: table_words(r) words
+pub fun pack_table(r: *Rule, w: *u32) {
+    val rad:  i64   = r.radius::i64;
+    val side: usize = 2 * r.radius::usize + 1;
+    var dy:   i64   = 0 - rad;
+    for (dy <= rad) {
+        var dx: i64 = 0 - rad;
+        for (dx <= rad) {
+            w[((dy + rad) * side::i64 + dx + rad)::usize] = weight(r, dx, dy):~u32;
+            dx                                            = dx + 1;
+        }
+        var ay: i64 = dy;
+        if (ay < 0) { ay = 0 - ay; }
+        w[side * side + (dy + rad)::usize] = r.widths[ay::usize]:~u32;
+        dy                                 = dy + 1;
+    }
+}
+
+# Chakazul's colour map, from deep blue through cyan, green and yellow to red
+val RAMP_COUNT: u32    = 9;
+val RAMP:       [9]u32 = [9]u32{0x000080, 0x0000ff, 0x0080ff, 0x00ffff, 0x80ff80, 0xffff00, 0xff8000, 0xff0000, 0x800000};
+
+# the colour a cell of a state is drawn in: its value along the colour map
+pub fun colour(r: *Rule, state: u32) opt[u32] {
+    if (state == 0) { ret opt[u32].none{}; }
+    # the map's stops lie evenly across the states 1 to 255
+    val pos: u32 = (state - 1) * (RAMP_COUNT - 1) * 256 / (STATES - 2);
+    var i:   u32 = pos / 256;
+    var f:   u32 = pos % 256;
+    if (i >= RAMP_COUNT - 1) {
+        i = RAMP_COUNT - 2;
+        f = 256;
+    }
+    val a:  u32 = RAMP[i];
+    val b:  u32 = RAMP[i + 1];
+    var c:  u32 = 0;
+    var sh: u32 = 0;
+    for (sh < 24) {
+        val x: u32 = (a >> sh) & 0xff;
+        val y: u32 = (b >> sh) & 0xff;
+        c  = c | (((x * (256 - f) + y * f) / 256) << sh);
+        sh = sh + 8;
+    }
+    ret opt[u32].some{c};
+}
+
+# the family's step stage, as SPIR-V
+# ---
+# len: receives its length in bytes
+# ret: its first byte
+pub fun stage(len: *usize) *u8 {
+    @len = $length_of(STAGE);
+    ret ?STAGE[0];
+}
+
+# rule strings that exercise the family, for the tests that run every family:
+# Orbium's, then Triparorbium's, whose kernel's core is the exponential bump
+# and whose growth is the gaussian
+pub val SAMPLE_COUNT: usize = 2;
+
+# the sample rule string i
+pub fun sample(i: usize) str {
+    if (i == 1) { ret "R=16,T=10,b=[1],m=0.114,s=0.0112,kn=2,gn=2"; }
+    ret "R=13,T=10,b=[1],m=0.15,s=0.015,kn=1,gn=1";
+}
+
+test parse__reads_chakazuls_parameters_and_refuses_the_rest {
+    val o: res[Rule, str] = parse("R=13,T=10,b=1,m=0.15,s=0.015,kn=1,gn=1");
+    if (!sel o.ok)                                                                                         { ret 1; }
+    if (o.ok.radius != 13 || o.ok.t != 10 || o.ok.peaks != 1 || o.ok.m != 150000000 || o.ok.s != 15000000) { ret 2; }
+    # keys in any order, kn and gn left out
+    val any: res[Rule, str] = parse(" m=0.15, s=0.015 ,b=[1],T=10,R=13");
+    if (!sel any.ok)                { ret 3; }
+    if (!same_rule(?any.ok, ?o.ok)) { ret 3; }
+    val bad: [10]str = [10]str{
+        "R=13,T=10,b=1,m=0.15",
+        "R=65,T=10,b=1,m=0.15,s=0.015",
+        "R=13,T=0,b=1,m=0.15,s=0.015",
+        "R=13,T=10,b=[1,2],m=0.15,s=0.015",
+        "R=13,T=10,b=1,m=0.15,s=0.0000000001",
+        "R=13,T=10,b=1,m=0.15,s=0.015,kn=5",
+        "R=13,T=10,b=1,m=0.15,s=0.015,R=12",
+        "R=13,T=10,b=0,m=0.15,s=0.015",
+        "R=13,T=10,b=1,m=0.01,s=0.015",
+        "R=13;T=10,b=1,m=0.15,s=0.015",
+    };
+    var i: usize = 0;
+    for (i < 10) {
+        val r: res[Rule, str] = parse(bad[i]);
+        if (sel r.ok) { ret 10 + i::i32; }
+        i = i + 1;
+    }
+    if (!claims("R=13") || claims("R13,C0") || claims("B3/S23")) { ret 4; }
+    ret 0;
+}
+
+test format__round_trips_through_parse {
+    var buf:  [FORMAT_MAX + 1]u8;
+    val wide: res[Rule, str] = parse("R=64,T=100000,b=[99/99,98/99,97/99,96/99,95/99,94/99,93/99,92/99],m=0.987654321,s=0.123456789,kn=4,gn=3");
+    if (!sel wide.ok) { ret 1; }
+    val n: usize = text.buf_str(?buf[0], 0, format(?wide.ok, ?buf[0]));
+    if (n > FORMAT_MAX) { ret 2; }
+    var i: usize = 0;
+    for (i < SAMPLE_COUNT) {
+        val r: res[Rule, str] = parse(sample(i));
+        if (!sel r.ok) { ret 3; }
+        val again: res[Rule, str] = parse(format(?r.ok, ?buf[0]));
+        if (!sel again.ok)                { ret 4; }
+        if (!same_rule(?again.ok, ?r.ok)) { ret 5; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test word__every_state_round_trips_and_shades_by_its_value {
+    var r:  Rule;
+    var st: u32 = 0;
+    for (st < STATES) {
+        val c: u32 = word_of(?r, st);
+        if (state_of(c) != st)                                           { ret 1; }
+        if (layout.texel_heat(c, word.HEAT_SHIFT, word.HEAT_MASK) != st) { ret 2; }
+        if (layout.live(c, 0xffffffff, 1, word.ONE) != (st != 0)::u32)   { ret 3; }
+        st = st + 1;
+    }
+    if (word_of(?r, 255) != word.ONE) { ret 4; }
+    ret 0;
+}
+
+test kernel__is_a_disc_whose_weights_sum_to_one {
+    var i: usize = 0;
+    for (i < SAMPLE_COUNT) {
+        val p: res[Rule, str] = parse(sample(i));
+        if (!sel p.ok) { ret 1; }
+        var r:   Rule = p.ok;
+        val rad: i64  = r.radius::i64;
+        var sum: f64  = 0.0;
+        var dy:  i64  = 0 - rad;
+        for (dy <= rad) {
+            var dx: i64 = 0 - rad;
+            for (dx <= rad) {
+                val w: f32 = weight(?r, dx, dy);
+                if (w < 0.0)                                    { ret 2; }
+                if (w != 0.0 && dx * dx + dy * dy >= rad * rad) { ret 3; }
+                sum = sum + w::f64;
+                dx  = dx + 1;
+            }
+            dy = dy + 1;
+        }
+        if (sum < 0.9999 || sum > 1.0001) { ret 4; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test growth__matches_chakazuls_functions {
+    # the quartic bump, the gaussian and the step at their centre and far off it
+    if (word.growth(0.15, word.POLYNOMIAL, 0.15, 1.0 / (9.0 * 0.015 * 0.015)) != 1.0) { ret 1; }
+    if (word.growth(0.5, word.POLYNOMIAL, 0.15, 1.0 / (9.0 * 0.015 * 0.015)) != -1.0) { ret 2; }
+    val g: f32 = word.growth(0.17, word.GAUSSIAN, 0.15, 1.442695 / (2.0 * 0.015 * 0.015));
+    # 2 e^(-(0.02^2) / (2 * 0.015^2)) - 1
+    val want: f32 = -0.17778;
+    if (g - want > 0.0001 || want - g > 0.0001)           { ret 3; }
+    if (word.growth(0.16, word.STEP, 0.15, 0.015) != 1.0) { ret 4; }
+    if (word.growth(0.2, word.STEP, 0.15, 0.015) != -1.0) { ret 5; }
+    # e^-x by hand against its known values
+    val e: f32 = word.exp2_neg(10.5);
+    if (e < 0.000690533 || e > 0.000690534)                       { ret 6; }
+    if (word.exp2_neg(0.0) != 1.0 || word.exp2_neg(200.0) != 0.0) { ret 7; }
+    ret 0;
+}

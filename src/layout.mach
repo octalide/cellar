@@ -14,6 +14,9 @@
 pub val SIDE: u32 = 64;
 # cells in a chunk
 pub val CELLS: u32 = 4096;
+# the farthest any rule may reach in a generation: a step reads the 3 by 3
+# block of chunks around its own, so a cell reads no further than a chunk away
+pub val REACH_MAX: u32 = SIDE;
 # page-table words per slot (see Meta)
 pub val ENTRY: u32 = 22;
 # the entry's word of the slot's incarnation, zero while the slot is free
@@ -43,8 +46,9 @@ pub val GEN_AT: u32 = 11;
 # generation, so odd generations hold the world's complement and are drawn
 # inverted (rule.Caps.b0)
 pub val STROBE_AT: u32 = 12;
-# the word of the first slot a step's dispatch covers: workgroup y names the
-# slot that many past it, so a generation can be dispatched in ranges of slots
+# the word of the first entry of the active list a step's dispatch covers:
+# workgroup y names the entry that many past it, so a generation can be
+# dispatched in ranges of the list (Flags)
 pub val BASE_AT: u32 = 13;
 # a neighbour that does not exist
 pub val NONE: u32 = 0xffffffff;
@@ -103,6 +107,50 @@ pub val EXTENT_QUADS: u32 = 24;
 # the quadrant bit of the cell at (x, y) inside its chunk
 pub fun quadrant(x: u32, y: u32) u32 {
     ret 1 << ((y / (SIDE / 2)) * 2 + x / (SIDE / 2));
+}
+
+# a live chunk's halo, the chunks around it its live cells may spread into
+# before the pool is next settled, is a mask with a bit per chunk of the 5 by 5
+# block around it, row-major with the chunk itself at HALO_SELF
+pub val HALO_SIDE: u32 = 5;
+pub val HALO_SELF: u32 = 12;
+# the most cells of spread a halo holds, every chunk two away
+pub val SPREAD_MAX: u32 = 2 * SIDE;
+
+# the halo row or column bits, the chunk's own at bit 2, a live cell in the
+# low or the high half of its chunk along one axis needs to spread span cells
+# either way: the chunks from its half's first cell less span to its last cell
+# plus span, so a chunk left out is more than span cells away
+fun halo_axis(high: u32, span: u32) u32 {
+    var s: u32 = span;
+    if (s > SPREAD_MAX) { s = SPREAD_MAX; }
+    val first: u32 = high * (SIDE / 2) + SPREAD_MAX;
+    val lo:    u32 = (first - s) / SIDE;
+    var hi:    u32 = (first + SIDE / 2 - 1 + s) / SIDE;
+    if (hi >= HALO_SIDE) { hi = HALO_SIDE - 1; }
+    ret ((2 << hi) - 1) & ~((1 << lo) - 1);
+}
+
+# the halo mask for live cells in the quadrants of a chunk quads names
+# (quadrant), which holds span cells of spread, at most SPREAD_MAX. a span of
+# half a chunk asks only for the chunks the live cells lean toward, and one of
+# a chunk for every adjacent chunk
+pub fun halo(quads: u32, span: u32) u32 {
+    var m: u32 = 0;
+    var q: u32 = 0;
+    for (q < 4) {
+        if (((quads >> q) & 1) != 0) {
+            val xs: u32 = halo_axis(q & 1, span);
+            val ys: u32 = halo_axis(q >> 1, span);
+            var r:  u32 = 0;
+            for (r < HALO_SIDE) {
+                if (((ys >> r) & 1) != 0) { m = m | (xs << (r * HALO_SIDE)); }
+                r = r + 1;
+            }
+        }
+        q = q + 1;
+    }
+    ret m & ~(1 << HALO_SELF);
 }
 
 # the extent word for live cells spanning columns x0 to x1 and rows y0 to y1,
@@ -314,10 +362,30 @@ pub rec List {
 }
 
 # per slot two words, each the serial of the last step that left a live cell
-# and a warm one
+# and a warm one, then the active list: the slots the steps until the next
+# gather may change (gather_comp), ahead of them the indirect arguments the
+# steps over it are dispatched from, whose second is its length, and the
+# gather's header bits in the fourth. the buffer is FLAGS_WORDS long whatever
+# the pool's capacity, so the list lies where the record puts it
 pub rec Flags {
-    v: [MAX_SLOTS * 2]u32;
+    v:    [MAX_SLOTS * 2]u32;
+    args: [4]u32;
+    list: [MAX_SLOTS]u32;
 }
+
+# the word of the flags buffer where the list's arguments start, and the
+# buffer's words
+pub val FLAGS_ARGS:  u32 = MAX_SLOTS * 2;
+pub val FLAGS_WORDS: u32 = MAX_SLOTS * 3 + 4;
+# the gather's header bits: the GPU owns the pool, so a closed gate (Status)
+# leaves the list empty, and the rule reads a plane's dead edge live on some
+# generation, so every seamed chunk steps (cellar.rule.rimmed)
+pub val GATHER_GATED: u32 = 1;
+pub val GATHER_RIM:   u32 = 2;
+# cells of spread a list holds: every slot within this many cells of a live
+# one at the gather is on it, so the steps over it may spread this far before
+# the next gather
+pub val LIST_SPREAD: u32 = SIDE;
 
 # a rule family's rule buffer, laid out as the family packs it
 pub rec Table {
@@ -327,6 +395,84 @@ pub rec Table {
 # every slot's coverage pyramid
 pub rec Mip {
     v: [MAX_SLOTS * MIP]u32;
+}
+
+# the status buffer: what the GPU reports to the host, and the allocator it
+# keeps while it owns the pool (cellar.gpu)
+#
+# the head holds the control words, then the indirect arguments the pass
+# stages are dispatched from. the census rows follow,
+# so a readback of the head and the rows below a pool's capacity brings back
+# everything the host reads each frame. the rest is the allocator's alone: the
+# pass each slot was last asked for by, the slots claimed this pass, a bit per
+# free slot, and a hash from chunk coordinates to slots.
+#
+# while the GPU owns the pool it alone writes the page table, the allocator
+# words and the hash. the host writes only the words marked as its own, in
+# order with the GPU's work in the frame's command stream, and takes the pool
+# back only once the device is idle (see cellar.gpu take).
+
+# words of the status head, the control words and the indirect arguments
+pub val STATUS_HEAD: u32 = 24;
+# the census id the frame's census was recorded under
+pub val CTL_CENSUS: u32 = 0;
+# nonzero once a pass could not claim every chunk it needed: no pass claims
+# and no step runs after it until the host reopens it
+pub val CTL_GATE: u32 = 1;
+# the generations recorded before the pass that closed the gate, low bits
+pub val CTL_HALT: u32 = 2;
+# hash buckets a free left as tombstones
+pub val CTL_TOMBS: u32 = 3;
+# the last incarnation handed out
+pub val CTL_SERIAL: u32 = 4;
+# the host's: slots below which a pass claims, every slot the frame's stages cover
+pub val CTL_TOP: u32 = 5;
+# the host's: slots the pool's buffers hold
+pub val CTL_CAP: u32 = 6;
+# the active list's length as the census found it, which the host estimates
+# the next generations' work from
+pub val CTL_LISTED: u32 = 7;
+# the pass header, which the host resets before every pass: slots claimed so
+# far, the pass id (never 0), the serial of the step that left the front, the
+# generations recorded before the pass, and the cells of spread the halo it
+# leaves must hold (halo)
+pub val CTL_FRESH: u32 = 8;
+pub val CTL_PASS:  u32 = 9;
+pub val CTL_NOW:   u32 = 10;
+pub val CTL_GENS:  u32 = 11;
+pub val CTL_SPAN:  u32 = 13;
+# the indirect arguments of the settle stage, one workgroup per 64 slots
+# claimed, and of the clear stage, one per settled slot, three words each
+pub val ARGS_SETTLE: u32 = 16;
+pub val ARGS_CLEAR:  u32 = 19;
+# census words per slot: the packed count, the extent, and the coordinates
+pub val ROW: u32 = 4;
+# buckets of the GPU's hash: a power of two, four a slot
+pub val HASH: u32 = MAX_SLOTS * 4;
+# a hash bucket nothing ever held, which ends a probe
+pub val EMPTY: u32 = 0xffffffff;
+# a hash bucket whose slot was freed, which a probe passes and a claim reuses
+pub val TOMB: u32 = 0xfffffffe;
+
+pub rec Status {
+    head:   [STATUS_HEAD]u32;
+    rows:   [MAX_SLOTS * ROW]u32;
+    asked:  [MAX_SLOTS]u32;
+    fresh:  [MAX_SLOTS]u32;
+    bitmap: [MAX_SLOTS / 32]u32;
+    hash:   [HASH]u32;
+}
+
+# words of the status buffer
+pub val STATUS_WORDS: u32 = STATUS_HEAD + MAX_SLOTS * ROW + MAX_SLOTS * 2 + MAX_SLOTS / 32 + HASH;
+
+# the first bucket a chunk's biased coordinates probe from
+pub fun bucket(bx: u32, by: u32) u32 {
+    var h: u32 = (bx * 0x9e3779b1) ^ (by * 0x85ebca77);
+    h = h ^ (h >> 15);
+    h = h * 0x2c1b3c6d;
+    h = h ^ (h >> 12);
+    ret h & (HASH - 1);
 }
 
 test link__takes_a_position_through_every_transform_and_back {

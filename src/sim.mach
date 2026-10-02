@@ -95,6 +95,7 @@ use cellar.history;
 use cellar.layout;
 use cellar.render;
 use cellar.rule;
+use rd_word:   cellar.rules.reaction.word;
 use ruletable: cellar.rules.table;
 use cellar.rules.table.load;
 use cellar.rules.table.store;
@@ -307,6 +308,7 @@ pub fun init(s: *Sim, a: *allo.Allocator) err[allo.Error] {
     # an empty world has no cells to re-encode
     s.rule        = rule.preset_rule(0);
     s.space.sense = rule.sense(?s.rule);
+    s.space.reach = rule.radius(?s.rule);
     hashlife.set_rule(?s.tree, s.rule);
     s.rng        = rand.init();
     s.gpu        = nil;
@@ -407,7 +409,7 @@ pub fun set_rule(s: *Sim, r: rule.Rule) bool {
     val why: opt[str]  = rule.refusal(?new);
     if (sel why.some)            { ret false; }
     if (refusal(s, ?new) != nil) { ret false; }
-    val same:   bool = alike(?old, ?new);
+    val same:   bool = rule.alike(?old, ?new);
     val regrid: bool = !topology.same(?old.grid, ?new.grid);
     if (on_tree(s) && rule.caps(?new).no_tree != nil && !use_hashlife(s, false)) { ret false; }
     if (on_tree(s)) {
@@ -416,6 +418,7 @@ pub fun set_rule(s: *Sim, r: rule.Rule) bool {
         if (fewer && wanted(s, 0, 0, 0, 0, true)) { kept(s, 0, 0, 0, 0, true, true); }
         s.rule        = r;
         s.space.sense = rule.sense(?s.rule);
+        s.space.reach = rule.radius(?s.rule);
         hashlife.set_rule(?s.tree, r);
         touched(s);
         if (fewer && !hashlife.limit_states(?s.tree, rule.states(?new))) { overflow(s); }
@@ -429,6 +432,7 @@ pub fun set_rule(s: *Sim, r: rule.Rule) bool {
     }
     s.rule        = r;
     s.space.sense = rule.sense(?s.rule);
+    s.space.reach = rule.radius(?s.rule);
     s.space.rim   = rule.rimmed(?s.rule);
     if (rule.caps(?new).no_tree == nil) { hashlife.set_rule(?s.tree, r); }
     if (same && !regrid) {
@@ -475,18 +479,6 @@ pub fun refusal(s: *Sim, r: *rule.Rule) str {
     ret gpu.refusal(s.gpu, rule.family_of(r));
 }
 
-# whether two rules write every state as the same word, so cells of one read
-# alike under the other
-fun alike(a: *rule.Rule, b: *rule.Rule) bool {
-    if (rule.family_of(a) != rule.family_of(b) || rule.states(a) != rule.states(b)) { ret false; }
-    var st: u32 = 0;
-    for (st < rule.states(a)) {
-        if (rule.word(a, st) != rule.word(b, st)) { ret false; }
-        st = st + 1;
-    }
-    ret true;
-}
-
 # stop the team and release the pool and the tree
 pub fun dnit(s: *Sim) {
     team.stop(?s.team);
@@ -511,7 +503,7 @@ pub fun on_gpu(s: *Sim) bool {
 pub fun attach(s: *Sim, g: *gpu.Gpu) {
     if (!gpu.steps(g, rule.family_of(?s.rule))) { gpu.forgo_compute(g); }
     s.gpu = g;
-    space.set_mirror(?s.space, gpu.mirror(g), g.slots);
+    space.set_mirror(?s.space, gpu.mirror(g, ?s.space), g.slots);
     var t: usize = 0;
     for (t < s.space.hi) {
         s.space.dirty[t] = space.DIRTY_ENTRY | space.DIRTY_CELLS;
@@ -819,9 +811,11 @@ fun took(t0: opt[time.Instant]) opt[u64] {
 # a ceiling's measure of the world, raw: cells, chunks, bytes or nanoseconds
 fun measure(s: *Sim, k: usize, pop: u64, step_ns: u64) u64 {
     if (k == ceiling.POPULATION) { ret pop; }
-    # the pool only draws the tree, so its chunks are the pool's only off it
+    # the pool only draws the tree, so its chunks are the pool's only off it.
+    # a bounded grid held whole cannot grow past the chunks taken when it was
+    # set, which were the grid's bound, so it has no growth to stop
     if (k == ceiling.POOL) {
-        if (on_tree(s)) { ret 0; }
+        if (on_tree(s) || s.space.whole) { ret 0; }
         ret s.space.live::u64;
     }
     if (k == ceiling.MEMORY) { ret hashlife.memory(?s.tree)::u64; }
@@ -971,6 +965,7 @@ pub fun collect(s: *Sim) {
         ret;
     }
     val got: gpu.Landed = gpu.collect(s.gpu, ?s.space);
+    rewind(s);
     if (!got.fits)  { overflow(s); }
     if (!got.fresh) { ret; }
     # every census older than the last clear is refused, so it is never more
@@ -1186,13 +1181,33 @@ pub fun record(s: *Sim, uncapped: bool, look: *gpu.Look) err[gfx.Error] {
 # ret: ok, or why the read failed
 pub fun sync(s: *Sim) err[gfx.Error] {
     if (!on_gpu(s)) { ret err[gfx.Error].ok{}; }
+    own(s);
     ret gpu.pull(s.gpu, ?s.space);
+}
+
+# take the pool back from a GPU that owns it, before the host reads or changes
+# its page table, and take any generations a closed gate voided off the count
+# (gpu.take). call outside a frame, or in one before gpu frame has recorded
+# anything
+fun own(s: *Sim) {
+    if (!on_gpu(s)) { ret; }
+    gpu.take(s.gpu, ?s.space);
+    rewind(s);
+}
+
+# take the generations a closed gate voided off the count, and owe them again
+fun rewind(s: *Sim) {
+    val v: u64 = gpu.rewound(s.gpu);
+    if (v == 0) { ret; }
+    s.generation = s.generation - v;
+    s.pending    = s.pending + v::usize;
 }
 
 # empty the world and reset the generation counter
 # ---
 # s: simulation
 pub fun clear(s: *Sim) {
+    own(s);
     if (wanted(s, 0, 0, 0, 0, true)) {
         val synced: err[gfx.Error] = sync(s);
         kept(s, 0, 0, 0, 0, true, sel synced.ok);
@@ -1583,6 +1598,7 @@ fun in_area(s: *Sim, sl: usize) bool {
 # are brought level with the GPU's, and with mark they are noted as written whole
 fun stage(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64, pull: bool, mark: bool) bool {
     if (x1 <= x0 || y1 <= y0) { ret true; }
+    own(s);
     val sp: *space.Space = ?s.space;
     var sl: usize        = 0;
     for (sl < sp.hi) {
@@ -1700,6 +1716,45 @@ pub fun read_run(s: *Sim, x: i64, y: i64, n: usize, out: *u8) bool {
     ret true;
 }
 
+# the words of n cells of a row in the open read, from (x, y) rightward: a
+# continuous rule's exact values, which read_run's states only approximate
+# ---
+# s:   simulation
+# x:   first column
+# y:   row
+# n:   cells to read
+# out: receives n words of the rule running, 0 off the grid and where no chunk is
+# ret: false when any cell lies outside the area or the world is flipped,
+#      whose held words are its complement's (rule.Caps b0), leaving out untouched
+pub fun read_words(s: *Sim, x: i64, y: i64, n: usize, out: *u32) bool {
+    val r: *Read = ?s.read;
+    if (!r.open || y < r.y0 || y >= r.y1 || x < r.x0 || x + n::i64 > r.x1 || flipped(s)) { ret false; }
+    mem.zero[u32](out, n);
+    var at:  i64 = x;
+    var end: i64 = x + n::i64;
+    if (!topology.clip(?s.rule.grid, y, ?at, ?end)) { ret true; }
+    for (at < end) {
+        var stop: i64 = (space.chunk_of(at) + 1) * space.SIDE;
+        if (stop > end) { stop = end; }
+        val o: usize = (at - x)::usize;
+        val k: usize = (stop - at)::usize;
+        if (on_tree(s)) {
+            val p: *u8   = tree_chunk(s, at, y, false);
+            var i: usize = 0;
+            for (p != nil && i < k) {
+                out[o + i] = rule.word(?s.rule, p[space.local_of(y) * 64 + space.local_of(at) + i]::u32);
+                i          = i + 1;
+            }
+            at = stop;
+            cnt;
+        }
+        val sl: u32 = space.find(?s.space, space.chunk_of(at), space.chunk_of(y));
+        if (sl != space.NONE) { mem.copy[u32](?out[o], ?s.space.cells[sl::usize * space.CELLS + space.local_of(y) * 64 + space.local_of(at)], k); }
+        at = stop;
+    }
+    ret true;
+}
+
 # close the open read
 # ---
 # s:   simulation
@@ -1772,21 +1827,21 @@ pub fun edit_begin(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64) bool {
 }
 
 # write one cell of a small area, as a recorded write on the GPU
-fun put_sparse(s: *Sim, x: i64, y: i64, v: u8) bool {
+fun put_sparse(s: *Sim, x: i64, y: i64, c: u32) bool {
     val sp: *space.Space = ?s.space;
     if (!space.holds(sp, x, y)) { ret true; }
     val cx: i64 = space.chunk_of(x);
     val cy: i64 = space.chunk_of(y);
     var sl: u32 = space.find(sp, cx, cy);
     if (sl == space.NONE) {
-        if (v == 0) { ret true; }
+        if (c == 0) { ret true; }
         sl = space.alloc(sp, cx, cy);
         if (sl == space.NONE) { ret false; }
     }
     val slot: usize = sl::usize;
     val i:    usize = space.local_of(y) * 64 + space.local_of(x);
-    sp.cells[slot * space.CELLS + i] = cell_of(s, v);
-    if (v != 0) { space.surround(sp, slot); }
+    sp.cells[slot * space.CELLS + i] = c;
+    if (c != 0) { space.surround(sp, slot); }
     # the GPU's copy takes the cell alone while it steps, and the chunk whole
     # while it only draws
     if (on_gpu(s)) { gpu.note_write(s.gpu, sp, slot, i); }
@@ -1814,12 +1869,47 @@ pub fun edit_set(s: *Sim, x: i64, y: i64, v: u8) bool {
 # w:   state of the world, below the rule's states
 # ret: false when any cell lies outside the area or the pool or the tree was full
 pub fun edit_run(s: *Sim, x: i64, y: i64, n: usize, w: u8) bool {
+    if (!editing(s, x, y, n)) { ret false; }
+    val v: u8 = held(s, w);
+    ret put_run(s, x, y, n, cell_of(s, v), v);
+}
+
+# write n words to a row of the open edit, from (x, y) rightward, as they are
+# given: a continuous rule's exact values, which a state only approximates
+# ---
+# s:   simulation
+# x:   first column
+# y:   row
+# n:   cells to write
+# w:   n words of the rule running, 0 the quiescent background
+# ret: false when any cell lies outside the area, the world is flipped, whose
+#      held words are its complement's (rule.Caps b0), or the pool or the tree
+#      was full
+pub fun edit_words(s: *Sim, x: i64, y: i64, n: usize, w: *u32) bool {
+    if (!editing(s, x, y, n) || flipped(s)) { ret false; }
+    var ok: bool  = true;
+    var i:  usize = 0;
+    for (i < n) {
+        var k: usize = i + 1;
+        for (k < n && w[k] == w[i]) { k = k + 1; }
+        if (!put_run(s, x + i::i64, y, k - i, w[i], rule.state(?s.rule, w[i])::u8)) { ok = false; }
+        i = k;
+    }
+    ret ok;
+}
+
+# whether the open edit's area holds n cells of row y from column x
+fun editing(s: *Sim, x: i64, y: i64, n: usize) bool {
     val e: *Edit = ?s.edit;
-    val v: u8    = held(s, w);
-    if (!e.open || y < e.y0 || y >= e.y1 || x < e.x0 || x + n::i64 > e.x1) { ret false; }
-    var ok:  bool = true;
-    var at:  i64  = x;
-    val end: i64  = x + n::i64;
+    ret e.open && y >= e.y0 && y < e.y1 && x >= e.x0 && x + n::i64 <= e.x1;
+}
+
+# write word c, which holds state v, to n cells of a row inside the open edit
+fun put_run(s: *Sim, x: i64, y: i64, n: usize, c: u32, v: u8) bool {
+    val e:   *Edit = ?s.edit;
+    var ok:  bool  = true;
+    var at:  i64   = x;
+    val end: i64   = x + n::i64;
     for (at < end) {
         var stop: i64 = (space.chunk_of(at) + 1) * space.SIDE;
         if (stop > end) { stop = end; }
@@ -1833,10 +1923,10 @@ pub fun edit_run(s: *Sim, x: i64, y: i64, n: usize, w: u8) bool {
             or (v != 0) { ok = false; }
         }
         or (e.sparse) {
-            var c: i64 = at;
-            for (c < stop) {
-                if (!put_sparse(s, c, y, v)) { ok = false; }
-                c = c + 1;
+            var cx: i64 = at;
+            for (cx < stop) {
+                if (!put_sparse(s, cx, y, c)) { ok = false; }
+                cx = cx + 1;
             }
         }
         or {
@@ -1845,13 +1935,13 @@ pub fun edit_run(s: *Sim, x: i64, y: i64, n: usize, w: u8) bool {
             var b: i64 = stop;
             if (space.clip(?s.space, y, ?a, ?b)) {
                 var sl: u32 = space.find(?s.space, space.chunk_of(a), space.chunk_of(y));
-                if (sl == space.NONE && v != 0) { sl = space.alloc(?s.space, space.chunk_of(a), space.chunk_of(y)); }
+                if (sl == space.NONE && c != 0) { sl = space.alloc(?s.space, space.chunk_of(a), space.chunk_of(y)); }
                 if (sl != space.NONE) {
                     val i: usize = sl::usize * space.CELLS + space.local_of(y) * 64 + space.local_of(a);
-                    mem.fill[u32](?s.space.cells[i], cell_of(s, v), (b - a)::usize);
+                    mem.fill[u32](?s.space.cells[i], c, (b - a)::usize);
                     space.touch(?s.space, sl::usize);
                 }
-                or (v != 0) { ok = false; }
+                or (c != 0) { ok = false; }
             }
         }
         at = stop;
@@ -2092,19 +2182,19 @@ rec ChunkAt {
 
 # the chunks an edit would add to the pool, measured before it is written
 #
-# a live cell's chunk and its halo, the eight neighbours or while the halo is
-# wide every chunk two away, all exist once an edit ends, so those of them the
+# a live cell's chunk and its halo, the eight neighbours or while the halo
+# reaches past a chunk every chunk two away, all exist once an edit ends, so those of them the
 # pool lacks are what the edit adds, and a pattern needing more than the pool
 # has room for can be refused before any of it is written. on the tree there
 # is no pool, and the live cells are counted instead, up to LOAD_CELLS.
 # ---
 # s:     simulation measured against
 # pool:  the world is in the pool, so the measure counts
+# cells: the live cells counted on the tree
 # add:   the chunks the edit would allocate
 # room:  slots the pool may still take
 # last:  the chunk the last run ended in, whose block is already counted
 # any:   whether last holds one
-# cells: the live cells counted on the tree
 # spent: the measure ran out of room or memory
 pub rec Need {
     s:     *Sim;
@@ -2160,7 +2250,7 @@ pub fun need_run(n: *Need, x: i64, y: i64, count: usize) bool {
     for (cx <= to) {
         if (!n.any || n.last.cx != cx || n.last.cy != cy) {
             var w: i64 = 3;
-            if (sp.wide) { w = space.HALO_SIDE::i64; }
+            if (space.span(sp) > space.SIDE::u32) { w = space.HALO_SIDE::i64; }
             var k: i64 = 0;
             for (k < w * w) {
                 # on a bounded grid a chunk of the halo is where its cells land
@@ -2246,7 +2336,19 @@ pub fun complemented(s: *Sim) bool {
 pub fun population(s: *Sim) usize {
     if (complemented(s)) { ret (s.rule.grid.w * s.rule.grid.h)::usize - space.population(?s.space); }
     if (on_tree(s))      { ret hashlife.population(?s.tree)::usize; }
+    if (owned(s))        { ret s.gpu.pop; }
     ret space.population(?s.space);
+}
+
+# whether the GPU owns the pool and its census, not the host's, counts the world
+fun owned(s: *Sim) bool {
+    ret on_gpu(s) && gpu.tallied(s.gpu);
+}
+
+# chunks the pool holds, as of the last step or census
+pub fun chunks_held(s: *Sim) usize {
+    if (owned(s)) { ret s.gpu.used; }
+    ret s.space.live;
 }
 
 # the smallest box holding every live cell, as of the last step or census
@@ -2255,7 +2357,11 @@ pub fun population(s: *Sim) usize {
 # ret: the box, or none when nothing is alive
 pub fun bounds(s: *Sim) opt[space.Box] {
     if (complemented(s)) { ret complement_bounds(s); }
-    if (!on_tree(s))     { ret space.bounds(?s.space); }
+    if (owned(s)) {
+        if (!s.gpu.boxed) { ret opt[space.Box].none{}; }
+        ret opt[space.Box].some{s.gpu.box};
+    }
+    if (!on_tree(s)) { ret space.bounds(?s.space); }
     if (s.boxed != s.epoch) {
         var e: [4]i64;
         s.box = opt[space.Box].none{};
@@ -2349,6 +2455,34 @@ pub fun chunk_cells(s: *Sim, cx: i64, cy: i64, out: *u8) {
         out[i] = rule.state(?s.rule, c[i])::u8;
         i      = i + 1;
     }
+}
+
+# the words of the chunk at (cx, cy), as the host holds them or the tree's
+# states written as the rule's words: a continuous rule's exact values, which
+# chunk_cells' states only approximate
+#
+# on the GPU the host's cells are the staging copy, current only after sync.
+# ---
+# s:   simulation, with no edit open, not flipped, whose held words are its
+#      complement's (rule.Caps b0)
+# cx:  chunk column
+# cy:  chunk row
+# out: receives space.CELLS words, row-major, 0 where no chunk exists
+pub fun chunk_words(s: *Sim, cx: i64, cy: i64, out: *u32) {
+    if (on_tree(s)) {
+        var st: [4096]u8;
+        hashlife.chunk_cells(?s.tree, cx, cy, ?st[0]);
+        var i: usize = 0;
+        for (i < space.CELLS) {
+            out[i] = rule.word(?s.rule, st[i]::u32);
+            i      = i + 1;
+        }
+        ret;
+    }
+    mem.zero[u32](out, space.CELLS);
+    val sl: u32 = space.find(?s.space, cx, cy);
+    if (sl == space.NONE) { ret; }
+    mem.copy[u32](out, ?s.space.cells[sl::usize * space.CELLS], space.CELLS);
 }
 
 # the states of the chunk at (cx, cy) as the world reads them: chunk_cells, but
@@ -2510,6 +2644,31 @@ test ceiling__a_run_pauses_at_a_ceiling_and_is_carried_past_it_until_back_under 
     # a world begun afresh forgets it
     clear(?s);
     if (s.tripped != ceiling.COUNT) { ret 6; }
+    dnit(?s);
+    ret 0;
+}
+
+test ceiling__a_bounded_grid_held_whole_steps_past_the_chunk_ceiling {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    Sim;
+    val made: err[allo.Error] = init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    # a 200 by 120 torus holds 8 chunks, past a ceiling of 2
+    var c: ceiling.Ceilings = ceiling.defaults();
+    c.on[ceiling.POOL]    = true;
+    c.limit[ceiling.POOL] = 2;
+    set_ceilings(?s, c);
+    if (!set_rule(?s, rule_named("B3/S23:T200,120"))) { ret 2; }
+    seed_glider(?s);
+    if (!s.space.whole || s.space.live != 8) { ret 3; }
+    toggle_running(?s);
+    var i: usize = 0;
+    for (i < 4) {
+        step(?s);
+        i = i + 1;
+    }
+    if (s.tripped != ceiling.COUNT || s.running == 0 || s.generation != 4) { ret 4; }
     dnit(?s);
     ret 0;
 }
@@ -3390,10 +3549,12 @@ fun settle_frames(r: *gfx.Renderer, s: *Sim, want: u64) bool {
     ret s.generation == want && sampled(s) == want;
 }
 
-# whether every cell either world holds is the same in the other
+# whether every cell either world holds is the same in the other, or as near
+# as the rule's slack lets two engines' words lie a generation apart
 #[testing]
 fun same_world(a: *Sim, b: *Sim) bool {
-    var pass: usize = 0;
+    val slack: u32   = rule.slack(?a.rule);
+    var pass:  usize = 0;
     for (pass < 2) {
         var x: *Sim = a;
         var y: *Sim = b;
@@ -3410,7 +3571,11 @@ fun same_world(a: *Sim, b: *Sim) bool {
                 for (i < space.CELLS) {
                     val cx: i64 = ox + (i % 64)::i64;
                     val cy: i64 = oy + (i / 64)::i64;
-                    if (cell(x, cx, cy) != cell(y, cx, cy)) {
+                    val p:  u32 = cell(x, cx, cy);
+                    val q:  u32 = cell(y, cx, cy);
+                    var d:  u32 = p - q;
+                    if (q > p) { d = q - p; }
+                    if (d > slack) {
                         print.eprintlnf("cells differ at ({}, {}): {} and {}", cx, cy, cell(x, cx, cy), cell(y, cx, cy));
                         ret false;
                     }
@@ -3424,25 +3589,44 @@ fun same_world(a: *Sim, b: *Sim) bool {
     ret true;
 }
 
+# the live cells a world's pool holds, counted cell by cell
+#[testing]
+fun live_cells(s: *Sim) usize {
+    var n:  usize = 0;
+    var sl: usize = 0;
+    for (sl < s.space.hi) {
+        if (space.used(?s.space, sl)) {
+            var i: usize = 0;
+            for (i < space.CELLS) {
+                if (space.live(?s.space, s.space.cells[sl * space.CELLS + i])) { n = n + 1; }
+                i = i + 1;
+            }
+        }
+        sl = sl + 1;
+    }
+    ret n;
+}
+
 # seed the same soups and far-flung glider into a world
 #[testing]
 pub fun seed_world(s: *Sim) {
+    val ink: u32 = rule.ink(?s.rule);
     s.rng = rand.seed(1, 2, 3, 4);
     fill_begin(s);
     var y: i64 = -70;
     for (y < 70) {
         var x: i64 = -70;
         for (x < 70) {
-            if (rand.range(?s.rng, 0, 1000) < 350) { fill_cell(s, x, y, 1); }
+            if (rand.range(?s.rng, 0, 1000) < 350) { fill_cell(s, x, y, ink); }
             x = x + 1;
         }
         y = y + 1;
     }
-    fill_cell(s, 5001, -3000, 1);
-    fill_cell(s, 5002, -2999, 1);
-    fill_cell(s, 5000, -2998, 1);
-    fill_cell(s, 5001, -2998, 1);
-    fill_cell(s, 5002, -2998, 1);
+    fill_cell(s, 5001, -3000, ink);
+    fill_cell(s, 5002, -2999, ink);
+    fill_cell(s, 5000, -2998, ink);
+    fill_cell(s, 5001, -2998, ink);
+    fill_cell(s, 5002, -2998, ink);
     fill_end(s);
 }
 
@@ -3495,25 +3679,33 @@ pub val RIG_SPAN: usize = 3;
 # a world the CPU steps and, where a GPU can step one, the same world on the GPU
 # beside it, for tests that hold the two engines to the same result, the GPU's
 # generations split across frames (RIG_SPAN)
+#
+# a rule whose engines' words may part by its slack (rule.slack) is held to it
+# a generation at a time: the GPU's world is checked against the CPU's after
+# each generation the rig steps, and then takes the CPU's cells, so a
+# generation's rounding is never carried on and amplified by the next
 # ---
-# a:    allocator behind both worlds
-# cpu:  the world the CPU steps
-# gpu:  the world the GPU steps, attached only when on
-# on:   a GPU steps gpu
-# w:    the window the renderer draws to
-# r:    the renderer
-# g:    the GPU side of gpu
-# made: how far the GPU's setup got, 1 window, 2 renderer, 3 GPU side
+# a:      allocator behind both worlds
+# cpu:    the world the CPU steps
+# gpu:    the world the GPU steps, attached only when on
+# on:     a GPU steps gpu
+# w:      the window the renderer draws to
+# r:      the renderer
+# g:      the GPU side of gpu
+# made:   how far the GPU's setup got, 1 window, 2 renderer, 3 GPU side
+# parted: a generation stepped one at a time left the worlds further apart
+#         than the rule's slack
 #[testing]
 pub rec Rig {
-    a:    allo.Allocator;
-    cpu:  Sim;
-    gpu:  Sim;
-    on:   bool;
-    w:    window.Window;
-    r:    gfx.Renderer;
-    g:    gpu.Gpu;
-    made: u8;
+    a:      allo.Allocator;
+    cpu:    Sim;
+    gpu:    Sim;
+    on:     bool;
+    w:      window.Window;
+    r:      gfx.Renderer;
+    g:      gpu.Gpu;
+    made:   u8;
+    parted: bool;
 }
 
 # seed both worlds and attach the GPU world where a GPU can step it
@@ -3527,13 +3719,23 @@ pub rec Rig {
 # ret:  0 when open, or the failure's code
 #[testing]
 pub fun rig_open(t: *Rig, r: rule.Rule, seed: fun(*Sim)) i32 {
-    t.on   = false;
-    t.made = 0;
+    ret rig_open_within(t, r, seed, space.HOST_SLOTS);
+}
+
+# rig_open with both worlds' pools held to a ceiling of slots, which a grid
+# with more chunks than that does not fit whole (cellar.space.cover)
+#[testing]
+pub fun rig_open_within(t: *Rig, r: rule.Rule, seed: fun(*Sim), slots: usize) i32 {
+    t.on     = false;
+    t.made   = 0;
+    t.parted = false;
     page.make(?t.a);
     val m1: err[allo.Error] = init(?t.cpu, ?t.a);
     if (sel m1.err) { ret 1; }
     val m2: err[allo.Error] = init(?t.gpu, ?t.a);
     if (sel m2.err) { ret 2; }
+    t.cpu.space.max_slots = slots;
+    t.gpu.space.max_slots = slots;
     set_rule(?t.cpu, r);
     set_rule(?t.gpu, r);
     seed(?t.cpu);
@@ -3567,15 +3769,24 @@ pub fun rig_open(t: *Rig, r: rule.Rule, seed: fun(*Sim)) i32 {
     ret 0;
 }
 
-# advance both worlds n generations
+# advance both worlds n generations, a rule with slack one generation at a
+# time, held to its slack after each and the GPU then given the CPU's cells
 #[testing]
 pub fun rig_step(t: *Rig, n: u64) {
+    val apart: bool = t.on && rule.slack(?t.cpu.rule) != 0;
+    var snap:  snapshot.Snapshot;
+    if (apart) { snapshot.init(?snap, ?t.a); }
     var i: u64 = 0;
     for (i < n) {
         step(?t.cpu);
         step(?t.gpu);
+        if (apart) {
+            if (!rig_same(t))                                    { t.parted = true; }
+            if (!take(?t.cpu, ?snap) || !restore(?t.gpu, ?snap)) { t.parted = true; }
+        }
         i = i + 1;
     }
+    if (apart) { snapshot.dnit(?snap); }
 }
 
 # let the GPU record every generation owed and go idle, its cells left on the
@@ -3617,6 +3828,7 @@ pub fun rig_frame(t: *Rig) bool {
 #[testing]
 pub fun rig_same(t: *Rig) bool {
     if (!t.on)          { ret true; }
+    if (t.parted)       { ret false; }
     if (!rig_settle(t)) { ret false; }
     val synced: err[gfx.Error] = sync(?t.gpu);
     if (sel synced.err) { ret false; }
@@ -3670,6 +3882,9 @@ fun engines_agree(f: usize) i32 {
     for (phase < rule.sample_count(f)) {
         var n: u64 = 60;
         if (phase > 0) {
+            # a generation spans a few frames however few chunks the rule
+            # left, so the edit below lands part way through one
+            gpu.split_span(?t.g, 3);
             # the GPU runs on past the host's staging cells, and a bulk edit then
             # pulls the chunks it covers before writing them whole
             rig_step(?t, 5);
@@ -3690,15 +3905,24 @@ fun engines_agree(f: usize) i32 {
         if (!rig_same(?t)) { ret 20 + phase::i32; }
         # the pyramids the draw reads below a pixel per cell hold what the cells do
         if (!gpu.pyramids_hold(?t.g, ?t.gpu.space)) { ret 14; }
-        # the census the GPU's readout and graph read agrees with the CPU's
-        if (population(?t.cpu) != population(?t.gpu))                                         { ret 9; }
-        if (history.pop_at(?t.gpu.history, t.gpu.history.len - 1) != population(?t.cpu)::u64) { ret 10; }
-        val cb: opt[space.Box] = bounds(?t.cpu);
-        val gb: opt[space.Box] = bounds(?t.gpu);
-        if (sel cb.none) { ret 11; }
-        if (sel gb.none) { ret 12; }
-        if (cb.some.x0 != gb.some.x0 || cb.some.y0 != gb.some.y0 || cb.some.x1 != gb.some.x1 || cb.some.y1 != gb.some.y1) {
-            ret 13;
+        # the census the GPU's readout and graph read agrees with the CPU's,
+        # where the engines step alike, and with the GPU's own cells where
+        # their words may part by the rule's slack, which can leave a cell
+        # live on one engine and empty on the other
+        if (rule.slack(?t.cpu.rule) != 0) {
+            if (population(?t.gpu) != live_cells(?t.gpu))                                         { ret 9; }
+            if (history.pop_at(?t.gpu.history, t.gpu.history.len - 1) != population(?t.gpu)::u64) { ret 10; }
+        }
+        or {
+            if (population(?t.cpu) != population(?t.gpu))                                         { ret 9; }
+            if (history.pop_at(?t.gpu.history, t.gpu.history.len - 1) != population(?t.cpu)::u64) { ret 10; }
+            val cb: opt[space.Box] = bounds(?t.cpu);
+            val gb: opt[space.Box] = bounds(?t.gpu);
+            if (sel cb.none) { ret 11; }
+            if (sel gb.none) { ret 12; }
+            if (cb.some.x0 != gb.some.x0 || cb.some.y0 != gb.some.y0 || cb.some.x1 != gb.some.x1 || cb.some.y1 != gb.some.y1) {
+                ret 13;
+            }
         }
         phase = phase + 1;
     }
@@ -4020,7 +4244,6 @@ test hashlife__edits_snapshots_and_the_way_back_match_the_pool {
 }
 
 # Gosper's glider gun, row by row
-#[testing]
 val GUN: [9]str = [9]str{
     "........................o...........",
     "......................o.o...........",
@@ -4033,8 +4256,8 @@ val GUN: [9]str = [9]str{
     "............oo......................",
 };
 
-#[testing]
-fun seed_gun(s: *Sim) {
+# seed Gosper's glider gun, its corner at the origin, into an emptied world
+pub fun seed_gun(s: *Sim) {
     fill_begin(s);
     var y: usize = 0;
     for (y < 9) {
@@ -4168,14 +4391,13 @@ fun seed_edges(s: *Sim) {
     fill_end(s);
 }
 
-# run uncapped frames, each asking for as many generations as the budget
+# run uncapped frames, each asking for as many generations as the frame
 # allows, until the GPU has recorded at least want, then pause and let the
 # census of the last land
 # ---
-# wide: set when the halo was wide on the way
-# ret:  the most generations one frame recorded, 0 when a frame failed
+# ret: the most generations one frame recorded, 0 when a frame failed
 #[testing]
-fun uncapped_frames(r: *gfx.Renderer, s: *Sim, want: u64, wide: *bool) usize {
+fun uncapped_frames(r: *gfx.Renderer, s: *Sim, want: u64) usize {
     var most:   usize = 0;
     var frames: usize = 0;
     var look:   gpu.Look;
@@ -4193,15 +4415,12 @@ fun uncapped_frames(r: *gfx.Renderer, s: *Sim, want: u64, wide: *bool) usize {
         if (sel br.err) { ret 0; }
         if (br.ok) {
             collect(s);
-            # pacing would shrink the span, and a slow machine keep the halo
-            # from widening; here the budget alone limits the frames
+            # pacing would shrink the span; here the dispatches alone limit the frames
             gpu.fix_span(s.gpu, gpu.MAX_SPAN);
-            s.gpu.want = true;
             val before: u64            = s.generation;
             val rec:    err[gfx.Error] = record(s, true, ?look);
             if (sel rec.err)                           { ret 0; }
             if ((s.generation - before)::usize > most) { most = (s.generation - before)::usize; }
-            if (s.gpu.wide)                            { @wide = true; }
             val ended: err[gfx.Error] = gfx.renderer_end_frame(r);
             if (sel ended.err) { ret 0; }
         }
@@ -4236,8 +4455,9 @@ test frame__uncapped_steps_past_the_old_reach_exactly_as_the_cpu_does {
         rig_close(?t);
         ret 0;
     }
-    # seeds at radius 1 for a few censuses, then a radius-4 rule, each from the
-    # same soups; either spreads well past the 32 cells a census once allowed
+    # seeds at radius 1, then a radius-4 rule, each from the same soups; either
+    # spreads well past the 32 cells a census once allowed, and a frame steps
+    # more generations than a census round trip ever let one
     var phase: usize = 0;
     for (phase < 2) {
         var k:    rule.Rule = rule.preset_rule(2);
@@ -4251,11 +4471,10 @@ test frame__uncapped_steps_past_the_old_reach_exactly_as_the_cpu_does {
             seed_edges(?t.gpu);
         }
         val from: i64   = spread_of(?t.cpu);
-        var wide: bool  = false;
-        val most: usize = uncapped_frames(?t.r, ?t.gpu, want, ?wide);
-        if (!wide) { ret 4 + phase::i32 * 10; }
-        # a frame ran more generations than the ring allowed a census
-        if (most * rule.radius(?k) <= space.SPREAD_RING::usize) { ret 5 + phase::i32 * 10; }
+        val most: usize = uncapped_frames(?t.r, ?t.gpu, want);
+        if (most == 0) { ret 4 + phase::i32 * 10; }
+        # a frame ran more generations than even the wide halo allowed a census
+        if (most * rule.radius(?k) <= space.SPREAD_WIDE::usize) { ret 5 + phase::i32 * 10; }
         if (!caught_up(?t))                                     { ret 6 + phase::i32 * 10; }
         # the soups spread past the halo the pool held when they were seeded
         if (spread_of(?t.cpu) < from + 4 * space.SIDE) { ret 7 + phase::i32 * 10; }
@@ -4273,19 +4492,39 @@ test frame__switching_between_uncapped_and_capped_steps_exactly_as_the_cpu_does 
         rig_close(?t);
         ret 0;
     }
-    # uncapped widens the halo, capped narrows it while the fronts still spread
-    # a cell a generation, and uncapped widens it again
+    # uncapped, then capped while the fronts still spread a cell a generation,
+    # then uncapped again, each picking up where the last left the pool
     var round: usize = 0;
     for (round < 2) {
-        var wide: bool = false;
-        if (uncapped_frames(?t.r, ?t.gpu, t.gpu.generation + 100, ?wide) == 0) { ret 4 + round::i32 * 10; }
-        if (!wide)                                                             { ret 5 + round::i32 * 10; }
-        if (!caught_up(?t))                                                    { ret 6 + round::i32 * 10; }
+        if (uncapped_frames(?t.r, ?t.gpu, t.gpu.generation + 100) == 0) { ret 4 + round::i32 * 10; }
+        if (!caught_up(?t))                                             { ret 6 + round::i32 * 10; }
         rig_step(?t, 80);
-        if (!rig_settle(?t) || t.g.wide) { ret 7 + round::i32 * 10; }
-        if (!caught_up(?t))              { ret 8 + round::i32 * 10; }
+        if (!rig_settle(?t)) { ret 7 + round::i32 * 10; }
+        if (!caught_up(?t))  { ret 8 + round::i32 * 10; }
         round = round + 1;
     }
+    rig_close(?t);
+    ret 0;
+}
+
+test frame__a_pass_out_of_room_stops_the_steps_and_the_count_goes_back_exactly {
+    var t:    Rig;
+    val code: i32 = rig_open(?t, rule.preset_rule(2), seed_edges);
+    if (code != 0) { ret code; }
+    if (!t.on) {
+        rig_close(?t);
+        ret 0;
+    }
+    # the soups need new chunks within a few passes, and the top leaves none
+    # free: the gate closes, the steps after it are voided, and the host takes
+    # the pool, counts back to the pass, makes room and runs on
+    if (uncapped_frames(?t.r, ?t.gpu, 10) == 0) { ret 4; }
+    val synced: err[gfx.Error] = sync(?t.gpu);
+    if (sel synced.err) { ret 8; }
+    gpu.squeeze(?t.g, t.gpu.space.hi);
+    if (uncapped_frames(?t.r, ?t.gpu, t.gpu.generation + 300) == 0) { ret 5; }
+    if (t.gpu.full || t.g.squeeze != 0)                             { ret 6; }
+    if (!caught_up(?t))                                             { ret 7; }
     rig_close(?t);
     ret 0;
 }
@@ -4968,9 +5207,9 @@ test step__generations_on_bounded_grids_match_a_reference_stepper {
     ret 0;
 }
 
-# a glider heading south-east with its top-left cell at (x, y)
-#[testing]
-fun seed_glider_at(s: *Sim, x: i64, y: i64) {
+# seed a glider heading south-east with its top-left cell at (x, y) into an
+# emptied world
+pub fun seed_glider_at(s: *Sim, x: i64, y: i64) {
     fill_begin(s);
     fill_cell(s, x + 1, y, 1);
     fill_cell(s, x + 2, y + 1, 1);
@@ -5110,14 +5349,15 @@ fun seed_nothing(s: *Sim) {}
 # a soup over the whole of the rule's bounded grid
 #[testing]
 fun seed_grid_soup(s: *Sim) {
-    var g: topology.Grid = s.rule.grid;
+    var g:   topology.Grid = s.rule.grid;
+    val ink: u32           = rule.ink(?s.rule);
     s.rng = rand.seed(4, 3, 2, 1);
     fill_begin(s);
     var y: i64 = 0;
     for (y < g.h) {
         var x: i64 = 0;
         for (x < g.w) {
-            if (rand.range(?s.rng, 0, 1000) < 350) { fill_cell(s, topology.left(?g) + x, topology.top(?g) + y, 1); }
+            if (rand.range(?s.rng, 0, 1000) < 350) { fill_cell(s, topology.left(?g) + x, topology.top(?g) + y, ink); }
             x = x + 1;
         }
         y = y + 1;
@@ -5133,18 +5373,28 @@ test frame__bounded_grids_step_on_the_gpu_as_on_the_cpu {
     mem.raw_copy(?wide[0], rule.sample(0, 3), n);
     mem.raw_copy(?wide[n], ":T100,90", 9);
     # then a rule whose background flips on a plane, seeded and empty, whose
-    # edge the stage reads live on odd generations, and non-totalistic rules
-    # across a twisted seam and on a plane whose edge flips
-    val strings: [12]str = [12]str{"B3/S23:T100,100", "B2/S/C3:K37,41*", "345/2/4:T100,90", "R2,C0,M0,S5..9,B7..8,NM:C66,65", "B3/S23:P70,50", "B0123/S123:T100,90",
-        "R5,C0,M1,S34..58,B34..45,NM:K70*,60", ?wide[0], "B0123/S123:P130,120", "B0123/S123:P130,120", "B2-a/S12:K70*,60", "B0124-k/S1c25:P130,120"};
+    # edge the stage reads live on odd generations, non-totalistic rules
+    # across a twisted seam and on a plane whose edge flips, the widest
+    # radius on a plane whose edge flips, read across every chunk of its apron,
+    # and a lenia rule and a reaction-diffusion rule across a twisted seam and
+    # on a plane's dead edge
+    val strings: [17]str = [17]str{"B3/S23:T100,100", "B2/S/C3:K37,41*", "345/2/4:T100,90", "R2,C0,M0,S5..9,B7..8,NM:C66,65", "B3/S23:P70,50", "B0123/S123:T100,90",
+        "R5,C0,M1,S34..58,B34..45,NM:K70*,60", ?wide[0], "B0123/S123:P130,120", "B0123/S123:P130,120", "B2-a/S12:K70*,60", "B0124-k/S1c25:P130,120",
+        "R16,C0,M1,S200..600,B0..180,NM:P130,120", "R=13,T=10,b=[1],m=0.15,s=0.015,kn=1,gn=1:K70*,60",
+        "R=13,T=10,b=[1],m=0.15,s=0.015,kn=1,gn=1:P70,60", "F=0.0367,k=0.0649:K70*,60", "F=0.029,k=0.057:P70,60"};
     var k: usize = 0;
-    for (k < 12) {
+    for (k < 17) {
         var t:    Rig;
         var seed: fun(*Sim) = seed_grid_soup;
         if (k == 9) { seed = seed_nothing; }
         val code: i32 = rig_open(?t, rule_named(strings[k]), seed);
         if (code != 0)                           { ret code; }
         if (!topology.bounded(?t.cpu.rule.grid)) { ret 1; }
+        # every grid fits the pool, so every chunk of it is held from the start
+        # and stepping allocates and frees none
+        val held: usize = space.grid_chunks(?t.cpu.rule.grid);
+        if (!t.cpu.space.whole || !t.gpu.space.whole || t.cpu.space.live != held || t.gpu.space.live != held) { ret 30 + k::i32; }
+        val made: [2]u32 = [2]u32{t.cpu.space.serial, t.gpu.space.serial};
         # an odd generation, then an even one
         val steps: [2]u64 = [2]u64{39, 1};
         var i:     usize  = 0;
@@ -5157,9 +5407,126 @@ test frame__bounded_grids_step_on_the_gpu_as_on_the_cpu {
             if (population(?t.cpu) != population(?t.gpu)) { ret 20 + k::i32; }
             i = i + 1;
         }
+        # a rule with slack has the rig restore the GPU's world each generation,
+        # which holds its chunks again
+        if (t.cpu.space.serial != made[0])                                 { ret 40 + k::i32; }
+        if (rule.slack(?t.cpu.rule) == 0 && t.gpu.space.serial != made[1]) { ret 40 + k::i32; }
+        if (t.cpu.space.live != held || t.gpu.space.live != held)          { ret 50 + k::i32; }
         rig_close(?t);
         k = k + 1;
     }
+    ret 0;
+}
+
+# a soup over the 100 by 100 corner of the rule's bounded grid nearest its top left
+#[testing]
+fun seed_corner_soup(s: *Sim) {
+    var g:   topology.Grid = s.rule.grid;
+    val ink: u32           = rule.ink(?s.rule);
+    s.rng = rand.seed(4, 3, 2, 1);
+    fill_begin(s);
+    var y: i64 = 0;
+    for (y < 100) {
+        var x: i64 = 0;
+        for (x < 100) {
+            if (rand.range(?s.rng, 0, 1000) < 350) { fill_cell(s, topology.left(?g) + x, topology.top(?g) + y, ink); }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    fill_end(s);
+}
+
+test frame__a_bounded_grid_past_the_pools_ceiling_allocates_around_its_cells_on_both_engines {
+    # a torus whose soup crosses its seams, and a plane whose edge flips, each
+    # with one chunk more than the pool's ceiling
+    val strings: [2]str = [2]str{"B3/S23:T400,300", "B0123/S123:P640,640"};
+    var k:       usize  = 0;
+    for (k < 2) {
+        var t:    Rig;
+        val r:    rule.Rule = rule_named(strings[k]);
+        val held: usize     = space.grid_chunks(?r.grid);
+        val code: i32       = rig_open_within(?t, r, seed_corner_soup, held - 1);
+        if (code != 0)                              { ret code; }
+        if (t.cpu.space.whole || t.gpu.space.whole) { ret 10 + k::i32; }
+        val steps: [2]u64 = [2]u64{39, 1};
+        var i:     usize  = 0;
+        for (i < 2) {
+            rig_step(?t, steps[i]);
+            if (!rig_same(?t)) {
+                print.eprintlnf("{} differs between the engines at generation {}", strings[k], t.cpu.generation);
+                ret 20 + k::i32;
+            }
+            if (population(?t.cpu) != population(?t.gpu)) { ret 30 + k::i32; }
+            i = i + 1;
+        }
+        if (t.cpu.full || t.gpu.full || t.cpu.space.live >= held) { ret 40 + k::i32; }
+        rig_close(?t);
+        k = k + 1;
+    }
+    ret 0;
+}
+
+# seed a 10 by 10 square of the rule's ink at the origin
+#[testing]
+fun seed_ink_square(s: *Sim) {
+    val ink: u32 = rule.ink(?s.rule);
+    fill_begin(s);
+    var y: i64 = 0;
+    for (y < 10) {
+        var x: i64 = 0;
+        for (x < 10) {
+            fill_cell(s, x, y, ink);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    fill_end(s);
+}
+
+test reaction__gray_scott_presets_grow_their_patterns_on_both_engines {
+    var k:     usize = 0;
+    var found: usize = 0;
+    for (k < rule.PRESET_COUNT) {
+        var p: rule.Rule = rule.preset_rule(k);
+        if (string.str_equals(rule.family_id(rule.family_of(?p)), "reaction")) {
+            found = found + 1;
+            var t:    Rig;
+            val code: i32 = rig_open(?t, p, seed_ink_square);
+            if (code != 0) { ret code; }
+            # a generation in one frame, the pattern's few chunks unsplit
+            if (t.on) { gpu.fix_span(?t.g, 64); }
+            # held to the same cells every hundred generations, so a frame's
+            # bounded steps settle each stretch
+            var g: usize = 0;
+            for (g < 10) {
+                rig_step(?t, 100);
+                if (!rig_same(?t)) { ret 10 + k::i32; }
+                g = g + 1;
+            }
+            # the square's 100 cells of v = 1 have spread into a pattern of
+            # spots or stripes of v above 1/4, five times wider
+            var dense: usize = 0;
+            var sl:    usize = 0;
+            for (sl < t.cpu.space.hi) {
+                if (space.used(?t.cpu.space, sl)) {
+                    var i: usize = 0;
+                    for (i < space.CELLS) {
+                        if (rd_word.b_of(t.cpu.space.cells[sl * space.CELLS + i]) > 16384) { dense = dense + 1; }
+                        i = i + 1;
+                    }
+                }
+                sl = sl + 1;
+            }
+            val b: opt[space.Box] = bounds(?t.cpu);
+            if (sel b.none)                 { ret 20 + k::i32; }
+            if (dense < 150)                { ret 30 + k::i32; }
+            if (b.some.x1 - b.some.x0 < 50) { ret 40 + k::i32; }
+            rig_close(?t);
+        }
+        k = k + 1;
+    }
+    if (found != 3) { ret 1; }
     ret 0;
 }
 

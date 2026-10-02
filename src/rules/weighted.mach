@@ -11,11 +11,11 @@
 # the radius reaches MAX_RADIUS, 16. a generation spreads a pattern by its
 # radius, and the GPU records only as many as the halo a census leaves reaches
 # (cellar.gpu budget): the ring's 32 cells hold two generations of a radius-16
-# kernel between censuses and the wide halo six, where past 32 the ring would
-# hold none. each cell reads the whole footprint, 1089 weights at 16 against 9
-# at 1, so a step costs the square of the radius too. a sum saturates at
-# SUM_MAX, which every sum a unit-weight footprint of MAX_RADIUS reaches lies
-# below, and the stage reads the sets only up to the kernel's greatest sum.
+# kernel between censuses and the wide halo six. each cell reads the whole
+# footprint, 1089 weights at 16 against 9 at 1, so a step costs the square of
+# the radius too. a sum saturates at SUM_MAX, which every sum a unit-weight
+# footprint of MAX_RADIUS reaches lies below, and the stage reads the sets
+# only up to the kernel's greatest sum.
 #
 # the stage keeps the radius and the sums' extent in the family's window of the
 # meta head, and the sets and the weights in its rule buffer (see cellar.rule).
@@ -62,27 +62,29 @@ val STAGE: [_]u8;
 
 # what the family's capabilities come to for one kernel
 # ---
-# b0:        the background flips each generation, so odd generations hold
-#            the world's complement: the STROBE form
-# isotropic: the footprint's weights are the same under every rotation and
-#            reflection of the square
-# no_tree:   why a quadtree engine cannot run it, nil when it can: radius 1 and no birth on 0
-# bounded:   it can run on a bounded grid
-# life_like: it is a Life-like rule (see life_like) that does not birth on
-#            0, so apgcodes name its patterns
+# b0:         the background flips each generation, so odd generations hold
+#             the world's complement: the STROBE form
+# isotropic:  the footprint's weights are the same under every rotation and
+#             reflection of the square
+# no_tree:    why a quadtree engine cannot run it, nil when it can: radius 1 and no birth on 0
+# bounded:    it can run on a bounded grid
+# life_like:  it is a Life-like rule (see life_like) that does not birth on
+#             0, so apgcodes name its patterns
+# continuous: a cell's state is all it holds, in every rule
 pub rec Caps {
-    b0:        bool;
-    isotropic: bool;
-    no_tree:   str;
-    bounded:   bool;
-    life_like: bool;
+    b0:         bool;
+    isotropic:  bool;
+    no_tree:    str;
+    bounded:    bool;
+    life_like:  bool;
+    continuous: bool;
 }
 
 # the family's stage binds a rule buffer, for the sets and the weights
 pub val TABLE: bool = true;
 
 # largest supported footprint radius (see the family's notes)
-pub val MAX_RADIUS: usize = 16;
+pub val MAX_RADIUS: usize = word.RADIUS_MAX::usize;
 # the widest footprint's side and cells
 pub val SIDE_MAX:  usize = 2 * MAX_RADIUS + 1;
 pub val FOOTPRINT: usize = SIDE_MAX * SIDE_MAX;
@@ -215,6 +217,28 @@ pub fun moore(birth: Sums, survive: Sums) Kernel {
 # conway's Life, B3/S23, the kernel the tests start from
 pub fun life() Kernel {
     ret moore(bs_sums("3"), bs_sums("23"));
+}
+
+# a kernel weighing every cell of its square by 1, the middle too, under which
+# a dead cell is born where most of its square is live and a live one survives
+# where more than a third of it is, so each cell reads its whole footprint. a
+# live square loses the tips of its corners under it and then holds still,
+# where under the plain majority vote its edges would round and shrink it away
+# ---
+# r:   footprint radius in [1, MAX_RADIUS]
+# ret: the kernel
+pub fun vote(r: usize) Kernel {
+    var k: Kernel = shaped('M', r, 1);
+    val n: usize  = cells(?k);
+    k.birth   = sums(0);
+    k.survive = sums(0);
+    var i: usize = n / 3 + 1;
+    for (i <= n) {
+        if (i > n / 2) { set(?k.birth, i); }
+        set(?k.survive, i);
+        i = i + 1;
+    }
+    ret k;
 }
 
 # lowercase an ASCII letter
@@ -1191,6 +1215,17 @@ pub fun state_of(c: u32) u32 {
     ret 0;
 }
 
+# the state painted or seeded when none is chosen: the live one
+pub fun ink(r: *Kernel) u32 {
+    ret 1;
+}
+
+# how far the engines' words for a cell may lie apart: none, the GPU stepping
+# every rule of the family bit for bit as the CPU does
+pub fun slack(r: *Kernel) u32 {
+    ret 0;
+}
+
 # how shared code reads the family's cell word
 pub fun sense() layout.Sense {
     ret word.sense();
@@ -1211,7 +1246,7 @@ fun no_tree(k: *Kernel, born: bool) str {
 # the capabilities the family has for a kernel
 pub fun caps(k: *Kernel) Caps {
     val born: bool = has(?k.birth, 0) != 0;
-    ret Caps{b0: form(k) == word.STROBE, isotropic: isotropic(k), no_tree: no_tree(k, born), bounded: true, life_like: life_like(k) && !born};
+    ret Caps{b0: form(k) == word.STROBE, isotropic: isotropic(k), no_tree: no_tree(k, born), bounded: true, life_like: life_like(k) && !born, continuous: false};
 }
 
 # the sum of every footprint weight, negatives included: a cell's weighted sum
@@ -1768,6 +1803,20 @@ test life__births_on_3_and_survives_on_2_or_3 {
     if (next_state(?k, 1, 3) != 1) { ret 1; }
     if (next_state(?k, 1, 1) != 0) { ret 1; }
     if (next_state(?k, 1, 4) != 0) { ret 1; }
+    ret 0;
+}
+
+test vote__weighs_the_whole_square_born_on_a_majority_surviving_on_a_third {
+    var k: Kernel = vote(1);
+    if (weight_at(?k, 0, 0) != 1 || weight_at(?k, -1, 1) != 1) { ret 1; }
+    var b: Sums = bs_sums("56789");
+    var v: Sums = bs_sums("456789");
+    if (!same_sums(?k.birth, ?b) || !same_sums(?k.survive, ?v)) { ret 2; }
+    var w: Kernel = vote(MAX_RADIUS);
+    if (weight_at(?w, 0, 0) != 1 || weight_at(?w, 16, -16) != 1)                        { ret 3; }
+    if (max_sum(?w) != FOOTPRINT::i32)                                                  { ret 4; }
+    if (has(?w.birth, FOOTPRINT / 2) != 0 || has(?w.birth, FOOTPRINT / 2 + 1) != 1)     { ret 5; }
+    if (has(?w.survive, FOOTPRINT / 3) != 0 || has(?w.survive, FOOTPRINT / 3 + 1) != 1) { ret 6; }
     ret 0;
 }
 

@@ -1,0 +1,41 @@
+# fill the GPU's hash and free bits from the page table, once wiped
+#
+# an invocation is a slot of the pool's capacity, which the host writes in the
+# head (cellar.layout.CTL_CAP), so a raised top needs no seeding. a slot in use
+# puts its chunk in the hash at the first empty bucket of its probe, and every
+# other sets its free bit. no two slots hold the same chunk, so no claim races
+# another for anything but a bucket.
+
+use cellar.layout;
+use cellar.layout.Meta;
+use cellar.layout.Status;
+use at: shader.atomic;
+use sy: shader.sync;
+
+#[storage(1, 0, "readonly")]
+var meta:   Meta;
+#[storage(1, 1)]
+var status: Status;
+
+#[builtin("global_invocation")]
+var gid: u32x3;
+
+val DEV: u32 = sy.SCOPE_DEVICE;
+val BUF: u32 = sy.SEMANTICS_UNIFORM_MEMORY;
+
+#[stage("compute")]
+#[workgroup(64, 1, 1)]
+fun comp_main() {
+    val s: u32 = gid[0];
+    if (s >= status.head[layout.CTL_CAP]) { ret; }
+    val e: u32 = s * layout.ENTRY;
+    if (meta.table[e + layout.INCARNATION_AT] == 0) {
+        at.atomic_or_u32(?status.bitmap[s / 32], DEV, sy.SEMANTICS_RELAXED, 1 << (s % 32));
+        ret;
+    }
+    var b: u32 = layout.bucket(meta.table[e + 9], meta.table[e + 10]);
+    for (at.atomic_compare_exchange_u32(?status.hash[b], DEV, sy.SEMANTICS_ACQUIRE_RELEASE | BUF, sy.SEMANTICS_ACQUIRE | BUF, s,
+        layout.EMPTY) != layout.EMPTY) {
+        b = (b + 1) & (layout.HASH - 1);
+    }
+}

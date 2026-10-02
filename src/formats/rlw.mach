@@ -1,0 +1,394 @@
+# run length words: cellar's pattern format that keeps a rule's cell words
+#
+# a continuous rule's cells hold values their states only approximate
+# (cellar.rule Caps), so a file records each cell's word, which only means
+# something under the rule it was read under, and the file names that rule.
+#
+# a file is the line "[RLW 1]", then an RLE head: '#' lines (#N the name, #C
+# comments, #R the top-left corner) and the header "x = <w>, y = <h>, rule =
+# <rule>", the rule required. the body is run-counted tokens ended by '!', as
+# RLE's: '.' is a cell whose word is 0, '$' ends a row, and any other token is
+# one word in base 26, most significant digit first, its leading digits 'a'
+# to 'z' and its last 'A' to 'Z', with no leading 'a' and never 0. a count
+# before a token repeats it. a Lenia word, up to 2^24, takes at most 6 bytes,
+# and any word at most 7. the writer wraps its body at 70 columns, as RLE's.
+#
+# a word's state is its state under the named rule, or live for a word but 0
+# under a rule this cellar does not know, as a world file's. a source that
+# offers no words is written as the words of its states under the rule the
+# Info names, which must be one cellar reads.
+
+use cellar.format;
+use cellar.formats.rle;
+use cellar.rule;
+use allo: std.allocator;
+use std.collections.vector.Vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string;
+use std.types.string.str;
+
+# the first line of every file
+val MAGIC: str = "[RLW 1]";
+# the base a word is written in
+val BASE: u64 = 26;
+# the words a decoder gathers into one run before handing it on
+val HELD: usize = 64;
+
+fun is_blank(b: u8) bool {
+    ret b == ' ' || b == '\t' || b == '\r' || b == '\n';
+}
+
+fun is_digit(b: u8) bool {
+    ret b >= '0' && b <= '9';
+}
+
+# the offset of the first byte that is not blank, from i
+fun skip_blank(p: *u8, n: usize, i: usize) usize {
+    var k: usize = i;
+    for (k < n && is_blank(p[k])) { k = k + 1; }
+    ret k;
+}
+
+# whether the bytes from i begin with s
+fun begins(p: *u8, n: usize, i: usize, s: str) bool {
+    val len: usize = string.str_len(s);
+    if (n - i < len) { ret false; }
+    ret string.str_region_equals(?p[i], 0, len, s);
+}
+
+# how the decode reads words: the rule they are the words of
+# ---
+# known: the named rule parses, so words have their states under it
+# r:     that rule
+rec Reading {
+    known: bool;
+    r:     rule.Rule;
+}
+
+# the state a word holds, false when the rule has no such state
+fun state_of(rd: *Reading, c: u32, v: *u8) bool {
+    if (!rd.known) {
+        @v = 1;
+        ret true;
+    }
+    val st: u32 = rule.state(?rd.r, c);
+    if (st >= rule.states(?rd.r) || st > 255) { ret false; }
+    @v = st::u8;
+    ret true;
+}
+
+# cells read but not yet handed on: one run of a state, its words held in word mode
+# ---
+# x: first column
+# y: row
+# n: cells
+# v: their state
+# w: their words, in word mode
+rec Pending {
+    x: i64;
+    y: i64;
+    n: usize;
+    v: u8;
+    w: [64]u32;
+}
+
+# hand the pending run on, and empty it
+fun flush(e: *format.Emit, p: *Pending) bool {
+    if (p.n == 0) { ret true; }
+    val n: usize = p.n;
+    p.n = 0;
+    if (e.words) { ret format.emit_words(e, p.x, p.y, n, p.v, ?p.w[0]); }
+    ret format.emit(e, p.x, p.y, n, p.v);
+}
+
+# add n cells of one word and state from (x, y) rightward to the pending run,
+# handing it on as it fills or no longer joins them
+fun add(e: *format.Emit, p: *Pending, x: i64, y: i64, n: usize, v: u8, c: u32) bool {
+    var at:   i64   = x;
+    var left: usize = n;
+    for (left > 0) {
+        if (p.n > 0 && (p.y != y || p.x + p.n::i64 != at || p.v != v || (e.words && p.n == HELD))) {
+            if (!flush(e, p)) { ret false; }
+        }
+        if (p.n == 0) {
+            p.x = at;
+            p.y = y;
+            p.v = v;
+        }
+        if (!e.words) {
+            p.n = p.n + left;
+            ret true;
+        }
+        var k: usize = HELD - p.n;
+        if (k > left) { k = left; }
+        var i: usize = 0;
+        for (i < k) {
+            p.w[p.n + i] = c;
+            i            = i + 1;
+        }
+        p.n  = p.n + k;
+        at   = at + k::i64;
+        left = left - k;
+    }
+    ret true;
+}
+
+# read one word from i, leaving i after it
+fun read_word(p: *u8, n: usize, i: *usize, out: *u32) err[format.Error] {
+    var v: u64   = 0;
+    var k: usize = @i;
+    if (k < n && p[k] == 'a') { ret err[format.Error].err{format.Error.malformed{}}; }
+    for (k < n && p[k] >= 'a' && p[k] <= 'z') {
+        v = v * BASE + (p[k] - 'a')::u64;
+        if (v > 0xffffffff) { ret err[format.Error].err{format.Error.range{}}; }
+        k = k + 1;
+    }
+    if (k >= n)                   { ret err[format.Error].err{format.Error.truncated{}}; }
+    if (p[k] < 'A' || p[k] > 'Z') { ret err[format.Error].err{format.Error.malformed{}}; }
+    v = v * BASE + (p[k] - 'A')::u64;
+    if (v > 0xffffffff) { ret err[format.Error].err{format.Error.range{}}; }
+    if (v == 0)         { ret err[format.Error].err{format.Error.malformed{}}; }
+    @i   = k + 1;
+    @out = v::u32;
+    ret err[format.Error].ok{};
+}
+
+# stream the body's cells to the emit
+# ---
+# p, n:   the bytes
+# i:  the body's first byte
+# e:  where the cells go
+# rd: the rule the words are read under
+# ox, oy: the world position of the pattern's top-left corner
+# w, h:   the declared size, which the cells must stay inside
+fun read_body(p: *u8, n: usize, i: usize, e: *format.Emit, rd: *Reading, ox: i64, oy: i64, w: i64, h: i64) err[format.Error] {
+    var pend: Pending;
+    pend.n = 0;
+    var at:    usize = i;
+    var x:     i64   = 0;
+    var y:     i64   = 0;
+    var count: i64   = 0;
+    var has:   bool  = false;
+    for (true) {
+        e.info.at = at;
+        if (at >= n) { ret err[format.Error].err{format.Error.truncated{}}; }
+        val ch: u8 = p[at];
+        if (is_blank(ch)) {
+            at = at + 1;
+            cnt;
+        }
+        if (is_digit(ch)) {
+            count = count * 10 + (ch - '0')::i64;
+            has   = true;
+            at    = at + 1;
+            if (count > format.LIMIT) { ret err[format.Error].err{format.Error.range{}}; }
+            cnt;
+        }
+        if (ch == '!') {
+            if (has)              { ret err[format.Error].err{format.Error.malformed{}}; }
+            if (!flush(e, ?pend)) { ret err[format.Error].err{format.Error.sink{}}; }
+            ret err[format.Error].ok{};
+        }
+        var k: i64 = 1;
+        if (has) { k = count; }
+        count = 0;
+        has   = false;
+        if (ch == '$') {
+            y  = y + k;
+            x  = 0;
+            at = at + 1;
+            if (y > format.LIMIT) { ret err[format.Error].err{format.Error.range{}}; }
+            cnt;
+        }
+        if (ch == '.') {
+            x  = x + k;
+            at = at + 1;
+            if (x > format.LIMIT) { ret err[format.Error].err{format.Error.range{}}; }
+            cnt;
+        }
+        var c: u32               = 0;
+        val r: err[format.Error] = read_word(p, n, ?at, ?c);
+        if (sel r.err) { ret r; }
+        var v: u8 = 0;
+        if (!state_of(rd, c, ?v))                           { ret err[format.Error].err{format.Error.range{}}; }
+        if (x + k > w || y >= h)                            { ret err[format.Error].err{format.Error.malformed{}}; }
+        if (!add(e, ?pend, ox + x, oy + y, k::usize, v, c)) { ret err[format.Error].err{format.Error.sink{}}; }
+        x = x + k;
+    }
+    ret err[format.Error].ok{};
+}
+
+# decode an RLW file
+fun decode(a: *allo.Allocator, p: *u8, n: usize, e: *format.Emit) err[format.Error] {
+    var at: usize = skip_blank(p, n, 0);
+    if (!begins(p, n, at, MAGIC)) {
+        e.info.at = at;
+        ret err[format.Error].err{format.Error.malformed{}};
+    }
+    for (at < n && p[at] != '\n') { at = at + 1; }
+    var ox: i64               = 0;
+    var oy: i64               = 0;
+    var w:  i64               = 0;
+    var h:  i64               = 0;
+    val hd: err[format.Error] = rle.read_head(a, p, n, ?at, e, ?ox, ?oy, ?w, ?h);
+    if (sel hd.err) { ret hd; }
+    val named: str = format.text_of(?e.info.rule);
+    if (named[0] == 0) {
+        e.info.at = at;
+        ret err[format.Error].err{format.Error.unruled{}};
+    }
+    var rd: Reading;
+    rd.known = false;
+    val r: res[rule.Rule, str] = rule.parse(named);
+    if (sel r.ok) {
+        rd.known = true;
+        rd.r     = r.ok;
+    }
+    ret read_body(p, n, at, e, ?rd, ox, oy, w, h);
+}
+
+# how likely the bytes are RLW: they begin with its first line
+fun sniff(p: *u8, n: usize) u32 {
+    if (begins(p, n, skip_blank(p, n, 0), MAGIC)) { ret 100; }
+    ret 0;
+}
+
+# write a word as one token, repeated count times
+fun put_word(w: *rle.Out, count: i64, c: u32) err[format.Error] {
+    var rev: [8]u8;
+    var k:   usize = 0;
+    var v:   u64   = c::u64;
+    rev[0] = 'A' + (v % BASE)::u8;
+    v      = v / BASE;
+    k      = 1;
+    for (v > 0) {
+        rev[k] = 'a' + (v % BASE)::u8;
+        v      = v / BASE;
+        k      = k + 1;
+    }
+    var tag: [8]u8;
+    var i:   usize = 0;
+    for (i < k) {
+        tag[i] = rev[k - 1 - i];
+        i      = i + 1;
+    }
+    ret rle.token(w, count, ?tag[0], k);
+}
+
+# where the writer stands, and how it reads the source
+# ---
+# src:   the source
+# words: read the source's words rather than its states
+# r:     the rule a state's word is taken from, when not reading words
+# curx:  the column the body has written up to
+# cury:  the row
+rec Writing {
+    src:   *format.Source;
+    words: bool;
+    r:     rule.Rule;
+    curx:  i64;
+    cury:  i64;
+}
+
+# the next run, false when none remain
+fun next(wr: *Writing, r: *format.Run) bool {
+    if (wr.words) { ret wr.src.words(wr.src.ctx, r); }
+    ret wr.src.next(wr.src.ctx, r);
+}
+
+# the word of the k-th cell of a run
+fun word_at(wr: *Writing, r: *format.Run, k: usize) u32 {
+    if (wr.words) { ret r.w[k]; }
+    ret rule.word(?wr.r, r.v::u32);
+}
+
+# write one run, its equal words counted together
+fun write_run(w: *rle.Out, wr: *Writing, r: *format.Run) err[format.Error] {
+    val src: *format.Source = wr.src;
+    if (r.n == 0 || r.y < wr.cury || r.y >= src.y1 || r.x < src.x0 || r.x + r.n::i64 > src.x1) {
+        ret err[format.Error].err{format.Error.range{}};
+    }
+    if (r.y > wr.cury) {
+        val a: err[format.Error] = rle.token(w, r.y - wr.cury, "$", 1);
+        if (sel a.err) { ret a; }
+        wr.cury = r.y;
+        wr.curx = src.x0;
+    }
+    if (r.x < wr.curx) { ret err[format.Error].err{format.Error.range{}}; }
+    if (r.x > wr.curx) {
+        val g: err[format.Error] = rle.token(w, r.x - wr.curx, ".", 1);
+        if (sel g.err) { ret g; }
+    }
+    var k: usize = 0;
+    for (k < r.n) {
+        val c: u32   = word_at(wr, r, k);
+        var e: usize = k + 1;
+        for (e < r.n && word_at(wr, r, e) == c) { e = e + 1; }
+        if (c == 0) { ret err[format.Error].err{format.Error.range{}}; }
+        val t: err[format.Error] = put_word(w, (e - k)::i64, c);
+        if (sel t.err) { ret t; }
+        k = e;
+    }
+    wr.curx = r.x + r.n::i64;
+    ret err[format.Error].ok{};
+}
+
+# encode a source as an RLW file
+fun encode(a: *allo.Allocator, src: *format.Source, info: *format.Info, out: *Vector[u8]) err[format.Error] {
+    val cw: i64 = src.x1 - src.x0;
+    val ch: i64 = src.y1 - src.y0;
+    if (cw < 0 || ch < 0 || cw > format.LIMIT || ch > format.LIMIT) { ret err[format.Error].err{format.Error.range{}}; }
+    if (src.x0 < 0 - format.LIMIT || src.x0 > format.LIMIT || src.y0 < 0 - format.LIMIT || src.y0 > format.LIMIT) {
+        ret err[format.Error].err{format.Error.range{}};
+    }
+    val named: str = format.text_of(?info.rule);
+    if (named[0] == 0) { ret err[format.Error].err{format.Error.unruled{}}; }
+    var wr: Writing;
+    wr.src   = src;
+    wr.words = src.words != nil;
+    wr.curx  = src.x0;
+    wr.cury  = src.y0;
+    if (!wr.words) {
+        val r: res[rule.Rule, str] = rule.parse(named);
+        if (sel r.err) { ret err[format.Error].err{format.Error.unruled{}}; }
+        wr.r = r.ok;
+    }
+    var w: rle.Out;
+    w.out = out;
+    w.col = 0;
+    val m: err[format.Error] = rle.put_str(?w, MAGIC);
+    if (sel m.err) { ret m; }
+    val nl: err[format.Error] = rle.put(?w, '\n');
+    if (sel nl.err) { ret nl; }
+    val h: err[format.Error] = rle.write_head(?w, src, info);
+    if (sel h.err) { ret h; }
+    val rw: err[format.Error] = src.rewind(src.ctx);
+    if (sel rw.err) { ret rw; }
+    var r: format.Run;
+    for (next(?wr, ?r)) {
+        val k: err[format.Error] = write_run(?w, ?wr, ?r);
+        if (sel k.err) { ret k; }
+    }
+    val bang: err[format.Error] = rle.put(?w, '!');
+    if (sel bang.err) { ret bang; }
+    ret rle.put(?w, '\n');
+}
+
+# the RLW format's registry record
+pub fun make() format.Format {
+    var f: format.Format;
+    f.id     = "rlw";
+    f.exts   = "rlw";
+    f.sniff  = sniff;
+    f.decode = decode;
+    f.builds = false;
+    f.states = 256;
+    f.words  = true;
+    f.encode = encode;
+    ret f;
+}

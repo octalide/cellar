@@ -41,6 +41,15 @@
 # encoder that is one may read it instead, paying for the tree's distinct nodes
 # rather than its runs. it must accept the runs all the same, since the tree is
 # optional.
+#
+# a continuous rule's cells hold values their states only approximate (cellar.rule
+# Caps), and a format whose files can record those values exactly, as the rule's
+# words, says so (Format.words). a sink or source that can carry words offers a
+# word mode beside its runs of states, and a load or save trades in words where
+# the format and the other end both can, and in states otherwise. in word mode
+# a run is cells of one state, which may be 0, each with its own word, and
+# every cell whose word is not 0 is in some run, so a value too small to have
+# a state but 0 is kept too. the words are those of the rule the Info names.
 
 use allo: std.allocator;
 use std.collections.vector.Vector;
@@ -69,6 +78,10 @@ pub val NOTE_STATES: u32 = 1;
 # range:       a number or coordinate is beyond LIMIT or the format's own bounds
 # sink:        the destination refused the pattern
 # unsupported: no format has this id, or it cannot write
+# levels:      the format holds fewer states than the levels of a continuous
+#              rule's values, which it would quantize
+# unruled:     the format records words, which need a rule cellar reads to
+#              mean anything, and none was named
 pub tag Error: u8 {
     alloc: allo.Error;
     malformed;
@@ -76,6 +89,8 @@ pub tag Error: u8 {
     range;
     sink;
     unsupported;
+    levels;
+    unruled;
 }
 
 # a one-line description of a format failure
@@ -88,6 +103,8 @@ pub fun error_message(e: Error) str {
     if (sel e.truncated) { ret "truncated pattern file"; }
     if (sel e.range)     { ret "number out of range"; }
     if (sel e.sink)      { ret "pattern does not fit"; }
+    if (sel e.levels)    { ret "the format cannot hold the rule's values"; }
+    if (sel e.unruled)   { ret "the pattern names no rule its cells can be read under"; }
     ret "unsupported format";
 }
 
@@ -234,6 +251,9 @@ fun lower(c: u8) u8 {
 # open:  begin writing the pattern plan accepted; false when the destination
 #        cannot be written
 # run:   n cells of state v from (x, y) rightward; false when they cannot be kept
+# words: in word mode, in place of run, n cells of state v from (x, y)
+#        rightward with their words; false when they cannot be kept. nil for a
+#        sink that takes states alone
 # close: the load ended; false when the destination lost anything
 pub rec Sink {
     ctx:   *u8;
@@ -242,6 +262,7 @@ pub rec Sink {
     fit:   fun(*u8, i64, i64, usize, u8) bool;
     open:  fun(*u8, *Info) bool;
     run:   fun(*u8, i64, i64, usize, u8) bool;
+    words: fun(*u8, i64, i64, usize, u8, *u32) bool;
     close: fun(*u8) bool;
 }
 
@@ -279,16 +300,20 @@ pub rec TreeSink {
 
 # the decoder's view of where its cells go
 # ---
-# sink: the destination, nil on the validating pass
-# info: what the decode gathers: metadata, bounds, counts
-# fits: the runs go to the sink's fit rather than its run
-# tree: the sink's tree to build the pattern into instead of emitting its runs,
-#       set on the writing pass of a format that builds when the sink offers one
+# sink:  the destination, nil on the validating pass
+# info:  what the decode gathers: metadata, bounds, counts
+# fits:  the runs go to the sink's fit rather than its run
+# tree:  the sink's tree to build the pattern into instead of emitting its runs,
+#        set on the writing pass of a format that builds when the sink offers one
+# words: word mode: a format that records words emits them with emit_words,
+#        and its states with emit otherwise. set when the format records words
+#        and the sink takes them, and on the validating pass
 pub rec Emit {
-    sink: *Sink;
-    info: *Info;
-    fits: bool;
-    tree: *TreeSink;
+    sink:  *Sink;
+    info:  *Info;
+    fits:  bool;
+    tree:  *TreeSink;
+    words: bool;
 }
 
 # report n live cells of state v from (x, y) rightward
@@ -309,6 +334,25 @@ pub fun emit(e: *Emit, x: i64, y: i64, n: usize, v: u8) bool {
     ret e.sink.run(e.sink.ctx, x, y, n, v);
 }
 
+# report n cells of state v from (x, y) rightward with their words, in word mode
+#
+# a decoder calls this for every word run and stops with Error.sink when it is false.
+# ---
+# e:   the decode's emit, in word mode
+# x:   first column
+# y:   row
+# n:   cells
+# v:   their state, which may be 0
+# w:   their n words, none of them 0
+# ret: false when the sink refused the run
+pub fun emit_words(e: *Emit, x: i64, y: i64, n: usize, v: u8, w: *u32) bool {
+    if (n == 0) { ret true; }
+    gather(e.info, x, y, x + n::i64, y + 1, n::u64, v);
+    if (e.sink == nil) { ret true; }
+    if (e.fits)        { ret e.sink.fit(e.sink.ctx, x, y, n, v); }
+    ret e.sink.words(e.sink.ctx, x, y, n, v, w);
+}
+
 # fold live cells into an Info as emitting them would, for a decoder that
 # knows their extent, count and highest state without listing them
 # ---
@@ -318,7 +362,7 @@ pub fun emit(e: *Emit, x: i64, y: i64, n: usize, v: u8) bool {
 # x1:   right edge, exclusive
 # y1:   bottom edge, exclusive
 # live: how many
-# top:  the highest state among them, nonzero
+# top:  the highest state among them
 pub fun gather(i: *Info, x0: i64, y0: i64, x1: i64, y1: i64, live: u64, top: u8) {
     if (live == 0) { ret; }
     cover(i, x0, y0, x1, y1);
@@ -331,12 +375,15 @@ pub fun gather(i: *Info, x0: i64, y0: i64, x1: i64, y1: i64, live: u64, top: u8)
 # x: first column
 # y: row
 # n: cells, at least 1
-# v: state, nonzero
+# v: state, nonzero, or in word mode any
+# w: in word mode the run's n words, none 0, until the next run is read;
+#    nil otherwise
 pub rec Run {
     x: i64;
     y: i64;
     n: usize;
     v: u8;
+    w: *u32;
 }
 
 # the cells of a Source as a quadtree
@@ -372,26 +419,32 @@ pub rec Quadtree {
 # may put off gathering its runs until the first rewind, which says when it
 # could not.
 # ---
-# ctx:    the source's own state, passed back to each callback
-# x0:     left edge of the extent to write, inclusive
-# y0:     top edge, inclusive
-# x1:     right edge, exclusive
-# y1:     bottom edge, exclusive
-# states: how many states the cells use, at least 2
-# tree:   the same cells as a quadtree, every live one inside the extent, or
-#         nil when the source has only runs
-# rewind: start over at the first run; an error when the runs cannot be read
-# next:   the next run, false when none remain
+# ctx:        the source's own state, passed back to each callback
+# x0:         left edge of the extent to write, inclusive
+# y0:         top edge, inclusive
+# x1:         right edge, exclusive
+# y1:         bottom edge, exclusive
+# states:     how many states the cells use, at least 2
+# continuous: the states are the levels of a continuous rule's values
+#             (cellar.rule Caps), which a format holding fewer states refuses
+# tree:       the same cells as a quadtree, every live one inside the extent, or
+#             nil when the source has only runs
+# rewind:     start over at the first run; an error when the runs cannot be read
+# next:       the next run, false when none remain
+# words:      in place of next, the next run in word mode, false when none
+#             remain. nil for a source that has states alone
 pub rec Source {
-    ctx:    *u8;
-    x0:     i64;
-    y0:     i64;
-    x1:     i64;
-    y1:     i64;
-    states: u32;
-    tree:   *Quadtree;
-    rewind: fun(*u8) err[Error];
-    next:   fun(*u8, *Run) bool;
+    ctx:        *u8;
+    x0:         i64;
+    y0:         i64;
+    x1:         i64;
+    y1:         i64;
+    states:     u32;
+    continuous: bool;
+    tree:       *Quadtree;
+    rewind:     fun(*u8) err[Error];
+    next:       fun(*u8, *Run) bool;
+    words:      fun(*u8, *Run) bool;
 }
 
 # a pattern file format
@@ -402,6 +455,10 @@ pub rec Source {
 # decode: stream the file's live cells through an Emit, filling its Info. it
 #         allocates from the allocator it is given and frees it all before it returns
 # builds: decode builds a sink's tree (Emit.tree) when it is given one
+# states: the most states its files record, 2 for live and dead alone
+# words:  its files can record a continuous rule's cells exactly, as words:
+#         decode emits them with emit_words in word mode, and encode reads a
+#         source's words when it offers them
 # encode: write the source's cells to out, describing them with the Info's text.
 #         nil when the format is read only
 pub rec Format {
@@ -410,6 +467,8 @@ pub rec Format {
     sniff:  fun(*u8, usize) u32;
     decode: fun(*allo.Allocator, *u8, usize, *Emit) err[Error];
     builds: bool;
+    states: u32;
+    words:  bool;
     encode: fun(*allo.Allocator, *Source, *Info, *Vector[u8]) err[Error];
 }
 

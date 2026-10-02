@@ -81,8 +81,8 @@ pub fun tool_name(t: usize) str {
 # number of interface scales offered
 pub val SCALE_COUNT: usize = 4;
 
-# ticks a message stays up
-pub val TOAST_TICKS: i32 = 150;
+# seconds a message stays up, its fades included
+pub val TOAST_SECONDS: f64 = 2.5;
 
 # clamp on the user zoom multiplier, from a whole large world to a few cells.
 # at the least a pixel stays well under a chunk wide, which the coverage draw
@@ -135,7 +135,7 @@ pub val ZOOM_TREE_MIN: f32 = 0.000000000001;
 # full_said:    the full pool was reported, until the world is cleared
 # ceil_said:    the ceiling the run paused at was reported, until it resumes
 # toast:        the message being flashed
-# toast_t:      ticks it has left
+# toast_held:   the message stays up until another replaces it
 # told:         messages flashed so far, which a wrap count compares
 # said:         the text of a message built at run time
 # go_to:        the generation the run section goes to on HashLife
@@ -168,6 +168,9 @@ pub val ZOOM_TREE_MIN: f32 = 0.000000000001;
 # log:          the changes undo and redo walk, once attach has run
 # clip:         text the frame is to put on the clipboard, once attach has run
 # clip_ready:   clip holds text not yet put on the clipboard
+# copied:       the pattern clip was last written from when it holds words
+#               the clipboard's RLE cannot, empty otherwise, so a paste of
+#               that same text takes it whole (cellar.exec)
 # identifier:   classifies a selection off the frame
 # id_limits:    the limits a selection is classified under
 # identified:   the last classification of a selection, empty for none
@@ -211,7 +214,7 @@ pub rec App {
     full_said:    bool;
     ceil_said:    bool;
     toast:        str;
-    toast_t:      i32;
+    toast_held:   bool;
     told:         u32;
     said:         [256]u8;
     go_to:        blit.field.Field;
@@ -243,6 +246,7 @@ pub rec App {
     log:          journal.Journal;
     clip:         Vector[u8];
     clip_ready:   bool;
+    copied:       pattern.Pattern;
     identifier:   worker.Worker;
     id_limits:    identify.Limits;
     identified:   [641]u8;
@@ -303,11 +307,11 @@ pub fun fit_box(a: *App) space.Box {
     ret space.Box{x0: 0 - h, y0: 0 - h, x1: h, y1: h};
 }
 
-# flash a message
+# flash a message for TOAST_SECONDS, replacing the one shown
 pub fun say(a: *App, s: str) {
-    a.toast   = s;
-    a.toast_t = TOAST_TICKS;
-    a.told    = a.told + 1;
+    a.toast      = s;
+    a.toast_held = false;
+    a.told       = a.told + 1;
 }
 
 # flash a message about something, as "what: why"
@@ -420,6 +424,8 @@ pub fun attach(a: *App, alloc: *allo.Allocator) err[format.Error] {
     if (sel p.err) { ret err[format.Error].err{format.Error.alloc{p.err}}; }
     val c: err[allo.Error] = pattern.init(?a.custom, alloc, 16, 16, "custom");
     if (sel c.err) { ret err[format.Error].err{format.Error.alloc{c.err}}; }
+    val k: err[allo.Error] = pattern.init(?a.copied, alloc, 0, 0, "");
+    if (sel k.err) { ret err[format.Error].err{format.Error.alloc{k.err}}; }
     choose_default(a);
     ret err[format.Error].ok{};
 }
@@ -429,6 +435,7 @@ pub fun dnit(a: *App) {
     library.dnit(?a.library);
     pattern.dnit(?a.picked);
     pattern.dnit(?a.custom);
+    pattern.dnit(?a.copied);
     command.dnit(?a.queue);
     saves.dnit(?a.saves);
     snapshot.dnit(?a.start);
@@ -662,7 +669,7 @@ pub fun init(a: *App) {
     a.full_said   = false;
     a.ceil_said   = false;
     a.toast       = "";
-    a.toast_t     = 0;
+    a.toast_held  = false;
     a.told        = 0;
     a.said[0]     = 0;
     blit.field.init(?a.name, ?a.name_buf[0], saves.NAME_MAX + 1, 0, saves.name_char);
@@ -697,16 +704,14 @@ pub fun identify_start(a: *App, r: rule.Rule, p: *pattern.Pattern) {
         ret;
     }
     say(a, IDENTIFYING);
+    a.toast_held = true;
 }
 
-# flash a finished classification, keeping the running message up until then;
-# the frame calls this once a frame
+# flash a finished classification in place of the running message, which
+# stays up until then; the frame calls this once a frame
 pub fun identify_poll(a: *App) {
     val c: worker.Collected = worker.collect(?a.identifier);
-    if (sel c.idle) {
-        if (worker.running(?a.identifier) && a.toast == IDENTIFYING) { a.toast_t = TOAST_TICKS; }
-        ret;
-    }
+    if (sel c.idle) { ret; }
     if (sel c.failed) {
         say(a, "out of memory");
         ret;

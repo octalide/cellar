@@ -19,6 +19,8 @@ use bint:   blit.interact;
 use blay:   blit.layout;
 use bov:    blit.overlay;
 use bstyle: blit.style;
+use btext:  blit.text;
+use btoast: blit.toast;
 use bw:     blit.widget;
 use cellar.app;
 use cellar.look;
@@ -29,26 +31,39 @@ use cellar.space;
 use cellar.text;
 use cellar.theme;
 use cellar.world;
+use allo: std.allocator;
+use std.allocator.page;
 use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.error.err;
 use std.types.option.opt;
 use std.types.size.usize;
+use std.types.string;
 use std.types.string.str;
 
 # the key reference and its scrim stack above every other overlay
 val HELP_ORDER: u32 = 10;
-# ticks a message takes to fade out at the end of its time
-val FADE_TICKS: i32 = 30;
+# the key the flashed message is posted under
+val MESSAGE: str = "message";
+# seconds a held message is posted for, longer than any wait it stands for
+val HELD: f64 = 86400.0;
 
 # the world's port as an area of the interface
 fun area(pt: render.Port) bctx.Area {
     ret bctx.Area{x0: pt.x0, y0: pt.y0, x1: pt.x0 + pt.w, y1: pt.y0 + pt.h};
 }
 
-# one label and value pair of the readout in the small face; ret the pen after it
-fun pair(ui: *bctx.Context, x: f32, y0: f32, y1: f32, label: str, value: str) f32 {
-    var pen: f32 = look.text_mid(ui, label, x, y0, y1, look.colour(theme.TEXT_FAINT, 1.0));
-    pen = look.text_mid(ui, value, pen + bctx.px(ui, 5.0), y0, y1, look.colour(theme.TEXT, 1.0));
-    ret pen + bctx.px(ui, 14.0);
+# the gap kept between a heads-up box and the edge of the world's port
+val HUD_MARGIN: f32 = 12.0;
+
+fun maxf(a: f32, b: f32) f32 {
+    if (a > b) { ret a; }
+    ret b;
+}
+
+fun minf(a: f32, b: f32) f32 {
+    if (a < b) { ret a; }
+    ret b;
 }
 
 # the readout of the world's state
@@ -91,45 +106,75 @@ pub fun readout(ui: *bctx.Context, l: look.Look, a: *app.App, s: *world.Shown, p
     if (world.full(s) && world.hashlife(s)) { extra = "table full"; }
     or (world.full(s))                      { extra = "pool full"; }
 
+    var ls: [6]str;
+    var vs: [6]str;
+    var n:  usize = 0;
+    ls[0] = "gen";
+    vs[0] = ?gen[0];
+    ls[1] = "pop";
+    vs[1] = ?pop[0];
+    ls[2] = "box";
+    vs[2] = ?bx[0];
+    ls[3] = name;
+    vs[3] = rule;
+    ls[4] = "speed";
+    vs[4] = ?sp[0];
+    n     = 5;
+    if (world.full(s)) {
+        ls[5] = nil;
+        vs[5] = extra;
+        n     = 6;
+    }
+
     var o: bov.Overlay = bov.on_rect(area(pt), bov.TOP_LEFT, bov.TOP_LEFT);
-    o.dx   = bctx.px(ui, 12.0);
-    o.dy   = bctx.px(ui, 12.0);
+    o.dx   = bctx.px(ui, HUD_MARGIN);
+    o.dy   = bctx.px(ui, HUD_MARGIN);
     o.fade = bov.Fade{dist: bctx.px(ui, 36.0), near: 0.25, far: 1.0};
     o.band = band.BASE;
     bstyle.push_class(ui, l.hud);
+    bstyle.push_class(ui, l.pad);
     val shown: bov.Shown = bov.begin(ui, "readout", o);
     bctx.push_style(ui, l.small);
 
-    val pd: f32 = bctx.px(ui, 12.0);
-    var w:  f32 = pd * 2.0 + bctx.px(ui, 22.0) + bctx.px(ui, 5.0 * 5.0 + 14.0 * 4.0);
-    w = w + bctx.text_width(ui, "gen") + bctx.text_width(ui, ?gen[0]);
-    w = w + bctx.text_width(ui, "pop") + bctx.text_width(ui, ?pop[0]);
-    w = w + bctx.text_width(ui, "box") + bctx.text_width(ui, ?bx[0]);
-    w = w + bctx.text_width(ui, name) + bctx.text_width(ui, rule);
-    w = w + bctx.text_width(ui, "speed") + bctx.text_width(ui, ?sp[0]);
-    if (world.full(s)) { w = w + bctx.text_width(ui, extra) + bctx.px(ui, 14.0); }
-    val h: f32       = bctx.px(ui, 30.0);
-    val r: bctx.Area = bw.place(ui, blay.fixed(w), blay.fixed(h), w, h);
+    # the fields flow into rows no wider than the world's port leaves, the
+    # least important last. one wider than a row on its own is cut to it
+    val lh:   f32       = bctx.line_height(ui);
+    val room: f32       = maxf(pt.w - bctx.px(ui, HUD_MARGIN) * 2.0 - bctx.px(ui, look.READOUT_PAD) * 2.0, 0.0);
+    var fo:   blay.Flow = bw.flow(ui);
+    fo.gap     = bctx.px(ui, 14.0);
+    fo.row_gap = bctx.px(ui, 4.0);
+    bw.size_next(ui, blay.limit(blay.fit(), 0.0, room), blay.fit());
+    bw.begin_flow(ui, "readout", fo);
 
-    val cy: f32 = (r.y0 + r.y1) / 2.0;
-    val k:  f32 = bctx.px(ui, 4.0);
-    var x:  f32 = r.x0 + pd;
-    if (world.running(s)) { bctx.tri(ui, x, cy - k * 1.2, x, cy + k * 1.2, x + k * 2.0, cy, look.colour(theme.ACCENT, 1.0)); }
+    # the state's icon is 2k wide, the flow's gap setting the first field off it
+    val k:  f32       = bctx.px(ui, 4.0);
+    val r:  bctx.Area = bw.place(ui, blay.fixed(k * 2.0), blay.fixed(lh), k * 2.0, lh);
+    val cy: f32       = r.y0 + lh / 2.0;
+    val x0: f32       = r.x0;
+    if (world.running(s)) { bctx.tri(ui, x0, cy - k * 1.2, x0, cy + k * 1.2, x0 + k * 2.0, cy, look.colour(theme.ACCENT, 1.0)); }
     or {
         val dim: blit.draw.Color = look.colour(theme.TEXT_DIM, 1.0);
-        bctx.quad(ui, x, cy - k * 1.1, x + k * 0.7, cy + k * 1.1, dim);
-        bctx.quad(ui, x + k * 1.3, cy - k * 1.1, x + k * 2.0, cy + k * 1.1, dim);
+        bctx.quad(ui, x0, cy - k * 1.1, x0 + k * 0.7, cy + k * 1.1, dim);
+        bctx.quad(ui, x0 + k * 1.3, cy - k * 1.1, x0 + k * 2.0, cy + k * 1.1, dim);
     }
-    x = x + bctx.px(ui, 22.0);
-    x = pair(ui, x, r.y0, r.y1, "gen", ?gen[0]);
-    x = pair(ui, x, r.y0, r.y1, "pop", ?pop[0]);
-    x = pair(ui, x, r.y0, r.y1, "box", ?bx[0]);
-    x = pair(ui, x, r.y0, r.y1, name, rule);
-    x = pair(ui, x, r.y0, r.y1, "speed", ?sp[0]);
-    if (world.full(s)) { look.text_mid(ui, extra, x, r.y0, r.y1, look.colour(theme.ACCENT, 1.0)); }
+    var i: usize = 0;
+    for (i < n) {
+        var nat: f32 = bctx.text_width(ui, vs[i]);
+        if (ls[i] != nil) { nat = nat + bctx.text_width(ui, ls[i]) + bctx.px(ui, 5.0); }
+        val b:  bctx.Area       = bw.place(ui, blay.fit(), blay.fixed(lh), nat, lh);
+        var lc: blit.draw.Color = look.colour(theme.TEXT_FAINT, 1.0);
+        var vc: blit.draw.Color = look.colour(theme.TEXT, 1.0);
+        var ln: usize           = 0;
+        if (ls[i] != nil) { ln = string.str_len(ls[i]); }
+        or                { vc = look.colour(theme.ACCENT, 1.0); }
+        btext.fit_pair(ui, bov.KIND_OVERLAY, ls[i], ln, lc, vs[i], vc, bctx.px(ui, 5.0), b.y0, b);
+        i = i + 1;
+    }
+    bw.end_flow(ui);
 
     bctx.pop_style(ui);
     bov.end(ui, shown);
+    bstyle.pop(ui);
     bstyle.pop(ui);
 }
 
@@ -143,32 +188,34 @@ pub fun readout(ui: *bctx.Context, l: look.Look, a: *app.App, s: *world.Shown, p
 # mx:   cursor x in screen pixels
 # my:   cursor y in screen pixels
 pub fun position(ui: *bctx.Context, l: look.Look, cam: render.Camera, pt: render.Port, over: bool, mx: f32, my: f32) {
-    var b: [96]u8;
-    var o: usize = 0;
+    var c:  [48]u8;
+    var co: usize = 0;
     if (over) {
         var cx: i64 = 0;
         var cy: i64 = 0;
         render.cell_at(cam, mx, my, ?cx, ?cy);
-        o = signed(?b[0], o, cx);
-        o = text.buf_str(?b[0], o, ", ");
-        o = signed(?b[0], o, cy);
-        o = text.buf_str(?b[0], o, "    ");
+        co = signed(?c[0], co, cx);
+        co = text.buf_str(?c[0], co, ", ");
+        co = signed(?c[0], co, cy);
     }
-    val z: f32 = cam.ppc;
+    c[co] = 0;
+    var zb: [48]u8;
+    var o:  usize = 0;
+    val z:  f32   = cam.ppc;
     if (z >= 1.0) {
-        o = text.buf_u64(?b[0], o, z::u64);
+        o = text.buf_u64(?zb[0], o, z::u64);
         if (z < 10.0) {
-            o = text.buf_str(?b[0], o, ".");
-            o = text.buf_u64(?b[0], o, ((z - z::u64::f32) * 10.0)::u64);
+            o = text.buf_str(?zb[0], o, ".");
+            o = text.buf_u64(?zb[0], o, ((z - z::u64::f32) * 10.0)::u64);
         }
-        o = text.buf_str(?b[0], o, " px per cell");
+        o = text.buf_str(?zb[0], o, " px per cell");
     }
     or {
-        o = text.buf_str(?b[0], o, "1 px per ");
-        o = text.buf_u64(?b[0], o, (1.0 / z + 0.5)::u64);
-        o = text.buf_str(?b[0], o, " cells");
+        o = text.buf_str(?zb[0], o, "1 px per ");
+        o = text.buf_u64(?zb[0], o, (1.0 / z + 0.5)::u64);
+        o = text.buf_str(?zb[0], o, " cells");
     }
-    b[o] = 0;
+    zb[o] = 0;
 
     var ov: bov.Overlay = bov.on_rect(area(pt), bov.BOTTOM_LEFT, bov.BOTTOM_LEFT);
     ov.dx   = bctx.px(ui, 6.0);
@@ -177,11 +224,35 @@ pub fun position(ui: *bctx.Context, l: look.Look, cam: render.Camera, pt: render
     bstyle.push_class(ui, l.hud);
     val shown: bov.Shown = bov.begin(ui, "position", ov);
     bctx.push_style(ui, l.small);
-    val pd: f32       = bctx.px(ui, 6.0);
-    val w:  f32       = bctx.text_width(ui, ?b[0]) + pd * 2.0;
-    val h:  f32       = bctx.line_height(ui) + pd * 2.0;
-    val r:  bctx.Area = bw.place(ui, blay.fixed(w), blay.fixed(h), w, h);
-    bctx.text_at(ui, ?b[0], r.x0 + pd, r.y0 + pd, look.colour(theme.TEXT_DIM, 1.0));
+    val pd:   f32 = bctx.px(ui, 6.0);
+    val room: f32 = maxf(pt.w - pd * 4.0, 0.0);
+    val cw:   f32 = bctx.text_width(ui, ?c[0]);
+    val zw:   f32 = bctx.text_width(ui, ?zb[0]);
+    val sep:  f32 = bctx.text_width(ui, "    ");
+    val lh:   f32 = bctx.line_height(ui);
+    # the cell and the zoom share a line while they fit, else the zoom drops under the cell
+    var rows: usize = 1;
+    var w:    f32   = zw;
+    if (co != 0) {
+        w = cw + sep + zw;
+        if (w > room) {
+            rows = 2;
+            w    = maxf(cw, zw);
+        }
+    }
+    w = minf(w, room) + pd * 2.0;
+    val h:   f32             = lh * rows::f32 + pd * 2.0;
+    val r:   bctx.Area       = bw.place(ui, blay.fixed(w), blay.fixed(h), w, h);
+    val dim: blit.draw.Color = look.colour(theme.TEXT_DIM, 1.0);
+    val bw0: f32             = w - pd * 2.0;
+    var y:   f32             = r.y0 + pd;
+    if (co != 0) {
+        btext.fit_at(ui, ?c[0], r.x0 + pd, y, bw0, btext.CUT_END, dim);
+        if (rows == 2) { y = y + lh; }
+    }
+    var zx: f32 = r.x0 + pd;
+    if (co != 0 && rows == 1) { zx = zx + cw + sep; }
+    btext.fit_at(ui, ?zb[0], zx, y, bw0, btext.CUT_END, dim);
     bctx.pop_style(ui);
     bov.end(ui, shown);
     bstyle.pop(ui);
@@ -209,53 +280,94 @@ pub fun selection(d: *paint.Paint, a: *app.App, cam: render.Camera, scale: f32) 
     paint.frame(d, r.x0 - 1.0, r.y0 - 1.0, r.x1 + 1.0, r.y1 + 1.0, 1.5 * scale, theme.ACCENT, 0.9);
 }
 
-# the selection's size, just above its top-left corner
+# a line of small accent text just above the top-left corner of a rect on the
+# world, kept inside the world's port and not drawn when the rect lies wholly
+# outside it
+# ---
+# ui:  the interface
+# l:   cellar's look
+# key: the overlay's key
+# s:   the text
+# r:   the rect, in screen pixels
+# pt:  the world's port
+pub fun tag(ui: *bctx.Context, l: look.Look, key: str, s: str, r: render.Span, pt: render.Port) {
+    if (r.x1 < pt.x0 || r.x0 > pt.x0 + pt.w || r.y1 < pt.y0 || r.y0 > pt.y0 + pt.h) { ret; }
+    bctx.push_style(ui, l.small);
+    val w:  f32 = minf(bctx.text_width(ui, s), pt.w);
+    val lh: f32 = bctx.line_height(ui);
+    bctx.pop_style(ui);
+    val x:  f32         = maxf(minf(r.x0, pt.x0 + pt.w - w), pt.x0);
+    val y:  f32         = maxf(minf(r.y0 - bctx.px(ui, 4.0) - lh, pt.y0 + pt.h - lh), pt.y0);
+    var ov: bov.Overlay = bov.on_rect(bctx.Area{x0: x, y0: y, x1: x, y1: y}, bov.TOP_LEFT, bov.TOP_LEFT);
+    ov.band = band.BASE;
+    val shown: bov.Shown = bov.begin(ui, key, ov);
+    bctx.push_alpha(ui, 0.9);
+    bctx.push_style(ui, l.small);
+    val box: bctx.Area = bw.place(ui, blay.fixed(w), blay.fixed(lh), w, lh);
+    btext.fit_at(ui, s, box.x0, box.y0, w, btext.CUT_END, look.colour(theme.ACCENT, 1.0));
+    bctx.pop_style(ui);
+    bctx.pop_alpha(ui);
+    bov.end(ui, shown);
+}
+
+# the selection's size, just above its top-left corner, kept inside the world's port
 # ---
 # ui:  the interface
 # l:   cellar's look
 # a:   application state
 # cam: the camera the world is drawn through
-pub fun selection_size(ui: *bctx.Context, l: look.Look, a: *app.App, cam: render.Camera) {
+# pt:  the world's port
+pub fun selection_size(ui: *bctx.Context, l: look.Look, a: *app.App, cam: render.Camera, pt: render.Port) {
     if (!a.selected) { ret; }
-    val r: render.Span = render.span(cam, a.area);
     var b: [64]u8;
-    var o: usize       = text.buf_u64(?b[0], 0, (a.area.x1 - a.area.x0)::u64);
+    var o: usize = text.buf_u64(?b[0], 0, (a.area.x1 - a.area.x0)::u64);
     o    = text.buf_str(?b[0], o, " x ");
     o    = text.buf_u64(?b[0], o, (a.area.y1 - a.area.y0)::u64);
     b[o] = 0;
-    var ov: bov.Overlay = bov.on_rect(bctx.Area{x0: r.x0, y0: r.y0, x1: r.x1, y1: r.y1}, bov.TOP_LEFT, bov.BOTTOM_LEFT);
-    ov.dy   = 0.0 - bctx.px(ui, 4.0);
-    ov.band = band.BASE;
-    val shown: bov.Shown = bov.begin(ui, "selection", ov);
-    bctx.push_alpha(ui, 0.9);
-    look.line(ui, l.small, ?b[0], theme.ACCENT);
-    bctx.pop_alpha(ui);
-    bov.end(ui, shown);
+    tag(ui, l, "selection", ?b[0], render.span(cam, a.area), pt);
 }
 
-# the flashed message at the bottom centre of the world, fading out over its
-# last half second, as a card in the theme's toast style with an accent edge
+# the flashed message as blit shows it: one keyed toast, replaced in place by
+# each message the application says
+# ---
+# stack: the toasts, of which the message is the one
+# seen:  the application's told count the stack last took a message at
+pub rec Messages {
+    stack: btoast.Toasts;
+    seen:  u32;
+}
+
+# start with no message shown
+# ---
+# m: the messages
+# a: allocator behind the toasts' text
+pub fun messages_init(m: *Messages, a: *allo.Allocator) {
+    btoast.init(?m.stack, a);
+    m.seen = 0;
+}
+
+# release the messages' text
+pub fun messages_dnit(m: *Messages) err[allo.Error] {
+    ret btoast.free(?m.stack);
+}
+
+# the flashed message at the bottom centre of the world, a card in the theme's
+# toast style. a new message replaces the one shown, and a held one stays up
+# until the next replaces it
 # ---
 # ui: the interface
+# m:  the messages
 # a:  application state
 # pt: the world's viewport
-pub fun toast(ui: *bctx.Context, a: *app.App, pt: render.Port) {
-    if (a.toast_t <= 0 || a.toast[0] == 0) { ret; }
-    var alpha: f32 = 1.0;
-    if (a.toast_t < FADE_TICKS) { alpha = a.toast_t::f32 / FADE_TICKS::f32; }
-    var o: bov.Overlay = bov.on_rect(area(pt), bov.BOTTOM, bov.BOTTOM);
-    o.dy = 0.0 - bctx.px(ui, 40.0);
-    val shown: bov.Shown = bov.begin(ui, "toast", o);
-    bctx.push_alpha(ui, alpha);
-    val c: bov.Chrome = bov.chrome(ui, bov.KIND_TOAST);
-    val w: f32        = bctx.text_width(ui, a.toast) + c.pad * 2.0;
-    val h: f32        = bctx.px(ui, 34.0);
-    val r: bctx.Area  = bw.place(ui, blay.fixed(w), blay.fixed(h), w, h);
-    bov.paint(ui, c, r.x0, r.y0, r.x1, r.y1);
-    bctx.quad(ui, r.x0, r.y0, r.x0 + bctx.px(ui, 3.0), r.y1, look.colour(theme.ACCENT, 1.0));
-    look.text_mid(ui, a.toast, r.x0 + c.pad, r.y0, r.y1, c.text);
-    bctx.pop_alpha(ui);
-    bov.end(ui, shown);
+pub fun toast(ui: *bctx.Context, m: *Messages, a: *app.App, pt: render.Port) {
+    if (a.told != m.seen) {
+        var secs: f64 = app.TOAST_SECONDS;
+        if (a.toast_held) { secs = HELD; }
+        # a refused copy leaves the message to be posted on the next frame
+        val posted: err[allo.Error] = btoast.post_keyed(?m.stack, MESSAGE, a.toast, secs);
+        if (sel posted.ok) { m.seen = a.told; }
+    }
+    btoast.show_in(ui, "toast", ?m.stack, area(pt), bov.BOTTOM);
 }
 
 # the key reference, over everything; a click anywhere closes it
@@ -364,4 +476,61 @@ pub fun help(ui: *bctx.Context, a: *app.App, sw: f32, sh: f32) {
         i = i + 1;
     }
     bov.end(ui, card);
+}
+
+# the flashed message over a world filling the surface
+#[testing]
+rec ToastProbe {
+    m: Messages;
+    a: *app.App;
+}
+
+#[testing]
+fun toast_ui(ui: *bctx.Context, user: ptr) {
+    val tp: *ToastProbe = user::*ToastProbe;
+    toast(ui, ?tp.m, tp.a, render.Port{x0: 0.0, y0: 0.0, w: 400.0, h: 300.0});
+}
+
+# whether the surface shows the message s and no other
+#[testing]
+fun shows(d: *blit.driver.Driver, tp: *ToastProbe, s: str) bool {
+    ret btoast.count(?tp.m.stack) == 1 && string.str_equals(blit.driver.text_in(d, 0.0, 0.0, 400.0, 300.0), s);
+}
+
+test toast__a_message_replaces_the_last_and_a_held_one_waits_for_the_next {
+    var al:   allo.Allocator;
+    val made: err[allo.Error] = page.make(?al);
+    if (sel made.err) { ret 1; }
+    var a: app.App;
+    app.init(?a);
+    var tp: ToastProbe;
+    tp.a = ?a;
+    messages_init(?tp.m, ?al);
+    var d:  blit.driver.Driver;
+    val di: err[allo.Error] = blit.driver.init(?d, ?al, 400.0, 300.0, toast_ui, (?tp)::ptr);
+    if (sel di.err) { ret 1; }
+    look.apply(?d.ctx);
+
+    app.say(?a, "bounds removed");
+    blit.driver.steps(?d, 2);
+    if (!shows(?d, ?tp, "bounds removed")) { ret 2; }
+
+    # the running identification replaces it, and stays past a message's time
+    app.say(?a, app.IDENTIFYING);
+    a.toast_held = true;
+    blit.driver.steps(?d, 240);
+    if (!shows(?d, ?tp, app.IDENTIFYING)) { ret 3; }
+
+    # until its result replaces it, which goes in its own time
+    app.say(?a, "selection: a glider");
+    blit.driver.steps(?d, 2);
+    if (!shows(?d, ?tp, "selection: a glider")) { ret 4; }
+    blit.driver.steps(?d, 240);
+    if (btoast.count(?tp.m.stack) != 0) { ret 5; }
+
+    val freed: err[allo.Error] = blit.driver.free(?d);
+    if (sel freed.err) { ret 1; }
+    val dropped: err[allo.Error] = messages_dnit(?tp.m);
+    if (sel dropped.err) { ret 1; }
+    ret 0;
 }

@@ -1,0 +1,268 @@
+# one generation of the chunks on the active list, under the lenia family
+# (cellar.rules.lenia)
+#
+# workgroup y names the chunk's slot through the active list
+# (cellar.layout.Flags), and the 8 workgroups along x each step a 32 by 16 tile
+# of it, an invocation a run of 8 cells in a row. a cell's potential is the
+# kernel's weighted sum of the values up to the radius around it, so a tile
+# reads its cells and an apron of the radius on every side. those are read from
+# the source pool once, as f32 levels, into a shared tile, in bands of as many
+# of the apron's rows as the tile holds, and every sum reads the shared tile
+# after a workgroup barrier. a sum adds its terms row by row from the north-
+# west, the order the CPU adds them in (cellar.rules.lenia step_chunk). a
+# position is read through the chunk's page-table entry, and through its links
+# on a seamed chunk, so a chunk that does not exist, or a position past a
+# plane's dead edge, reads as zero.
+#
+# the stamps are the weighted stage's: a chunk with no live cell in its 3 by 3
+# block steps to zeros, and is only cleared, once, from the stamps. which way a
+# tile goes is decided by its first invocation into shared memory, so every
+# barrier is reached by the whole workgroup.
+#
+# the radius, growth function and constants are in the family's window of
+# the meta head, and the kernel in the rule buffer at layout.TABLE_BINDING
+# (cellar.rules.lenia.word).
+
+use cellar.layout;
+use cellar.layout.Cells;
+use cellar.layout.Flags;
+use cellar.layout.Meta;
+use cellar.layout.Table;
+use cellar.rules.lenia.word;
+use sy: shader.sync;
+
+#[storage(1, 0, "readonly")]
+var src:   Cells;
+#[storage(1, 1)]
+var dst:   Cells;
+#[storage(1, 2, "readonly")]
+var meta:  Meta;
+#[storage(1, 3)]
+var flags: Flags;
+#[storage(1, 4, "readonly")]
+var table: Table;
+
+#[builtin("global_invocation")]
+var gid: u32x3;
+#[builtin("local_invocation_index")]
+var lid: u32;
+
+# a tile's columns and rows
+val TILE_W: i32 = 32;
+val TILE_H: i32 = 16;
+# the levels the shared tile holds, 15 KiB, under the 16 KiB every device
+# gives a workgroup: a band of 24 rows of the widest apron, 160 columns at
+# radius 64, so its 144 rows load in six bands
+val SHARED: u32 = 3840;
+
+# a record, since mach 6.9 lowers a bare shared array indexed in a loop to
+# computed addressing at O2 (briar-systems/mach#4388)
+rec Band {
+    v: [SHARED]f32;
+}
+
+# the band of the tile and its apron loaded, row by row from the apron's top
+#[shared]
+var band: Band;
+# what the tile does, as its first invocation found: SKIP, ZERO or FULL
+#[shared]
+var plan: u32;
+
+val SKIP: u32 = 0;
+val ZERO: u32 = 1;
+val FULL: u32 = 2;
+
+# the index in the source pool of the cell at (x, y) of a slot's frame, taken
+# through the links where it lies outside the window (cellar.layout), NONE
+# where no chunk holds it, or PAST past a plane's dead edge
+fun reach(slot: u32, x: i32, y: i32) u32 {
+    var sl: u32 = slot;
+    var px: i32 = x;
+    var py: i32 = y;
+    var at: u32 = layout.NONE;
+    var h:  u32 = 0;
+    for (h <= layout.HOPS) {
+        val b: u32 = sl * layout.ENTRY;
+        val k: u32 = layout.edge_side(meta.table[b + layout.EDGE_AT], px, py);
+        val n: u32 = meta.table[b + k];
+        val t: u32 = meta.table[b + layout.LINK_AT + k];
+        if (k == 4) {
+            at = sl * layout.CELLS + (py * layout.SIDE::i32 + px)::u32;
+            h  = layout.HOPS;
+        }
+        or (n == layout.NONE) {
+            if ((t & layout.LINK_EDGE) != 0) { at = layout.PAST; }
+            h = layout.HOPS;
+        }
+        or {
+            val nx: i32 = layout.hop_x(t, px, py);
+            py = layout.hop_y(t, px, py);
+            px = nx;
+            sl = n;
+        }
+        h = h + 1;
+    }
+    ret at;
+}
+
+# the level of the cell at (x, y) of a slot's frame, within a chunk of it,
+# zero where no chunk holds it and past a plane's edge, which no rule holds live
+fun level_at(slot: u32, seamed: u32, x: i32, y: i32) f32 {
+    var at: u32 = layout.NONE;
+    if (seamed != 0) { at = reach(slot, x, y); }
+    or {
+        var xx: i32 = x;
+        var yy: i32 = y;
+        var cx: u32 = 1;
+        var cy: u32 = 1;
+        if (xx < 0) {
+            xx = xx + layout.SIDE::i32;
+            cx = 0;
+        }
+        or (xx >= layout.SIDE::i32) {
+            xx = xx - layout.SIDE::i32;
+            cx = 2;
+        }
+        if (yy < 0) {
+            yy = yy + layout.SIDE::i32;
+            cy = 0;
+        }
+        or (yy >= layout.SIDE::i32) {
+            yy = yy - layout.SIDE::i32;
+            cy = 2;
+        }
+        val n: u32 = meta.table[slot * layout.ENTRY + cy * 3 + cx];
+        if (n != layout.NONE) { at = n * layout.CELLS + (yy * layout.SIDE::i32 + xx)::u32; }
+    }
+    if (at == layout.NONE || at == layout.PAST) { ret 0.0; }
+    ret word.level(src.v[at]);
+}
+
+# what a tile of a slot does: SKIP when its cells already hold the zeros it
+# steps to, ZERO when it steps to zeros its cells do not hold yet, FULL to step.
+# it leaves only at its end, which the SPIR-V target asks of a loop once it is
+# inlined
+fun plan_of(slot: u32, base: u32, seamed: u32) u32 {
+    # the serial that produced the source. a stamp this step already wrote
+    # may have replaced it, so a stamp of either serial counts as set then
+    val last: u32 = meta.serial - 1;
+    val now:  u32 = meta.serial;
+    var live: u32 = seamed;
+    var k:    u32 = 0;
+    for (k < 9) {
+        val n: u32 = meta.table[base + k];
+        if (n != layout.NONE) {
+            val f: u32 = flags.v[n * 2];
+            if (f == last || f == now) { live = 1; }
+        }
+        k = k + 1;
+    }
+    # a warm cell is a live one, so the block is empty at the source; the
+    # destination holds zeros unless the chunk was warm a step earlier
+    val warm: u32 = flags.v[slot * 2 + 1];
+    var plan: u32 = SKIP;
+    if (live != 0 || warm == last || warm == now) { plan = FULL; }
+    or (warm == last - 1)                         { plan = ZERO; }
+    ret plan;
+}
+
+#[stage("compute")]
+#[workgroup(64, 1, 1)]
+fun comp_main() {
+    # workgroup y names an entry of the active list past the dispatch's base,
+    # and a dispatch may run past the list's end
+    val entry: u32 = gid[1] + meta.base[0];
+    if (entry >= flags.args[1]) { ret; }
+    val slot: u32 = flags.list[entry];
+    val tile: u32 = gid[0] / 64;
+    val tx0:  i32 = (tile % 2)::i32 * TILE_W;
+    val ty0:  i32 = (tile / 2)::i32 * TILE_H;
+    val ly:   i32 = ty0 + (lid / 4)::i32;
+    val x0:   i32 = tx0 + (lid % 4)::i32 * 8;
+    val base: u32 = slot * layout.ENTRY;
+    val row:  u32 = slot * layout.CELLS + (ly * layout.SIDE::i32)::u32;
+    # the slot is the workgroup's, so every invocation leaves here or none does
+    if (meta.table[base + layout.INCARNATION_AT] == 0) { ret; }
+    val edge:   u32 = meta.table[base + layout.EDGE_AT];
+    val seamed: u32 = layout.seamed(edge);
+
+    if (lid == 0) { plan = plan_of(slot, base, seamed); }
+    sy.workgroup_barrier();
+    val p: u32 = plan;
+    if (p == SKIP) { ret; }
+    var x: i32 = x0;
+    if (p == ZERO) {
+        for (x < x0 + 8) {
+            dst.v[row + x::u32] = 0;
+            x                   = x + 1;
+        }
+        ret;
+    }
+
+    val r:     i32 = meta.rule[word.RADIUS_AT]::i32;
+    val side:  i32 = 2 * r + 1;
+    val wide:  i32 = TILE_W + 2 * r;
+    val high:  i32 = TILE_H + 2 * r;
+    val rows:  i32 = SHARED::i32 / wide;
+    val halfs: u32 = (side * side)::u32;
+    var sum:   [8]f32;
+    var c:     i32 = 0;
+    for (c < 8) {
+        sum[c::u32] = 0.0;
+        c           = c + 1;
+    }
+    var top: i32 = 0;
+    for (top < high) {
+        var n: i32 = high - top;
+        if (n > rows) { n = rows; }
+        # every invocation is done reading the band before it is replaced
+        sy.workgroup_barrier();
+        var i: i32 = lid::i32;
+        for (i < n * wide) {
+            band.v[i::u32] = level_at(slot, seamed, tx0 - r + i % wide, ty0 - r + top + i / wide);
+            i              = i + 64;
+        }
+        sy.workgroup_barrier();
+        var dy: i32 = 0 - r;
+        for (dy <= r) {
+            # the apron row the term lies in, counted from the apron's top
+            val ar: i32 = ly - ty0 + dy + r;
+            if (ar >= top && ar < top + n) {
+                val h:  i32 = table.v[halfs + (dy + r)::u32]:~i32;
+                val at: i32 = (ar - top) * wide + x0 - tx0 + r;
+                val wr: u32 = ((dy + r) * side + r)::u32;
+                var dx: i32 = 0 - h;
+                for (dx <= h) {
+                    val w: f32 = table.v[(wr::i32 + dx)::u32]:~f32;
+                    c = 0;
+                    for (c < 8) {
+                        sum[c::u32] = sum[c::u32] + w * band.v[(at + dx + c)::u32];
+                        c           = c + 1;
+                    }
+                    dx = dx + 1;
+                }
+            }
+            dy = dy + 1;
+        }
+        top = top + n;
+    }
+
+    val gn:   u32 = meta.rule[word.GROWTH_AT];
+    val m:    f32 = meta.rule[word.M_AT]:~f32;
+    val k:    f32 = meta.rule[word.K_AT]:~f32;
+    val dt:   f32 = meta.rule[word.DT_AT]:~f32;
+    var live: u32 = 0;
+    c = 0;
+    for (c < 8) {
+        x = x0 + c;
+        var next: u32 = word.next(src.v[row + x::u32], sum[c::u32], gn, m, k, dt);
+        if (seamed != 0 && layout.edge_side(edge, x, ly) != 4) { next = 0; }
+        if (next != 0)                                         { live = 1; }
+        dst.v[row + x::u32] = next;
+        c                   = c + 1;
+    }
+    if (live != 0) {
+        flags.v[slot * 2]     = meta.serial;
+        flags.v[slot * 2 + 1] = meta.serial;
+    }
+}

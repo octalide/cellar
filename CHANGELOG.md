@@ -6,6 +6,32 @@ All notable changes to cellar are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-02
+
+### Added
+
+- Lenia, continuous automata with float cells and smooth kernels, on the CPU and GPU engines. A rule is Chakazul's parameter string, his patterns open as RLE, Orbium glides stably, and R runs to 64 (#49, #179).
+- Gray-Scott reaction-diffusion rules with spots, stripes and mitosis presets, bit-exact between the engines (#180).
+- RLW, a pattern file that keeps a continuous rule's exact cell values. Saving a Lenia or reaction-diffusion pattern or world picks it, and a run resumed from one continues exactly (#189).
+- Copy, paste and stamps keep a continuous rule's exact cell values inside cellar (#178).
+- `--bench <gpu|cpu> footprint`, a bench whose rate is bound by the step shader, and bench worlds for a gun, a torus, a bounded plane and a glider in a large box. Every bench line reports step time and cells per second (#176, #51, #195).
+
+### Changed
+
+- The GPU allocates its own chunks on the unbounded plane, so uncapped stepping is no longer held to the census round trip: about 3x faster on dense worlds and 2x on a glider gun (#51).
+- A bounded grid that fits the pool is allocated once when it is set, and the GPU steps only the chunks that can change. Uncapped runs inside a drawn box are about 5x faster, and a small pattern in a very large box about 10x (#195, #198).
+- Wide kernels read their neighbourhood through workgroup shared memory and load each weight once, about 20x faster per step at radius 16 (#171, #177).
+- The census counts each chunk with a workgroup, about 3x faster (#172).
+- The readout wraps inside the world area rather than running under the docks, and uses blit's flow layout (#165, #167).
+- cellar's own padding, tab placement and toast stopgaps are gone, so the side docks resize by dragging and their widths are saved (#158).
+- Built on mach 6.9, boom 0.43, blit 0.12 and mach-shader 0.5.
+
+### Fixed
+
+- Opening a world file keeps its saved camera instead of reframing (#182).
+- `cellar run --engine hashlife` names the real reason a rule cannot run there (#181).
+- The release build of Lenia's step shader (#190).
+
 ## [0.6.0] - 2026-10-01
 
 ### Added
