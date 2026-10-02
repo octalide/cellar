@@ -114,6 +114,7 @@ use cellar.topology;
 use allo: std.allocator;
 use std.chrono.time;
 use std.chrono.time.Instant;
+use std.collections.sort;
 use std.collections.vector;
 use std.collections.vector.Vector;
 use mem: std.memory;
@@ -204,9 +205,6 @@ val NO_HOLD: u64 = 0xffffffffffffffff;
 val FALLBACK_HZ: f32 = 60.0;
 # censuses in flight a frame can look back over
 val RING: usize = 8;
-# dirty entries or chunks past which one write of the span they lie in beats a
-# write of each
-val BULK: usize = 32;
 # the refresh interval divides by this for the time a frame spends sending the
 # CPU's chunks: more than that stretches the frame that follows a step
 val VIEW_SHARE: u64 = 32;
@@ -431,6 +429,10 @@ rec Pool {
 # writes:   painted cells to upload
 # zeros:    slots to clear this frame
 # stamped:  slots whose stamps to set current this frame
+# batch:    the writes of one buffer a frame records as one copy (send)
+# keys:     painted cells ordered by cell, then by when they were painted
+# stamp:    the current serial, twice for every slot a run of stamps covers
+# pyrs:     pyramids built in the frame, staged for upload
 # span:     slots the next frame may step, over every generation it records
 # fixed:    span is held where it was set rather than following the frame time
 # found:    a frame came late since the span began following it
@@ -541,6 +543,10 @@ pub rec Gpu {
     writes:   Vector[Write];
     zeros:    Vector[u32];
     stamped:  Vector[u32];
+    batch:    Vector[gfx.BufferWrite];
+    keys:     Vector[u64];
+    stamp:    Vector[u32];
+    pyrs:     Vector[u32];
     span:     usize;
     fixed:    bool;
     found:    bool;
@@ -837,6 +843,10 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     g.writes   = vector.init[Write](a);
     g.zeros    = vector.init[u32](a);
     g.stamped  = vector.init[u32](a);
+    g.batch    = vector.init[gfx.BufferWrite](a);
+    g.keys     = vector.init[u64](a);
+    g.stamp    = vector.init[u32](a);
+    g.pyrs     = vector.init[u32](a);
     g.cut      = false;
     g.span     = FIRST_SPAN;
     g.fixed    = false;
@@ -1036,6 +1046,23 @@ pub fun refusal(g: *Gpu, f: usize) str {
     ret "this GPU's compute stages bind too few storage buffers for the rule buffer this family's rules need, so they cannot run while it steps the world";
 }
 
+# add a write to the batch the next send records
+fun queue(g: *Gpu, offset: usize, src: *u8, len: usize) err[gfx.Error] {
+    val pushed: res[usize, allo.Error] = vector.push[gfx.BufferWrite](?g.batch, gfx.BufferWrite{offset: offset, src: src, len: len});
+    if (sel pushed.err) { ret err[gfx.Error].err{gfx.Error.alloc{pushed.err}}; }
+    ret err[gfx.Error].ok{};
+}
+
+# record the batched writes into b as one copy, with one barrier pair around
+# them all, and empty the batch. the bytes are staged as this returns, so their
+# sources may change at once. the writes must not overlap
+fun send(g: *Gpu, b: *gfx.StorageBuffer) err[gfx.Error] {
+    if (g.batch.len == 0) { ret err[gfx.Error].ok{}; }
+    val e: err[gfx.Error] = gfx.renderer_buffer_update_batch(g.r, b, g.batch.data, g.batch.len);
+    vector.clear[gfx.BufferWrite](?g.batch);
+    ret e;
+}
+
 # bring the rule buffer level with the rule running, ahead of the frame's steps
 #
 # a rule needing more words than the buffer holds replaces it, which waits for
@@ -1224,6 +1251,10 @@ pub fun dnit(g: *Gpu) {
     vector.dnit[Write](?g.writes);
     vector.dnit[u32](?g.zeros);
     vector.dnit[u32](?g.stamped);
+    vector.dnit[gfx.BufferWrite](?g.batch);
+    vector.dnit[u64](?g.keys);
+    vector.dnit[u32](?g.stamp);
+    vector.dnit[u32](?g.pyrs);
 }
 
 # note an edit, which a census recorded before it cannot free chunks around
@@ -1675,12 +1706,64 @@ pub fun forget_writes(g: *Gpu, lo: usize, n: usize) {
     g.writes.len = keep;
 }
 
-# upload a run of whole chunks, recorded into the frame
-fun upload_cells(g: *Gpu, sp: *space.Space, s: usize, n: usize) err[gfx.Error] {
-    val at:  usize = s * space.CELLS * 4;
-    val len: usize = n * space.CELLS * 4;
-    val src: *u8   = (?sp.cells[s * space.CELLS])::*u8;
-    ret gfx.renderer_buffer_update(g.r, ?g.p.cells[g.front], at, src, len);
+# whether the host filled slot s since the last flush, so it goes up whole
+fun refilled(sp: *space.Space, s: usize) bool {
+    ret (sp.dirty[s] & space.DIRTY_CELLS) != 0 && space.used(sp, s);
+}
+
+# batch the painted cells: the last painted of each cell, and none in a chunk
+# going up whole (filled), whose cells the host has written since
+fun queue_painted(g: *Gpu, sp: *space.Space, filled: bool) err[gfx.Error] {
+    vector.clear[u64](?g.keys);
+    var i: usize = 0;
+    for (i < g.writes.len) {
+        val at: usize = g.writes.data[i].at::usize;
+        if (!filled || !refilled(sp, at / space.CELLS)) {
+            val pushed: res[usize, allo.Error] = vector.push[u64](?g.keys, (at::u64 << 32) | i::u64);
+            if (sel pushed.err) { ret err[gfx.Error].err{gfx.Error.alloc{pushed.err}}; }
+        }
+        i = i + 1;
+    }
+    sort.sort[u64](g.keys.data, g.keys.len);
+    i = 0;
+    for (i < g.keys.len) {
+        val k: u64 = g.keys.data[i];
+        if (i + 1 < g.keys.len && (g.keys.data[i + 1] >> 32) == (k >> 32)) {
+            i = i + 1;
+            cnt;
+        }
+        val w: *Write         = ?g.writes.data[(k & 0xffffffff)::usize];
+        val e: err[gfx.Error] = queue(g, w.at::usize * 4, (?w.v)::*u8, 4);
+        if (sel e.err) { ret e; }
+        i = i + 1;
+    }
+    ret err[gfx.Error].ok{};
+}
+
+# batch the stamps that mark the slots in stamped alive and warm as of the
+# current serial, a write for each run of them
+fun queue_stamps(g: *Gpu) err[gfx.Error] {
+    val n: usize = g.stamped.len;
+    if (n == 0) { ret err[gfx.Error].ok{}; }
+    sort.sort[u32](g.stamped.data, n);
+    vector.clear[u32](?g.stamp);
+    val room: res[usize, allo.Error] = vector.ensure[u32](?g.stamp, n * 2);
+    if (sel room.err) { ret err[gfx.Error].err{gfx.Error.alloc{room.err}}; }
+    mem.fill[u32](g.stamp.data, g.serial, n * 2);
+    g.stamp.len = n * 2;
+    var i: usize = 0;
+    for (i < n) {
+        val lo:  u32   = g.stamped.data[i];
+        var run: usize = 1;
+        i = i + 1;
+        for (i < n && g.stamped.data[i] <= lo + run::u32) {
+            if (g.stamped.data[i] == lo + run::u32) { run = run + 1; }
+            i = i + 1;
+        }
+        val e: err[gfx.Error] = queue(g, lo::usize * 8, g.stamp.data::*u8, run * 8);
+        if (sel e.err) { ret e; }
+    }
+    ret err[gfx.Error].ok{};
 }
 
 # bring the GPU's pool level with the host's: grow it, then upload changed
@@ -1761,34 +1844,24 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
     # a list gathered before read the page table and the stamps as they were
     if (grew || chunks != 0 || entries != 0 || g.writes.len != 0 || g.stamped.len != 0) { g.listed = false; }
 
-    if (entries > BULK) {
-        # one recorded write of the span the dirty entries lie in, which never
-        # waits on the GPU the way a stalled upload would every frame
-        var lo: usize = top;
-        var hi: usize = 0;
-        s = 0;
-        for (s < top) {
-            if ((sp.dirty[s] & space.DIRTY_ENTRY) != 0) {
-                if (s < lo) { lo = s; }
-                hi = s + 1;
-            }
+    # every write below is recorded into the frame, in order with the growth
+    # copy and the steps, so nothing waits on the GPU, and each buffer's go up
+    # as one batch with one barrier pair, a write for each run of changed
+    # entries or chunks
+    s = 0;
+    for (entries != 0 && s < top) {
+        if ((sp.dirty[s] & space.DIRTY_ENTRY) == 0) {
             s = s + 1;
+            cnt;
         }
-        val e10: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.meta, (HEAD + lo * space.ENTRY) * 4,
-            (?sp.table[lo * space.ENTRY])::*u8, (hi - lo) * space.ENTRY * 4);
+        var run: usize = 1;
+        for (s + run < top && (sp.dirty[s + run] & space.DIRTY_ENTRY) != 0) { run = run + 1; }
+        val e10: err[gfx.Error] = queue(g, (HEAD + s * space.ENTRY) * 4, (?sp.table[s * space.ENTRY])::*u8, run * space.ENTRY * 4);
         if (sel e10.err) { ret e10; }
+        s = s + run;
     }
-    or (entries != 0) {
-        s = 0;
-        for (s < top) {
-            if ((sp.dirty[s] & space.DIRTY_ENTRY) != 0) {
-                val e11: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.meta, (HEAD + s * space.ENTRY) * 4,
-                    (?sp.table[s * space.ENTRY])::*u8, space.ENTRY * 4);
-                if (sel e11.err) { ret e11; }
-            }
-            s = s + 1;
-        }
-    }
+    val e11: err[gfx.Error] = send(g, ?g.p.meta);
+    if (sel e11.err) { ret e11; }
 
     if (g.stepping) {
         # chunks allocated empty are cleared on the GPU, in both pools
@@ -1813,61 +1886,37 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
         }
     }
 
-    if (g.stepping || whole) {
-        # chunks the host filled are uploaded, and stamped so they step in full.
-        # every write is recorded into the frame, in order with the growth copy
-        # and the steps, so nothing waits on the GPU. a run of changed chunks
-        # goes up in one write, and with many at once the run goes on over
-        # free slots, whose cells nothing reads, so a fragmented pool still
-        # goes up in a few
-        val bulk: bool = chunks > BULK;
-        s = 0;
-        for (chunks != 0 && s < top) {
-            if ((sp.dirty[s] & space.DIRTY_CELLS) != 0 && space.used(sp, s)) {
-                var run: usize = 1;
-                for (s + run < top && (((sp.dirty[s + run] & space.DIRTY_CELLS) != 0 && space.used(sp, s + run))
-                    || (bulk && !space.used(sp, s + run)))) {
-                    run = run + 1;
-                }
-                val e12: err[gfx.Error] = upload_cells(g, sp, s, run);
-                if (sel e12.err) { ret e12; }
-                var k: usize = 0;
-                for (!bulk && g.stepping && k < run) {
-                    vector.push[u32](?g.stamped, (s + k)::u32);
-                    k = k + 1;
-                }
-                s = s + run;
-                cnt;
-            }
+    # chunks the host filled are uploaded, where the GPU steps or with whole,
+    # and stamped so they step in full. painted cells go up after the clear,
+    # which may have emptied the chunk they lie in
+    val filled: bool = g.stepping || whole;
+    s = 0;
+    for (filled && chunks != 0 && s < top) {
+        if (!refilled(sp, s)) {
             s = s + 1;
+            cnt;
         }
-        if (bulk && g.stepping) {
-            # many at once: every slot is stamped, which only costs one full step
-            val rs: res[*u32, allo.Error] = allo.allocate[u32](g.a, top * 2);
-            if (sel rs.err) { ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.empty{}}}; }
-            mem.fill[u32](rs.ok, g.serial, top * 2);
-            val ef: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.flags, 0, rs.ok::*u8, top * 8);
-            allo.deallocate[u32](g.a, rs.ok, top * 2);
-            if (sel ef.err) { ret ef; }
+        var run: usize = 1;
+        for (s + run < top && refilled(sp, s + run)) { run = run + 1; }
+        val e12: err[gfx.Error] = queue(g, s * space.CELLS * 4, (?sp.cells[s * space.CELLS])::*u8, run * space.CELLS * 4);
+        if (sel e12.err) { ret e12; }
+        var k: usize = 0;
+        for (g.stepping && k < run) {
+            vector.push[u32](?g.stamped, (s + k)::u32);
+            k = k + 1;
         }
+        s = s + run;
     }
-
-    var i: usize = 0;
-    for (i < g.writes.len) {
-        val w:   *Write         = ?g.writes.data[i];
-        val e13: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.cells[g.front], w.at::usize * 4, (?w.v)::*u8, 4);
-        if (sel e13.err) { ret e13; }
-        i = i + 1;
-    }
+    val e13: err[gfx.Error] = queue_painted(g, sp, filled);
+    if (sel e13.err) { ret e13; }
     vector.clear[Write](?g.writes);
-    var now: [2]u32;
-    now[0] = g.serial;
-    now[1] = g.serial;
-    i      = 0;
-    for (i < g.stamped.len && g.stepping) {
-        val es: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.flags, g.stamped.data[i]::usize * 8, (?now[0])::*u8, 8);
+    val e14: err[gfx.Error] = send(g, ?g.p.cells[g.front]);
+    if (sel e14.err) { ret e14; }
+    if (g.stepping) {
+        val es: err[gfx.Error] = queue_stamps(g);
         if (sel es.err) { ret es; }
-        i = i + 1;
+        val ef: err[gfx.Error] = send(g, ?g.p.flags);
+        if (sel ef.err) { ret ef; }
     }
     vector.clear[u32](?g.stamped);
 
@@ -1978,6 +2027,7 @@ fun upload_view(g: *Gpu, sp: *space.Space, look: *Look) err[gfx.Error] {
     view_chunks(look, ?box[0]);
     var want: u8 = SENT_CELLS;
     if (reads_pyramids(look)) { want = SENT_MIP; }
+    vector.clear[u32](?g.pyrs);
     val t0: time.InstantClock = time.instant();
     if (sel t0.err) { ret err[gfx.Error].ok{}; }
     val budget: u64   = g.pace_us.quick_us * 1000 / VIEW_SHARE;
@@ -1994,16 +2044,27 @@ fun upload_view(g: *Gpu, sp: *space.Space, look: *Look) err[gfx.Error] {
                 if (sel now.ok) {
                     if (time.instant_sub(now.ok, t0.ok)::u64 > budget) { brk; }
                 }
+                var e: err[gfx.Error] = err[gfx.Error].ok{};
                 if (want == SENT_CELLS) {
-                    val e: err[gfx.Error] = upload_cells(g, sp, s, 1);
-                    if (sel e.err) { ret e; }
+                    e = queue(g, s * space.CELLS * 4, (?sp.cells[s * space.CELLS])::*u8, space.CELLS * 4);
+                }
+                or ((h & BUILT) != 0) {
+                    e = queue(g, s * MIP * 4, (?sp.mips[s * MIP])::*u8, MIP * 4);
                 }
                 or {
-                    var m: *u32 = ?g.built[0];
-                    if ((h & BUILT) != 0) { m = ?sp.mips[s * MIP]; }
-                    or                    { space.pyramid(?sp.cells[s * space.CELLS], sp.sense, m); }
-                    val em: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.mip, s * MIP * 4, m::*u8, MIP * 4);
-                    if (sel em.err) { ret em; }
+                    # staged in pyrs, which may move as it grows, so the write
+                    # finds its bytes once every pyramid is built
+                    val room: res[usize, allo.Error] = vector.reserve[u32](?g.pyrs, MIP);
+                    if (sel room.err) { e = err[gfx.Error].err{gfx.Error.alloc{room.err}}; }
+                    or {
+                        space.pyramid(?sp.cells[s * space.CELLS], sp.sense, ?g.pyrs.data[g.pyrs.len]);
+                        g.pyrs.len = g.pyrs.len + MIP;
+                        e          = queue(g, s * MIP * 4, nil, MIP * 4);
+                    }
+                }
+                if (sel e.err) {
+                    vector.clear[gfx.BufferWrite](?g.batch);
+                    ret e;
                 }
                 g.p.held[s] = h | want;
             }
@@ -2013,7 +2074,17 @@ fun upload_view(g: *Gpu, sp: *space.Space, look: *Look) err[gfx.Error] {
         n = n + 1;
     }
     g.cursor = s;
-    ret err[gfx.Error].ok{};
+    if (want == SENT_CELLS) { ret send(g, ?g.p.cells[g.front]); }
+    var k: usize = 0;
+    var i: usize = 0;
+    for (i < g.batch.len) {
+        if (g.batch.data[i].src == nil) {
+            g.batch.data[i].src = (?g.pyrs.data[k * MIP])::*u8;
+            k                   = k + 1;
+        }
+        i = i + 1;
+    }
+    ret send(g, ?g.p.mip);
 }
 
 # whether the GPU's pyramid of every chunk the host's staging holds as the GPU
