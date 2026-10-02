@@ -6,6 +6,22 @@ All notable changes to cellar are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-02
+
+### Changed
+
+- Uncapped GPU stepping is paced from measured GPU time, so frames hold the display's refresh rate instead of a sawtooth that missed one refresh in six. Without GPU timestamps, the frame-time controller cuts as soon as a frame runs over (#207).
+- The GPU pool grows without stalling the frame. Its buffers are made inside the frame and the GPU keeps the pool while it grows. If the host cannot get the memory, the run pauses with a toast instead of losing any of the world (#208).
+- HashLife collects in 6 to 20 ms instead of freezing the run for 60 to 80 ms (#209), and shows each generation without a stalled upload (#210).
+- The view is published through a double buffer, so an uncapped HashLife or CPU run shows a new generation every frame (#220, #223).
+- Chunk uploads and the rule table go up as one batched write recorded into the frame (#211, #216, #218).
+- Built on boom 0.45.
+
+### Fixed
+
+- HashLife no longer crashes in the GPU driver when a large world grows the pool. Only the render thread creates or deletes GPU resources (#206).
+- A small edit while the GPU owns the pool could land in the wrong chunk once the GPU had reused a slot (#228).
+
 ## [0.7.1] - 2026-10-02
 
 0.7.0 was tagged but never published, because its release run failed on macOS Intel. 0.7.1 is the first release carrying 0.7.0's changes.
