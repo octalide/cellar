@@ -811,9 +811,11 @@ fun took(t0: opt[time.Instant]) opt[u64] {
 # a ceiling's measure of the world, raw: cells, chunks, bytes or nanoseconds
 fun measure(s: *Sim, k: usize, pop: u64, step_ns: u64) u64 {
     if (k == ceiling.POPULATION) { ret pop; }
-    # the pool only draws the tree, so its chunks are the pool's only off it
+    # the pool only draws the tree, so its chunks are the pool's only off it.
+    # a bounded grid held whole cannot grow past the chunks taken when it was
+    # set, which were the grid's bound, so it has no growth to stop
     if (k == ceiling.POOL) {
-        if (on_tree(s)) { ret 0; }
+        if (on_tree(s) || s.space.whole) { ret 0; }
         ret s.space.live::u64;
     }
     if (k == ceiling.MEMORY) { ret hashlife.memory(?s.tree)::u64; }
@@ -2646,6 +2648,31 @@ test ceiling__a_run_pauses_at_a_ceiling_and_is_carried_past_it_until_back_under 
     ret 0;
 }
 
+test ceiling__a_bounded_grid_held_whole_steps_past_the_chunk_ceiling {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    Sim;
+    val made: err[allo.Error] = init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    # a 200 by 120 torus holds 8 chunks, past a ceiling of 2
+    var c: ceiling.Ceilings = ceiling.defaults();
+    c.on[ceiling.POOL]    = true;
+    c.limit[ceiling.POOL] = 2;
+    set_ceilings(?s, c);
+    if (!set_rule(?s, rule_named("B3/S23:T200,120"))) { ret 2; }
+    seed_glider(?s);
+    if (!s.space.whole || s.space.live != 8) { ret 3; }
+    toggle_running(?s);
+    var i: usize = 0;
+    for (i < 4) {
+        step(?s);
+        i = i + 1;
+    }
+    if (s.tripped != ceiling.COUNT || s.running == 0 || s.generation != 4) { ret 4; }
+    dnit(?s);
+    ret 0;
+}
+
 test ceiling__hashlife_collects_before_its_memory_ceiling_pauses_it {
     var a: allo.Allocator;
     page.make(?a);
@@ -3692,6 +3719,13 @@ pub rec Rig {
 # ret:  0 when open, or the failure's code
 #[testing]
 pub fun rig_open(t: *Rig, r: rule.Rule, seed: fun(*Sim)) i32 {
+    ret rig_open_within(t, r, seed, space.HOST_SLOTS);
+}
+
+# rig_open with both worlds' pools held to a ceiling of slots, which a grid
+# with more chunks than that does not fit whole (cellar.space.cover)
+#[testing]
+pub fun rig_open_within(t: *Rig, r: rule.Rule, seed: fun(*Sim), slots: usize) i32 {
     t.on     = false;
     t.made   = 0;
     t.parted = false;
@@ -3700,6 +3734,8 @@ pub fun rig_open(t: *Rig, r: rule.Rule, seed: fun(*Sim)) i32 {
     if (sel m1.err) { ret 1; }
     val m2: err[allo.Error] = init(?t.gpu, ?t.a);
     if (sel m2.err) { ret 2; }
+    t.cpu.space.max_slots = slots;
+    t.gpu.space.max_slots = slots;
     set_rule(?t.cpu, r);
     set_rule(?t.gpu, r);
     seed(?t.cpu);
@@ -5171,9 +5207,9 @@ test step__generations_on_bounded_grids_match_a_reference_stepper {
     ret 0;
 }
 
-# a glider heading south-east with its top-left cell at (x, y)
-#[testing]
-fun seed_glider_at(s: *Sim, x: i64, y: i64) {
+# seed a glider heading south-east with its top-left cell at (x, y) into an
+# emptied world
+pub fun seed_glider_at(s: *Sim, x: i64, y: i64) {
     fill_begin(s);
     fill_cell(s, x + 1, y, 1);
     fill_cell(s, x + 2, y + 1, 1);
@@ -5354,6 +5390,11 @@ test frame__bounded_grids_step_on_the_gpu_as_on_the_cpu {
         val code: i32 = rig_open(?t, rule_named(strings[k]), seed);
         if (code != 0)                           { ret code; }
         if (!topology.bounded(?t.cpu.rule.grid)) { ret 1; }
+        # every grid fits the pool, so every chunk of it is held from the start
+        # and stepping allocates and frees none
+        val held: usize = space.grid_chunks(?t.cpu.rule.grid);
+        if (!t.cpu.space.whole || !t.gpu.space.whole || t.cpu.space.live != held || t.gpu.space.live != held) { ret 30 + k::i32; }
+        val made: [2]u32 = [2]u32{t.cpu.space.serial, t.gpu.space.serial};
         # an odd generation, then an even one
         val steps: [2]u64 = [2]u64{39, 1};
         var i:     usize  = 0;
@@ -5366,6 +5407,60 @@ test frame__bounded_grids_step_on_the_gpu_as_on_the_cpu {
             if (population(?t.cpu) != population(?t.gpu)) { ret 20 + k::i32; }
             i = i + 1;
         }
+        # a rule with slack has the rig restore the GPU's world each generation,
+        # which holds its chunks again
+        if (t.cpu.space.serial != made[0])                                 { ret 40 + k::i32; }
+        if (rule.slack(?t.cpu.rule) == 0 && t.gpu.space.serial != made[1]) { ret 40 + k::i32; }
+        if (t.cpu.space.live != held || t.gpu.space.live != held)          { ret 50 + k::i32; }
+        rig_close(?t);
+        k = k + 1;
+    }
+    ret 0;
+}
+
+# a soup over the 100 by 100 corner of the rule's bounded grid nearest its top left
+#[testing]
+fun seed_corner_soup(s: *Sim) {
+    var g:   topology.Grid = s.rule.grid;
+    val ink: u32           = rule.ink(?s.rule);
+    s.rng = rand.seed(4, 3, 2, 1);
+    fill_begin(s);
+    var y: i64 = 0;
+    for (y < 100) {
+        var x: i64 = 0;
+        for (x < 100) {
+            if (rand.range(?s.rng, 0, 1000) < 350) { fill_cell(s, topology.left(?g) + x, topology.top(?g) + y, ink); }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    fill_end(s);
+}
+
+test frame__a_bounded_grid_past_the_pools_ceiling_allocates_around_its_cells_on_both_engines {
+    # a torus whose soup crosses its seams, and a plane whose edge flips, each
+    # with one chunk more than the pool's ceiling
+    val strings: [2]str = [2]str{"B3/S23:T400,300", "B0123/S123:P640,640"};
+    var k:       usize  = 0;
+    for (k < 2) {
+        var t:    Rig;
+        val r:    rule.Rule = rule_named(strings[k]);
+        val held: usize     = space.grid_chunks(?r.grid);
+        val code: i32       = rig_open_within(?t, r, seed_corner_soup, held - 1);
+        if (code != 0)                              { ret code; }
+        if (t.cpu.space.whole || t.gpu.space.whole) { ret 10 + k::i32; }
+        val steps: [2]u64 = [2]u64{39, 1};
+        var i:     usize  = 0;
+        for (i < 2) {
+            rig_step(?t, steps[i]);
+            if (!rig_same(?t)) {
+                print.eprintlnf("{} differs between the engines at generation {}", strings[k], t.cpu.generation);
+                ret 20 + k::i32;
+            }
+            if (population(?t.cpu) != population(?t.gpu)) { ret 30 + k::i32; }
+            i = i + 1;
+        }
+        if (t.cpu.full || t.gpu.full || t.cpu.space.live >= held) { ret 40 + k::i32; }
         rig_close(?t);
         k = k + 1;
     }
