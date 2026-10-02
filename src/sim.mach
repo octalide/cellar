@@ -246,6 +246,11 @@ pub rec Watch {
 # tree:       the quadtree the hashlife member holds it in
 # epoch:      changes each time the tree does
 # seen:       what the pool last showed of the tree
+# view:       while the CPU steps the world, the pool as the last stage left
+#             it, which the GPU draws from while the next step runs
+#             (stage_view)
+# viewed:     view holds the pool's slots, so a stage copies what changed
+# view_gen:   the generation view holds
 # boxed:      the epoch box was found at, or 0 for none
 # box:        the tree's live box as of boxed
 # rng:        generator randomize draws from
@@ -275,6 +280,9 @@ pub rec Sim {
     tree:       hashlife.Tree;
     epoch:      u64;
     seen:       Seen;
+    view:       space.Space;
+    viewed:     bool;
+    view_gen:   u64;
     boxed:      u64;
     box:        opt[space.Box];
     rng:        rand.Rng;
@@ -305,11 +313,18 @@ pub rec Sim {
 pub fun init(s: *Sim, a: *allo.Allocator) err[allo.Error] {
     val e: err[allo.Error] = space.init(?s.space, a, true);
     if (sel e.err) { ret e; }
+    val ev: err[allo.Error] = space.init(?s.view, a, false);
+    if (sel ev.err) {
+        space.dnit(?s.space);
+        ret ev;
+    }
     team.start(?s.team);
     s.engine = Engine.cpu{};
     hashlife.init(?s.tree, a, hashlife.DEFAULT_MAX);
     s.epoch      = 1;
     s.seen.valid = false;
+    s.viewed     = false;
+    s.view_gen   = 0;
     s.boxed      = 0;
     # an empty world has no cells to re-encode
     s.rule        = rule.preset_rule(0);
@@ -489,6 +504,7 @@ pub fun refusal(s: *Sim, r: *rule.Rule) str {
 pub fun dnit(s: *Sim) {
     team.stop(?s.team);
     space.dnit(?s.space);
+    space.dnit(?s.view);
     hashlife.dnit(?s.tree);
 }
 
@@ -523,6 +539,7 @@ pub fun attach(s: *Sim, g: *gpu.Gpu) {
     or               { space.set_pyramids(?s.space, true); }
     if (!on_tree(s)) { s.engine = pool_engine(s); }
     s.seen.valid = false;
+    s.viewed     = false;
 }
 
 # make room on the GPU before the pool grows. the render thread holds the world
@@ -638,6 +655,7 @@ pub fun use_hashlife(s: *Sim, on: bool) bool {
     # the pool only shows the tree, so it is emptied to be measured against
     space.reset(?s.space);
     s.seen.valid = false;
+    s.viewed     = false;
     var n: Need;
     need_init(?n, s);
     n.pool = true;
@@ -1173,22 +1191,41 @@ pub fun shown_shift(s: *Sim) u32 {
     ret s.seen.shift;
 }
 
-# fill the pool with the tree as the look sees it, where the pool is what the
-# GPU draws of it, for a draw from another thread to show (cellar.runner)
+# build the view of the last completed generation that show reads, for a draw
+# from another thread (cellar.runner): on the tree the pool filled with the
+# tree as the look sees it, where the pool is what the GPU draws of it, and
+# while the CPU steps the pool staged into the view. nothing a step writes is
+# read by the draw, so a step never waits on one
 # ---
 # s:    simulation
-# look: the camera, in cells
-pub fun show_view(s: *Sim, look: gpu.Look) {
-    if (!on_tree(s)) { ret; }
-    var l: gpu.Look = look;
-    show_tree(s, ?l);
+# look: the camera, in cells, or nil when no draw has aimed one, which the
+#       tree's view waits for
+pub fun show_view(s: *Sim, look: *gpu.Look) {
+    if (on_tree(s)) {
+        if (look == nil) { ret; }
+        var l: gpu.Look = @look;
+        show_tree(s, ?l);
+        ret;
+    }
+    if (!on_gpu(s)) { stage_view(s, look); }
 }
 
-# whether commit changes what show reads, so no draw may read it meanwhile: the
-# CPU's commit swaps the pool's cells, where the tree's leaves the pool to
-# show_view
-pub fun commit_shows(s: *Sim) bool {
-    ret !on_tree(s);
+# stage the pool the CPU steps into the view the GPU draws from, copying the
+# chunks a look can see that changed since the last stage, or every chunk that
+# did without a look
+fun stage_view(s: *Sim, look: *gpu.Look) {
+    var box: [4]i64;
+    var at:  *i64 = nil;
+    if (look != nil) {
+        gpu.view_chunks(look, ?box[0]);
+        at = ?box[0];
+    }
+    if (!space.stage(?s.view, ?s.space, !s.viewed, at)) {
+        s.viewed = false;
+        ret;
+    }
+    s.viewed   = true;
+    s.view_gen = s.generation;
 }
 
 # have the CPU's steps build the coverage pyramids a look draws from, of the
@@ -1203,9 +1240,9 @@ pub fun aim_pyramids(s: *Sim, look: *gpu.Look) {
 }
 
 # ready the draw of the last completed generation without stepping or reading
-# anything a step changes: the cells the CPU last committed, or the squares of
-# the tree show_view last put in the pool. the GPU's own steps are recorded by
-# record, on the thread that owns the world
+# anything a step changes: the view show_view last staged of the CPU's pool,
+# or the squares of the tree it last put in the pool. the GPU's own steps are
+# recorded by record, on the thread that owns the world
 # ---
 # s:    simulation, whose step may be running on another thread
 # look: the camera and colours for the draw, in cells
@@ -1216,7 +1253,8 @@ pub fun show(s: *Sim, look: *gpu.Look) err[gfx.Error] {
         ret gpu.show(s.gpu, ?s.space, ?s.rule, s.seen.gen, look);
     }
     if (on_gpu(s)) { ret gpu.aim(s.gpu, look); }
-    val done: res[usize, gfx.Error] = gpu.frame(s.gpu, ?s.space, ?s.rule, s.generation, 0, look);
+    if (!s.viewed) { ret gpu.aim(s.gpu, look); }
+    val done: res[usize, gfx.Error] = gpu.frame(s.gpu, ?s.view, ?s.rule, s.view_gen, 0, look);
     if (sel done.err) { ret err[gfx.Error].err{done.err}; }
     ret err[gfx.Error].ok{};
 }
@@ -1241,7 +1279,15 @@ pub fun record(s: *Sim, uncapped: bool, look: *gpu.Look) err[gfx.Error] {
     val fast: bool  = uncapped && s.running != 0 && on_gpu(s) && !s.full;
     if (fast)                 { want = gpu.MAX_STEPS; }
     if (!on_gpu(s) || s.full) { want = 0; }
-    val done: res[usize, gfx.Error] = gpu.frame(s.gpu, ?s.space, ?s.rule, s.generation, want, look);
+    # the CPU's pool is drawn from its view, as a frame that does not hold the
+    # world draws it
+    var pool: *space.Space = ?s.space;
+    if (!on_gpu(s)) {
+        stage_view(s, look);
+        if (!s.viewed) { ret gpu.aim(s.gpu, look); }
+        pool = ?s.view;
+    }
+    val done: res[usize, gfx.Error] = gpu.frame(s.gpu, pool, ?s.rule, s.generation, want, look);
     if (sel done.err) { ret err[gfx.Error].err{done.err}; }
     s.generation = s.generation + done.ok::u64;
     if (fast)                 { gpu.tune(s.gpu); }
@@ -4729,7 +4775,7 @@ test hashlife__a_view_built_off_the_render_thread_owes_the_pool_growth_to_the_ne
     # the view the simulation thread builds after a step grows the pool, while
     # the GPU can step but does not step the world, and calls nothing on the
     # device: the growth is owed
-    show_view(?t.gpu, look);
+    show_view(?t.gpu, ?look);
     val cap: usize = t.gpu.space.cap;
     if (cap <= was)                                         { ret 2; }
     if (t.g.p.cap != was || t.g.reserved || t.g.owed < cap) { ret 3; }
