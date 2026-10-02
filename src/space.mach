@@ -174,6 +174,7 @@ pub rec Mirror {
 # live:      slots in use
 # table:     the page table, cap * ENTRY words
 # set:       the layers the cells are stored in
+# spans:     words of a slot's span of each layer, as set gives them
 # fronts:    each layer's front cells, cap spans of it (cellar.layer)
 # backs:     each layer's back cells, cap spans of it, or nil when the GPU
 #            steps
@@ -225,6 +226,7 @@ pub rec Space {
     live:      usize;
     table:     *u32;
     set:       plane.Set;
+    spans:     [layer.LAYERS_MAX]usize;
     fronts:    [layer.LAYERS_MAX]*u32;
     backs:     [layer.LAYERS_MAX]*u32;
     mips:      *u32;
@@ -470,7 +472,17 @@ pub fun layers(sp: *Space) *plane.Set {
 # words of a slot's span of the pool's layer k
 #[inline]
 fun span_of(sp: *Space, k: usize) usize {
-    ret plane.span_words(sp.set.at[k].width);
+    ret sp.spans[k];
+}
+
+# take a set as the pool's layers, and each layer's span with it
+fun take_set(sp: *Space, set: *plane.Set) {
+    sp.set = @set;
+    var k: usize = 0;
+    for (k < set.n) {
+        sp.spans[k] = plane.span_words(set.at[k].width);
+        k           = k + 1;
+    }
 }
 
 # layer k's front span of slot s, the world as it stands
@@ -962,7 +974,8 @@ pub fun init(sp: *Space, a: *allo.Allocator, stepped: bool) err[allo.Error] {
     sp.frames  = nil;
     sp.nframes = 0;
     # a 32-bit state layer until a rule names its own (relayer)
-    sp.set = plane.state("cells", layer.WIDTH_MAX);
+    var first: plane.Set = plane.state("cells", layer.WIDTH_MAX);
+    take_set(sp, ?first);
     var k: usize = 0;
     for (k < layer.LAYERS_MAX::usize) {
         sp.fronts[k] = nil;
@@ -996,7 +1009,7 @@ pub fun relayer(sp: *Space, set: *plane.Set, map: Remap, ctx: *u8) err[allo.Erro
     val mn:   usize     = plane.exact(set);
     val same: bool      = plane.same_shape(?old, set) && plane.same_words(?old, set);
     if (same && map == nil) {
-        sp.set = @set;
+        take_set(sp, set);
         ret err[allo.Error].ok{};
     }
     # every cell's old words, then its new, one slot at a time
@@ -1034,8 +1047,8 @@ pub fun relayer(sp: *Space, set: *plane.Set, map: Remap, ctx: *u8) err[allo.Erro
                 i = i + 1;
             }
             # the new layers, read and written as the pool's for the while
-            sp.set = @set;
-            k      = 0;
+            take_set(sp, set);
+            k = 0;
             for (!same && k < set.n) {
                 sp.fronts[k] = fronts[k];
                 k            = k + 1;
@@ -1051,8 +1064,8 @@ pub fun relayer(sp: *Space, set: *plane.Set, map: Remap, ctx: *u8) err[allo.Erro
                 }
                 k = k + 1;
             }
-            sp.set = old;
-            k      = 0;
+            take_set(sp, ?old);
+            k = 0;
             for (k < layer.LAYERS_MAX::usize) {
                 sp.fronts[k] = was[k];
                 k            = k + 1;
@@ -1061,7 +1074,7 @@ pub fun relayer(sp: *Space, set: *plane.Set, map: Remap, ctx: *u8) err[allo.Erro
         }
         s = s + 1;
     }
-    sp.set = @set;
+    take_set(sp, set);
     if (same) { ret err[allo.Error].ok{}; }
     drop_layers(sp.a, ?old, sp.cap, ?was[0], ?wasb[0]);
     k = 0;
@@ -1631,6 +1644,13 @@ fun quiet(sp: *Space, s: usize) {
 # holds it, and past a plane's dead edge past, the value the rule holds the
 # edge as in that layer (cellar.rule.outside)
 pub fun resolve(sp: *Space, k: usize, s: usize, x: i32, y: i32, past: u32) u32 {
+    ret resolve_at(sp, k, sp.set.at[k].width, s, x, y, past);
+}
+
+# resolve, layer k's width named by the caller, which must be its own, so a
+# word-wide layer is read a word a cell
+#[inline]
+pub fun resolve_at(sp: *Space, k: usize, width: u32, s: usize, x: i32, y: i32, past: u32) u32 {
     var sl: usize = s;
     var px: i32   = x;
     var py: i32   = y;
@@ -1638,7 +1658,7 @@ pub fun resolve(sp: *Space, k: usize, s: usize, x: i32, y: i32, past: u32) u32 {
     for (true) {
         val e: *u32 = ?sp.table[sl * ENTRY];
         val q: u32  = layout.edge_side(e[layout.EDGE_AT::usize], px, py);
-        if (q == 4) { ret plane.load(plane_of(sp, k, sl).w, sp.set.at[k].width, (py * 64 + px)::usize); }
+        if (q == 4) { ret plane.load(?sp.fronts[k][sl * sp.spans[k]], width, (py * 64 + px)::usize); }
         val t: u32 = e[layout.LINK_AT::usize + q::usize];
         if (e[q::usize] == NONE && (t & layout.LINK_EDGE) != 0) { ret past; }
         if (h == layout.HOPS || e[q::usize] == NONE)            { ret 0; }
