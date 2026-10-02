@@ -2,7 +2,9 @@
 #
 # each adapter is a record holding its own state and the Sink or Source that
 # points back at it, so it lives on the caller's stack and must not move while
-# in use.
+# in use. a pattern trades in words where it holds them, and the world takes
+# them where its rule reads them alike (see cellar.format), so a format that
+# records a continuous rule's words carries its values exactly between them.
 
 use gfx: boom.graphics;
 use cellar.format;
@@ -30,7 +32,8 @@ use std.types.string.str;
 # its population, is refused before anything is allocated.
 # ---
 # p:    the pattern to fill; on open it is resized and takes the file's rule and
-#       comments, and its name when the file has one
+#       comments, and its name when the file has one, and in word mode it
+#       holds the words
 # sink: the sink to hand to formats.load
 pub rec PatternSink {
     p:    *pattern.Pattern;
@@ -84,6 +87,18 @@ fun pattern_run(ctx: *u8, x: i64, y: i64, n: usize, v: u8) bool {
     ret true;
 }
 
+fun pattern_words(ctx: *u8, x: i64, y: i64, n: usize, v: u8, w: *u32) bool {
+    val s:    *PatternSink    = ctx::*PatternSink;
+    val held: err[allo.Error] = pattern.hold_words(s.p);
+    if (sel held.err) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        pattern.set_word(s.p, (x - s.p.x)::usize + i, (y - s.p.y)::usize, w[i], v);
+        i = i + 1;
+    }
+    ret true;
+}
+
 fun pattern_close(ctx: *u8) bool {
     ret true;
 }
@@ -100,6 +115,7 @@ pub fun pattern_sink(s: *PatternSink, p: *pattern.Pattern) *format.Sink {
     s.sink.fit   = nil;
     s.sink.open  = pattern_open;
     s.sink.run   = pattern_run;
+    s.sink.words = pattern_words;
     s.sink.close = pattern_close;
     ret ?s.sink;
 }
@@ -129,6 +145,8 @@ pub fun pattern_sink(s: *PatternSink, p: *pattern.Pattern) *format.Sink {
 # take:    rule holds a rule to set as the sink opens
 # rule:    the rule to take
 # refused: the simulation refused the rule, so the world kept its own
+# exact:   the world's rule reads the words of the rule the file names alike,
+#          so word runs are written as their words rather than their states
 # tree:    the tree the sink offers while the quadtree holds the world
 # sink:    the sink to hand to formats.load
 pub rec WorldSink {
@@ -142,6 +160,7 @@ pub rec WorldSink {
     take:    bool;
     rule:    rule.Rule;
     refused: bool;
+    exact:   bool;
     tree:    format.TreeSink;
     sink:    format.Sink;
 }
@@ -177,6 +196,8 @@ fun take_rule(w: *WorldSink) {
 fun world_open(ctx: *u8, info: *format.Info) bool {
     val w: *WorldSink = ctx::*WorldSink;
     take_rule(w);
+    val named: res[rule.Rule, str] = rule.parse(format.text_of(?info.rule));
+    if (sel named.ok)  { w.exact = !sim.flipped(w.s) && rule.alike(?named.ok, ?w.s.rule); }
     if (!info.bounded) { ret true; }
     w.opened = sim.edit_begin(w.s, info.x0 + w.dx, info.y0 + w.dy, info.x1 + w.dx, info.y1 + w.dy);
     ret w.opened;
@@ -184,6 +205,14 @@ fun world_open(ctx: *u8, info: *format.Info) bool {
 
 fun world_run(ctx: *u8, x: i64, y: i64, n: usize, v: u8) bool {
     val w: *WorldSink = ctx::*WorldSink;
+    ret sim.edit_run(w.s, x + w.dx, y + w.dy, n, v);
+}
+
+fun world_words(ctx: *u8, x: i64, y: i64, n: usize, v: u8, c: *u32) bool {
+    val w: *WorldSink = ctx::*WorldSink;
+    if (w.exact) { ret sim.edit_words(w.s, x + w.dx, y + w.dy, n, c); }
+    # a cell whose state is 0 is dead to a rule that reads the states alone
+    if (v == 0) { ret true; }
     ret sim.edit_run(w.s, x + w.dx, y + w.dy, n, v);
 }
 
@@ -231,6 +260,7 @@ pub fun world_sink(w: *WorldSink, s: *sim.Sim, dx: i64, dy: i64) *format.Sink {
     w.opened    = false;
     w.take      = false;
     w.refused   = false;
+    w.exact     = false;
     w.tree.ctx  = w::*u8;
     w.tree.x0   = 0 - dx;
     w.tree.y0   = 0 - dy;
@@ -244,6 +274,7 @@ pub fun world_sink(w: *WorldSink, s: *sim.Sim, dx: i64, dy: i64) *format.Sink {
     w.sink.fit   = world_fit;
     w.sink.open  = world_open;
     w.sink.run   = world_run;
+    w.sink.words = world_words;
     w.sink.close = world_close;
     ret ?w.sink;
 }
@@ -300,8 +331,34 @@ fun pattern_next(ctx: *u8, r: *format.Run) bool {
                 r.y = s.p.y + s.y::i64;
                 r.n = n;
                 r.v = v;
+                r.w = nil;
                 ret true;
             }
+        }
+        s.x = 0;
+        s.y = s.y + 1;
+    }
+    ret false;
+}
+
+# the next run of cells of one state whose words are not 0
+fun pattern_next_words(ctx: *u8, r: *format.Run) bool {
+    val s: *PatternSource = ctx::*PatternSource;
+    for (s.y < s.p.h) {
+        for (s.x < s.p.w) {
+            val at: usize = s.x;
+            if (pattern.word(s.p, at, s.y) == 0) {
+                s.x = s.x + 1;
+                cnt;
+            }
+            val v: u8 = pattern.get(s.p, at, s.y);
+            for (s.x < s.p.w && pattern.word(s.p, s.x, s.y) != 0 && pattern.get(s.p, s.x, s.y) == v) { s.x = s.x + 1; }
+            r.x = s.p.x + at::i64;
+            r.y = s.p.y + s.y::i64;
+            r.n = s.x - at;
+            r.v = v;
+            r.w = ?s.p.words[s.y * s.p.w + at];
+            ret true;
         }
         s.x = 0;
         s.y = s.y + 1;
@@ -339,6 +396,8 @@ pub fun pattern_source(s: *PatternSource, p: *pattern.Pattern) *format.Source {
     s.source.tree   = nil;
     s.source.rewind = pattern_rewind;
     s.source.next   = pattern_next;
+    s.source.words  = nil;
+    if (pattern.exact(p)) { s.source.words = pattern_next_words; }
     ret ?s.source;
 }
 
@@ -485,6 +544,7 @@ fun world_next(ctx: *u8, r: *format.Run) bool {
             r.x  = c.cx * space.SIDE + w.lx;
             r.y  = c.cy * space.SIDE + w.ly;
             r.v  = v;
+            r.w  = nil;
             w.lx = w.lx + m;
             var n: i64 = m;
             # a run reaching the edge goes on into the chunk beside it
@@ -570,6 +630,7 @@ pub fun world_source(w: *WorldSource, s: *sim.Sim, a: *allo.Allocator) res[*form
     w.source.continuous = rule.caps(?s.rule).continuous;
     w.source.rewind     = world_rewind;
     w.source.next       = world_next;
+    w.source.words      = nil;
     w.band              = 0;
     w.end               = 0;
     ret res[*format.Source, format.Error].ok{?w.source};
