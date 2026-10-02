@@ -13,6 +13,14 @@
 # before a token repeats it. a Lenia word, up to 2^24, takes at most 6 bytes,
 # and any word at most 7. the writer wraps its body at 70 columns, as RLE's.
 #
+# a version 1 file holds a word of one value a cell, a rule whose cells are
+# their state layer alone. a rule with rule layers (cellar.layer) has words of
+# more values, and its file opens "[RLW 2 <n>]", n the values a word holds, 2
+# to cellar.layer.LAYERS_MAX: a token is then n numbers, one a value, each
+# written as a version 1 word is but for 0, which is 'A' alone, and a cell all
+# of whose values are 0 is '.'. the writer writes version 1 for a word of one
+# value, so those files are what they always were.
+#
 # a word's state is its state under the named rule, or live for a word but 0
 # under a rule this cellar does not know, as a world file's. a source that
 # offers no words is written as the words of its states under the rule the
@@ -20,9 +28,11 @@
 
 use cellar.format;
 use cellar.formats.rle;
+use cellar.layer;
 use cellar.rule;
 use allo: std.allocator;
 use std.collections.vector.Vector;
+use mem: std.memory;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -32,8 +42,9 @@ use std.types.size.usize;
 use std.types.string;
 use std.types.string.str;
 
-# the first line of every file
-val MAGIC: str = "[RLW 1]";
+# the first line of a file of one value a word, and the start of one of more
+val MAGIC:  str = "[RLW 1]";
+val MAGIC2: str = "[RLW 2 ";
 # the base a word is written in
 val BASE: u64 = 26;
 # the words a decoder gathers into one run before handing it on
@@ -88,13 +99,15 @@ fun state_of(rd: *Reading, c: u32, v: *u8) bool {
 # y: row
 # n: cells
 # v: their state
-# w: their words, in word mode
+# m: values a word holds
+# w: their words, in word mode, m values each
 rec Pending {
     x: i64;
     y: i64;
     n: usize;
     v: u8;
-    w: [64]u32;
+    m: usize;
+    w: [64 * layer.LAYERS_MAX]u32;
 }
 
 # hand the pending run on, and empty it
@@ -108,7 +121,7 @@ fun flush(e: *format.Emit, p: *Pending) bool {
 
 # add n cells of one word and state from (x, y) rightward to the pending run,
 # handing it on as it fills or no longer joins them
-fun add(e: *format.Emit, p: *Pending, x: i64, y: i64, n: usize, v: u8, c: u32) bool {
+fun add(e: *format.Emit, p: *Pending, x: i64, y: i64, n: usize, v: u8, c: *u32) bool {
     var at:   i64   = x;
     var left: usize = n;
     for (left > 0) {
@@ -128,8 +141,12 @@ fun add(e: *format.Emit, p: *Pending, x: i64, y: i64, n: usize, v: u8, c: u32) b
         if (k > left) { k = left; }
         var i: usize = 0;
         for (i < k) {
-            p.w[p.n + i] = c;
-            i            = i + 1;
+            var j: usize = 0;
+            for (j < p.m) {
+                p.w[(p.n + i) * p.m + j] = c[j];
+                j                        = j + 1;
+            }
+            i = i + 1;
         }
         p.n  = p.n + k;
         at   = at + k::i64;
@@ -138,8 +155,8 @@ fun add(e: *format.Emit, p: *Pending, x: i64, y: i64, n: usize, v: u8, c: u32) b
     ret true;
 }
 
-# read one word from i, leaving i after it
-fun read_word(p: *u8, n: usize, i: *usize, out: *u32) err[format.Error] {
+# read one value from i, leaving i after it, 0 only when zero allows it
+fun read_word(p: *u8, n: usize, i: *usize, out: *u32, zero: bool) err[format.Error] {
     var v: u64   = 0;
     var k: usize = @i;
     if (k < n && p[k] == 'a') { ret err[format.Error].err{format.Error.malformed{}}; }
@@ -151,8 +168,8 @@ fun read_word(p: *u8, n: usize, i: *usize, out: *u32) err[format.Error] {
     if (k >= n)                   { ret err[format.Error].err{format.Error.truncated{}}; }
     if (p[k] < 'A' || p[k] > 'Z') { ret err[format.Error].err{format.Error.malformed{}}; }
     v = v * BASE + (p[k] - 'A')::u64;
-    if (v > 0xffffffff) { ret err[format.Error].err{format.Error.range{}}; }
-    if (v == 0)         { ret err[format.Error].err{format.Error.malformed{}}; }
+    if (v > 0xffffffff)  { ret err[format.Error].err{format.Error.range{}}; }
+    if (v == 0 && !zero) { ret err[format.Error].err{format.Error.malformed{}}; }
     @i   = k + 1;
     @out = v::u32;
     ret err[format.Error].ok{};
@@ -164,11 +181,13 @@ fun read_word(p: *u8, n: usize, i: *usize, out: *u32) err[format.Error] {
 # i:  the body's first byte
 # e:  where the cells go
 # rd: the rule the words are read under
+# m:  values a word holds
 # ox, oy: the world position of the pattern's top-left corner
 # w, h:   the declared size, which the cells must stay inside
-fun read_body(p: *u8, n: usize, i: usize, e: *format.Emit, rd: *Reading, ox: i64, oy: i64, w: i64, h: i64) err[format.Error] {
+fun read_body(p: *u8, n: usize, i: usize, e: *format.Emit, rd: *Reading, m: usize, ox: i64, oy: i64, w: i64, h: i64) err[format.Error] {
     var pend: Pending;
     pend.n = 0;
+    pend.m = m;
     var at:    usize = i;
     var x:     i64   = 0;
     var y:     i64   = 0;
@@ -211,13 +230,21 @@ fun read_body(p: *u8, n: usize, i: usize, e: *format.Emit, rd: *Reading, ox: i64
             if (x > format.LIMIT) { ret err[format.Error].err{format.Error.range{}}; }
             cnt;
         }
-        var c: u32               = 0;
-        val r: err[format.Error] = read_word(p, n, ?at, ?c);
-        if (sel r.err) { ret r; }
+        var c:   [layer.LAYERS_MAX]u32;
+        var any: bool  = false;
+        var j:   usize = 0;
+        for (j < m) {
+            val r: err[format.Error] = read_word(p, n, ?at, ?c[j], m > 1);
+            if (sel r.err) { ret r; }
+            if (c[j] != 0) { any = true; }
+            j = j + 1;
+        }
+        # a cell of all 0 is '.'
+        if (!any) { ret err[format.Error].err{format.Error.malformed{}}; }
         var v: u8 = 0;
-        if (!state_of(rd, c, ?v))                           { ret err[format.Error].err{format.Error.range{}}; }
-        if (x + k > w || y >= h)                            { ret err[format.Error].err{format.Error.malformed{}}; }
-        if (!add(e, ?pend, ox + x, oy + y, k::usize, v, c)) { ret err[format.Error].err{format.Error.sink{}}; }
+        if (!state_of(rd, c[0], ?v))                            { ret err[format.Error].err{format.Error.range{}}; }
+        if (x + k > w || y >= h)                                { ret err[format.Error].err{format.Error.malformed{}}; }
+        if (!add(e, ?pend, ox + x, oy + y, k::usize, v, ?c[0])) { ret err[format.Error].err{format.Error.sink{}}; }
         x = x + k;
     }
     ret err[format.Error].ok{};
@@ -226,10 +253,25 @@ fun read_body(p: *u8, n: usize, i: usize, e: *format.Emit, rd: *Reading, ox: i64
 # decode an RLW file
 fun decode(a: *allo.Allocator, p: *u8, n: usize, e: *format.Emit) err[format.Error] {
     var at: usize = skip_blank(p, n, 0);
-    if (!begins(p, n, at, MAGIC)) {
+    var m:  usize = 1;
+    if (begins(p, n, at, MAGIC2)) {
+        # version 2 names the values a word holds
+        var k: usize = at + string.str_len(MAGIC2);
+        m = 0;
+        for (k < n && is_digit(p[k]) && m <= layer.LAYERS_MAX::usize) {
+            m = m * 10 + (p[k] - '0')::usize;
+            k = k + 1;
+        }
+        if (k >= n || p[k] != ']' || m < 2 || m > layer.LAYERS_MAX::usize) {
+            e.info.at = at;
+            ret err[format.Error].err{format.Error.malformed{}};
+        }
+    }
+    or (!begins(p, n, at, MAGIC)) {
         e.info.at = at;
         ret err[format.Error].err{format.Error.malformed{}};
     }
+    e.info.values = m;
     for (at < n && p[at] != '\n') { at = at + 1; }
     var ox: i64               = 0;
     var oy: i64               = 0;
@@ -249,17 +291,32 @@ fun decode(a: *allo.Allocator, p: *u8, n: usize, e: *format.Emit) err[format.Err
         rd.known = true;
         rd.r     = r.ok;
     }
-    ret read_body(p, n, at, e, ?rd, ox, oy, w, h);
+    ret read_body(p, n, at, e, ?rd, m, ox, oy, w, h);
 }
 
 # how likely the bytes are RLW: they begin with its first line
 fun sniff(p: *u8, n: usize) u32 {
-    if (begins(p, n, skip_blank(p, n, 0), MAGIC)) { ret 100; }
+    val at: usize = skip_blank(p, n, 0);
+    if (begins(p, n, at, MAGIC) || begins(p, n, at, MAGIC2)) { ret 100; }
     ret 0;
 }
 
-# write a word as one token, repeated count times
-fun put_word(w: *rle.Out, count: i64, c: u32) err[format.Error] {
+# write a cell's word of m values as one token, repeated count times
+fun put_word(w: *rle.Out, count: i64, c: *u32, m: usize) err[format.Error] {
+    var tag: [8 * layer.LAYERS_MAX]u8;
+    var len: usize = 0;
+    var j:   usize = 0;
+    for (j < m) {
+        len = len + digits(c[j], ?tag[len]);
+        j   = j + 1;
+    }
+    ret rle.token(w, count, ?tag[0], len);
+}
+
+# write a value in base 26 to out, as a token writes it
+# ---
+# ret: the bytes written, at most 8
+fun digits(c: u32, out: *u8) usize {
     var rev: [8]u8;
     var k:   usize = 0;
     var v:   u64   = c::u64;
@@ -271,13 +328,12 @@ fun put_word(w: *rle.Out, count: i64, c: u32) err[format.Error] {
         v      = v / BASE;
         k      = k + 1;
     }
-    var tag: [8]u8;
-    var i:   usize = 0;
+    var i: usize = 0;
     for (i < k) {
-        tag[i] = rev[k - 1 - i];
+        out[i] = rev[k - 1 - i];
         i      = i + 1;
     }
-    ret rle.token(w, count, ?tag[0], k);
+    ret k;
 }
 
 # where the writer stands, and how it reads the source
@@ -285,12 +341,16 @@ fun put_word(w: *rle.Out, count: i64, c: u32) err[format.Error] {
 # src:   the source
 # words: read the source's words rather than its states
 # r:     the rule a state's word is taken from, when not reading words
+# m:     values a word holds
+# fresh: a word taken from a state
 # curx:  the column the body has written up to
 # cury:  the row
 rec Writing {
     src:   *format.Source;
     words: bool;
     r:     rule.Rule;
+    m:     usize;
+    fresh: [layer.LAYERS_MAX]u32;
     curx:  i64;
     cury:  i64;
 }
@@ -301,10 +361,21 @@ fun next(wr: *Writing, r: *format.Run) bool {
     ret wr.src.next(wr.src.ctx, r);
 }
 
-# the word of the k-th cell of a run
-fun word_at(wr: *Writing, r: *format.Run, k: usize) u32 {
-    if (wr.words) { ret r.w[k]; }
-    ret rule.word(?wr.r, r.v::u32);
+# the word of the k-th cell of a run, its m values
+fun word_at(wr: *Writing, r: *format.Run, k: usize) *u32 {
+    if (wr.words) { ret ?r.w[k * wr.m]; }
+    rule.fresh(?wr.r, r.v::u32, ?wr.fresh[0]);
+    ret ?wr.fresh[0];
+}
+
+# whether a word of m values is all 0
+fun blank(c: *u32, m: usize) bool {
+    var j: usize = 0;
+    for (j < m) {
+        if (c[j] != 0) { ret false; }
+        j = j + 1;
+    }
+    ret true;
 }
 
 # write one run, its equal words counted together
@@ -326,16 +397,34 @@ fun write_run(w: *rle.Out, wr: *Writing, r: *format.Run) err[format.Error] {
     }
     var k: usize = 0;
     for (k < r.n) {
-        val c: u32   = word_at(wr, r, k);
+        var c: [layer.LAYERS_MAX]u32;
+        mem.copy[u32](?c[0], word_at(wr, r, k), wr.m);
         var e: usize = k + 1;
-        for (e < r.n && word_at(wr, r, e) == c) { e = e + 1; }
-        if (c == 0) { ret err[format.Error].err{format.Error.range{}}; }
-        val t: err[format.Error] = put_word(w, (e - k)::i64, c);
+        for (e < r.n && mem.equal[u32](word_at(wr, r, e), ?c[0], wr.m)) { e = e + 1; }
+        if (blank(?c[0], wr.m)) { ret err[format.Error].err{format.Error.range{}}; }
+        val t: err[format.Error] = put_word(w, (e - k)::i64, ?c[0], wr.m);
         if (sel t.err) { ret t; }
         k = e;
     }
     wr.curx = r.x + r.n::i64;
     ret err[format.Error].ok{};
+}
+
+# write the first line, less its newline, of a file of words of m values
+fun put_magic(w: *rle.Out, m: usize) err[format.Error] {
+    if (m == 1) { ret rle.put_str(w, MAGIC); }
+    val head: err[format.Error] = rle.put_str(w, MAGIC2);
+    if (sel head.err) { ret head; }
+    var num: [4]u8;
+    var len: usize = 0;
+    if (m >= 10) {
+        num[len] = '0' + (m / 10)::u8;
+        len      = len + 1;
+    }
+    num[len]     = '0' + (m % 10)::u8;
+    num[len + 1] = ']';
+    num[len + 2] = 0;
+    ret rle.put_str(w, ?num[0]);
 }
 
 # encode a source as an RLW file
@@ -351,17 +440,20 @@ fun encode(a: *allo.Allocator, src: *format.Source, info: *format.Info, out: *Ve
     var wr: Writing;
     wr.src   = src;
     wr.words = src.words != nil;
+    wr.m     = src.values;
     wr.curx  = src.x0;
     wr.cury  = src.y0;
     if (!wr.words) {
         val r: res[rule.Rule, str] = rule.parse(named);
         if (sel r.err) { ret err[format.Error].err{format.Error.unruled{}}; }
         wr.r = r.ok;
+        wr.m = rule.word_len(?wr.r);
     }
+    if (wr.m < 1 || wr.m > layer.LAYERS_MAX::usize) { ret err[format.Error].err{format.Error.range{}}; }
     var w: rle.Out;
     w.out = out;
     w.col = 0;
-    val m: err[format.Error] = rle.put_str(?w, MAGIC);
+    val m: err[format.Error] = put_magic(?w, wr.m);
     if (sel m.err) { ret m; }
     val nl: err[format.Error] = rle.put(?w, '\n');
     if (sel nl.err) { ret nl; }

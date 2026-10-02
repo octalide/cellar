@@ -31,16 +31,18 @@ use std.types.string.str;
 # a pattern is dense, so it plans by the box: one past pattern.holds, whatever
 # its population, is refused before anything is allocated.
 # ---
-# p:     the pattern to fill; on open it is resized and takes the file's rule
-#        and comments, and its name when the file has one, and in word mode it
-#        holds the words
-# words: the words are kept, as they are unless the file names a rule of
-#        states alone, whose patterns hold states (see cellar.pattern)
-# sink:  the sink to hand to formats.load
+# p:      the pattern to fill; on open it is resized and takes the file's rule
+#         and comments, and its name when the file has one, and in word mode it
+#         holds the words
+# words:  the words are kept, as they are unless the file names a rule whose
+#         words are its states, whose patterns hold states (see cellar.pattern)
+# values: values a word holds, as the file records them
+# sink:   the sink to hand to formats.load
 pub rec PatternSink {
-    p:     *pattern.Pattern;
-    words: bool;
-    sink:  format.Sink;
+    p:      *pattern.Pattern;
+    words:  bool;
+    values: usize;
+    sink:   format.Sink;
 }
 
 # the width and height of an Info's box, 0 by 0 when it has none
@@ -77,8 +79,9 @@ fun pattern_open(ctx: *u8, info: *format.Info) bool {
     val u: err[allo.Error] = pattern.set_rule(s.p, format.text_of(?info.rule));
     if (sel u.err) { ret false; }
     val named: res[rule.Rule, str] = rule.parse(format.text_of(?info.rule));
-    s.words = true;
-    if (sel named.ok) { s.words = rule.caps(?named.ok).continuous; }
+    s.words  = true;
+    s.values = info.values;
+    if (sel named.ok) { s.words = rule.keeps_words(?named.ok); }
     val c: err[allo.Error] = pattern.set_comments(s.p, format.text_of(?info.comments));
     ret !(sel c.err);
 }
@@ -96,11 +99,11 @@ fun pattern_run(ctx: *u8, x: i64, y: i64, n: usize, v: u8) bool {
 fun pattern_words(ctx: *u8, x: i64, y: i64, n: usize, v: u8, w: *u32) bool {
     val s: *PatternSink = ctx::*PatternSink;
     if (!s.words) { ret pattern_run(ctx, x, y, n, v); }
-    val held: err[allo.Error] = pattern.hold_words(s.p);
+    val held: err[allo.Error] = pattern.hold_words(s.p, s.values);
     if (sel held.err) { ret false; }
     var i: usize = 0;
     for (i < n) {
-        pattern.set_word(s.p, (x - s.p.x)::usize + i, (y - s.p.y)::usize, w[i], v);
+        pattern.set_word(s.p, (x - s.p.x)::usize + i, (y - s.p.y)::usize, ?w[i * s.values], v);
         i = i + 1;
     }
     ret true;
@@ -117,6 +120,7 @@ fun pattern_close(ctx: *u8) bool {
 pub fun pattern_sink(s: *PatternSink, p: *pattern.Pattern) *format.Sink {
     s.p          = p;
     s.words      = false;
+    s.values     = 1;
     s.sink.ctx   = s::*u8;
     s.sink.tree  = nil;
     s.sink.plan  = pattern_plan;
@@ -154,7 +158,8 @@ pub fun pattern_sink(s: *PatternSink, p: *pattern.Pattern) *format.Sink {
 # rule:    the rule to take
 # refused: the simulation refused the rule, so the world kept its own
 # exact:   the world's rule reads the words of the rule the file names alike,
-#          so word runs are written as their words rather than their states
+#          and the file's words hold as many values as the world's, so word
+#          runs are written as their words rather than their states
 # tree:    the tree the sink offers while the quadtree holds the world
 # sink:    the sink to hand to formats.load
 pub rec WorldSink {
@@ -205,7 +210,7 @@ fun world_open(ctx: *u8, info: *format.Info) bool {
     val w: *WorldSink = ctx::*WorldSink;
     take_rule(w);
     val named: res[rule.Rule, str] = rule.parse(format.text_of(?info.rule));
-    if (sel named.ok)  { w.exact = !sim.flipped(w.s) && rule.alike(?named.ok, ?w.s.rule); }
+    if (sel named.ok)  { w.exact = !sim.flipped(w.s) && rule.alike(?named.ok, ?w.s.rule) && info.values == sim.word_len(w.s); }
     if (!info.bounded) { ret true; }
     w.opened = sim.edit_begin(w.s, info.x0 + w.dx, info.y0 + w.dy, info.x1 + w.dx, info.y1 + w.dy);
     ret w.opened;
@@ -355,17 +360,17 @@ fun pattern_next_words(ctx: *u8, r: *format.Run) bool {
     for (s.y < s.p.h) {
         for (s.x < s.p.w) {
             val at: usize = s.x;
-            if (pattern.word(s.p, at, s.y) == 0) {
+            if (pattern.blank(s.p, at, s.y)) {
                 s.x = s.x + 1;
                 cnt;
             }
             val v: u8 = pattern.get(s.p, at, s.y);
-            for (s.x < s.p.w && pattern.word(s.p, s.x, s.y) != 0 && pattern.get(s.p, s.x, s.y) == v) { s.x = s.x + 1; }
+            for (s.x < s.p.w && !pattern.blank(s.p, s.x, s.y) && pattern.get(s.p, s.x, s.y) == v) { s.x = s.x + 1; }
             r.x = s.p.x + at::i64;
             r.y = s.p.y + s.y::i64;
             r.n = s.x - at;
             r.v = v;
-            r.w = ?s.p.words[s.y * s.p.w + at];
+            r.w = pattern.word(s.p, at, s.y);
             ret true;
         }
         s.x = 0;
@@ -396,6 +401,8 @@ pub fun pattern_source(s: *PatternSource, p: *pattern.Pattern) *format.Source {
     # the rule the pattern names, where it parses, says whether its states are
     # a continuous rule's levels
     s.source.continuous = false;
+    s.source.values     = p.values;
+    if (p.values == 0) { s.source.values = 1; }
     val named: str = pattern.rule(p);
     if (named[0] != 0) {
         val r: res[rule.Rule, str] = rule.parse(named);
@@ -440,6 +447,7 @@ rec Held {
 # ---
 # s:      simulation to read
 # exact:  word mode: the chunks and extent are by word, and words are offered
+# m:      values a word holds
 # listed: held holds the chunks
 # held:   the chunks holding a state, or a word, ordered
 # cells:  the states of the chunks of the row being read, in order
@@ -454,6 +462,7 @@ rec Held {
 pub rec WorldSource {
     s:      *sim.Sim;
     exact:  bool;
+    m:      usize;
     listed: bool;
     held:   Vector[Held];
     cells:  Vector[u8];
@@ -485,11 +494,11 @@ fun band_end(w: *WorldSource, from: usize) usize {
     var k: usize = from;
     for (k < e) {
         val c: *Held = ?w.held.data[k];
-        if (w.exact) { sim.chunk_words(w.s, c.cx, c.cy, ?w.words.data[(k - from) * space.CELLS]); }
+        if (w.exact) { sim.chunk_words(w.s, c.cx, c.cy, ?w.words.data[(k - from) * space.CELLS * w.m]); }
         or           { sim.world_chunk_cells(w.s, c.cx, c.cy, ?w.cells.data[(k - from) * space.CELLS]); }
         k = k + 1;
     }
-    if (w.exact) { w.words.len = (e - from) * space.CELLS; }
+    if (w.exact) { w.words.len = (e - from) * space.CELLS * w.m; }
     or           { w.cells.len = (e - from) * space.CELLS; }
     ret e;
 }
@@ -500,11 +509,13 @@ fun band_end(w: *WorldSource, from: usize) usize {
 # ok:    every chunk was kept
 # boxed: box holds the extent of the words listed
 # box:   the cells holding a word but 0, half-open
+# m:     values a word holds
 rec Listed {
     held:  *Vector[Held];
     ok:    bool;
     boxed: bool;
     box:   space.Box;
+    m:     usize;
 }
 
 fun list_chunk(ctx: *u8, cx: i64, cy: i64, cells: *u8) {
@@ -520,7 +531,7 @@ fun list_words(ctx: *u8, cx: i64, cy: i64, cells: *u32) {
     if (sel put.err) { at.ok = false; }
     var i: usize = 0;
     for (i < space.CELLS) {
-        if (cells[i] != 0) {
+        if (!blank(?cells[i * at.m], at.m)) {
             val x: i64 = cx * space.SIDE + (i % space.SIDE::usize)::i64;
             val y: i64 = cy * space.SIDE + (i / space.SIDE::usize)::i64;
             if (!at.boxed || x < at.box.x0)     { at.box.x0 = x; }
@@ -536,7 +547,7 @@ fun list_words(ctx: *u8, cx: i64, cy: i64, cells: *u32) {
 fun world_rewind(ctx: *u8) err[format.Error] {
     val w: *WorldSource = ctx::*WorldSource;
     if (!w.listed) {
-        var at: Listed = Listed{held: ?w.held, ok: true, boxed: false, box: space.Box{x0: 0, y0: 0, x1: 0, y1: 0}};
+        var at: Listed = Listed{held: ?w.held, ok: true, boxed: false, box: space.Box{x0: 0, y0: 0, x1: 0, y1: 0}, m: w.m};
         sim.world_chunks(w.s, list_chunk, (?at)::*u8);
         if (!at.ok) { ret err[format.Error].err{format.Error.alloc{allo.Error.exhausted{}}}; }
         sort.sort_by[Held](w.held.data, w.held.len, held_order);
@@ -554,7 +565,7 @@ fun world_rewind(ctx: *u8) err[format.Error] {
     w.words.len = 0;
     w.cells.len = 0;
     if (w.exact) {
-        val room: res[usize, allo.Error] = vector.reserve[u32](?w.words, widest * space.CELLS);
+        val room: res[usize, allo.Error] = vector.reserve[u32](?w.words, widest * space.CELLS * w.m);
         if (sel room.err) { ret err[format.Error].err{format.Error.alloc{room.err}}; }
     }
     or {
@@ -571,13 +582,23 @@ fun world_rewind(ctx: *u8) err[format.Error] {
 
 # the state of a cell of chunk k of the row being read, its word's in word mode
 fun state_at(w: *WorldSource, k: usize, lx: i64, ly: i64) u8 {
-    if (w.exact) { ret rule.state(?w.s.rule, word_at(w, k, lx, ly))::u8; }
+    if (w.exact) { ret rule.state(?w.s.rule, word_at(w, k, lx, ly)[0])::u8; }
     ret w.cells.data[(k - w.band) * space.CELLS + (ly * space.SIDE + lx)::usize];
 }
 
-# the word of a cell of chunk k of the row being read, in word mode
-fun word_at(w: *WorldSource, k: usize, lx: i64, ly: i64) u32 {
-    ret w.words.data[(k - w.band) * space.CELLS + (ly * space.SIDE + lx)::usize];
+# the word of a cell of chunk k of the row being read, in word mode, its values
+fun word_at(w: *WorldSource, k: usize, lx: i64, ly: i64) *u32 {
+    ret ?w.words.data[((k - w.band) * space.CELLS + (ly * space.SIDE + lx)::usize) * w.m];
+}
+
+# whether a word of m values is all 0
+fun blank(c: *u32, m: usize) bool {
+    var j: usize = 0;
+    for (j < m) {
+        if (c[j] != 0) { ret false; }
+        j = j + 1;
+    }
+    ret true;
 }
 
 # how many cells of state v run from column lx of a chunk's row, to its edge at most
@@ -641,20 +662,20 @@ fun world_next_words(ctx: *u8, r: *format.Run) bool {
     for (w.band < w.held.len) {
         for (w.k < w.end) {
             val c: *Held = ?w.held.data[w.k];
-            for (w.lx < space.SIDE && word_at(w, w.k, w.lx, w.ly) == 0) { w.lx = w.lx + 1; }
+            for (w.lx < space.SIDE && blank(word_at(w, w.k, w.lx, w.ly), w.m)) { w.lx = w.lx + 1; }
             if (w.lx == space.SIDE) {
                 w.k  = w.k + 1;
                 w.lx = 0;
                 cnt;
             }
             val at: i64 = w.lx;
-            val v:  u32 = rule.state(?w.s.rule, word_at(w, w.k, at, w.ly));
-            for (w.lx < space.SIDE && word_at(w, w.k, w.lx, w.ly) != 0 && rule.state(?w.s.rule, word_at(w, w.k, w.lx, w.ly)) == v) { w.lx = w.lx + 1; }
+            val v:  u32 = rule.state(?w.s.rule, word_at(w, w.k, at, w.ly)[0]);
+            for (w.lx < space.SIDE && !blank(word_at(w, w.k, w.lx, w.ly), w.m) && rule.state(?w.s.rule, word_at(w, w.k, w.lx, w.ly)[0]) == v) { w.lx = w.lx + 1; }
             r.x = c.cx * space.SIDE + at;
             r.y = c.cy * space.SIDE + w.ly;
             r.n = (w.lx - at)::usize;
             r.v = v::u8;
-            r.w = ?w.words.data[(w.k - w.band) * space.CELLS + (w.ly * space.SIDE + at)::usize];
+            r.w = word_at(w, w.k, at, w.ly);
             ret true;
         }
         next_row(w);
@@ -691,8 +712,8 @@ pub fun quadtree(q: *format.Quadtree, t: *hashlife.Tree) *format.Quadtree {
 #
 # the cells are brought from the GPU first when it steps, and the tree is
 # offered as well when HashLife holds the world. words are offered when asked
-# for under a continuous rule on a world that is not flipped, whose held words
-# would be its complement's.
+# for under a rule whose words hold more than its states (rule.keeps_words) on
+# a world that is not flipped, whose held words would be its complement's.
 # ---
 # w:     source record; world_source_dnit releases it, whether this succeeded or not
 # s:     simulation to write out, left as it is
@@ -701,7 +722,8 @@ pub fun quadtree(q: *format.Quadtree, t: *hashlife.Tree) *format.Quadtree {
 # ret:   the source, or why the cells could not be read
 pub fun world_source(w: *WorldSource, s: *sim.Sim, a: *allo.Allocator, words: bool) res[*format.Source, format.Error] {
     w.s      = s;
-    w.exact  = words && rule.caps(?s.rule).continuous && !sim.flipped(s);
+    w.exact  = words && rule.keeps_words(?s.rule) && !sim.flipped(s);
+    w.m      = sim.word_len(s);
     w.listed = false;
     w.held   = vector.init[Held](a);
     w.cells  = vector.init[u8](a);
@@ -712,7 +734,7 @@ pub fun world_source(w: *WorldSource, s: *sim.Sim, a: *allo.Allocator, words: bo
     if (w.exact) {
         # the chunks are listed now, since the extent is theirs
         val reach: i64    = space.chunk_of(space.REACH) + 1;
-        var at:    Listed = Listed{held: ?w.held, ok: true, boxed: false, box: space.Box{x0: 0, y0: 0, x1: 0, y1: 0}};
+        var at:    Listed = Listed{held: ?w.held, ok: true, boxed: false, box: space.Box{x0: 0, y0: 0, x1: 0, y1: 0}, m: w.m};
         sim.chunks_in(s, space.Box{x0: 0 - reach, y0: 0 - reach, x1: reach, y1: reach}, list_words, (?at)::*u8);
         if (!at.ok) { ret res[*format.Source, format.Error].err{format.Error.alloc{allo.Error.exhausted{}}}; }
         sort.sort_by[Held](w.held.data, w.held.len, held_order);
@@ -736,6 +758,7 @@ pub fun world_source(w: *WorldSource, s: *sim.Sim, a: *allo.Allocator, words: bo
     if (t != nil && !w.exact) { w.source.tree = quadtree(?w.quad, t); }
     w.source.states     = rule.states(?s.rule);
     w.source.continuous = rule.caps(?s.rule).continuous;
+    w.source.values     = w.m;
     w.source.rewind     = world_rewind;
     w.source.next       = world_next;
     w.source.words      = nil;

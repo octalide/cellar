@@ -22,10 +22,14 @@
 #   layers(r: *R) plane.Set          the layers its cells are stored in, its
 #                                    state layer and any rule layers its step
 #                                    needs (cellar.layer)
-#   word_of(r: *R, state: u32) u32   the word a fresh cell of a state holds:
-#                                    its exact value, its state and rule
-#                                    layers' values where they lie in it
-#   state_of(c: u32) u32             the state a word holds
+#   word_of(r: *R, state: u32) u32   the value a fresh cell of a state holds
+#                                    in its state layer
+#   rest_of(r: *R, state: u32, k: usize) u32
+#                                    the value a fresh cell of a state holds
+#                                    in rule layer k, from 1, so a fresh
+#                                    cell's word is word_of then rest_of for
+#                                    each rule layer (cellar.layer)
+#   state_of(c: u32) u32             the state a state layer's value holds
 #   ink(r: *R) u32                   the state painted or seeded when none is
 #                                    chosen, the fully live one
 #   slack(r: *R) u32                 how far the GPU's word for a cell may lie
@@ -62,11 +66,13 @@
 #
 # the states and their words belong to the rule, not only its family: a
 # generations rule has as many states as its string names, and its words show
-# where each state lies among them.
+# where each state lies among them. a cell's state is read from its state
+# layer alone, and its word, the values of all its state and rule layers
+# (cellar.layer), is what keeps it exactly.
 #
 # changing a world's rule to one whose words differ, one of another family or
 # of the same family with other states, re-encodes its cells: each word becomes
-# the new rule's word for the state the old rule reads in it, word(new,
+# the new rule's fresh word for the state the old rule reads in it, fresh(new,
 # state(old, c)), and a state the new rule lacks becomes state 0, the quiescent
 # background, the one mapping safe between any two rules. a family that needs
 # a smarter mapping can later offer adopt(state, from) u32 as the extension
@@ -108,6 +114,7 @@ use cellar.layout;
 use cellar.rules.generations;
 use cellar.rules.lenia;
 use cellar.rules.nontotalistic;
+use cellar.rules.probe;
 use cellar.rules.reaction;
 use ruletable: cellar.rules.table;
 use cellar.rules.weighted;
@@ -137,6 +144,7 @@ use std.types.string.str;
 # table:         a rule table or tree of up to 256 states, Golly's .rule files
 # lenia:         a continuous rule, Bert Chan's Lenia
 # reaction:      a reaction-diffusion rule of two continuous fields, Gray-Scott's
+# probe:         a rule for the tests alone, Life with two rule layers of memory
 pub tag Kind: u8 {
     weighted:      weighted.Kernel;
     generations:   generations.Rule;
@@ -144,6 +152,7 @@ pub tag Kind: u8 {
     table:         ruletable.Rule;
     lenia:         lenia.Rule;
     reaction:      reaction.Rule;
+    probe:         probe.Rule;
 }
 
 # a rule: a family's rule and the grid it runs on
@@ -161,7 +170,9 @@ pub fun of(k: Kind) Rule {
 }
 
 # rule families this version runs
-pub val FAMILIES: usize = 6;
+pub val FAMILIES: usize = 7;
+# the family the tests alone run (cellar.rules.probe)
+pub val PROBE: usize = 6;
 
 # the longest rule string any family's format writes, less its NUL, the
 # weighted family's being the longest (see dispatch__every_function_handles_every_family)
@@ -196,6 +207,7 @@ pub rec Caps {
 
 # the id family i's rule strings are recorded under, in world and settings files
 pub fun family_id(i: usize) str {
+    if (i == 6) { ret "probe"; }
     if (i == 5) { ret "reaction"; }
     if (i == 4) { ret "lenia"; }
     if (i == 3) { ret "table"; }
@@ -225,6 +237,7 @@ pub fun family_of(r: *Rule) usize {
     if (sel r.kind.table)         { ret 3; }
     if (sel r.kind.lenia)         { ret 4; }
     if (sel r.kind.reaction)      { ret 5; }
+    if (sel r.kind.probe)         { ret 6; }
     unmatched();
     ret 0;
 }
@@ -240,6 +253,7 @@ fun unmatched() {
 # len: receives its length in bytes
 # ret: its first byte
 pub fun stage(i: usize, len: *usize) *u8 {
+    if (i == 6) { ret probe.stage(len); }
     if (i == 5) { ret reaction.stage(len); }
     if (i == 4) { ret lenia.stage(len); }
     if (i == 3) { ret ruletable.stage(len); }
@@ -250,6 +264,7 @@ pub fun stage(i: usize, len: *usize) *u8 {
 
 # whether family i's step stage binds a rule buffer
 pub fun table(i: usize) bool {
+    if (i == 6) { ret probe.TABLE; }
     if (i == 5) { ret reaction.TABLE; }
     if (i == 4) { ret lenia.TABLE; }
     if (i == 3) { ret ruletable.TABLE; }
@@ -266,6 +281,7 @@ pub fun bindings(i: usize) usize {
 
 # how many sample rule strings family i gives its tests
 pub fun sample_count(i: usize) usize {
+    if (i == 6) { ret probe.SAMPLE_COUNT; }
     if (i == 5) { ret reaction.SAMPLE_COUNT; }
     if (i == 4) { ret lenia.SAMPLE_COUNT; }
     if (i == 3) { ret ruletable.SAMPLE_COUNT; }
@@ -276,6 +292,7 @@ pub fun sample_count(i: usize) usize {
 
 # family i's sample rule string n
 pub fun sample(i: usize, n: usize) str {
+    if (i == 6) { ret probe.sample(n); }
     if (i == 5) { ret reaction.sample(n); }
     if (i == 4) { ret lenia.sample(n); }
     if (i == 3) { ret ruletable.sample(n); }
@@ -286,6 +303,11 @@ pub fun sample(i: usize, n: usize) str {
 
 # read family i's part of a rule string
 fun parse_kind(i: usize, s: str) res[Kind, str] {
+    if (i == 6) {
+        val q: res[probe.Rule, str] = probe.parse(s);
+        if (sel q.err) { ret res[Kind, str].err{q.err}; }
+        ret res[Kind, str].ok{Kind.probe{q.ok}};
+    }
     if (i == 5) {
         val d: res[reaction.Rule, str] = reaction.parse(s);
         if (sel d.err) { ret res[Kind, str].err{d.err}; }
@@ -373,6 +395,7 @@ pub fun parse_as(i: usize, s: str) res[Rule, str] {
 
 # whether family i plausibly meant a rule string
 fun claims(i: usize, s: str) bool {
+    if (i == 6) { ret probe.claims(s); }
     if (i == 5) { ret reaction.claims(s); }
     if (i == 4) { ret lenia.claims(s); }
     if (i == 3) { ret ruletable.claims(s); }
@@ -421,6 +444,7 @@ pub fun format(r: *Rule, buf: *u8) str {
     or (sel r.kind.table)         { ruletable.format(?r.kind.table, buf); }
     or (sel r.kind.lenia)         { lenia.format(?r.kind.lenia, buf); }
     or (sel r.kind.reaction)      { reaction.format(?r.kind.reaction, buf); }
+    or (sel r.kind.probe)         { probe.format(?r.kind.probe, buf); }
     or                            { unmatched(); }
     topology.format(?r.grid, buf, string.str_len(buf));
     ret buf;
@@ -443,6 +467,7 @@ pub fun display(r: *Rule, buf: *u8) str {
     or (sel r.kind.table)         { ruletable.display(?r.kind.table, buf); }
     or (sel r.kind.lenia)         { lenia.display(?r.kind.lenia, buf); }
     or (sel r.kind.reaction)      { reaction.display(?r.kind.reaction, buf); }
+    or (sel r.kind.probe)         { probe.display(?r.kind.probe, buf); }
     or                            { unmatched(); }
     topology.format(?r.grid, buf, string.str_len(buf));
     ret buf;
@@ -473,16 +498,31 @@ fun same_kind(a: *Kind, b: *Kind) bool {
     if (sel a.reaction) {
         if (sel b.reaction) { ret reaction.same_rule(?a.reaction, ?b.reaction); }
     }
+    if (sel a.probe) {
+        if (sel b.probe) { ret probe.same_rule(?a.probe, ?b.probe); }
+    }
     ret false;
 }
 
-# whether two rules write every state as the same word, so cells of one read
-# alike under the other: a cell's word, not only its state, carries between them
+# whether two rules store their cells in layers of the same widths and write
+# every state as the same word, so cells of one read alike under the other: a
+# cell's word, not only its state, carries between them
 pub fun alike(a: *Rule, b: *Rule) bool {
     if (family_of(a) != family_of(b) || states(a) != states(b)) { ret false; }
+    var la: plane.Set = layers(a);
+    var lb: plane.Set = layers(b);
+    if (!plane.same_words(?la, ?lb)) { ret false; }
+    var wa: [layer.LAYERS_MAX]u32;
+    var wb: [layer.LAYERS_MAX]u32;
     var st: u32 = 0;
     for (st < states(a)) {
-        if (word(a, st) != word(b, st)) { ret false; }
+        fresh(a, st, ?wa[0]);
+        fresh(b, st, ?wb[0]);
+        var k: usize = 0;
+        for (k < plane.exact(?la)) {
+            if (wa[k] != wb[k]) { ret false; }
+            k = k + 1;
+        }
         st = st + 1;
     }
     ret true;
@@ -496,27 +536,73 @@ pub fun states(r: *Rule) u32 {
     if (sel r.kind.table)         { ret ruletable.states(?r.kind.table); }
     if (sel r.kind.lenia)         { ret lenia.states(?r.kind.lenia); }
     if (sel r.kind.reaction)      { ret reaction.states(?r.kind.reaction); }
+    if (sel r.kind.probe)         { ret probe.states(?r.kind.probe); }
     unmatched();
     ret 0;
 }
 
-# the word a fresh cell of a state is written as
+# the value a fresh cell of a state holds in the rule's state layer, the one
+# a cell's state is read from
 # ---
 # r:     the rule
 # state: below states(r)
-# ret:   the word
-pub fun word(r: *Rule, state: u32) u32 {
+# ret:   the value
+pub fun value(r: *Rule, state: u32) u32 {
     if (sel r.kind.weighted)      { ret weighted.word_of(?r.kind.weighted, state); }
     if (sel r.kind.generations)   { ret generations.word_of(?r.kind.generations, state); }
     if (sel r.kind.nontotalistic) { ret nontotalistic.word_of(?r.kind.nontotalistic, state); }
     if (sel r.kind.table)         { ret ruletable.word_of(?r.kind.table, state); }
     if (sel r.kind.lenia)         { ret lenia.word_of(?r.kind.lenia, state); }
     if (sel r.kind.reaction)      { ret reaction.word_of(?r.kind.reaction, state); }
+    if (sel r.kind.probe)         { ret probe.word_of(?r.kind.probe, state); }
     unmatched();
     ret 0;
 }
 
-# the state a cell's word holds, its display channels aside
+# whether a cell's word holds more than its state under the rule, so a copy,
+# a pattern and a file that can keep words keep them: a continuous rule's
+# value only approximated by its state, or the values of rule layers beside
+# the state layer
+pub fun keeps_words(r: *Rule) bool {
+    ret caps(r).continuous || word_len(r) > 1;
+}
+
+# values a cell's word holds under the rule, its state and rule layers'
+pub fun word_len(r: *Rule) usize {
+    var set: plane.Set = layers(r);
+    ret plane.exact(?set);
+}
+
+# the word a fresh cell of a state is written as: its value in each of the
+# rule's state and rule layers (cellar.layer)
+# ---
+# r:     the rule
+# state: below states(r)
+# out:   receives word_len(r) values
+pub fun fresh(r: *Rule, state: u32, out: *u32) {
+    out[0] = value(r, state);
+    val n: usize = word_len(r);
+    var k: usize = 1;
+    for (k < n) {
+        out[k] = rest(r, state, k);
+        k      = k + 1;
+    }
+}
+
+# the value a fresh cell of a state holds in rule layer k, from 1
+fun rest(r: *Rule, state: u32, k: usize) u32 {
+    if (sel r.kind.weighted)      { ret weighted.rest_of(?r.kind.weighted, state, k); }
+    if (sel r.kind.generations)   { ret generations.rest_of(?r.kind.generations, state, k); }
+    if (sel r.kind.nontotalistic) { ret nontotalistic.rest_of(?r.kind.nontotalistic, state, k); }
+    if (sel r.kind.table)         { ret ruletable.rest_of(?r.kind.table, state, k); }
+    if (sel r.kind.lenia)         { ret lenia.rest_of(?r.kind.lenia, state, k); }
+    if (sel r.kind.reaction)      { ret reaction.rest_of(?r.kind.reaction, state, k); }
+    if (sel r.kind.probe)         { ret probe.rest_of(?r.kind.probe, state, k); }
+    unmatched();
+    ret 0;
+}
+
+# the state a cell's value in the state layer holds, its display channels aside
 pub fun state(r: *Rule, c: u32) u32 {
     if (sel r.kind.weighted)      { ret weighted.state_of(c); }
     if (sel r.kind.generations)   { ret generations.state_of(c); }
@@ -524,6 +610,7 @@ pub fun state(r: *Rule, c: u32) u32 {
     if (sel r.kind.table)         { ret ruletable.state_of(c); }
     if (sel r.kind.lenia)         { ret lenia.state_of(c); }
     if (sel r.kind.reaction)      { ret reaction.state_of(c); }
+    if (sel r.kind.probe)         { ret probe.state_of(c); }
     unmatched();
     ret 0;
 }
@@ -536,6 +623,7 @@ pub fun ink(r: *Rule) u32 {
     if (sel r.kind.table)         { ret ruletable.ink(?r.kind.table); }
     if (sel r.kind.lenia)         { ret lenia.ink(?r.kind.lenia); }
     if (sel r.kind.reaction)      { ret reaction.ink(?r.kind.reaction); }
+    if (sel r.kind.probe)         { ret probe.ink(?r.kind.probe); }
     unmatched();
     ret 0;
 }
@@ -552,6 +640,7 @@ pub fun slack(r: *Rule) u32 {
     if (sel r.kind.table)         { ret ruletable.slack(?r.kind.table); }
     if (sel r.kind.lenia)         { ret lenia.slack(?r.kind.lenia); }
     if (sel r.kind.reaction)      { ret reaction.slack(?r.kind.reaction); }
+    if (sel r.kind.probe)         { ret probe.slack(?r.kind.probe); }
     unmatched();
     ret 0;
 }
@@ -565,6 +654,7 @@ pub fun layers(r: *Rule) plane.Set {
     if (sel r.kind.table)         { ret ruletable.layers(?r.kind.table); }
     if (sel r.kind.lenia)         { ret lenia.layers(?r.kind.lenia); }
     if (sel r.kind.reaction)      { ret reaction.layers(?r.kind.reaction); }
+    if (sel r.kind.probe)         { ret probe.layers(?r.kind.probe); }
     unmatched();
     ret plane.state("", 32);
 }
@@ -579,6 +669,7 @@ pub fun sense(r: *Rule) layout.Sense {
     if (sel r.kind.table)         { ret ruletable.sense(); }
     if (sel r.kind.lenia)         { ret lenia.sense(); }
     if (sel r.kind.reaction)      { ret reaction.sense(); }
+    if (sel r.kind.probe)         { ret probe.sense(); }
     unmatched();
     ret none;
 }
@@ -591,6 +682,7 @@ pub fun radius(r: *Rule) usize {
     if (sel r.kind.table)         { ret ruletable.radius(?r.kind.table); }
     if (sel r.kind.lenia)         { ret lenia.radius(?r.kind.lenia); }
     if (sel r.kind.reaction)      { ret reaction.radius(?r.kind.reaction); }
+    if (sel r.kind.probe)         { ret probe.radius(?r.kind.probe); }
     unmatched();
     ret 0;
 }
@@ -605,9 +697,12 @@ pub fun caps(r: *Rule) Caps {
 # the word a cell past a plane's dead edge reads as to a step from generation
 # gen: dead, and so live as held on the generations a flipping background
 # (caps.b0) holds as the world's complement
-pub fun outside(r: *Rule, gen: u64) u32 {
-    if ((gen & 1) != 0 && kind_caps(?r.kind).b0) { ret word(r, 1); }
-    ret 0;
+# ---
+# out: receives word_len(r) values
+pub fun outside(r: *Rule, gen: u64, out: *u32) {
+    var st: u32 = 0;
+    if ((gen & 1) != 0 && kind_caps(?r.kind).b0) { st = 1; }
+    fresh(r, st, out);
 }
 
 # whether a step reads the rule's plane edge live on some generation, so the
@@ -641,6 +736,10 @@ fun kind_caps(k: *Kind) Caps {
     }
     if (sel k.reaction) {
         val c: reaction.Caps = reaction.caps(?k.reaction);
+        ret Caps{b0: c.b0, isotropic: c.isotropic, no_tree: c.no_tree, bounded: c.bounded, life_like: c.life_like, continuous: c.continuous};
+    }
+    if (sel k.probe) {
+        val c: probe.Caps = probe.caps(?k.probe);
         ret Caps{b0: c.b0, isotropic: c.isotropic, no_tree: c.no_tree, bounded: c.bounded, life_like: c.life_like, continuous: c.continuous};
     }
     unmatched();
@@ -678,6 +777,10 @@ pub fun step_chunk(r: *Rule, b: *space.Block, t: *space.Tally) {
         reaction.step_chunk(?r.kind.reaction, b, t);
         ret;
     }
+    if (sel r.kind.probe) {
+        probe.step_chunk(?r.kind.probe, b, t);
+        ret;
+    }
     unmatched();
 }
 
@@ -693,6 +796,7 @@ pub fun next(r: *Rule, nb: *u32) u32 {
     if (sel r.kind.table)         { ret ruletable.next_of(?r.kind.table, nb); }
     if (sel r.kind.lenia)         { ret lenia.next_of(?r.kind.lenia, nb); }
     if (sel r.kind.reaction)      { ret reaction.next_of(?r.kind.reaction, nb); }
+    if (sel r.kind.probe)         { ret probe.next_of(?r.kind.probe, nb); }
     unmatched();
     ret 0;
 }
@@ -726,6 +830,10 @@ pub fun pack(r: *Rule, w: *u32) {
         reaction.pack(?r.kind.reaction, w);
         ret;
     }
+    if (sel r.kind.probe) {
+        probe.pack(?r.kind.probe, w);
+        ret;
+    }
     unmatched();
 }
 
@@ -737,6 +845,7 @@ pub fun table_words(r: *Rule) usize {
     if (sel r.kind.table)         { ret ruletable.table_words(?r.kind.table); }
     if (sel r.kind.lenia)         { ret lenia.table_words(?r.kind.lenia); }
     if (sel r.kind.reaction)      { ret reaction.table_words(?r.kind.reaction); }
+    if (sel r.kind.probe)         { ret probe.table_words(?r.kind.probe); }
     unmatched();
     ret 0;
 }
@@ -770,6 +879,10 @@ pub fun pack_table(r: *Rule, w: *u32) {
         reaction.pack_table(?r.kind.reaction, w);
         ret;
     }
+    if (sel r.kind.probe) {
+        probe.pack_table(?r.kind.probe, w);
+        ret;
+    }
     unmatched();
 }
 
@@ -785,6 +898,7 @@ pub fun colour(r: *Rule, state: u32) opt[u32] {
     if (sel r.kind.table)         { ret ruletable.colour(?r.kind.table, state); }
     if (sel r.kind.lenia)         { ret lenia.colour(?r.kind.lenia, state); }
     if (sel r.kind.reaction)      { ret reaction.colour(?r.kind.reaction, state); }
+    if (sel r.kind.probe)         { ret probe.colour(?r.kind.probe, state); }
     unmatched();
     ret opt[u32].none{};
 }
@@ -913,8 +1027,9 @@ test parse__reports_the_error_of_the_family_the_string_means {
 test dispatch__every_function_handles_every_family {
     var a: allo.Allocator;
     page.make(?a);
-    var own: [4096]u32;
-    var out: [4096]u32;
+    probe.enable();
+    var own: [layer.LAYERS_MAX * layout.CELLS]u32;
+    var out: [layer.LAYERS_MAX * layout.CELLS]u32;
     var buf: [FORMAT_MAX + 1]u8;
     var win: [112]u32;
     var f:   usize = 0;
@@ -922,8 +1037,9 @@ test dispatch__every_function_handles_every_family {
         val named: opt[usize] = family_named(family_id(f));
         if (sel named.none)  { ret 1; }
         if (named.some != f) { ret 1; }
+        # every family but the tests' own probe has a step stage
         var len: usize = 0;
-        if (stage(f, ?len) == nil || len == 0)                                                          { ret 2; }
+        if ((stage(f, ?len) == nil || len == 0) && f != PROBE)                                          { ret 2; }
         if (bindings(f) < layout.STEP_BINDINGS::usize || bindings(f) > layout.STEP_BINDINGS::usize + 1) { ret 2; }
         var n: usize = 0;
         for (n < sample_count(f)) {
@@ -939,32 +1055,34 @@ test dispatch__every_function_handles_every_family {
             val why: str = caps(?r).no_tree;
             if (why != nil && why[0] == 0) { ret 6; }
             # word 0 is the quiescent background, and every state survives a round trip
-            if (states(?r) < 2 || word(?r, 0) != 0 || state(?r, 0) != 0) { ret 7; }
+            if (states(?r) < 2 || value(?r, 0) != 0 || state(?r, 0) != 0) { ret 7; }
             var st: u32 = 0;
             for (st < states(?r)) {
-                if (state(?r, word(?r, st)) != st) { ret 8; }
+                if (state(?r, value(?r, st)) != st) { ret 8; }
                 st = st + 1;
             }
             # its layers hold to the contract, with no view layer, and every
-            # state's word lies inside them
+            # state's fresh word fits its layers' widths, the empty state's
+            # all zeros
             var ls: plane.Set = layers(?r);
-            if (!plane.holds(?ls) || plane.views(?ls) != 0) { ret 16; }
-            var bits: u32   = 0;
-            var lk:   usize = 0;
-            for (lk < ls.n) {
-                bits = bits | (layer.mask(ls.at[lk].width) << ls.at[lk].at);
-                lk   = lk + 1;
-            }
-            var sw: u32 = 0;
+            if (!plane.holds(?ls) || plane.views(?ls) != 0 || word_len(?r) != plane.exact(?ls)) { ret 16; }
+            var fw: [layer.LAYERS_MAX]u32;
+            var lk: usize = 0;
+            var sw: u32   = 0;
             for (sw < states(?r)) {
-                if ((word(?r, sw) & ~bits) != 0) { ret 16; }
+                fresh(?r, sw, ?fw[0]);
+                lk = 0;
+                for (lk < ls.n) {
+                    if ((fw[lk] & ~layer.mask(ls.at[lk].width)) != 0 || (sw == 0 && fw[lk] != 0)) { ret 16; }
+                    lk = lk + 1;
+                }
                 sw = sw + 1;
             }
             val sn: layout.Sense = sense(?r);
             if (layout.live(0, sn.live_mask, sn.live_lo, sn.live_hi) != 0) { ret 9; }
             # the ink is a live state
-            if (ink(?r) == 0 || ink(?r) >= states(?r))                                                                              { ret 9; }
-            if (layout.live(layer.take(word(?r, ink(?r)), ls.at[0].width, ls.at[0].at), sn.live_mask, sn.live_lo, sn.live_hi) == 0) { ret 9; }
+            if (ink(?r) == 0 || ink(?r) >= states(?r))                                      { ret 9; }
+            if (layout.live(value(?r, ink(?r)), sn.live_mask, sn.live_lo, sn.live_hi) == 0) { ret 9; }
             slack(?r);
             if (radius(?r) == 0) { ret 10; }
             caps(?r);
@@ -1025,9 +1143,10 @@ test dispatch__every_function_handles_every_family {
                     own[i] = 0;
                     i      = i + 1;
                 }
-                space.put_image_word(?ls, ?own[0], 10 * 64 + 10, word(?r, 1));
-                space.put_image_word(?ls, ?own[0], 10 * 64 + 11, word(?r, 1));
-                space.put_image_word(?ls, ?own[0], 10 * 64 + 12, word(?r, 1));
+                fresh(?r, 1, ?fw[0]);
+                space.put_image_word(?ls, ?own[0], 10 * 64 + 10, ?fw[0]);
+                space.put_image_word(?ls, ?own[0], 10 * 64 + 11, ?fw[0]);
+                space.put_image_word(?ls, ?own[0], 10 * 64 + 12, ?fw[0]);
                 b.gen = 0;
                 var tb: space.Tally = space.tally(sn);
                 step_chunk(?r, ?b, ?tb);
@@ -1038,10 +1157,12 @@ test dispatch__every_function_handles_every_family {
                     for (x < 15) {
                         var q: usize = 0;
                         for (q < 9) {
-                            nb[q] = state(?r, space.image_word(?ls, ?own[0], (y + q / 3 - 1) * 64 + x + q % 3 - 1));
+                            space.image_word(?ls, ?own[0], (y + q / 3 - 1) * 64 + x + q % 3 - 1, ?fw[0]);
+                            nb[q] = state(?r, fw[0]);
                             q     = q + 1;
                         }
-                        if (next(?r, ?nb[0]) != state(?r, space.image_word(?ls, ?out[0], y * 64 + x))) { ret 13; }
+                        space.image_word(?ls, ?out[0], y * 64 + x, ?fw[0]);
+                        if (next(?r, ?nb[0]) != state(?r, fw[0])) { ret 13; }
                         x = x + 1;
                     }
                     y = y + 1;
