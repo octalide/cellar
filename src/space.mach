@@ -18,10 +18,14 @@
 # seams, and the halo a live chunk asks for lands where the seams take it (see
 # cellar.layout for how a step reads through them).
 #
-# a cell is a word the rule family gives its meaning, which the pool reads
-# through the family's sense (cellar.layout.Sense). the front cells are the
-# world; the back cells, kept only when the CPU steps, take the next
-# generation. a hash over chunk coordinates finds a chunk's slot.
+# a chunk's cells are stored in layers (cellar.layer), the set the running
+# rule declares and any the view keeps, each holding every slot's span at its
+# width. the pool reads a cell's state through the family's sense
+# (cellar.layout.Sense), and everything outside it reads and writes cells
+# through the planes and exact values below, never knowing a cell's width.
+# each layer's front cells are the world; its back cells, kept only when the
+# CPU steps, take the next generation. a hash over chunk coordinates finds a
+# chunk's slot.
 #
 # settle keeps the pool the shape stepping needs: every chunk with a live cell
 # has the chunks its census mask asks for, and a chunk that is empty, cold and
@@ -43,6 +47,8 @@
 # anything and no census need make room before a step. its census still counts
 # the live cells, and its empty chunks stay allocated.
 
+use cellar.layer;
+use cellar.layer.plane;
 use cellar.layout;
 use cellar.topology;
 use allo: std.allocator;
@@ -123,9 +129,9 @@ pub val BIAS: i64 = 1073741824;
 # the world's cells lie in [-REACH, REACH) on both axes, so every chunk and each
 # of its neighbours has a coordinate the page table holds
 pub val REACH: i64 = (BIAS - 1) * SIDE;
-# the ceiling of a pool held on the host alone. front and back cells come to
-# 32 KiB a slot, so this is a gigabyte of cells, the most host memory the
-# world may take. a mirror on a device sets its own, lower where the device
+# the ceiling of a pool held on the host alone. front and back cells of a
+# 32-bit layer come to 32 KiB a slot, so this is a gigabyte of them, the most
+# host memory the world may take. a mirror on a device sets its own, lower where the device
 # needs it
 pub val HOST_SLOTS: usize = 32768;
 # the slots a new pool holds
@@ -167,8 +173,13 @@ pub rec Mirror {
 # hi:        slots in use lie below this
 # live:      slots in use
 # table:     the page table, cap * ENTRY words
-# cells:     the front cells, cap * CELLS
-# back:      the back cells, cap * CELLS, or nil when the GPU steps
+# set:       the layers the cells are stored in
+# fronts:    each layer's front cells, cap spans of it (cellar.layer)
+# backs:     each layer's back cells, cap spans of it, or nil when the GPU
+#            steps
+# cells:     the state layer's front cells, fronts[0], for code not yet
+#            reading them through the planes
+# back:      the state layer's back cells, backs[0]
 # mips:      each slot's coverage pyramid (layout.MIP texels), cap * MIP, for a
 #            draw of the cells the CPU steps, or nil
 # mips_back: the pyramids of the back cells, which a step builds as it goes
@@ -213,6 +224,9 @@ pub rec Space {
     hi:        usize;
     live:      usize;
     table:     *u32;
+    set:       plane.Set;
+    fronts:    [layer.LAYERS_MAX]*u32;
+    backs:     [layer.LAYERS_MAX]*u32;
     cells:     *u32;
     back:      *u32;
     mips:      *u32;
@@ -244,23 +258,61 @@ pub rec Space {
 
 # one chunk's step, as a rule family's CPU step sees it
 # ---
-# nb:   the front cells of the 3 by 3 block of chunks around it, row-major with
-#       the chunk itself at 4, nil where a chunk does not exist and reads as
-#       zeros
-# out:  the chunk's back cells, every one of which the step writes
+# set:  the layers the cells are stored in
+# nb:   each layer's front cells of the 3 by 3 block of chunks around it:
+#       layer k's span of block chunk q, row-major with the chunk itself at 4,
+#       at k * 9 + q, nil where a chunk does not exist and reads as zeros
+# out:  each layer's back span of the chunk, every cell of which the step
+#       writes
 # busy: a live cell lay in the block as the step began; when not, only the
 #       chunk's own cells can change, since the pool's background steps to
 #       itself under every rule
 # gen:  the generation the block's cells hold
 pub rec Block {
-    nb:   [9]*u32;
-    out:  *u32;
+    set:  *plane.Set;
+    nb:   [layer.LAYERS_MAX * 9]*u32;
+    out:  [layer.LAYERS_MAX]*u32;
     busy: bool;
     gen:  u64;
 }
 
-# the word of a cell of a block, in its chunk's coordinates, which a family's
-# step reads every cell outside its own chunk through
+# a block with no chunk, of a set's layers, whose spans the caller names
+pub fun block(set: *plane.Set, gen: u64) Block {
+    var b: Block;
+    b.set  = set;
+    b.busy = false;
+    b.gen  = gen;
+    var i: usize = 0;
+    for (i < layer.LAYERS_MAX::usize * 9) {
+        b.nb[i] = nil;
+        i       = i + 1;
+    }
+    i = 0;
+    for (i < layer.LAYERS_MAX::usize) {
+        b.out[i] = nil;
+        i        = i + 1;
+    }
+    ret b;
+}
+
+# layer k's span of block chunk q, row-major with the chunk itself at 4; its
+# words are nil where the chunk does not exist
+pub fun block_plane(b: *Block, k: usize, q: usize) plane.Plane {
+    ret plane.at(b.nb[k * 9 + q], b.set.at[k].width);
+}
+
+# layer k's front span of the chunk a block steps
+pub fun block_own(b: *Block, k: usize) plane.Plane {
+    ret block_plane(b, k, 4);
+}
+
+# layer k's back span of the chunk a block steps, which its step writes
+pub fun block_out(b: *Block, k: usize) plane.Plane {
+    ret plane.at(b.out[k], b.set.at[k].width);
+}
+
+# the state layer's value of a cell of a block, in its chunk's coordinates,
+# which a family's step reads every cell outside its own chunk through
 # ---
 # b:   the block
 # x:   the column, in [-SIDE, 2 * SIDE)
@@ -268,6 +320,12 @@ pub rec Block {
 # ret: the cell, zero in a chunk that does not exist
 #[inline]
 pub fun block_cell(b: *Block, x: i64, y: i64) u32 {
+    ret block_value(b, 0, x, y);
+}
+
+# layer k's value of a cell of a block, as block_cell reads the state layer's
+#[inline]
+pub fun block_value(b: *Block, k: usize, x: i64, y: i64) u32 {
     var lx: i64   = x;
     var ly: i64   = y;
     var cx: usize = 1;
@@ -288,9 +346,9 @@ pub fun block_cell(b: *Block, x: i64, y: i64) u32 {
         ly = ly - SIDE;
         cy = 2;
     }
-    val src: *u32 = b.nb[cy * 3 + cx];
-    if (src == nil) { ret 0; }
-    ret src[(ly * SIDE + lx)::usize];
+    val src: plane.Plane = block_plane(b, k, cy * 3 + cx);
+    if (src.w == nil) { ret 0; }
+    ret plane.get(src, (ly * SIDE + lx)::usize);
 }
 
 # a chunk's census as its cells are written, which a step keeps while it goes
@@ -370,9 +428,206 @@ pub fun tally_census(t: *Tally, cn: *u32, inc: u32) {
     }
 }
 
-# whether a cell is live, as the pool's sense reads it
+# whether a state layer's value is live, as the pool's sense reads it
 pub fun live(sp: *Space, c: u32) bool {
     ret layout.live(c, sp.sense.live_mask, sp.sense.live_lo, sp.sense.live_hi) != 0;
+}
+
+# the layers the pool stores its cells in
+pub fun layers(sp: *Space) *plane.Set {
+    ret ?sp.set;
+}
+
+# words of a slot's span of the pool's layer k
+fun span_of(sp: *Space, k: usize) usize {
+    ret plane.span_words(sp.set.at[k].width);
+}
+
+# layer k's front span of slot s, the world as it stands
+pub fun plane_of(sp: *Space, k: usize, s: usize) plane.Plane {
+    ret plane.at(?sp.fronts[k][s * span_of(sp, k)], sp.set.at[k].width);
+}
+
+# layer k's back span of slot s, which the CPU's step writes; the pool must
+# keep back cells
+pub fun back_of(sp: *Space, k: usize, s: usize) plane.Plane {
+    ret plane.at(?sp.backs[k][s * span_of(sp, k)], sp.set.at[k].width);
+}
+
+# the value of cell i of slot s in the state layer, which the sense reads
+pub fun sensed(sp: *Space, s: usize, i: usize) u32 {
+    ret plane.get(plane_of(sp, 0, s), i);
+}
+
+# whether the state and rule layers are the state layer alone, its values
+# the word's low bits, so a word is the state layer's value
+fun lone(sp: *Space) bool {
+    ret sp.set.n == 1 || sp.set.at[1].role == layer.VIEW;
+}
+
+# the word of cell i of slot s: its exact value, its state and rule layers'
+# values where each lies in it (cellar.layer)
+pub fun word(sp: *Space, s: usize, i: usize) u32 {
+    if (lone(sp)) { ret plane.get(plane_of(sp, 0, s), i); }
+    var w: u32   = 0;
+    var k: usize = 0;
+    for (k < plane.exact(?sp.set)) {
+        val d: *plane.Decl = ?sp.set.at[k];
+        w = w | layer.give(plane.get(plane_of(sp, k, s), i), d.width, d.at);
+        k = k + 1;
+    }
+    ret w;
+}
+
+# write the word of cell i of slot s into its state and rule layers, leaving
+# its view layers alone
+pub fun put_word(sp: *Space, s: usize, i: usize, w: u32) {
+    var k: usize = 0;
+    for (k < plane.exact(?sp.set)) {
+        val d: *plane.Decl = ?sp.set.at[k];
+        plane.put(plane_of(sp, k, s), i, layer.take(w, d.width, d.at));
+        k = k + 1;
+    }
+}
+
+# write the word w to n cells of slot s from cell i
+pub fun fill_words(sp: *Space, s: usize, i: usize, n: usize, w: u32) {
+    var k: usize = 0;
+    for (k < plane.exact(?sp.set)) {
+        val d: *plane.Decl = ?sp.set.at[k];
+        plane.fill(plane_of(sp, k, s), i, n, layer.take(w, d.width, d.at));
+        k = k + 1;
+    }
+}
+
+# the words of n cells of slot s from cell i, into out
+pub fun get_words(sp: *Space, s: usize, i: usize, n: usize, out: *u32) {
+    if (lone(sp)) {
+        plane.get_run(plane_of(sp, 0, s), i, n, out);
+        ret;
+    }
+    var j: usize = 0;
+    for (j < n) {
+        out[j] = word(sp, s, i + j);
+        j      = j + 1;
+    }
+}
+
+# write n words from w to the cells of slot s from cell i
+pub fun put_words(sp: *Space, s: usize, i: usize, n: usize, w: *u32) {
+    if (lone(sp)) {
+        plane.put_run(plane_of(sp, 0, s), i, n, w);
+        ret;
+    }
+    var j: usize = 0;
+    for (j < n) {
+        put_word(sp, s, i + j, w[j]);
+        j = j + 1;
+    }
+}
+
+# whether any cell of slot s holds a value but 0 in any layer
+pub fun any(sp: *Space, s: usize) bool {
+    var k: usize = 0;
+    for (k < sp.set.n) {
+        if (plane.any(plane_of(sp, k, s))) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# zero every cell of slot s in every layer
+pub fun clear_slot(sp: *Space, s: usize) {
+    var k: usize = 0;
+    for (k < sp.set.n) {
+        plane.clear(plane_of(sp, k, s));
+        k = k + 1;
+    }
+}
+
+# zero cell i of slot s in every layer
+fun clear_cell(sp: *Space, s: usize, i: usize) {
+    var k: usize = 0;
+    for (k < sp.set.n) {
+        plane.put(plane_of(sp, k, s), i, 0);
+        k = k + 1;
+    }
+}
+
+# whether cell i of slot s holds a value but 0 in any layer
+fun holds_cell(sp: *Space, s: usize, i: usize) bool {
+    var k: usize = 0;
+    for (k < sp.set.n) {
+        if (plane.get(plane_of(sp, k, s), i) != 0) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# words of a chunk's image under the pool's layers (plane.image_words)
+pub fun image_words(sp: *Space) usize {
+    ret plane.image_words(?sp.set);
+}
+
+# copy slot s's image, its state and rule layers' spans in order, into out
+pub fun get_image(sp: *Space, s: usize, out: *u32) {
+    var at: usize = 0;
+    var k:  usize = 0;
+    for (k < plane.exact(?sp.set)) {
+        mem.copy[u32](?out[at], plane_of(sp, k, s).w, span_of(sp, k));
+        at = at + span_of(sp, k);
+        k  = k + 1;
+    }
+}
+
+# write an image under the pool's layers into slot s's state and rule layers
+pub fun put_image(sp: *Space, s: usize, img: *u32) {
+    var at: usize = 0;
+    var k:  usize = 0;
+    for (k < plane.exact(?sp.set)) {
+        mem.copy[u32](plane_of(sp, k, s).w, ?img[at], span_of(sp, k));
+        at = at + span_of(sp, k);
+        k  = k + 1;
+    }
+}
+
+# the word of cell i of an image under a set
+pub fun image_word(set: *plane.Set, img: *u32, i: usize) u32 {
+    var w:  u32   = 0;
+    var at: usize = 0;
+    var k:  usize = 0;
+    for (k < plane.exact(set)) {
+        val d: *plane.Decl = ?set.at[k];
+        w  = w | layer.give(plane.get(plane.at(?img[at], d.width), i), d.width, d.at);
+        at = at + plane.span_words(d.width);
+        k  = k + 1;
+    }
+    ret w;
+}
+
+# write the word of cell i of an image under a set
+pub fun put_image_word(set: *plane.Set, img: *u32, i: usize, w: u32) {
+    var at: usize = 0;
+    var k:  usize = 0;
+    for (k < plane.exact(set)) {
+        val d: *plane.Decl = ?set.at[k];
+        plane.put(plane.at(?img[at], d.width), i, layer.take(w, d.width, d.at));
+        at = at + plane.span_words(d.width);
+        k  = k + 1;
+    }
+}
+
+# swap every layer's front and back cells, as a step completes
+pub fun swap(sp: *Space) {
+    var k: usize = 0;
+    for (k < sp.set.n) {
+        val f: *u32 = sp.fronts[k];
+        sp.fronts[k] = sp.backs[k];
+        sp.backs[k]  = f;
+        k            = k + 1;
+    }
+    sp.cells = sp.fronts[0];
+    sp.back  = sp.backs[0];
 }
 
 # the chunk coordinate holding a cell coordinate
@@ -462,15 +717,47 @@ fun zwords(a: *allo.Allocator, n: usize) *u32 {
     ret r.ok;
 }
 
+# make every layer of a set for cap slots, zeroed: its front cells, and its
+# back cells when stepped
+# ---
+# ret: false when the allocator refused one, leaving none made
+fun make_layers(a: *allo.Allocator, set: *plane.Set, cap: usize, stepped: bool, fronts: **u32, backs: **u32) bool {
+    var ok: bool  = true;
+    var k:  usize = 0;
+    for (k < set.n) {
+        val n: usize = cap * plane.span_words(set.at[k].width);
+        fronts[k] = zwords(a, n);
+        backs[k]  = nil;
+        if (stepped)                                          { backs[k] = zwords(a, n); }
+        if (fronts[k] == nil || (stepped && backs[k] == nil)) { ok = false; }
+        k = k + 1;
+    }
+    if (!ok) { drop_layers(a, set, cap, fronts, backs); }
+    ret ok;
+}
+
+# free every layer of a set made for cap slots
+fun drop_layers(a: *allo.Allocator, set: *plane.Set, cap: usize, fronts: **u32, backs: **u32) {
+    var k: usize = 0;
+    for (k < set.n) {
+        val n: usize = cap * plane.span_words(set.at[k].width);
+        if (fronts[k] != nil) { allo.deallocate[u32](a, fronts[k], n); }
+        if (backs[k] != nil)  { allo.deallocate[u32](a, backs[k], n); }
+        fronts[k] = nil;
+        backs[k]  = nil;
+        k         = k + 1;
+    }
+}
+
 fun alloc_arrays(sp: *Space, cap: usize) err[allo.Error] {
-    val a:     *allo.Allocator = sp.a;
-    val table: *u32            = zwords(a, cap * ENTRY);
-    val cells: *u32            = zwords(a, cap * CELLS);
-    var back:  *u32            = nil;
-    if (sp.stepped) { back = zwords(a, cap * CELLS); }
-    val pyr:   bool = sp.mips != nil;
-    var mips:  *u32 = nil;
-    var mback: *u32 = nil;
+    val a:      *allo.Allocator = sp.a;
+    val table:  *u32            = zwords(a, cap * ENTRY);
+    var fronts: [layer.LAYERS_MAX]*u32;
+    var backs:  [layer.LAYERS_MAX]*u32;
+    val made:   bool            = make_layers(a, ?sp.set, cap, sp.stepped, ?fronts[0], ?backs[0]);
+    val pyr:    bool            = sp.mips != nil;
+    var mips:   *u32            = nil;
+    var mback:  *u32            = nil;
     if (pyr) {
         mips  = zwords(a, cap * MIP);
         mback = zwords(a, cap * MIP);
@@ -491,12 +778,11 @@ fun alloc_arrays(sp: *Space, cap: usize) err[allo.Error] {
     if (sel rw.ok) { woke = rw.ok; }
     val awake: *u32 = zwords(a, cap);
     val due:   *u32 = zwords(a, cap);
-    if (table == nil || cells == nil || (sp.stepped && back == nil) || census == nil
+    if (table == nil || !made || census == nil
         || before == nil || frees == nil || hash == nil || dirty == nil || asked == nil
         || woke == nil || awake == nil || due == nil || (pyr && (mips == nil || mback == nil))) {
         if (table != nil)  { allo.deallocate[u32](a, table, cap * ENTRY); }
-        if (cells != nil)  { allo.deallocate[u32](a, cells, cap * CELLS); }
-        if (back != nil)   { allo.deallocate[u32](a, back, cap * CELLS); }
+        if (made)          { drop_layers(a, ?sp.set, cap, ?fronts[0], ?backs[0]); }
         if (mips != nil)   { allo.deallocate[u32](a, mips, cap * MIP); }
         if (mback != nil)  { allo.deallocate[u32](a, mback, cap * MIP); }
         if (census != nil) { allo.deallocate[u32](a, census, cap * CENSUS); }
@@ -513,9 +799,13 @@ fun alloc_arrays(sp: *Space, cap: usize) err[allo.Error] {
     # carry the old pool over, then rebuild the hash at its new size
     if (sp.cap != 0) {
         mem.copy[u32](table, sp.table, sp.hi * ENTRY);
-        mem.copy[u32](cells, sp.cells, sp.hi * CELLS);
-        if (back != nil) { mem.copy[u32](back, sp.back, sp.hi * CELLS); }
-        if (pyr)         { mem.copy[u32](mips, sp.mips, sp.hi * MIP); }
+        var k: usize = 0;
+        for (k < sp.set.n) {
+            mem.copy[u32](fronts[k], sp.fronts[k], sp.hi * span_of(sp, k));
+            if (backs[k] != nil) { mem.copy[u32](backs[k], sp.backs[k], sp.hi * span_of(sp, k)); }
+            k = k + 1;
+        }
+        if (pyr) { mem.copy[u32](mips, sp.mips, sp.hi * MIP); }
         mem.copy[u32](census, sp.census, sp.hi * CENSUS);
         mem.copy[u8](dirty, sp.dirty, sp.hi);
         mem.copy[u8](asked, sp.asked, sp.hi);
@@ -525,9 +815,15 @@ fun alloc_arrays(sp: *Space, cap: usize) err[allo.Error] {
         mem.copy[u32](frees, sp.frees, sp.nfree);
         free_arrays(sp);
     }
-    sp.table     = table;
-    sp.cells     = cells;
-    sp.back      = back;
+    sp.table = table;
+    var k: usize = 0;
+    for (k < sp.set.n) {
+        sp.fronts[k] = fronts[k];
+        sp.backs[k]  = backs[k];
+        k            = k + 1;
+    }
+    sp.cells     = sp.fronts[0];
+    sp.back      = sp.backs[0];
     sp.mips      = mips;
     sp.mips_back = mback;
     sp.census    = census;
@@ -553,8 +849,9 @@ fun alloc_arrays(sp: *Space, cap: usize) err[allo.Error] {
 fun free_arrays(sp: *Space) {
     val a: *allo.Allocator = sp.a;
     allo.deallocate[u32](a, sp.table, sp.cap * ENTRY);
-    allo.deallocate[u32](a, sp.cells, sp.cap * CELLS);
-    if (sp.back != nil) { allo.deallocate[u32](a, sp.back, sp.cap * CELLS); }
+    drop_layers(a, ?sp.set, sp.cap, ?sp.fronts[0], ?sp.backs[0]);
+    sp.cells = nil;
+    sp.back  = nil;
     if (sp.mips != nil) {
         allo.deallocate[u32](a, sp.mips, sp.cap * MIP);
         allo.deallocate[u32](a, sp.mips_back, sp.cap * MIP);
@@ -597,7 +894,119 @@ pub fun init(sp: *Space, a: *allo.Allocator, stepped: bool) err[allo.Error] {
     sp.whole  = false;
     sp.nawake = 0;
     sp.ndue   = 0;
+    # a 32-bit state layer until a rule names its own (relayer)
+    sp.set = plane.state("cells", layer.WIDTH_MAX);
+    var k: usize = 0;
+    for (k < layer.LAYERS_MAX::usize) {
+        sp.fronts[k] = nil;
+        sp.backs[k]  = nil;
+        k            = k + 1;
+    }
     ret alloc_arrays(sp, FIRST_CAP);
+}
+
+# a word turned into another, for relayer
+pub def Remap: fun(*u8, u32) u32;
+
+# store the pool's cells in another set of layers, every cell's word turned
+# into its word under it
+#
+# a view layer of the new set keeps its cells where the old set held one of
+# the same name and width, and starts at zero otherwise. the back cells start
+# at zero, as a pool's do. every slot in use is touched once anything moved.
+# ---
+# sp:  the pool
+# set: the layers, holding to the contract (plane.holds)
+# map: (ctx, word under the old layers) its word under the new, or nil to
+#      keep every word as it is
+# ctx: passed back to map
+# ret: ok, or the allocator's refusal, which leaves the pool as it was
+pub fun relayer(sp: *Space, set: *plane.Set, map: Remap, ctx: *u8) err[allo.Error] {
+    var old: plane.Set = sp.set;
+    if (plane.same_shape(?old, set) && plane.same_words(?old, set)) {
+        sp.set = @set;
+        if (map == nil) { ret err[allo.Error].ok{}; }
+        var buf: [4096]u32;
+        var s:   usize = 0;
+        for (s < sp.hi) {
+            if (used(sp, s)) {
+                get_words(sp, s, 0, CELLS, ?buf[0]);
+                var i: usize = 0;
+                for (i < CELLS) {
+                    buf[i] = map(ctx, buf[i]);
+                    i      = i + 1;
+                }
+                put_words(sp, s, 0, CELLS, ?buf[0]);
+                touch(sp, s);
+            }
+            s = s + 1;
+        }
+        ret err[allo.Error].ok{};
+    }
+    var fronts: [layer.LAYERS_MAX]*u32;
+    var backs:  [layer.LAYERS_MAX]*u32;
+    if (!make_layers(sp.a, set, sp.cap, sp.stepped, ?fronts[0], ?backs[0])) { ret err[allo.Error].err{allo.Error.exhausted{}}; }
+    var was:  [layer.LAYERS_MAX]*u32;
+    var wasb: [layer.LAYERS_MAX]*u32;
+    var k:    usize = 0;
+    for (k < layer.LAYERS_MAX::usize) {
+        was[k]  = sp.fronts[k];
+        wasb[k] = sp.backs[k];
+        k       = k + 1;
+    }
+    var buf: [4096]u32;
+    var s:   usize = 0;
+    for (s < sp.hi) {
+        if (used(sp, s)) {
+            get_words(sp, s, 0, CELLS, ?buf[0]);
+            var i: usize = 0;
+            for (map != nil && i < CELLS) {
+                buf[i] = map(ctx, buf[i]);
+                i      = i + 1;
+            }
+            # the new layers, read and written as the pool's for the while
+            sp.set = @set;
+            k      = 0;
+            for (k < set.n) {
+                sp.fronts[k] = fronts[k];
+                k            = k + 1;
+            }
+            put_words(sp, s, 0, CELLS, ?buf[0]);
+            k = plane.exact(set);
+            for (k < set.n) {
+                val kept: opt[usize] = plane.find(?old, set.at[k].name);
+                if (sel kept.some) {
+                    if (old.at[kept.some].role == layer.VIEW && old.at[kept.some].width == set.at[k].width) {
+                        mem.copy[u32](plane_of(sp, k, s).w, ?was[kept.some][s * plane.span_words(set.at[k].width)], span_of(sp, k));
+                    }
+                }
+                k = k + 1;
+            }
+            sp.set = old;
+            k      = 0;
+            for (k < layer.LAYERS_MAX::usize) {
+                sp.fronts[k] = was[k];
+                k            = k + 1;
+            }
+            touch(sp, s);
+        }
+        s = s + 1;
+    }
+    drop_layers(sp.a, ?old, sp.cap, ?was[0], ?wasb[0]);
+    sp.set = @set;
+    k      = 0;
+    for (k < layer.LAYERS_MAX::usize) {
+        sp.fronts[k] = fronts[k];
+        sp.backs[k]  = backs[k];
+        if (k >= set.n) {
+            sp.fronts[k] = nil;
+            sp.backs[k]  = nil;
+        }
+        k = k + 1;
+    }
+    sp.cells = sp.fronts[0];
+    sp.back  = sp.backs[0];
+    ret err[allo.Error].ok{};
 }
 
 # hand the pool a mirror that must make room before it grows, and the ceiling
@@ -631,15 +1040,8 @@ pub fun limit(sp: *Space, slots: usize) {
     var s: usize = 0;
     for (s < sp.hi) {
         if (used(sp, s)) {
-            val c:   *u32  = ?sp.cells[s * CELLS];
-            var any: bool  = false;
-            var i:   usize = 0;
-            for (!any && i < CELLS) {
-                any = c[i] != 0;
-                i   = i + 1;
-            }
-            if (any) { recount(sp, s); }
-            or       { release(sp, s); }
+            if (any(sp, s)) { recount(sp, s); }
+            or              { release(sp, s); }
         }
         s = s + 1;
     }
@@ -667,15 +1069,36 @@ pub fun dnit(sp: *Space) {
 # ret:     ok, or the allocator's refusal, which leaves the pool as it was
 pub fun set_stepped(sp: *Space, stepped: bool) err[allo.Error] {
     if (stepped == sp.stepped) { ret err[allo.Error].ok{}; }
+    var k: usize = 0;
     if (!stepped) {
-        allo.deallocate[u32](sp.a, sp.back, sp.cap * CELLS);
+        for (k < sp.set.n) {
+            allo.deallocate[u32](sp.a, sp.backs[k], sp.cap * span_of(sp, k));
+            sp.backs[k] = nil;
+            k           = k + 1;
+        }
         sp.back    = nil;
         sp.stepped = false;
         ret err[allo.Error].ok{};
     }
-    val rb: res[*u32, allo.Error] = allo.zallocate[u32](sp.a, sp.cap * CELLS);
-    if (sel rb.err) { ret err[allo.Error].err{rb.err}; }
-    sp.back    = rb.ok;
+    var backs: [layer.LAYERS_MAX]*u32;
+    for (k < sp.set.n) {
+        backs[k] = zwords(sp.a, sp.cap * span_of(sp, k));
+        if (backs[k] == nil) {
+            var j: usize = 0;
+            for (j < k) {
+                allo.deallocate[u32](sp.a, backs[j], sp.cap * span_of(sp, j));
+                j = j + 1;
+            }
+            ret err[allo.Error].err{allo.Error.exhausted{}};
+        }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < sp.set.n) {
+        sp.backs[k] = backs[k];
+        k           = k + 1;
+    }
+    sp.back    = sp.backs[0];
     sp.stepped = true;
     ret err[allo.Error].ok{};
 }
@@ -719,10 +1142,10 @@ pub fun set_pyramids(sp: *Space, on: bool) err[allo.Error] {
 # ages carried up from the level below, so every level is exactly what its
 # cells give
 # ---
-# cells: the chunk's CELLS cells
+# cells: the chunk's span of its state layer
 # sn:    how a cell is read, the rule's sense
 # out:   receives MIP texels
-pub fun pyramid(cells: *u32, sn: layout.Sense, out: *u32) {
+pub fun pyramid(cells: plane.Plane, sn: layout.Sense, out: *u32) {
     var live: [1024]u32;
     var heat: [1024]u32;
     var ages: [1024]u32;
@@ -738,7 +1161,7 @@ pub fun pyramid(cells: *u32, sn: layout.Sense, out: *u32) {
         var g:  u32 = 0;
         var i:  u32 = 0;
         for (i < 4) {
-            val c: u32 = cells[((oy + i / 2) * side + ox + i % 2)::usize];
+            val c: u32 = plane.get(cells, ((oy + i / 2) * side + ox + i % 2)::usize);
             if (layout.live(c, sn.live_mask, sn.live_lo, sn.live_hi) != 0) {
                 l = l + 1;
                 g = g + layout.texel_age(c, sn.age_shift, sn.age_mask);
@@ -843,6 +1266,11 @@ pub fun wake(sp: *Space, s: usize) {
 #       and the pool's dirty marks as they were
 pub fun stage(dst: *Space, src: *Space, full: bool, box: *i64) bool {
     var all: bool = full;
+    if (!plane.same(?dst.set, ?src.set)) {
+        val laid: err[allo.Error] = relayer(dst, ?src.set, nil, nil);
+        if (sel laid.err) { ret false; }
+        all = true;
+    }
     if ((src.mips != nil) != (dst.mips != nil)) {
         val made: err[allo.Error] = set_pyramids(dst, src.mips != nil);
         if (sel made.err) { ret false; }
@@ -880,7 +1308,11 @@ pub fun stage(dst: *Space, src: *Space, full: bool, box: *i64) bool {
         if (s < src.hi) {
             if (all) { d = d | DIRTY_CELLS; }
             if ((d & (DIRTY_CELLS | DIRTY_ZERO)) != 0) {
-                mem.copy[u32](?dst.cells[s * CELLS], ?src.cells[s * CELLS], CELLS);
+                var k: usize = 0;
+                for (k < src.set.n) {
+                    plane.copy(plane_of(dst, k, s), plane_of(src, k, s));
+                    k = k + 1;
+                }
                 dst.dirty[s] = dst.dirty[s] & ~DIRTY_MIP;
             }
             if ((d & DIRTY_MIP) != 0 && src.mips != nil) { mem.copy[u32](?dst.mips[s * MIP], ?src.mips[s * MIP], MIP); }
@@ -982,11 +1414,10 @@ pub fun clip(sp: *Space, y: i64, x0: *i64, x1: *i64) bool {
 # zero a slot's cells that lie off the grid, marking them dirty when any was set
 pub fun mask(sp: *Space, s: usize) {
     val e: u32   = sp.table[s * ENTRY + layout.EDGE_AT::usize];
-    val c: *u32  = ?sp.cells[s * CELLS];
     var i: usize = 0;
     for (i < CELLS) {
-        if (c[i] != 0 && layout.edge_side(e, (i & 63)::i32, (i >> 6)::i32) != 4) {
-            c[i] = 0;
+        if (layout.edge_side(e, (i & 63)::i32, (i >> 6)::i32) != 4 && holds_cell(sp, s, i)) {
+            clear_cell(sp, s, i);
             touch(sp, s);
         }
         i = i + 1;
@@ -1080,30 +1511,34 @@ fun cover(sp: *Space) {
 # began from
 fun quiet(sp: *Space, s: usize) {
     mem.zero[u32](?sp.before[s * CENSUS], CENSUS);
-    if (sp.back != nil)      { mem.zero[u32](?sp.back[s * CELLS], CELLS); }
+    var k: usize = 0;
+    for (sp.stepped && k < sp.set.n) {
+        plane.clear(back_of(sp, k, s));
+        k = k + 1;
+    }
     if (sp.mips_back != nil) { mem.zero[u32](?sp.mips_back[s * MIP], MIP); }
 }
 
-# the word of the cell at (x, y) of a slot's frame, taken through the links
-# where it lies outside the window (cellar.layout), zero where no chunk holds
-# it, and past a plane's dead edge the word the rule holds the edge as
-# (cellar.rule.outside)
-pub fun resolve(sp: *Space, s: usize, x: i32, y: i32, past: u32) u32 {
+# layer k's value of the cell at (x, y) of a slot's frame, taken through the
+# links where it lies outside the window (cellar.layout), zero where no chunk
+# holds it, and past a plane's dead edge past, the value the rule holds the
+# edge as in that layer (cellar.rule.outside)
+pub fun resolve(sp: *Space, k: usize, s: usize, x: i32, y: i32, past: u32) u32 {
     var sl: usize = s;
     var px: i32   = x;
     var py: i32   = y;
     var h:  u32   = 0;
     for (true) {
         val e: *u32 = ?sp.table[sl * ENTRY];
-        val k: u32  = layout.edge_side(e[layout.EDGE_AT::usize], px, py);
-        if (k == 4) { ret sp.cells[sl * CELLS + (py * 64 + px)::usize]; }
-        val t: u32 = e[layout.LINK_AT::usize + k::usize];
-        if (e[k::usize] == NONE && (t & layout.LINK_EDGE) != 0) { ret past; }
-        if (h == layout.HOPS || e[k::usize] == NONE)            { ret 0; }
+        val q: u32  = layout.edge_side(e[layout.EDGE_AT::usize], px, py);
+        if (q == 4) { ret plane.get(plane_of(sp, k, sl), (py * 64 + px)::usize); }
+        val t: u32 = e[layout.LINK_AT::usize + q::usize];
+        if (e[q::usize] == NONE && (t & layout.LINK_EDGE) != 0) { ret past; }
+        if (h == layout.HOPS || e[q::usize] == NONE)            { ret 0; }
         val nx: i32 = layout.hop_x(t, px, py);
         py = layout.hop_y(t, px, py);
         px = nx;
-        sl = e[k::usize]::usize;
+        sl = e[q::usize]::usize;
         h  = h + 1;
     }
     ret 0;
@@ -1253,7 +1688,7 @@ fun claim(sp: *Space, cx: i64, cy: i64) u32 {
     e[9]  = (cx + BIAS)::u32;
     e[10] = (cy + BIAS)::u32;
     e[11] = sp.serial;
-    mem.zero[u32](?sp.cells[s * CELLS], CELLS);
+    clear_slot(sp, s);
     mem.zero[u32](?sp.census[s * CENSUS], CENSUS);
     hash_put(sp, s);
     sp.live     = sp.live + 1;
@@ -1614,11 +2049,11 @@ fun slot_counted(sp: *Space, i: usize) usize {
 
 # count a slot's live and warm cells into its census from its front cells
 pub fun recount(sp: *Space, s: usize) {
-    var t: Tally = tally(sp.sense);
-    val c: *u32  = ?sp.cells[s * CELLS];
-    var i: usize = 0;
+    var t: Tally       = tally(sp.sense);
+    val c: plane.Plane = plane_of(sp, 0, s);
+    var i: usize       = 0;
     for (i < CELLS) {
-        note(?t, c[i], (i & 63)::u32, (i >> 6)::u32);
+        note(?t, plane.get(c, i), (i & 63)::u32, (i >> 6)::u32);
         i = i + 1;
     }
     tally_census(?t, ?sp.census[s * CENSUS], incarnation(sp, s));
@@ -1707,26 +2142,26 @@ test stage__a_view_takes_the_chunks_in_box_and_leaves_the_rest_marked {
     var box: [4]i64;
     mem.zero[i64](?box[0], 4);
     # a full stage copies every chunk, whatever the box
-    sp.cells[t * CELLS] = 7;
+    put_word(?sp, t, 0, 7);
     if (!stage(?view, ?sp, true, ?box[0]))                      { ret 2; }
-    if (view.hi != sp.hi || view.cells[t * CELLS] != 7)         { ret 3; }
+    if (view.hi != sp.hi || word(?view, t, 0) != 7)             { ret 3; }
     if ((view.dirty[s] & DIRTY_CELLS) == 0 || sp.dirty[s] != 0) { ret 4; }
     if (view.table[t * ENTRY + 9] != sp.table[t * ENTRY + 9])   { ret 5; }
     mem.zero[u8](view.dirty, view.hi);
     # after it, only the chunks in box that changed, the rest keeping their marks
-    sp.cells[s * CELLS] = 5;
-    sp.cells[t * CELLS] = 6;
+    put_word(?sp, s, 0, 5);
+    put_word(?sp, t, 0, 6);
     touch(?sp, s);
     touch(?sp, t);
-    if (!stage(?view, ?sp, false, ?box[0]))                               { ret 6; }
-    if (view.cells[s * CELLS] != 5 || (view.dirty[s] & DIRTY_CELLS) == 0) { ret 7; }
-    if (view.cells[t * CELLS] != 7 || (view.dirty[t] & DIRTY_CELLS) != 0) { ret 8; }
-    if (sp.dirty[s] != 0 || (sp.dirty[t] & DIRTY_CELLS) == 0)             { ret 9; }
+    if (!stage(?view, ?sp, false, ?box[0]))                           { ret 6; }
+    if (word(?view, s, 0) != 5 || (view.dirty[s] & DIRTY_CELLS) == 0) { ret 7; }
+    if (word(?view, t, 0) != 7 || (view.dirty[t] & DIRTY_CELLS) != 0) { ret 8; }
+    if (sp.dirty[s] != 0 || (sp.dirty[t] & DIRTY_CELLS) == 0)         { ret 9; }
     # until a box takes them in
     box[2] = 9;
     box[3] = 9;
-    if (!stage(?view, ?sp, false, ?box[0]))             { ret 10; }
-    if (view.cells[t * CELLS] != 6 || sp.dirty[t] != 0) { ret 11; }
+    if (!stage(?view, ?sp, false, ?box[0]))         { ret 10; }
+    if (word(?view, t, 0) != 6 || sp.dirty[t] != 0) { ret 11; }
     dnit(?view);
     dnit(?sp);
     ret 0;
@@ -1803,14 +2238,14 @@ test cover__holds_every_chunk_of_a_grid_that_fits_until_its_ceiling_drops {
     if (!sp.whole || sp.live != 8) { ret 6; }
     # a ceiling lowered below the grid lets go of every chunk but the live one
     # and its halo, and shrinks the pool to it
-    sp.sense.live_mask                            = 1;
-    sp.sense.live_lo                              = 1;
-    sp.sense.live_hi                              = 1;
-    sp.sense.warm_mask                            = 1;
-    sp.cells[find(?sp, 0, 0)::usize * CELLS + 65] = 1;
+    sp.sense.live_mask = 1;
+    sp.sense.live_lo   = 1;
+    sp.sense.live_hi   = 1;
+    sp.sense.warm_mask = 1;
+    put_word(?sp, find(?sp, 0, 0)::usize, 65, 1);
     limit(?sp, 7);
     val o: u32 = find(?sp, 0, 0);
-    if (sp.whole || sp.live >= 8 || sp.cap != 7 || o == NONE || sp.cells[o::usize * CELLS + 65] != 1) { ret 7; }
+    if (sp.whole || sp.live >= 8 || sp.cap != 7 || o == NONE || word(?sp, o::usize, 65) != 1) { ret 7; }
     # a grid past the ceiling, or with an unbounded axis, is not held whole
     set_grid(?sp, t.ok);
     if (sp.whole) { ret 10; }
