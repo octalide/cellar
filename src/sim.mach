@@ -92,6 +92,8 @@ use cellar.cpu;
 use cellar.gpu;
 use cellar.hashlife;
 use cellar.history;
+use cellar.layer;
+use cellar.layer.plane;
 use cellar.layout;
 use cellar.render;
 use cellar.rule;
@@ -322,6 +324,14 @@ pub fun init(s: *Sim, a: *allo.Allocator) err[allo.Error] {
         space.dnit(?s.space);
         ret ev;
     }
+    var first: rule.Rule       = rule.preset_rule(0);
+    var lay:   plane.Set       = rule.layers(?first);
+    val laid:  err[allo.Error] = space.relayer(?s.space, ?lay, nil, nil);
+    if (sel laid.err) {
+        space.dnit(?s.space);
+        space.dnit(?s.view);
+        ret laid;
+    }
     team.start(?s.team);
     s.engine = Engine.cpu{};
     hashlife.init(?s.tree, a, hashlife.DEFAULT_MAX);
@@ -450,18 +460,30 @@ pub fun set_rule(s: *Sim, r: rule.Rule) bool {
         if (fewer && !hashlife.limit_states(?s.tree, rule.states(?new))) { overflow(s); }
         ret true;
     }
-    if (!same || regrid) {
+    # the cells move into the new rule's layers, each word re-encoded unless
+    # the two rules write every state alike
+    # the view's layers stay as they are, beside the new rule's
+    var bare:   plane.Set  = rule.layers(?new);
+    var lay:    plane.Set  = plane.with_views(?bare, space.layers(?s.space));
+    val was:    *plane.Set = space.layers(?s.space);
+    val relaid: bool       = !plane.same_shape(was, ?lay) || !plane.same_words(was, ?lay);
+    if (!same || regrid || relaid) {
         val synced: err[gfx.Error] = sync(s);
         if (sel synced.err) { ret false; }
         # re-encoding rewrites every cell, so the watch is shown the world whole
         if (wanted(s, 0, 0, 0, 0, true)) { kept(s, 0, 0, 0, 0, true, true); }
     }
+    var rc:  Recode      = Recode{from: ?old, to: ?new};
+    var map: space.Remap = recode;
+    if (same) { map = nil; }
+    val laid: err[allo.Error] = space.relayer(?s.space, ?lay, map, (?rc)::*u8);
+    if (sel laid.err) { ret false; }
     s.rule        = r;
     s.space.sense = rule.sense(?s.rule);
     s.space.reach = rule.radius(?s.rule);
     s.space.rim   = rule.rimmed(?s.rule);
     if (rule.caps(?new).no_tree == nil) { hashlife.set_rule(?s.tree, r); }
-    if (same && !regrid) {
+    if (same && !regrid && !relaid) {
         if (!space.keep_rim(?s.space)) { overflow(s); }
         ret true;
     }
@@ -469,26 +491,68 @@ pub fun set_rule(s: *Sim, r: rule.Rule) bool {
     val sp: *space.Space = ?s.space;
     if (on_gpu(s)) { gpu.forget_writes(s.gpu, 0, sp.hi); }
     if (regrid)    { space.set_grid(sp, s.rule.grid); }
-    val n:  u32   = rule.states(?s.rule);
     var sl: usize = 0;
     for (sl < sp.hi) {
-        if (space.used(sp, sl) && same) { space.touch(sp, sl); }
-        or (space.used(sp, sl)) {
-            val c: *u32  = ?sp.cells[sl * space.CELLS];
-            var i: usize = 0;
-            for (i < space.CELLS) {
-                var st: u32 = rule.state(?old, c[i]);
-                if (st >= n) { st = 0; }
-                c[i] = rule.word(?s.rule, st);
-                i    = i + 1;
-            }
-            space.touch(sp, sl);
-        }
+        if (space.used(sp, sl)) { space.touch(sp, sl); }
         sl = sl + 1;
     }
     # the live cells changed, so the census and the chunks around them follow
     fill_end(s);
     ret true;
+}
+
+# the rules a re-encoding takes the cells between
+rec Recode {
+    from: *rule.Rule;
+    to:   *rule.Rule;
+}
+
+# a word under one rule re-encoded as the other's fresh word for the state the
+# first reads in it, a state the other lacks becoming 0 (see cellar.rule)
+fun recode(ctx: *u8, from: *u32, to: *u32) {
+    val rc: *Recode = ctx::*Recode;
+    var st: u32     = rule.state(rc.from, from[0]);
+    if (st >= rule.states(rc.to)) { st = 0; }
+    rule.fresh(rc.to, st, to);
+}
+
+# values a cell's word holds under the rule running: one for each of its
+# state and rule layers (cellar.layer), which every word this module takes or
+# gives is that many of, a cell's together
+pub fun word_len(s: *Sim) usize {
+    ret rule.word_len(?s.rule);
+}
+
+# whether a word of m values is the quiescent background's, every value 0
+fun blank(w: *u32, m: usize) bool {
+    var k: usize = 0;
+    for (k < m) {
+        if (w[k] != 0) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# words for n cells under the rule running, from the pool's allocator, or nil
+# when it refused them; give them back with unbuffer and the same n
+fun buffer(s: *Sim, n: usize) *u32 {
+    val r: res[*u32, allo.Error] = allo.allocate[u32](s.space.a, n * word_len(s));
+    if (sel r.err) { ret nil; }
+    ret r.ok;
+}
+
+fun unbuffer(s: *Sim, w: *u32, n: usize) {
+    if (w != nil) { allo.deallocate[u32](s.space.a, w, n * word_len(s)); }
+}
+
+# the fresh words of n cells of the states st, into out
+fun fresh_words(s: *Sim, st: *u8, n: usize, out: *u32) {
+    val m: usize = word_len(s);
+    var i: usize = 0;
+    for (i < n) {
+        rule.fresh(?s.rule, st[i]::u32, ?out[i * m]);
+        i = i + 1;
+    }
 }
 
 # why the world cannot run a rule, or nil when it can: a GPU steps the pool the
@@ -502,7 +566,7 @@ pub fun refusal(s: *Sim, r: *rule.Rule) str {
     if (s.gpu == nil || !s.gpu.stepping) { ret nil; }
     # a rule the tree runs stays off the GPU, where any other goes
     if (on_tree(s) && rule.caps(r).no_tree == nil) { ret nil; }
-    ret gpu.refusal(s.gpu, rule.family_of(r));
+    ret gpu.refusal(s.gpu, r);
 }
 
 # stop the team and release the pool and the tree
@@ -573,9 +637,10 @@ fun pool_to_tree(s: *Sim) bool {
     var sl:  usize = 0;
     for (sl < sp.hi) {
         if (space.used(sp, sl)) {
-            val c:   *u32  = ?sp.cells[sl * space.CELLS];
+            var c:   [4096]u32;
             var any: bool  = false;
             var i:   usize = 0;
+            space.get_sensed(sp, sl, 0, space.CELLS, ?c[0]);
             for (i < space.CELLS) {
                 buf[i] = rule.state(?s.rule, c[i])::u8;
                 if (buf[i] != 0) { any = true; }
@@ -600,30 +665,29 @@ fun measure_chunk(ctx: *u8, cx: i64, cy: i64, cells: *u8) {
 # the pool being seeded from the tree
 # ---
 # s:    simulation, its world in the pool
+# w:    a chunk's words
 # lost: a chunk did not fit
 rec Seed {
     s:    *Sim;
+    w:    *u32;
     lost: bool;
 }
 
 # seed a live chunk of the tree into the pool, ahead of pool_settle
 fun seed_chunk(ctx: *u8, cx: i64, cy: i64, cells: *u8) {
     val sd: *Seed = ctx::*Seed;
-    var w:  [4096]u32;
-    var i:  usize = 0;
-    for (i < space.CELLS) {
-        w[i] = rule.word(?sd.s.rule, cells[i]::u32);
-        i    = i + 1;
-    }
-    if (!fill_chunk(sd.s, cx, cy, ?w[0])) { sd.lost = true; }
+    fresh_words(sd.s, cells, space.CELLS, sd.w);
+    if (!fill_chunk(sd.s, cx, cy, sd.w)) { sd.lost = true; }
 }
 
 # seed the tree's live chunks into the emptied pool and settle it
 fun tree_to_pool(s: *Sim) bool {
-    var sd:  Seed = Seed{s: s, lost: false};
+    var sd:  Seed = Seed{s: s, w: buffer(s, space.CELLS), lost: false};
     var buf: [4096]u8;
     space.reset(?s.space);
+    if (sd.w == nil) { ret false; }
     hashlife.chunks(?s.tree, seed_chunk, (?sd)::*u8, ?buf[0]);
+    unbuffer(s, sd.w, space.CELLS);
     ret pool_settle(s) && !sd.lost;
 }
 
@@ -646,7 +710,14 @@ pub fun use_hashlife(s: *Sim, on: bool) bool {
         val synced: err[gfx.Error] = sync(s);
         if (sel synced.err) { ret false; }
         hashlife.set_rule(t, s.rule);
+        # the pool shows the tree from here on, in drawn cells of its own
+        var shown: plane.Set = tree_layers();
         if (!pool_to_tree(s)) {
+            hashlife.clear(t);
+            ret false;
+        }
+        val laid: err[allo.Error] = space.relayer(?s.space, ?shown, nil, nil);
+        if (sel laid.err) {
             hashlife.clear(t);
             ret false;
         }
@@ -670,6 +741,9 @@ pub fun use_hashlife(s: *Sim, on: bool) bool {
     val fits: bool = !n.spent;
     need_dnit(?n);
     if (!fits) { ret false; }
+    var held: plane.Set       = rule.layers(?s.rule);
+    val laid: err[allo.Error] = space.relayer(?s.space, ?held, nil, nil);
+    if (sel laid.err) { ret false; }
     s.engine = pool_engine(s);
     val ok: bool = tree_to_pool(s);
     hashlife.clear(t);
@@ -1039,6 +1113,13 @@ fun floor64(v: f64) i64 {
     ret t;
 }
 
+# the layers the pool holds a view of the tree in: one of drawn cells, a word
+# of the rule at a cell a square and a summary below (summary), whichever
+# rule the tree runs
+fun tree_layers() plane.Set {
+    ret plane.state("drawn", layer.WIDTH_MAX);
+}
+
 # a drawn cell's word for a square of level shift above a cell, as the pool's
 # coverage summarises its cells: the share of them the rule counts live in
 # 255ths, never 0 when one is, and above it the most heat any carries, which
@@ -1060,7 +1141,7 @@ fun show_square(ctx: *u8, qx: i64, qy: i64, n: u32) {
     val s: *Sim           = ctx::*Sim;
     val i: usize          = space.local_of(qy) * 64 + space.local_of(qx);
     val t: *hashlife.Tree = ?s.tree;
-    if (s.seen.shift == 0) { s.seen.cells[i] = rule.word(?s.rule, n); }
+    if (s.seen.shift == 0) { s.seen.cells[i] = rule.value(?s.rule, n); }
     or {
         val was:  u32 = s.seen.cells[i];
         val new:  u32 = summary(s.seen.shift, hashlife.live(t, n), hashlife.heat(t, n));
@@ -1097,10 +1178,14 @@ fun show_chunk(s: *Sim, cx: i64, cy: i64) {
         if (sl != space.NONE) { space.release(sp, sl::usize); }
         ret;
     }
-    if (sl != space.NONE && mem.equal[u32](?sp.cells[sl::usize * space.CELLS], cells, space.CELLS)) { ret; }
-    if (sl == space.NONE)                                                                           { sl = space.alloc(sp, cx, cy); }
-    if (sl == space.NONE)                                                                           { ret; }
-    mem.copy[u32](?sp.cells[sl::usize * space.CELLS], cells, space.CELLS);
+    if (sl != space.NONE) {
+        var held: [4096]u32;
+        space.get_words(sp, sl::usize, 0, space.CELLS, ?held[0]);
+        if (mem.equal[u32](?held[0], cells, space.CELLS)) { ret; }
+    }
+    if (sl == space.NONE) { sl = space.alloc(sp, cx, cy); }
+    if (sl == space.NONE) { ret; }
+    space.put_words(sp, sl::usize, 0, space.CELLS, cells);
     space.touch(sp, sl::usize);
 }
 
@@ -1406,8 +1491,9 @@ pub fun fill_cell(s: *Sim, x: i64, y: i64, state: u32) bool {
     }
     val sl: u32 = space.alloc(?s.space, space.chunk_of(x), space.chunk_of(y));
     if (sl == space.NONE) { ret false; }
-    val i: usize = sl::usize * space.CELLS + space.local_of(y) * 64 + space.local_of(x);
-    s.space.cells[i] = rule.word(?s.rule, state);
+    var w: [layer.LAYERS_MAX]u32;
+    rule.fresh(?s.rule, state, ?w[0]);
+    space.put_word(?s.space, sl::usize, space.local_of(y) * 64 + space.local_of(x), ?w[0]);
     space.touch(?s.space, sl::usize);
     ret true;
 }
@@ -1417,16 +1503,17 @@ pub fun fill_cell(s: *Sim, x: i64, y: i64, state: u32) bool {
 # s:     simulation
 # cx:    chunk column
 # cy:    chunk row
-# cells: space.CELLS cells, row-major
+# cells: space.CELLS words, row-major (word_len)
 # ret:   false when the pool or the tree is full
 pub fun fill_chunk(s: *Sim, cx: i64, cy: i64, cells: *u32) bool {
     if (!space.on_grid(?s.space, cx, cy)) { ret true; }
     if (on_tree(s)) {
-        val p: *u8 = hashlife.chunk(?s.tree, cx, cy, true);
+        val p: *u8   = hashlife.chunk(?s.tree, cx, cy, true);
+        val m: usize = word_len(s);
         if (p == nil) { ret false; }
         var i: usize = 0;
         for (i < space.CELLS) {
-            p[i] = rule.state(?s.rule, cells[i])::u8;
+            p[i] = rule.state(?s.rule, cells[i * m])::u8;
             i    = i + 1;
         }
         hashlife.wrote(?s.tree, cx, cy);
@@ -1434,7 +1521,7 @@ pub fun fill_chunk(s: *Sim, cx: i64, cy: i64, cells: *u32) bool {
     }
     val sl: u32 = space.alloc(?s.space, cx, cy);
     if (sl == space.NONE) { ret false; }
-    mem.copy[u32](?s.space.cells[sl::usize * space.CELLS], cells, space.CELLS);
+    space.put_words(?s.space, sl::usize, 0, space.CELLS, cells);
     space.touch(?s.space, sl::usize);
     space.mask(?s.space, sl::usize);
     ret true;
@@ -1524,7 +1611,7 @@ pub fun capture(s: *Sim, sn: *snapshot.Snapshot) bool {
 }
 
 # what a list of chunks by their words hands each one: its column and row and
-# its space.CELLS words, row-major, which last until the next call
+# its space.CELLS words, row-major (word_len), which last until the next call
 pub def Words: fun(*u8, i64, i64, *u32);
 
 # the world being listed by words
@@ -1532,21 +1619,18 @@ pub def Words: fun(*u8, i64, i64, *u32);
 # s:   simulation
 # f:   the visit
 # ctx: passed back to f
+# w:   a chunk's words
 rec ByWords {
     s:   *Sim;
     f:   Words;
     ctx: *u8;
+    w:   *u32;
 }
 
 fun tree_words(ctx: *u8, cx: i64, cy: i64, cells: *u8) {
     val bw: *ByWords = ctx::*ByWords;
-    var w:  [4096]u32;
-    var i:  usize    = 0;
-    for (i < space.CELLS) {
-        w[i] = rule.word(?bw.s.rule, cells[i]::u32);
-        i    = i + 1;
-    }
-    bw.f(bw.ctx, cx, cy, ?w[0]);
+    fresh_words(bw.s, cells, space.CELLS, bw.w);
+    bw.f(bw.ctx, cx, cy, bw.w);
 }
 
 # hand f every chunk in a box of chunks that holds a word but 0, as the host
@@ -1560,8 +1644,11 @@ fun tree_words(ctx: *u8, cx: i64, cy: i64, cells: *u8) {
 # f:   the visit
 # ctx: passed back to f
 pub fun chunks_in(s: *Sim, b: space.Box, f: Words, ctx: *u8) {
+    val w: *u32 = buffer(s, space.CELLS);
+    if (w == nil) { ret; }
+    fin { unbuffer(s, w, space.CELLS); }
     if (on_tree(s)) {
-        var bw:  ByWords = ByWords{s: s, f: f, ctx: ctx};
+        var bw:  ByWords = ByWords{s: s, f: f, ctx: ctx, w: w};
         var buf: [4096]u8;
         var box: [4]i64;
         box[0] = b.x0 * space.SIDE;
@@ -1576,10 +1663,12 @@ pub fun chunks_in(s: *Sim, b: space.Box, f: Words, ctx: *u8) {
     var sl:  usize        = 0;
     for (sl < top) {
         if (space.used(sp, sl)) {
-            val cx: i64  = space.slot_x(sp, sl);
-            val cy: i64  = space.slot_y(sp, sl);
-            val c:  *u32 = ?sp.cells[sl * space.CELLS];
-            if (cx >= b.x0 && cx < b.x1 && cy >= b.y0 && cy < b.y1 && snapshot.any(c)) { f(ctx, cx, cy, c); }
+            val cx: i64 = space.slot_x(sp, sl);
+            val cy: i64 = space.slot_y(sp, sl);
+            if (cx >= b.x0 && cx < b.x1 && cy >= b.y0 && cy < b.y1 && space.holds_word(sp, sl)) {
+                space.get_words(sp, sl, 0, space.CELLS, w);
+                f(ctx, cx, cy, w);
+            }
         }
         sl = sl + 1;
     }
@@ -1612,11 +1701,15 @@ pub fun restore(s: *Sim, sn: *snapshot.Snapshot) bool {
     }
     or {
         fill_begin(s);
+        val w: *u32 = buffer(s, space.CELLS);
+        if (w == nil) { ok = false; }
         var i: usize = 0;
         for (i < sn.n && ok) {
-            ok = fill_chunk(s, sn.at[i * 2], sn.at[i * 2 + 1], ?sn.cells[i * space.CELLS]);
+            snapshot.words_of(sn, i, w);
+            ok = fill_chunk(s, sn.at[i * 2], sn.at[i * 2 + 1], w);
             i  = i + 1;
         }
+        unbuffer(s, w, space.CELLS);
         if (!fill_end(s)) { ok = false; }
     }
     if (!ok) { overflow(s); }
@@ -1680,24 +1773,27 @@ pub fun place(s: *Sim, g: topology.Grid, dx: i64, dy: i64) Placed {
     val sp: *space.Space = ?s.space;
     var ok: bool         = true;
     var i:  usize        = 0;
+    val c:  *u32         = buffer(s, space.CELLS);
+    val m:  usize        = word_len(s);
+    if (c == nil) { ok = false; }
     for (ok && i < was.n) {
-        val c:  *u32  = snapshot.cells_of(?was, i);
+        snapshot.words_of(?was, i, c);
         val x0: i64   = was.at[i * 2] * space.SIDE + dx;
         val y0: i64   = was.at[i * 2 + 1] * space.SIDE + dy;
         var k:  usize = 0;
         for (ok && k < space.CELLS) {
-            val w: u32 = c[k];
-            if (w != 0) {
+            val w: *u32 = ?c[k * m];
+            if (!blank(w, m)) {
                 val x: i64 = x0 + (k % 64)::i64;
                 val y: i64 = y0 + (k / 64)::i64;
                 if (!space.holds(sp, x, y)) {
-                    if (space.live(sp, w)) { out.dropped = out.dropped + 1; }
+                    if (space.live(sp, w[0])) { out.dropped = out.dropped + 1; }
                 }
                 or {
                     val sl: u32 = space.alloc(sp, space.chunk_of(x), space.chunk_of(y));
                     if (sl == space.NONE) { ok = false; }
                     or {
-                        sp.cells[sl::usize * space.CELLS + space.local_of(y) * 64 + space.local_of(x)] = w;
+                        space.put_word(sp, sl::usize, space.local_of(y) * 64 + space.local_of(x), w);
                         space.touch(sp, sl::usize);
                     }
                 }
@@ -1706,6 +1802,7 @@ pub fun place(s: *Sim, g: topology.Grid, dx: i64, dy: i64) Placed {
         }
         i = i + 1;
     }
+    unbuffer(s, c, space.CELLS);
     val settled: bool = fill_end(s);
     if (!ok) { overflow(s); }
     s.generation = gen;
@@ -1726,11 +1823,6 @@ pub fun flipped(s: *Sim) bool {
 fun held(s: *Sim, v: u8) u8 {
     if (flipped(s)) { ret 1 - v; }
     ret v;
-}
-
-# the word a held state is written as, fresh
-fun cell_of(s: *Sim, v: u8) u32 {
-    ret rule.word(?s.rule, v::u32);
 }
 
 # whether a chunk slot overlaps the cells in [x0, x1) by [y0, y1), which is not empty
@@ -1857,10 +1949,10 @@ pub fun read_run(s: *Sim, x: i64, y: i64, n: usize, out: *u8) bool {
         val sl: u32 = space.find(sp, space.chunk_of(at), space.chunk_of(y));
         if (sl == space.NONE) { mem.fill[u8](?out[o], held(s, 0), k); }
         or {
-            val row: *u32  = ?sp.cells[sl::usize * space.CELLS + space.local_of(y) * 64 + space.local_of(at)];
+            val row: usize = space.local_of(y) * 64 + space.local_of(at);
             var i:   usize = 0;
             for (i < k) {
-                out[o + i] = held(s, rule.state(?s.rule, row[i])::u8);
+                out[o + i] = held(s, rule.state(?s.rule, space.sensed(sp, sl::usize, row + i))::u8);
                 i          = i + 1;
             }
         }
@@ -1870,19 +1962,22 @@ pub fun read_run(s: *Sim, x: i64, y: i64, n: usize, out: *u8) bool {
 }
 
 # the words of n cells of a row in the open read, from (x, y) rightward: a
-# continuous rule's exact values, which read_run's states only approximate
+# cell's exact values, its state and rule layers' (word_len), which
+# read_run's states only approximate
 # ---
 # s:   simulation
 # x:   first column
 # y:   row
 # n:   cells to read
-# out: receives n words of the rule running, 0 off the grid and where no chunk is
+# out: receives n words of the rule running, a cell's values together, 0 off
+#      the grid and where no chunk is
 # ret: false when any cell lies outside the area or the world is flipped,
 #      whose held words are its complement's (rule.Caps b0), leaving out untouched
 pub fun read_words(s: *Sim, x: i64, y: i64, n: usize, out: *u32) bool {
     val r: *Read = ?s.read;
     if (!r.open || y < r.y0 || y >= r.y1 || x < r.x0 || x + n::i64 > r.x1 || flipped(s)) { ret false; }
-    mem.zero[u32](out, n);
+    val m: usize = word_len(s);
+    mem.zero[u32](out, n * m);
     var at:  i64 = x;
     var end: i64 = x + n::i64;
     if (!topology.clip(?s.rule.grid, y, ?at, ?end)) { ret true; }
@@ -1892,17 +1987,13 @@ pub fun read_words(s: *Sim, x: i64, y: i64, n: usize, out: *u32) bool {
         val o: usize = (at - x)::usize;
         val k: usize = (stop - at)::usize;
         if (on_tree(s)) {
-            val p: *u8   = tree_chunk(s, at, y, false);
-            var i: usize = 0;
-            for (p != nil && i < k) {
-                out[o + i] = rule.word(?s.rule, p[space.local_of(y) * 64 + space.local_of(at) + i]::u32);
-                i          = i + 1;
-            }
+            val p: *u8 = tree_chunk(s, at, y, false);
+            if (p != nil) { fresh_words(s, ?p[space.local_of(y) * 64 + space.local_of(at)], k, ?out[o * m]); }
             at = stop;
             cnt;
         }
         val sl: u32 = space.find(?s.space, space.chunk_of(at), space.chunk_of(y));
-        if (sl != space.NONE) { mem.copy[u32](?out[o], ?s.space.cells[sl::usize * space.CELLS + space.local_of(y) * 64 + space.local_of(at)], k); }
+        if (sl != space.NONE) { space.get_words(?s.space, sl::usize, space.local_of(y) * 64 + space.local_of(at), k, ?out[o * m]); }
         at = stop;
     }
     ret true;
@@ -1974,8 +2065,11 @@ pub fun edit_begin(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64) bool {
     val pull: bool = !read_covers(s, e.x0, e.y0, e.x1, e.y1);
     if (e.sparse) {
         # a small edit writes single cells and pulls nothing, unless the watch
-        # needs the chunks as they stand
-        if (watch && !stage(s, e.x0, e.y0, e.x1, e.y1, pull, false)) { ret false; }
+        # needs the chunks as they stand, or a layer narrower than a word
+        # sends a painted cell up with the cells sharing its word
+        # (cellar.gpu note_write)
+        val share: bool = on_gpu(s) && space.packed(?s.space);
+        if ((watch || share) && !stage(s, e.x0, e.y0, e.x1, e.y1, pull, false)) { ret false; }
     }
     or (!stage(s, e.x0, e.y0, e.x1, e.y1, pull, true)) { ret false; }
     if (watch)                                         { kept(s, e.x0, e.y0, e.x1, e.y1, false, true); }
@@ -1983,22 +2077,23 @@ pub fun edit_begin(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64) bool {
     ret true;
 }
 
-# write one cell of a small area, as a recorded write on the GPU
-fun put_sparse(s: *Sim, x: i64, y: i64, c: u32) bool {
+# write the word c to one cell of a small area, as a recorded write on the GPU
+fun put_sparse(s: *Sim, x: i64, y: i64, c: *u32) bool {
     val sp: *space.Space = ?s.space;
     if (!space.holds(sp, x, y)) { ret true; }
-    val cx: i64 = space.chunk_of(x);
-    val cy: i64 = space.chunk_of(y);
-    var sl: u32 = space.find(sp, cx, cy);
+    val cx:   i64  = space.chunk_of(x);
+    val cy:   i64  = space.chunk_of(y);
+    var sl:   u32  = space.find(sp, cx, cy);
+    val none: bool = blank(c, word_len(s));
     if (sl == space.NONE) {
-        if (c == 0) { ret true; }
+        if (none) { ret true; }
         sl = space.alloc(sp, cx, cy);
         if (sl == space.NONE) { ret false; }
     }
     val slot: usize = sl::usize;
     val i:    usize = space.local_of(y) * 64 + space.local_of(x);
-    sp.cells[slot * space.CELLS + i] = c;
-    if (c != 0) { space.surround(sp, slot); }
+    space.put_word(sp, slot, i, c);
+    if (!none) { space.surround(sp, slot); }
     # the GPU's copy takes the cell alone while it steps, and the chunk whole
     # while it only draws
     if (on_gpu(s)) { gpu.note_write(s.gpu, sp, slot, i); }
@@ -2028,28 +2123,33 @@ pub fun edit_set(s: *Sim, x: i64, y: i64, v: u8) bool {
 pub fun edit_run(s: *Sim, x: i64, y: i64, n: usize, w: u8) bool {
     if (!editing(s, x, y, n)) { ret false; }
     val v: u8 = held(s, w);
-    ret put_run(s, x, y, n, cell_of(s, v), v);
+    var c: [layer.LAYERS_MAX]u32;
+    rule.fresh(?s.rule, v::u32, ?c[0]);
+    ret put_run(s, x, y, n, ?c[0], v);
 }
 
 # write n words to a row of the open edit, from (x, y) rightward, as they are
-# given: a continuous rule's exact values, which a state only approximates
+# given: a cell's exact values, its state and rule layers' (word_len), which a
+# state only approximates
 # ---
 # s:   simulation
 # x:   first column
 # y:   row
 # n:   cells to write
-# w:   n words of the rule running, 0 the quiescent background
+# w:   n words of the rule running, a cell's values together, all 0 the
+#      quiescent background
 # ret: false when any cell lies outside the area, the world is flipped, whose
 #      held words are its complement's (rule.Caps b0), or the pool or the tree
 #      was full
 pub fun edit_words(s: *Sim, x: i64, y: i64, n: usize, w: *u32) bool {
     if (!editing(s, x, y, n) || flipped(s)) { ret false; }
+    val m:  usize = word_len(s);
     var ok: bool  = true;
     var i:  usize = 0;
     for (i < n) {
         var k: usize = i + 1;
-        for (k < n && w[k] == w[i]) { k = k + 1; }
-        if (!put_run(s, x + i::i64, y, k - i, w[i], rule.state(?s.rule, w[i])::u8)) { ok = false; }
+        for (k < n && mem.equal[u32](?w[k * m], ?w[i * m], m)) { k = k + 1; }
+        if (!put_run(s, x + i::i64, y, k - i, ?w[i * m], rule.state(?s.rule, w[i * m])::u8)) { ok = false; }
         i = k;
     }
     ret ok;
@@ -2062,11 +2162,12 @@ fun editing(s: *Sim, x: i64, y: i64, n: usize) bool {
 }
 
 # write word c, which holds state v, to n cells of a row inside the open edit
-fun put_run(s: *Sim, x: i64, y: i64, n: usize, c: u32, v: u8) bool {
-    val e:   *Edit = ?s.edit;
-    var ok:  bool  = true;
-    var at:  i64   = x;
-    val end: i64   = x + n::i64;
+fun put_run(s: *Sim, x: i64, y: i64, n: usize, c: *u32, v: u8) bool {
+    val none: bool  = blank(c, word_len(s));
+    val e:    *Edit = ?s.edit;
+    var ok:   bool  = true;
+    var at:   i64   = x;
+    val end:  i64   = x + n::i64;
     for (at < end) {
         var stop: i64 = (space.chunk_of(at) + 1) * space.SIDE;
         if (stop > end) { stop = end; }
@@ -2092,13 +2193,12 @@ fun put_run(s: *Sim, x: i64, y: i64, n: usize, c: u32, v: u8) bool {
             var b: i64 = stop;
             if (space.clip(?s.space, y, ?a, ?b)) {
                 var sl: u32 = space.find(?s.space, space.chunk_of(a), space.chunk_of(y));
-                if (sl == space.NONE && c != 0) { sl = space.alloc(?s.space, space.chunk_of(a), space.chunk_of(y)); }
+                if (sl == space.NONE && !none) { sl = space.alloc(?s.space, space.chunk_of(a), space.chunk_of(y)); }
                 if (sl != space.NONE) {
-                    val i: usize = sl::usize * space.CELLS + space.local_of(y) * 64 + space.local_of(a);
-                    mem.fill[u32](?s.space.cells[i], c, (b - a)::usize);
+                    space.fill_words(?s.space, sl::usize, space.local_of(y) * 64 + space.local_of(a), (b - a)::usize, c);
                     space.touch(?s.space, sl::usize);
                 }
-                or (c != 0) { ok = false; }
+                or (!none) { ok = false; }
             }
         }
         at = stop;
@@ -2114,7 +2214,8 @@ fun put_run(s: *Sim, x: i64, y: i64, n: usize, c: u32, v: u8) bool {
 # s:     simulation
 # cx:    chunk column
 # cy:    chunk row
-# cells: space.CELLS words, row-major, or nil to kill every cell of the chunk
+# cells: space.CELLS words, row-major (word_len), or nil to kill every cell
+#        of the chunk
 # ret:   false when no such edit is open, the chunk lies outside it, or the
 #        pool was full
 pub fun edit_chunk(s: *Sim, cx: i64, cy: i64, cells: *u32) bool {
@@ -2129,10 +2230,11 @@ pub fun edit_chunk(s: *Sim, cx: i64, cy: i64, cells: *u32) bool {
             e.lost = true;
             ret false;
         }
+        val m: usize = word_len(s);
         var i: usize = 0;
         for (i < space.CELLS) {
             p[i] = 0;
-            if (cells != nil) { p[i] = rule.state(?s.rule, cells[i])::u8; }
+            if (cells != nil) { p[i] = rule.state(?s.rule, cells[i * m])::u8; }
             i = i + 1;
         }
         hashlife.wrote(?s.tree, cx, cy);
@@ -2148,9 +2250,10 @@ pub fun edit_chunk(s: *Sim, cx: i64, cy: i64, cells: *u32) bool {
             ret false;
         }
     }
-    val to: *u32 = ?sp.cells[sl::usize * space.CELLS];
-    if (cells == nil) { mem.zero[u32](to, space.CELLS); }
-    or                { mem.copy[u32](to, cells, space.CELLS); }
+    var none: [layer.LAYERS_MAX]u32;
+    mem.zero[u32](?none[0], layer.LAYERS_MAX::usize);
+    if (cells == nil) { space.fill_words(sp, sl::usize, 0, space.CELLS, ?none[0]); }
+    or                { space.put_words(sp, sl::usize, 0, space.CELLS, cells); }
     space.touch(sp, sl::usize);
     ret true;
 }
@@ -2459,19 +2562,36 @@ pub fun paint(s: *Sim, x: i64, y: i64, v: u8) {
     edit_end(s);
 }
 
-# the word of the cell at (x, y), from the host's cells or the tree
+# the value of the cell at (x, y) in the rule's state layer, the one its state
+# is read from, from the host's cells or the tree
 #
 # on the GPU this is the staging copy, current only after sync.
 # ---
 # s:   simulation
 # x:   column
 # y:   row
-# ret: the cell, 0 where no chunk exists
+# ret: the value, 0 where no chunk exists
 pub fun cell(s: *Sim, x: i64, y: i64) u32 {
-    if (on_tree(s)) { ret rule.word(?s.rule, hashlife.get(?s.tree, x, y)); }
+    if (on_tree(s)) { ret rule.value(?s.rule, hashlife.get(?s.tree, x, y)); }
     val sl: u32 = space.find(?s.space, space.chunk_of(x), space.chunk_of(y));
     if (sl == space.NONE) { ret 0; }
-    ret s.space.cells[sl::usize * space.CELLS + space.local_of(y) * 64 + space.local_of(x)];
+    ret space.sensed(?s.space, sl::usize, space.local_of(y) * 64 + space.local_of(x));
+}
+
+# the word of the cell at (x, y), its values in every state and rule layer
+# (word_len), from the host's cells or the tree
+#
+# on the GPU this is the staging copy, current only after sync.
+# ---
+# out: receives word_len(s) values, 0 where no chunk exists
+pub fun word_at(s: *Sim, x: i64, y: i64, out: *u32) {
+    mem.zero[u32](out, word_len(s));
+    if (on_tree(s)) {
+        rule.fresh(?s.rule, hashlife.get(?s.tree, x, y)::u32, out);
+        ret;
+    }
+    val sl: u32 = space.find(?s.space, space.chunk_of(x), space.chunk_of(y));
+    if (sl != space.NONE) { space.get_word(?s.space, sl::usize, space.local_of(y) * 64 + space.local_of(x), out); }
 }
 
 # whether the cell at (x, y) of the world is live, from the host's cells or the tree
@@ -2578,9 +2698,10 @@ pub fun chunks(s: *Sim, f: hashlife.Visit, ctx: *u8) {
     var sl: usize        = 0;
     for (sl < sp.hi) {
         if (space.used(sp, sl)) {
-            val c:   *u32  = ?sp.cells[sl * space.CELLS];
+            var c:   [4096]u32;
             var any: bool  = false;
             var i:   usize = 0;
+            space.get_sensed(sp, sl, 0, space.CELLS, ?c[0]);
             for (i < space.CELLS) {
                 buf[i] = rule.state(?s.rule, c[i])::u8;
                 if (buf[i] != 0) { any = true; }
@@ -2608,8 +2729,9 @@ pub fun chunk_cells(s: *Sim, cx: i64, cy: i64, out: *u8) {
     mem.zero[u8](out, space.CELLS);
     val sl: u32 = space.find(?s.space, cx, cy);
     if (sl == space.NONE) { ret; }
-    val c: *u32  = ?s.space.cells[sl::usize * space.CELLS];
+    var c: [4096]u32;
     var i: usize = 0;
+    space.get_sensed(?s.space, sl::usize, 0, space.CELLS, ?c[0]);
     for (i < space.CELLS) {
         out[i] = rule.state(?s.rule, c[i])::u8;
         i      = i + 1;
@@ -2617,8 +2739,8 @@ pub fun chunk_cells(s: *Sim, cx: i64, cy: i64, out: *u8) {
 }
 
 # the words of the chunk at (cx, cy), as the host holds them or the tree's
-# states written as the rule's words: a continuous rule's exact values, which
-# chunk_cells' states only approximate
+# states written as the rule's fresh words: every cell's exact values, its
+# state and rule layers' (word_len), which chunk_cells' states only approximate
 #
 # on the GPU the host's cells are the staging copy, current only after sync.
 # ---
@@ -2626,22 +2748,19 @@ pub fun chunk_cells(s: *Sim, cx: i64, cy: i64, out: *u8) {
 #      complement's (rule.Caps b0)
 # cx:  chunk column
 # cy:  chunk row
-# out: receives space.CELLS words, row-major, 0 where no chunk exists
+# out: receives space.CELLS words, row-major, a cell's values together, 0
+#      where no chunk exists
 pub fun chunk_words(s: *Sim, cx: i64, cy: i64, out: *u32) {
     if (on_tree(s)) {
         var st: [4096]u8;
         hashlife.chunk_cells(?s.tree, cx, cy, ?st[0]);
-        var i: usize = 0;
-        for (i < space.CELLS) {
-            out[i] = rule.word(?s.rule, st[i]::u32);
-            i      = i + 1;
-        }
+        fresh_words(s, ?st[0], space.CELLS, out);
         ret;
     }
-    mem.zero[u32](out, space.CELLS);
+    mem.zero[u32](out, space.CELLS * word_len(s));
     val sl: u32 = space.find(?s.space, cx, cy);
     if (sl == space.NONE) { ret; }
-    mem.copy[u32](out, ?s.space.cells[sl::usize * space.CELLS], space.CELLS);
+    space.get_words(?s.space, sl::usize, 0, space.CELLS, out);
 }
 
 # the states of the chunk at (cx, cy) as the world reads them: chunk_cells, but
@@ -2711,7 +2830,8 @@ pub fun state_bounds(s: *Sim) opt[space.Box] {
     var sl:  usize        = 0;
     for (sl < sp.hi) {
         if (space.used(sp, sl)) {
-            val c:  *u32  = ?sp.cells[sl * space.CELLS];
+            var c: [4096]u32;
+            space.get_sensed(sp, sl, 0, space.CELLS, ?c[0]);
             val ox: i64   = space.slot_x(sp, sl) * space.SIDE;
             val oy: i64   = space.slot_y(sp, sl) * space.SIDE;
             var i:  usize = 0;
@@ -3659,11 +3779,11 @@ test set_rule__re_encodes_the_cells_between_families {
     paint(?s, 0, 1, 1);
     paint(?s, 1, 1, 1);
     step(?s);
-    if (cell(?s, 0, 0) == rule.word(?s.rule, 1)) { ret 2; }
+    if (cell(?s, 0, 0) == rule.value(?s.rule, 1)) { ret 2; }
 
     # live Life cells become live Brian's Brain cells
-    if (!set_rule(?s, brain))                                          { ret 3; }
-    if (cell(?s, 0, 0) != rule.word(?brain, 1) || population(?s) != 4) { ret 3; }
+    if (!set_rule(?s, brain))                                           { ret 3; }
+    if (cell(?s, 0, 0) != rule.value(?brain, 1) || population(?s) != 4) { ret 3; }
 
     # every block cell has three live neighbours, so all start dying, and the
     # cells beside the block's edges have two and are born
@@ -3672,9 +3792,9 @@ test set_rule__re_encodes_the_cells_between_families {
     val born: usize = population(?s);
 
     # dying cells are a state Life lacks, so they become dead, and live ones live
-    if (!set_rule(?s, life))                                           { ret 5; }
-    if (cell(?s, 0, 0) != 0 || cell(?s, -1, 0) != rule.word(?life, 1)) { ret 5; }
-    if (population(?s) != born)                                        { ret 6; }
+    if (!set_rule(?s, life))                                            { ret 5; }
+    if (cell(?s, 0, 0) != 0 || cell(?s, -1, 0) != rule.value(?life, 1)) { ret 5; }
+    if (population(?s) != born)                                         { ret 6; }
     dnit(?s);
     ret 0;
 }
@@ -3783,7 +3903,7 @@ fun live_cells(s: *Sim) usize {
         if (space.used(?s.space, sl)) {
             var i: usize = 0;
             for (i < space.CELLS) {
-                if (space.live(?s.space, s.space.cells[sl * space.CELLS + i])) { n = n + 1; }
+                if (space.live(?s.space, space.sensed(?s.space, sl, i))) { n = n + 1; }
                 i = i + 1;
             }
         }
@@ -4152,8 +4272,8 @@ pub fun same_snapshot(a: *snapshot.Snapshot, b: *snapshot.Snapshot) bool {
     for (i < a.n) {
         var j: usize = 0;
         for (j < b.n && (b.at[j * 2] != a.at[i * 2] || b.at[j * 2 + 1] != a.at[i * 2 + 1])) { j = j + 1; }
-        if (j == b.n)                                                                           { ret false; }
-        if (!mem.equal[u32](?a.cells[i * space.CELLS], ?b.cells[j * space.CELLS], space.CELLS)) { ret false; }
+        if (j == b.n)                                                                                   { ret false; }
+        if (!mem.equal[u32](snapshot.image_of(a, i), snapshot.image_of(b, j), snapshot.image_words(a))) { ret false; }
         i = i + 1;
     }
     ret true;
@@ -4844,10 +4964,10 @@ test hashlife__a_zoomed_out_view_summarises_squares_of_the_tree {
     # cell out of view
     val sp: *space.Space = ?t.space;
     val sl: u32          = space.find(sp, 0, 0);
-    if (sl == space.NONE || sp.live != 2)                                                   { ret 5; }
-    if (sp.cells[sl::usize * space.CELLS] != (255 * 4 / 64 | (255 << layout.SUMMARY_HEAT))) { ret 6; }
-    if (sp.cells[sl::usize * space.CELLS + 1] != 0)                                         { ret 7; }
-    if ((sp.dirty[sl::usize] & space.DIRTY_CELLS) == 0)                                     { ret 8; }
+    if (sl == space.NONE || sp.live != 2)                                                { ret 5; }
+    if (space.sensed(sp, sl::usize, 0) != (255 * 4 / 64 | (255 << layout.SUMMARY_HEAT))) { ret 6; }
+    if (space.sensed(sp, sl::usize, 1) != 0)                                             { ret 7; }
+    if ((sp.dirty[sl::usize] & space.DIRTY_CELLS) == 0)                                  { ret 8; }
     # an unchanged view is not rebuilt, and a step's rebuilds only the chunk it
     # changed: the blinker turns across the squares, and the block stays
     val bl: u32 = space.find(sp, 1, 0);
@@ -4927,28 +5047,28 @@ test hashlife__a_view_of_a_generations_rule_shows_dying_cells_as_the_pool_does {
     # as the pool's pyramid summarises cells: the live ones as coverage, and
     # the hottest heat of any, so a square of dying cells alone shows its trail
     val sn:    layout.Sense = rule.sense(?t.rule);
-    val hot:   u32          = layout.texel_heat(rule.word(?t.rule, 1), sn.heat_shift, sn.heat_mask);
-    val dying: u32          = layout.texel_heat(rule.word(?t.rule, 2), sn.heat_shift, sn.heat_mask);
+    val hot:   u32          = layout.texel_heat(rule.value(?t.rule, 1), sn.heat_shift, sn.heat_mask);
+    val dying: u32          = layout.texel_heat(rule.value(?t.rule, 2), sn.heat_shift, sn.heat_mask);
     var look:  gpu.Look     = far_look();
     look.mode = render.MODE_HEAT::u32;
     show_tree(?t, ?look);
     if (look.shift != 3 || look.mode != render.MODE_HEAT::u32) { ret 5; }
     val sp: *space.Space = ?t.space;
     val sl: u32          = space.find(sp, 0, 0);
-    if (sl == space.NONE)                                                               { ret 6; }
-    if (sp.cells[sl::usize * space.CELLS] != (255 / 64 | (hot << layout.SUMMARY_HEAT))) { ret 7; }
-    if (sp.cells[sl::usize * space.CELLS + 1] != (dying << layout.SUMMARY_HEAT))        { ret 8; }
-    if (dying == 0 || dying >= hot)                                                     { ret 9; }
+    if (sl == space.NONE)                                                            { ret 6; }
+    if (space.sensed(sp, sl::usize, 0) != (255 / 64 | (hot << layout.SUMMARY_HEAT))) { ret 7; }
+    if (space.sensed(sp, sl::usize, 1) != (dying << layout.SUMMARY_HEAT))            { ret 8; }
+    if (dying == 0 || dying >= hot)                                                  { ret 9; }
 
     # at a pixel a cell or more, a drawn cell is its cell's word
     look     = far_look();
     look.ppc = 2.0;
     show_tree(?t, ?look);
     val at: u32 = space.find(sp, 0, 0);
-    if (look.shift != 0 || at == space.NONE)                                      { ret 10; }
-    if (sp.cells[at::usize * space.CELLS] != rule.word(?t.rule, 1))               { ret 11; }
-    if (sp.cells[at::usize * space.CELLS + 65] != rule.word(?t.rule, 2))          { ret 12; }
-    if (sp.cells[at::usize * space.CELLS + 5 * 64 + 12] != rule.word(?t.rule, 2)) { ret 13; }
+    if (look.shift != 0 || at == space.NONE)                                { ret 10; }
+    if (space.sensed(sp, at::usize, 0) != rule.value(?t.rule, 1))           { ret 11; }
+    if (space.sensed(sp, at::usize, 65) != rule.value(?t.rule, 2))          { ret 12; }
+    if (space.sensed(sp, at::usize, 5 * 64 + 12) != rule.value(?t.rule, 2)) { ret 13; }
 
     # a rule that words its states otherwise is shown as that rule's
     val sw: res[rule.Rule, str] = rule.parse("345/2/4");
@@ -4958,10 +5078,10 @@ test hashlife__a_view_of_a_generations_rule_shows_dying_cells_as_the_pool_does {
     look.mode = render.MODE_HEAT::u32;
     show_tree(?t, ?look);
     val sn4:    layout.Sense = rule.sense(?t.rule);
-    val dying4: u32          = layout.texel_heat(rule.word(?t.rule, 2), sn4.heat_shift, sn4.heat_mask);
+    val dying4: u32          = layout.texel_heat(rule.value(?t.rule, 2), sn4.heat_shift, sn4.heat_mask);
     val at4:    u32          = space.find(sp, 0, 0);
-    if (dying4 == dying || at4 == space.NONE)                                      { ret 16; }
-    if (sp.cells[at4::usize * space.CELLS + 1] != (dying4 << layout.SUMMARY_HEAT)) { ret 17; }
+    if (dying4 == dying || at4 == space.NONE)                               { ret 16; }
+    if (space.sensed(sp, at4::usize, 1) != (dying4 << layout.SUMMARY_HEAT)) { ret 17; }
     dnit(?t);
     ret 0;
 }
@@ -5223,9 +5343,9 @@ test record__the_draw_holds_what_the_cpu_steps_and_is_sent_only_changed_chunks {
         val x: i64 = space.slot_x(?s.space, sl);
         val y: i64 = space.slot_y(?s.space, sl);
         if (space.used(?s.space, sl) && x >= -2 && x <= 2 && y >= -2 && y <= 2) {
-            val read: err[gfx.Error] = gfx.storage_buffer_read(g.d, ?g.p.cells[g.front], sl * space.CELLS * 4, (?got[0])::*u8, space.CELLS * 4);
-            if (sel read.err)                                                            { ret 9; }
-            if (!mem.equal[u32](?got[0], ?s.space.cells[sl * space.CELLS], space.CELLS)) { ret 10; }
+            if (!gpu.read_front(?g, 0, sl, ?got[0])) { ret 9; }
+            val held: plane.Plane = space.plane_of(?s.space, 0, sl);
+            if (!mem.equal[u32](?got[0], held.w, plane.span_words(held.width))) { ret 10; }
         }
         sl = sl + 1;
     }
@@ -5857,7 +5977,7 @@ test reaction__gray_scott_presets_grow_their_patterns_on_both_engines {
                 if (space.used(?t.cpu.space, sl)) {
                     var i: usize = 0;
                     for (i < space.CELLS) {
-                        if (rd_word.b_of(t.cpu.space.cells[sl * space.CELLS + i]) > 16384) { dense = dense + 1; }
+                        if (rd_word.b_of(space.sensed(?t.cpu.space, sl, i)) > 16384) { dense = dense + 1; }
                         i = i + 1;
                     }
                 }

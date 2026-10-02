@@ -1,6 +1,10 @@
 # one generation of the chunks on the active list, under the non-totalistic
 # family (cellar.rules.nontotalistic)
 #
+# a cell is its value in the family's state layer, read and written at the
+# width the family declares (word.WIDTH, cellar.layer), and an invocation
+# builds the words its run of cells fills before it writes them.
+#
 # an invocation is a run of 8 cells in a row, and 8 workgroups of 64 cover a
 # chunk; workgroup y names the chunk's slot through the active list
 # (cellar.layout.Flags). a cell's 3 by 3 block is read straight from the source
@@ -22,17 +26,18 @@
 # cell past a plane's dead edge reads as the form holds the edge at that
 # parity (word.past).
 
+use cellar.layer;
 use cellar.layout;
-use cellar.layout.Cells;
 use cellar.layout.Flags;
+use cellar.layout.Layer;
 use cellar.layout.Meta;
 use cellar.rules.nontotalistic.window;
 use cellar.rules.weighted.word;
 
 #[storage(1, 0, "readonly")]
-var src:   Cells;
+var src:   Layer;
 #[storage(1, 1)]
-var dst:   Cells;
+var dst:   Layer;
 #[storage(1, 2, "readonly")]
 var meta:  Meta;
 #[storage(1, 3)]
@@ -41,7 +46,13 @@ var flags: Flags;
 #[builtin("global_invocation")]
 var gid: u32x3;
 
-# the index in the source pool of the cell at (x, y) of a slot's frame, taken
+# the source's value of the cell at address a in the family's state layer
+# (cellar.layer)
+fun cell_of(a: u32) u32 {
+    ret layer.read(src.v[layer.addr_word(word.WIDTH, a)], word.WIDTH, a);
+}
+
+# the address (cellar.layer) of the cell at (x, y) of a slot's frame, taken
 # through the links where it lies outside the window (cellar.layout), NONE
 # where no chunk holds it, or PAST past a plane's dead edge
 fun reach(slot: u32, x: i32, y: i32) u32 {
@@ -56,7 +67,7 @@ fun reach(slot: u32, x: i32, y: i32) u32 {
         val n: u32 = meta.table[b + k];
         val t: u32 = meta.table[b + layout.LINK_AT + k];
         if (k == 4) {
-            at = sl * layout.CELLS + (py * layout.SIDE::i32 + px)::u32;
+            at = layer.addr(sl, (py * layout.SIDE::i32 + px)::u32);
             h  = layout.HOPS;
         }
         or (n == layout.NONE) {
@@ -85,7 +96,8 @@ fun comp_main() {
     val ly:   i32 = (gid[0] / 8)::i32;
     val x0:   u32 = (gid[0] % 8) * 8;
     val base: u32 = slot * layout.ENTRY;
-    val row:  u32 = slot * layout.CELLS + (ly * layout.SIDE::i32)::u32;
+    val row:  u32 = layer.addr(slot, (ly * layout.SIDE::i32)::u32);
+    var acc:  u32 = 0;
     if (meta.table[base + layout.INCARNATION_AT] == 0) { ret; }
     # a seamed chunk reads its block through its links, and holds its cells
     # off the grid at zero
@@ -116,17 +128,21 @@ fun comp_main() {
             # destination already holds zeros
             if (warm != last - 1) { ret; }
             for (x < x0 + 8) {
-                dst.v[row + x] = 0;
-                x              = x + 1;
+                dst.v[layer.addr_word(word.WIDTH, row + x)] = 0;
+                x                                           = x + 1;
             }
             ret;
         }
         var any: u32 = 0;
         for (x < x0 + 8) {
-            val c: u32 = word.cool(src.v[row + x]);
-            dst.v[row + x] = c;
-            any            = any | c;
-            x              = x + 1;
+            val c: u32 = word.cool(cell_of(row + x));
+            acc = acc | layer.place(word.WIDTH, row + x, c);
+            if (layer.ends(word.WIDTH, row + x) != 0) {
+                dst.v[layer.addr_word(word.WIDTH, row + x)] = acc;
+                acc                                         = 0;
+            }
+            any = any | c;
+            x   = x + 1;
         }
         if (any != 0) { flags.v[slot * 2 + 1] = now; }
         ret;
@@ -171,12 +187,12 @@ fun comp_main() {
                 if (seamed != 0) { at = reach(slot, lx + dx, ly + dy); }
                 or {
                     val nb: u32 = meta.table[base + cy * 3 + cx];
-                    if (nb != layout.NONE) { at = nb * layout.CELLS + (y * layout.SIDE::i32 + xx)::u32; }
+                    if (nb != layout.NONE) { at = layer.addr(nb, (y * layout.SIDE::i32 + xx)::u32); }
                 }
                 nh = nh << 1;
                 if (at == layout.PAST) { nh = nh | past; }
                 or (at != layout.NONE) {
-                    if (src.v[at] >= word.LIVE) { nh = nh | 1; }
+                    if (cell_of(at) >= word.LIVE) { nh = nh | 1; }
                 }
                 dx = dx + 1;
             }
@@ -186,12 +202,16 @@ fun comp_main() {
         # a generation held as the complement reads its neighbourhood complemented
         nh = nh ^ flip;
         val bit:  u32 = ((meta.rule[window.MAP_AT + nh / 32] >> (nh % 32)) & 1) ^ inv_out;
-        var next: u32 = word.become(src.v[row + x], bit);
+        var next: u32 = word.become(cell_of(row + x), bit);
         if (seamed != 0 && layout.edge_side(edge, lx, ly) != 4) { next = 0; }
         if (next >= word.LIVE)                                  { live = 1; }
-        warm           = warm | (next & word.HEAT_MASK);
-        dst.v[row + x] = next;
-        x              = x + 1;
+        warm = warm | (next & word.HEAT_MASK);
+        acc  = acc | layer.place(word.WIDTH, row + x, next);
+        if (layer.ends(word.WIDTH, row + x) != 0) {
+            dst.v[layer.addr_word(word.WIDTH, row + x)] = acc;
+            acc                                         = 0;
+        }
+        x = x + 1;
     }
     if (live != 0) { flags.v[slot * 2] = now; }
     if (warm != 0) { flags.v[slot * 2 + 1] = now; }

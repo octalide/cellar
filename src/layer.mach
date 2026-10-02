@@ -1,0 +1,231 @@
+# the layer contract: how a chunk's cells are stored, one source for the host
+# and the SPIR-V stages
+#
+# a chunk's storage is a set of layers. a layer holds one value per cell at
+# its width, 1, 2, 4, 8, 16 or 32 bits. everything that reads or writes cells,
+# the CPU's step, the GPU's stages, the census, the draw, the undo journal,
+# snapshots, the quadtree's conversions and the file formats, does it through
+# this contract: the addressing below in the stages and the pool, and the
+# host's planes and sets in cellar.layer.plane. nothing else knows how wide a
+# cell is, and only the rule family that declared a layer knows what its
+# values mean.
+#
+# a layer has an owner and a role:
+#
+#   state  the first layer of every set, declared by the rule family at the
+#          width its states need. shared code reads a cell by it, through the
+#          family's sense (cellar.layout.Sense): the census, the halo, the
+#          pyramids and the draw
+#   rule   a further layer the family's step needs, such as a second field,
+#          declared by the family with a name and a width. a rule's own data
+#          may declare one, as a rule table read from a file would, since a
+#          set is data and not code: a layer added changes no layout
+#   view   a layer the view keeps for a colour mode, trails, heat or age. it
+#          exists only while the view's colour mode uses it: made from the
+#          state as it stands when the mode turns on, stepped with the world
+#          while it lasts, and freed when the mode turns off. it is never
+#          saved, copied, journaled or written by an edit, since the state
+#          gives it again
+#
+# the state and rule layers are a cell's word, its exact value: a value for
+# each of them, in the set's order, each at its layer's width. a word is what
+# a fresh cell of a state is written as (cellar.rule fresh), what a copy, a
+# snapshot, the journal, a world file and a format that keeps exact values
+# carry, and what an edit writes. it has no width of its own: a set holds as
+# many rule layers as its owner needs, and a word holds that many values, one
+# u32 each wherever it travels, so a run of n cells' words is n times the
+# set's word length of values, a cell's values together. a format that
+# carries states alone carries the state layer's, which the family reads a
+# cell's state from. zero in every layer is the quiescent background: what a
+# chunk that does not exist reads as and what a chunk just made holds.
+#
+# a set is ordered. the state layer is layer 0, the rule layers follow in the
+# order declared, and the view layers come last, so a view layer coming or
+# going never moves a rule layer. a layer is named by its place in the set.
+#
+# a layer is addressed by layer, then slot, then cell. a slot's span of a
+# layer is span_words(width) words of 32 bits, CELLS * width / 32 of them and
+# at least 128, so no two slots share a word. cell i of a slot, row-major,
+# lies in word cell_word(width, i) of the span at bit cell_shift(width, i):
+# cells pack from the low bit, 32 / width of them to a word, and a word's
+# cells lie in one row, so a step that works a word at a time steps 32 / width
+# cells at once.
+#
+# where a span lies is the store's to say and no one else's. today a layer is
+# one buffer holding every slot's span in slot order (span_at). a store that
+# spreads a layer over several buffers names the buffer and offset of a slot's
+# span instead, since a span never straddles two, and nothing above it changes:
+# no code finds a span but span_at, the host's store and the stages through it.
+#
+# until the stages reach the pool by device address, a step stage binds each
+# layer of its set as a source and a destination buffer: the state layer at
+# bindings 0 and 1, ahead of the meta and flags buffers (cellar.layout), and
+# layer k of the rest two by two after those and the family's rule buffer
+# (binding). the shared stages read the state layer alone, at the width the
+# meta head holds (cellar.layout.WIDTH_AT).
+
+use cellar.layout;
+
+# the widest layer, and the bits an exact value holds
+pub val WIDTH_MAX: u32 = 32;
+# the most layers a set holds, of every role
+pub val LAYERS_MAX: u32 = 8;
+
+# the roles a layer can have
+pub val STATE: u32 = 0;
+pub val RULE:  u32 = 1;
+pub val VIEW:  u32 = 2;
+
+# 1 when width is one a layer may have, 1, 2, 4, 8, 16 or 32, else 0
+pub fun valid(width: u32) u32 {
+    if (width == 1 || width == 2 || width == 4 || width == 8 || width == 16 || width == 32) { ret 1; }
+    ret 0;
+}
+
+# the values a layer of a width can hold, as a mask of its low bits
+#[inline]
+pub fun mask(width: u32) u32 {
+    if (width >= WIDTH_MAX) { ret 0xffffffff; }
+    ret (1 << width) - 1;
+}
+
+# words of a slot's span of a layer of a width
+#[inline]
+pub fun span_words(width: u32) u32 {
+    ret layout.CELLS * width / WIDTH_MAX;
+}
+
+# the width whose slot's span is words long, for a stage that sees a span
+# only as words
+pub fun width_of(words: u32) u32 {
+    ret words * WIDTH_MAX / layout.CELLS;
+}
+
+# the first word of a slot's span in a layer held as one buffer, slot by slot
+#[inline]
+pub fun span_at(width: u32, slot: u32) u32 {
+    ret slot * span_words(width);
+}
+
+# the word of a slot's span holding cell i
+#[inline]
+pub fun cell_word(width: u32, i: u32) u32 {
+    if (width == WIDTH_MAX) { ret i; }
+    ret (i * width) / WIDTH_MAX;
+}
+
+# the bit of its word where cell i's value starts
+#[inline]
+pub fun cell_shift(width: u32, i: u32) u32 {
+    if (width == WIDTH_MAX) { ret 0; }
+    ret (i * width) % WIDTH_MAX;
+}
+
+# the word of a layer held as one buffer holding cell i of a slot
+#[inline]
+pub fun cell_at(width: u32, slot: u32, i: u32) u32 {
+    ret span_at(width, slot) + cell_word(width, i);
+}
+
+# a cell's address, its slot's cells then its own: it names a cell whatever
+# the width of the layer it is read in (addr_word)
+#[inline]
+pub fun addr(slot: u32, i: u32) u32 {
+    ret slot * layout.CELLS + i;
+}
+
+# the word of a layer held as one buffer holding the cell at address a; read,
+# write, place and ends take an address as they take a cell of a slot
+#[inline]
+pub fun addr_word(width: u32, a: u32) u32 {
+    if (width == WIDTH_MAX) { ret a; }
+    ret cell_at(width, a / layout.CELLS, a % layout.CELLS);
+}
+
+# cells a word holds
+pub fun per_word(width: u32) u32 {
+    ret WIDTH_MAX / width;
+}
+
+# cell i's value in the word holding it
+#[inline]
+pub fun read(w: u32, width: u32, i: u32) u32 {
+    if (width == WIDTH_MAX) { ret w; }
+    ret (w >> cell_shift(width, i)) & mask(width);
+}
+
+# cell i's value v placed in an otherwise empty word, for a step that builds
+# its words a cell at a time (ends)
+#[inline]
+pub fun place(width: u32, i: u32, v: u32) u32 {
+    if (width == WIDTH_MAX) { ret v; }
+    ret (v & mask(width)) << cell_shift(width, i);
+}
+
+# the word holding cell i with its value replaced by v
+#[inline]
+pub fun write(w: u32, width: u32, i: u32, v: u32) u32 {
+    val m: u32 = mask(width) << cell_shift(width, i);
+    ret (w & ~m) | ((v << cell_shift(width, i)) & m);
+}
+
+# 1 when cell i is the last its word holds, so a word built a cell at a time
+# is complete once it is placed, else 0
+#[inline]
+pub fun ends(width: u32, i: u32) u32 {
+    if (width == WIDTH_MAX)                 { ret 1; }
+    if (((i + 1) * width) % WIDTH_MAX == 0) { ret 1; }
+    ret 0;
+}
+
+# the binding of layer k's source buffer in a step stage, its destination's
+# the one after: the state layer's at 0, any other's past the fixed bindings
+# and the rule buffer a family with one binds
+# ---
+# k:     the layer
+# table: 1 when the family binds a rule buffer, else 0
+pub fun binding(k: u32, table: u32) u32 {
+    if (k == 0) { ret 0; }
+    ret layout.STEP_BINDINGS + table + (k - 1) * 2;
+}
+
+# the storage buffers a step stage binds for a set of n layers
+pub fun bindings(n: u32, table: u32) u32 {
+    ret layout.STEP_BINDINGS + table + (n - 1) * 2;
+}
+
+test address__packs_every_width_low_bit_first_a_row_to_a_word {
+    var width: u32 = 1;
+    for (width <= WIDTH_MAX) {
+        if (valid(width) == 0)                                     { ret 1; }
+        if (span_words(width) * WIDTH_MAX != layout.CELLS * width) { ret 2; }
+        # a slot's span ends where the next one's begins
+        if (span_at(width, 3) + span_words(width) != span_at(width, 4)) { ret 3; }
+        if (width_of(span_words(width)) != width)                       { ret 3; }
+        var i: u32 = 0;
+        for (i < layout.CELLS) {
+            # a word's cells lie in one row
+            val first: u32 = cell_word(width, i) * per_word(width);
+            if (first / layout.SIDE != i / layout.SIDE)      { ret 4; }
+            if (cell_shift(width, i) != (i - first) * width) { ret 5; }
+            i = i + 1;
+        }
+        # writing a cell leaves its neighbours in the word alone
+        val all: u32 = 0xa5a5a5a5;
+        val v:   u32 = 0x5a5a5a5a & mask(width);
+        val j:   u32 = per_word(width) - 1;
+        val put: u32 = write(all, width, j, v);
+        if (read(put, width, j) != v)                                                                         { ret 6; }
+        if ((put & ~(mask(width) << cell_shift(width, j))) != (all & ~(mask(width) << cell_shift(width, j)))) { ret 7; }
+        if (place(width, j, v) != (v << cell_shift(width, j)))                                                { ret 8; }
+        if (ends(width, j) != 1 || (width < WIDTH_MAX && ends(width, 0) != 0))                                { ret 9; }
+        # an address names a slot's cell in every width
+        val a: u32 = addr(5, 77);
+        if (addr_word(width, a) != cell_at(width, 5, 77) || read(0xffffffff, width, a) != mask(width)) { ret 14; }
+        width = width * 2;
+    }
+    if (valid(0) != 0 || valid(3) != 0 || valid(64) != 0)                                                         { ret 10; }
+    if (binding(0, 1) != 0 || binding(1, 0) != layout.STEP_BINDINGS || binding(2, 1) != layout.STEP_BINDINGS + 3) { ret 12; }
+    if (bindings(1, 1) != layout.STEP_BINDINGS + 1)                                                               { ret 13; }
+    ret 0;
+}

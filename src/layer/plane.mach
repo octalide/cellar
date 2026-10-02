@@ -1,0 +1,382 @@
+# the layer contract's host half: the sets rule families and the view declare,
+# and a slot's span of a layer as the host reads and writes it (see
+# cellar.layer for the contract itself)
+
+use cellar.layer;
+use cellar.layout;
+use mem: std.memory;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.size.usize;
+use std.types.string;
+use std.types.string.str;
+
+# cells in a chunk
+pub val CELLS: usize = layout.CELLS::usize;
+# the most layers a set holds
+pub val LAYERS_MAX: usize = layer.LAYERS_MAX::usize;
+
+# a layer as its owner declares it
+# ---
+# name:  what the layer holds, for a reader of the set
+# width: bits a cell takes, 1, 2, 4, 8, 16 or 32
+# role:  layer.STATE, layer.RULE or layer.VIEW
+pub rec Decl {
+    name:  str;
+    width: u32;
+    role:  u32;
+}
+
+# a set of layers: the state layer, the rule layers, then the view layers
+# ---
+# n:  layers held
+# at: each layer's declaration, in order
+pub rec Set {
+    n:  usize;
+    at: [layer.LAYERS_MAX]Decl;
+}
+
+# a set holding the state layer alone
+# ---
+# name:  what it holds
+# width: bits a cell takes
+pub fun state(name: str, width: u32) Set {
+    var s: Set;
+    s.n     = 1;
+    s.at[0] = Decl{name: name, width: width, role: layer.STATE};
+    ret s;
+}
+
+# add a rule layer to a set that holds no view layer yet
+# ---
+# s:     the set
+# name:  what it holds
+# width: bits a cell takes
+# ret:   false when the set is full or holds a view layer, leaving it alone
+pub fun add_rule(s: *Set, name: str, width: u32) bool {
+    if (s.n == LAYERS_MAX || views(s) != 0) { ret false; }
+    s.at[s.n] = Decl{name: name, width: width, role: layer.RULE};
+    s.n       = s.n + 1;
+    ret true;
+}
+
+# add a view layer to the end of a set
+# ---
+# ret: false when the set is full, leaving it alone
+pub fun add_view(s: *Set, name: str, width: u32) bool {
+    if (s.n == LAYERS_MAX) { ret false; }
+    s.at[s.n] = Decl{name: name, width: width, role: layer.VIEW};
+    s.n       = s.n + 1;
+    ret true;
+}
+
+# the layers of a set that make a cell's word, its state and rule layers, and
+# so the values a word holds
+pub fun exact(s: *Set) usize {
+    var n: usize = 0;
+    for (n < s.n && s.at[n].role != layer.VIEW) { n = n + 1; }
+    ret n;
+}
+
+# the view layers a set holds
+pub fun views(s: *Set) usize {
+    ret s.n - exact(s);
+}
+
+# a set's state and rule layers alone, its view layers left out
+pub fun without_views(s: *Set) Set {
+    var t: Set = @s;
+    t.n = exact(s);
+    ret t;
+}
+
+# a set's state and rule layers followed by another set's view layers
+pub fun with_views(s: *Set, v: *Set) Set {
+    var t: Set   = without_views(s);
+    var k: usize = exact(v);
+    for (k < v.n && t.n < LAYERS_MAX) {
+        t.at[t.n] = v.at[k];
+        t.n       = t.n + 1;
+        k         = k + 1;
+    }
+    ret t;
+}
+
+# the index of a set's layer of a name, or none
+pub fun find(s: *Set, name: str) opt[usize] {
+    var k: usize = 0;
+    for (k < s.n) {
+        if (string.str_equals(s.at[k].name, name)) { ret opt[usize].some{k}; }
+        k = k + 1;
+    }
+    ret opt[usize].none{};
+}
+
+# why a set breaks the contract, or none when it holds to it: it opens with
+# one state layer, its rule layers follow and its view layers come last, and
+# every width is one a layer may have
+pub fun refusal(s: *Set) opt[str] {
+    if (s.n == 0 || s.n > LAYERS_MAX || s.at[0].role != layer.STATE) { ret opt[str].some{"a set of layers opens with one state layer"}; }
+    var view: bool  = false;
+    var k:    usize = 0;
+    for (k < s.n) {
+        val d: *Decl = ?s.at[k];
+        if (layer.valid(d.width) == 0)       { ret opt[str].some{"a layer is 1, 2, 4, 8, 16 or 32 bits wide"}; }
+        if (k != 0 && d.role == layer.STATE) { ret opt[str].some{"a set of layers opens with one state layer"}; }
+        if (d.role == layer.VIEW)            { view = true; }
+        or (view)                            { ret opt[str].some{"a set's view layers come after its rule layers"}; }
+        k = k + 1;
+    }
+    ret opt[str].none{};
+}
+
+# whether a set holds to the contract (refusal)
+pub fun holds(s: *Set) bool {
+    val why: opt[str] = refusal(s);
+    ret sel why.none;
+}
+
+# whether two sets store alike: the same widths in the same order, so storage
+# made for one holds the other
+pub fun same_shape(a: *Set, b: *Set) bool {
+    if (a.n != b.n) { ret false; }
+    var k: usize = 0;
+    for (k < a.n) {
+        if (a.at[k].width != b.at[k].width) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# whether a word is stored alike under two sets: their state and rule layers
+# have the same widths in the same order
+pub fun same_words(a: *Set, b: *Set) bool {
+    if (exact(a) != exact(b)) { ret false; }
+    var k: usize = 0;
+    for (k < exact(a)) {
+        if (a.at[k].width != b.at[k].width) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# whether two sets are the same layers: their shape, roles and names
+pub fun same(a: *Set, b: *Set) bool {
+    if (!same_shape(a, b)) { ret false; }
+    var k: usize = 0;
+    for (k < a.n) {
+        val x: *Decl = ?a.at[k];
+        val y: *Decl = ?b.at[k];
+        if (x.role != y.role || !string.str_equals(x.name, y.name)) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# words of a slot's span of a layer of a width
+#[inline]
+pub fun span_words(width: u32) usize {
+    ret layer.span_words(width)::usize;
+}
+
+# words of a chunk's image under a set: the spans of its state and rule
+# layers, one after another in order, which a snapshot keeps a chunk as
+pub fun image_words(s: *Set) usize {
+    var n: usize = 0;
+    var k: usize = 0;
+    for (k < exact(s)) {
+        n = n + span_words(s.at[k].width);
+        k = k + 1;
+    }
+    ret n;
+}
+
+# a slot's span of one layer, as the host reads and writes it
+# ---
+# w:     the span's span_words(width) words
+# width: bits a cell takes
+pub rec Plane {
+    w:     *u32;
+    width: u32;
+}
+
+# a span of a width at w
+#[inline]
+pub fun at(w: *u32, width: u32) Plane {
+    ret Plane{w: w, width: width};
+}
+
+# cell i's value
+#[inline]
+pub fun get(p: Plane, i: usize) u32 {
+    if (p.width == layer.WIDTH_MAX) { ret p.w[i]; }
+    ret layer.read(p.w[layer.cell_word(p.width, i::u32)::usize], p.width, i::u32);
+}
+
+# write cell i's value
+#[inline]
+pub fun put(p: Plane, i: usize, v: u32) {
+    if (p.width == layer.WIDTH_MAX) {
+        p.w[i] = v;
+        ret;
+    }
+    val k: usize = layer.cell_word(p.width, i::u32)::usize;
+    p.w[k] = layer.write(p.w[k], p.width, i::u32, v);
+}
+
+# cell i's value in a span's words w, read at a width the caller names, which
+# must be the span's: a family stepping its own layer names the width it
+# declared, so its reads compile to the width's own access
+#[inline]
+pub fun load(w: *u32, width: u32, i: usize) u32 {
+    if (width == layer.WIDTH_MAX) { ret w[i]; }
+    ret layer.read(w[layer.cell_word(width, i::u32)::usize], width, i::u32);
+}
+
+# write cell i's value in a span's words w at a width the caller names, as
+# load reads it
+#[inline]
+pub fun store(w: *u32, width: u32, i: usize, v: u32) {
+    if (width == layer.WIDTH_MAX) {
+        w[i] = v;
+        ret;
+    }
+    val k: usize = layer.cell_word(width, i::u32)::usize;
+    w[k] = layer.write(w[k], width, i::u32, v);
+}
+
+# zero n cells from cell i of a span's words w, at a width the caller names
+# as load reads it
+#[inline]
+pub fun blank(w: *u32, width: u32, i: usize, n: usize) {
+    if (width == layer.WIDTH_MAX) {
+        mem.zero[u32](?w[i], n);
+        ret;
+    }
+    fill(at(w, width), i, n, 0);
+}
+
+# write v to n cells from cell i
+pub fun fill(p: Plane, i: usize, n: usize, v: u32) {
+    if (p.width == layer.WIDTH_MAX && v == 0) {
+        mem.zero[u32](?p.w[i], n);
+        ret;
+    }
+    if (p.width == layer.WIDTH_MAX) {
+        mem.fill[u32](?p.w[i], v, n);
+        ret;
+    }
+    var k: usize = 0;
+    for (k < n) {
+        put(p, i + k, v);
+        k = k + 1;
+    }
+}
+
+# n cells' values from cell i, into out
+pub fun get_run(p: Plane, i: usize, n: usize, out: *u32) {
+    if (p.width == layer.WIDTH_MAX) {
+        mem.copy[u32](out, ?p.w[i], n);
+        ret;
+    }
+    var k: usize = 0;
+    for (k < n) {
+        out[k] = get(p, i + k);
+        k      = k + 1;
+    }
+}
+
+# write n cells' values from cell i, from v
+pub fun put_run(p: Plane, i: usize, n: usize, v: *u32) {
+    if (p.width == layer.WIDTH_MAX) {
+        mem.copy[u32](?p.w[i], v, n);
+        ret;
+    }
+    var k: usize = 0;
+    for (k < n) {
+        put(p, i + k, v[k]);
+        k = k + 1;
+    }
+}
+
+# zero every cell
+pub fun clear(p: Plane) {
+    mem.zero[u32](p.w, span_words(p.width));
+}
+
+# copy every cell of one span into another of the same width
+pub fun copy(dst: Plane, src: Plane) {
+    mem.copy[u32](dst.w, src.w, span_words(dst.width));
+}
+
+# whether two spans of the same width hold the same cells
+pub fun equal(a: Plane, b: Plane) bool {
+    ret mem.equal[u32](a.w, b.w, span_words(a.width));
+}
+
+# whether any cell holds a value but 0
+pub fun any(p: Plane) bool {
+    val n: usize = span_words(p.width);
+    var k: usize = 0;
+    for (k < n) {
+        if (p.w[k] != 0) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+test set__holds_its_layers_to_the_contract {
+    var s: Set = state("value", 16);
+    if (!holds(?s))               { ret 1; }
+    if (!add_rule(?s, "v", 16))   { ret 2; }
+    if (!holds(?s))               { ret 3; }
+    if (!add_view(?s, "heat", 8)) { ret 4; }
+    if (!holds(?s))               { ret 5; }
+    # a rule layer after a view layer is refused
+    if (add_rule(?s, "w", 1))                  { ret 6; }
+    if (exact(?s) != 2 || views(?s) != 1)      { ret 7; }
+    if (image_words(?s) != 2 * span_words(16)) { ret 8; }
+    # a word holds as many values as the set has rule layers, whatever their
+    # widths come to
+    var o: Set = state("value", 32);
+    add_rule(?o, "v", 32);
+    add_rule(?o, "w", 16);
+    if (!holds(?o) || exact(?o) != 3) { ret 9; }
+    var w: Set = state("value", 24);
+    if (holds(?w)) { ret 10; }
+    # a view layer comes and goes without moving a rule layer
+    val bare: Set = without_views(?s);
+    if (bare.n != 2 || !same(?bare, ?bare)) { ret 11; }
+    val back: Set = with_views(?bare, ?s);
+    if (!same(?back, ?s)) { ret 12; }
+    val heat: opt[usize] = find(?s, "heat");
+    if (sel heat.none)  { ret 13; }
+    if (heat.some != 2) { ret 13; }
+    ret 0;
+}
+
+test plane__reads_and_writes_every_width_alike {
+    var w:     [4096]u32;
+    var width: u32 = 1;
+    for (width <= layer.WIDTH_MAX) {
+        val p: Plane = at(?w[0], width);
+        clear(p);
+        var i: usize = 0;
+        for (i < CELLS) {
+            put(p, i, (i * 7)::u32 & layer.mask(width));
+            i = i + 1;
+        }
+        i = 0;
+        for (i < CELLS) {
+            if (get(p, i) != ((i * 7)::u32 & layer.mask(width))) { ret 1; }
+            i = i + 1;
+        }
+        # a run filled leaves the cells either side of it alone
+        fill(p, 3, 5, 0);
+        if (get(p, 2) != (14 & layer.mask(width)) || get(p, 5) != 0 || get(p, 8) != (56 & layer.mask(width))) { ret 2; }
+        width = width * 2;
+    }
+    ret 0;
+}
