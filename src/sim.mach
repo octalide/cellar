@@ -95,6 +95,7 @@ use cellar.history;
 use cellar.layout;
 use cellar.render;
 use cellar.rule;
+use rd_word:   cellar.rules.reaction.word;
 use ruletable: cellar.rules.table;
 use cellar.rules.table.load;
 use cellar.rules.table.store;
@@ -5311,13 +5312,14 @@ test frame__bounded_grids_step_on_the_gpu_as_on_the_cpu {
     # edge the stage reads live on odd generations, non-totalistic rules
     # across a twisted seam and on a plane whose edge flips, the widest
     # radius on a plane whose edge flips, read across every chunk of its apron,
-    # and a lenia rule across a twisted seam and on a plane's dead edge
-    val strings: [15]str = [15]str{"B3/S23:T100,100", "B2/S/C3:K37,41*", "345/2/4:T100,90", "R2,C0,M0,S5..9,B7..8,NM:C66,65", "B3/S23:P70,50", "B0123/S123:T100,90",
+    # and a lenia rule and a reaction-diffusion rule across a twisted seam and
+    # on a plane's dead edge
+    val strings: [17]str = [17]str{"B3/S23:T100,100", "B2/S/C3:K37,41*", "345/2/4:T100,90", "R2,C0,M0,S5..9,B7..8,NM:C66,65", "B3/S23:P70,50", "B0123/S123:T100,90",
         "R5,C0,M1,S34..58,B34..45,NM:K70*,60", ?wide[0], "B0123/S123:P130,120", "B0123/S123:P130,120", "B2-a/S12:K70*,60", "B0124-k/S1c25:P130,120",
         "R16,C0,M1,S200..600,B0..180,NM:P130,120", "R=13,T=10,b=[1],m=0.15,s=0.015,kn=1,gn=1:K70*,60",
-        "R=13,T=10,b=[1],m=0.15,s=0.015,kn=1,gn=1:P70,60"};
+        "R=13,T=10,b=[1],m=0.15,s=0.015,kn=1,gn=1:P70,60", "F=0.0367,k=0.0649:K70*,60", "F=0.029,k=0.057:P70,60"};
     var k: usize = 0;
-    for (k < 15) {
+    for (k < 17) {
         var t:    Rig;
         var seed: fun(*Sim) = seed_grid_soup;
         if (k == 9) { seed = seed_nothing; }
@@ -5339,6 +5341,69 @@ test frame__bounded_grids_step_on_the_gpu_as_on_the_cpu {
         rig_close(?t);
         k = k + 1;
     }
+    ret 0;
+}
+
+# seed a 10 by 10 square of the rule's ink at the origin
+#[testing]
+fun seed_ink_square(s: *Sim) {
+    val ink: u32 = rule.ink(?s.rule);
+    fill_begin(s);
+    var y: i64 = 0;
+    for (y < 10) {
+        var x: i64 = 0;
+        for (x < 10) {
+            fill_cell(s, x, y, ink);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    fill_end(s);
+}
+
+test reaction__gray_scott_presets_grow_their_patterns_on_both_engines {
+    var k:     usize = 0;
+    var found: usize = 0;
+    for (k < rule.PRESET_COUNT) {
+        var p: rule.Rule = rule.preset_rule(k);
+        if (string.str_equals(rule.family_id(rule.family_of(?p)), "reaction")) {
+            found = found + 1;
+            var t:    Rig;
+            val code: i32 = rig_open(?t, p, seed_ink_square);
+            if (code != 0) { ret code; }
+            # a generation in one frame, the pattern's few chunks unsplit
+            if (t.on) { gpu.fix_span(?t.g, 64); }
+            # held to the same cells every hundred generations, so a frame's
+            # bounded steps settle each stretch
+            var g: usize = 0;
+            for (g < 10) {
+                rig_step(?t, 100);
+                if (!rig_same(?t)) { ret 10 + k::i32; }
+                g = g + 1;
+            }
+            # the square's 100 cells of v = 1 have spread into a pattern of
+            # spots or stripes of v above 1/4, five times wider
+            var dense: usize = 0;
+            var sl:    usize = 0;
+            for (sl < t.cpu.space.hi) {
+                if (space.used(?t.cpu.space, sl)) {
+                    var i: usize = 0;
+                    for (i < space.CELLS) {
+                        if (rd_word.b_of(t.cpu.space.cells[sl * space.CELLS + i]) > 16384) { dense = dense + 1; }
+                        i = i + 1;
+                    }
+                }
+                sl = sl + 1;
+            }
+            val b: opt[space.Box] = bounds(?t.cpu);
+            if (sel b.none)                 { ret 20 + k::i32; }
+            if (dense < 150)                { ret 30 + k::i32; }
+            if (b.some.x1 - b.some.x0 < 50) { ret 40 + k::i32; }
+            rig_close(?t);
+        }
+        k = k + 1;
+    }
+    if (found != 3) { ret 1; }
     ret 0;
 }
 

@@ -76,6 +76,20 @@ their values in 255ths, so they open as RLE files. Pattern formats keep the
 255ths, and a format with fewer states refuses the rule. A world file keeps
 every value exactly. Lenia runs on the CPU and the GPU, not on HashLife.
 
+Reaction-diffusion rules are Gray-Scott's model: a cell holds two
+concentrations, u and v, that diffuse and react, v feeding on u at u v^2,
+u fed in at F (1 - u) and v killed at (F + k) v. A rule is its rates,
+`F=0.0367,k=0.0649,Du=0.2097152,Dv=0.1048576`, with Du and Dv Pearson's when
+left out. The step is Pearson's, on the 5-point Laplacian, in integers, so both
+engines give the same cells. Each concentration is kept to 16 bits in the
+cell, and a pattern format keeps each to a 15th: state 16 j + i is
+u = 1 - i/15 and v = j/15, so a pattern needs 256 states, as multi-state RLE
+holds, and a format with fewer refuses the rule. A world file keeps every
+value exactly. The pen paints u = 1, v = 1, which starts a pattern from a
+stroke. Cells are drawn by v. Built-in: Gray-Scott spots (`F=0.03,k=0.062`),
+stripes (`F=0.029,k=0.057`) and mitosis (`F=0.0367,k=0.0649`). Reaction-diffusion
+runs on the CPU and the GPU, not on HashLife.
+
 Any rule runs on a bounded grid named after it as Golly writes one:
 `B3/S23:T100,100` is a 100 by 100 torus, `:P` a plane with dead edges, `:K`
 a Klein bottle whose starred size (`:K100*,80`) is the edge joined with a
