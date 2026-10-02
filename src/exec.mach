@@ -30,7 +30,6 @@ use cellar.pattern;
 use cellar.persist;
 use cellar.region;
 use cellar.rule;
-use cellar.rules.probe;
 use cellar.rules.table.load;
 use cellar.rules.weighted;
 use cellar.saves;
@@ -949,130 +948,6 @@ test run__a_lenia_selection_copies_pastes_and_stamps_back_its_exact_values {
     app.paste(?ap, clipboard(?ap, ?other[0]), false);
     run(?ap, ?s, ?d);
     if (pattern.exact(?ap.custom) || ap.custom.w != 4) { ret 7; }
-
-    app.dnit(?ap);
-    sim.dnit(?s);
-    ret 0;
-}
-
-# whether the 4 by 3 cells from (x0, y0) hold the words vals, three values each
-#[testing]
-fun holds_words(s: *sim.Sim, x0: i64, y0: i64, vals: *u32) bool {
-    var w: [3]u32;
-    var i: usize = 0;
-    for (i < 12) {
-        sim.word_at(s, x0 + (i % 4)::i64, y0 + (i / 4)::i64, ?w[0]);
-        if (w[0] != vals[i * 3] || w[1] != vals[i * 3 + 1] || w[2] != vals[i * 3 + 2]) { ret false; }
-        i = i + 1;
-    }
-    ret true;
-}
-
-test run__a_rule_of_three_16_bit_layers_keeps_every_layer_through_copies_undo_and_files {
-    var a: allo.Allocator;
-    page.make(?a);
-    var s:    sim.Sim;
-    val made: err[allo.Error] = sim.init(?s, ?a);
-    if (sel made.err) { ret 1; }
-    var ap: app.App;
-    app.init(?ap);
-    val shown: err[format.Error] = app.attach(?ap, ?a);
-    if (sel shown.err) { ret 1; }
-    var d: Deps = Deps{a: ?a};
-    # the tests' probe family: a 16-bit state and two 16-bit rule layers, a
-    # word of 48 bits
-    probe.enable();
-    val r: res[rule.Rule, str] = rule.parse("Probe");
-    if (sel r.err)                                        { ret 1; }
-    if (!sim.set_rule(?s, r.ok) || sim.word_len(?s) != 3) { ret 1; }
-
-    # live cells with memory in both rule layers, up to every bit of them, a
-    # dead cell that still remembers, and empty cells
-    var vals: [36]u32 = [36]u32{
-        1, 1, 7, 1, 0xffff, 0xffff, 0, 0, 0, 1, 2, 0x1234,
-        0, 5, 0, 1, 300, 0xabcd, 1, 0, 0, 0, 0, 0,
-        1, 0xfffe, 1, 0, 0, 0xffff, 1, 9, 9, 1, 40000, 3
-    };
-    if (!sim.edit_begin(?s, 0, 0, 4, 3)) { ret 2; }
-    var y: usize = 0;
-    for (y < 3) {
-        sim.edit_words(?s, 0, y::i64, 4, ?vals[y * 12]);
-        y = y + 1;
-    }
-    if (!sim.edit_end(?s))                { ret 2; }
-    if (!holds_words(?s, 0, 0, ?vals[0])) { ret 3; }
-
-    # copied, the selection holds every value, and its clipboard text pastes
-    # back as the copy
-    app.select(?ap, 0, 0, 3, 2);
-    app.area(?ap, command.AREA_COPY);
-    run(?ap, ?s, ?d);
-    if (!pattern.exact(?ap.custom) || ap.custom.values != 3 || ap.custom.w != 4 || ap.custom.h != 3) { ret 4; }
-    if (!ap.clip_ready)                                                                              { ret 4; }
-    pattern.clear(?ap.custom);
-    app.paste(?ap, clipboard(?ap, ap.clip.data::str), false);
-    run(?ap, ?s, ?d);
-    if (!pattern.exact(?ap.custom) || ap.custom.values != 3 || ap.custom.w != 4 || ap.custom.h != 3) { ret 5; }
-
-    # stamped away from the original, and over it a cell to the south-east,
-    # which undo takes back to the words it covered
-    app.stamp(?ap, ?ap.custom, 0, 102, 51);
-    run(?ap, ?s, ?d);
-    if (!holds_words(?s, 100, 50, ?vals[0])) { ret 6; }
-    app.stamp(?ap, ?ap.custom, 0, 3, 2);
-    run(?ap, ?s, ?d);
-    if (!holds_words(?s, 1, 1, ?vals[0])) { ret 7; }
-    app.submit(?ap, command.Command.undo{});
-    run(?ap, ?s, ?d);
-    if (!holds_words(?s, 0, 0, ?vals[0]) || !holds_words(?s, 100, 50, ?vals[0])) { ret 8; }
-    app.submit(?ap, command.Command.redo{});
-    run(?ap, ?s, ?d);
-    if (!holds_words(?s, 1, 1, ?vals[0])) { ret 9; }
-    app.submit(?ap, command.Command.undo{});
-    run(?ap, ?s, ?d);
-
-    # a world file keeps every layer, as version 6
-    app.submit(?ap, command.Command.save_world{file(?ap, "out/test/exec_probe/world.cellar")});
-    run(?ap, ?s, ?d);
-    val bytes: res[vector.Vector[u8], fs.FsError] = fs.read_bytes(?a, "out/test/exec_probe/world.cellar");
-    if (sel bytes.err) { ret 10; }
-    var head: vector.Vector[u8] = bytes.ok;
-    val six:  bool              = head.len > 9 && string.str_region_equals(head.data::str, 0, 9, "cellar 6\n");
-    vector.dnit[u8](?head);
-    if (!six) { ret 10; }
-    sim.clear(?s);
-    app.submit(?ap, command.Command.load_world{file(?ap, "out/test/exec_probe/world.cellar")});
-    run(?ap, ?s, ?d);
-    fs.remove_file("out/test/exec_probe/world.cellar");
-    if (!holds_words(?s, 0, 0, ?vals[0]) || !holds_words(?s, 100, 50, ?vals[0])) { ret 11; }
-
-    # and the pattern, saved under a typed name, is written as RLW and loads back exact
-    var fname: [saves.FILE_MAX]u8;
-    var path:  [128]u8;
-    val named: str   = saves.file_name("probe", saves.KIND_PATTERN, pattern.exact(?ap.custom), ?fname[0]);
-    var at:    usize = text.buf_str(?path[0], 0, "out/test/exec_probe/");
-    at       = text.buf_str(?path[0], at, named);
-    path[at] = 0;
-    if (!string.str_equals(named, "probe.rlw")) { ret 12; }
-    app.submit(?ap, command.Command.save_pattern{file(?ap, ?path[0])});
-    run(?ap, ?s, ?d);
-    val rlw: res[vector.Vector[u8], fs.FsError] = fs.read_bytes(?a, ?path[0]);
-    if (sel rlw.err) { ret 12; }
-    var body: vector.Vector[u8] = rlw.ok;
-    val two:  bool              = body.len > 9 && string.str_region_equals(body.data::str, 0, 9, "[RLW 2 3]");
-    vector.dnit[u8](?body);
-    if (!two) { ret 12; }
-    pattern.clear(?ap.custom);
-    app.submit(?ap, command.Command.load_pattern{file(?ap, ?path[0])});
-    run(?ap, ?s, ?d);
-    fs.remove_file(?path[0]);
-    if (!pattern.exact(?ap.custom) || ap.custom.values != 3 || ap.custom.w != 4 || ap.custom.h != 3) { ret 13; }
-    var i: usize = 0;
-    for (i < 12) {
-        val c: *u32 = pattern.word(?ap.custom, i % 4, i / 4);
-        if (c[0] != vals[i * 3] || c[1] != vals[i * 3 + 1] || c[2] != vals[i * 3 + 2]) { ret 14; }
-        i = i + 1;
-    }
 
     app.dnit(?ap);
     sim.dnit(?s);

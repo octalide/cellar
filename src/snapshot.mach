@@ -19,6 +19,7 @@ use cellar.layer.plane;
 use cellar.rule;
 use cellar.space;
 use allo: std.allocator;
+use std.allocator.page;
 use std.collections.vector;
 use std.collections.vector.Vector;
 use mem: std.memory;
@@ -102,10 +103,15 @@ pub fun dnit(sn: *Snapshot) {
 # buffers of another image size
 fun shape(sn: *Snapshot, r: *rule.Rule) {
     var set: plane.Set = rule.layers(r);
-    set = plane.without_views(?set);
-    val words: usize = plane.image_words(?set);
+    shape_set(sn, ?set);
+}
+
+# take up a set's state and rule layers as the ones the images are of
+fun shape_set(sn: *Snapshot, set: *plane.Set) {
+    val bare:  plane.Set = plane.without_views(set);
+    val words: usize     = plane.image_words(?bare);
     if (words != sn.words) { release(sn); }
-    sn.set   = set;
+    sn.set   = bare;
     sn.words = words;
 }
 
@@ -286,4 +292,39 @@ pub fun capture_tree(sn: *Snapshot, t: *hashlife.Tree, generation: u64, r: *rule
     sn.rule       = @r;
     sn.held       = true;
     ret true;
+}
+
+test add__keeps_every_value_of_words_wider_than_a_u32 {
+    var a: allo.Allocator;
+    page.make(?a);
+    var sn: Snapshot;
+    init(?sn, ?a);
+    # a hand-built set of three 16-bit layers, 48 bits a cell
+    var r: rule.Rule = rule.preset_rule(0);
+    open(?sn, 7, ?r);
+    var set: plane.Set = plane.state("state", 16);
+    plane.add_rule(?set, "age", 16);
+    plane.add_rule(?set, "mix", 16);
+    shape_set(?sn, ?set);
+    if (word_len(?sn) != 3 || image_words(?sn) != 3 * plane.span_words(16)) { ret 1; }
+    var w: [12288]u32;
+    var i: usize = 0;
+    for (i < 4096) {
+        w[i * 3]     = (i & 1)::u32;
+        w[i * 3 + 1] = (i * 7)::u32 & 0xffff;
+        w[i * 3 + 2] = 0xffff - i::u32;
+        i            = i + 1;
+    }
+    val one: err[allo.Error] = add(?sn, 2, -3, ?w[0]);
+    if (sel one.err) { ret 2; }
+    w[5] = 0xabcd;
+    val two: err[allo.Error] = add(?sn, -1, 4, ?w[0]);
+    if (sel two.err) { ret 2; }
+    var back: [12288]u32;
+    words_of(?sn, 0, ?back[0]);
+    if (back[5] != 0xfffe || back[3 * 4095 + 1] != 28665) { ret 3; }
+    words_of(?sn, 1, ?back[0]);
+    if (!mem.equal[u32](?back[0], ?w[0], 12288) || find(?sn, -1, 4) != 1) { ret 4; }
+    dnit(?sn);
+    ret 0;
 }
