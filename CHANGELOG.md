@@ -6,6 +6,14 @@ All notable changes to cellar are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-10-02
+
+0.7.0 was tagged but never published, because its release run failed on macOS Intel. 0.7.1 is the first release carrying 0.7.0's changes.
+
+### Fixed
+
+- A HashLife step passes its step-time ceiling once the clock reaches the deadline, not only after it, so a run to a generation pauses on the ceiling on every clock (#202).
+
 ## [0.7.0] - 2026-10-02
 
 ### Added
