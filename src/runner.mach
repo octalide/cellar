@@ -30,10 +30,11 @@
 # from, and what the interface shows of it (world.Shown). the view is double
 # buffered. the pool is the back buffer a step writes, and the GPU's copy the
 # front one, which only the interface writes (gpu.flush) and draws from every
-# frame. one atomic word (slot) says who has the back buffer, and nobody ever
-# waits for the interface: a step publishes the generation it completed into
-# the view and posts it, and the frame takes what was posted, sending it to the
-# front. the tree's commit leaves the pool alone, so a step on the tree builds
+# frame. one atomic word (slot) says who has the back buffer, and the
+# interface never waits for it: a step publishes the generation it completed
+# into the view and posts it, and the frame takes what was posted, sending it
+# to the front. what the interface shows is observed once a frame, by the
+# first step to post after the frame took the last. the tree's commit leaves the pool alone, so a step on the tree builds
 # a view (sim.show_view) only once the frame has taken the last, for the
 # camera that frame aimed, and never waits: the frame finds a new generation
 # posted every frame. the CPU's commit swaps the pool's own cells, so it takes
@@ -106,7 +107,7 @@ val MAX_BEHIND: u64 = 16;
 #           look
 # aiming:   aimed holds one
 # shown:    what the interface shows of the generation the view holds
-# fresh:    the interface took a posted generation, for seen to copy
+# posted:   shown holds a generation the interface has not taken
 pub rec Runner {
     lock:     mutex.Mutex;
     wake:     condition.Condition;
@@ -130,7 +131,7 @@ pub rec Runner {
     aimed:    gpu.Look;
     aiming:   bool;
     shown:    world.Shown;
-    fresh:    bool;
+    posted:   bool;
 }
 
 fun now() Instant {
@@ -192,8 +193,12 @@ fun step(r: *Runner) {
     if (!writes && !atomic.cas(?r.slot, ?was, VIEW_SIM)) { ret; }
     r.aimed  = r.look;
     r.aiming = r.looked;
-    if (r.looked) { sim.show_view(s, r.look); }
-    world.observe(s, ?r.shown);
+    # what the interface shows is observed once a frame, as the view is built
+    if (!r.posted) {
+        if (r.looked) { sim.show_view(s, r.look); }
+        world.observe(s, ?r.shown);
+        r.posted = true;
+    }
     atomic.store(?r.slot, VIEW_POSTED);
 }
 
@@ -256,7 +261,7 @@ pub fun start(r: *Runner, s: *sim.Sim) err[thread.ThreadError] {
     r.looked   = false;
     r.aiming   = false;
     r.slot     = VIEW_FREE;
-    r.fresh    = false;
+    r.posted   = false;
     val spawned: thread.Operation = thread.spawn_with(work, r::*u8, ?r.worker);
     if (sel spawned.err) { ret err[thread.ThreadError].err{spawned.err}; }
     r.started = true;
@@ -300,6 +305,7 @@ pub fun give(r: *Runner) {
     r.on_gpu  = sim.on_gpu(s);
     # the interface saw the world itself, so what was posted before is stale
     atomic.store(?r.slot, VIEW_FREE);
+    r.posted = false;
     r.holder = HOLD_FREE;
     condition.signal(?r.wake);
     mutex.unlock(?r.lock);
@@ -345,8 +351,7 @@ pub fun owed(r: *Runner) u64 {
 # look: the camera, in cells, the next tree view is built for
 pub fun view(r: *Runner, look: gpu.Look) bool {
     var was: i64 = VIEW_POSTED;
-    r.fresh = atomic.cas(?r.slot, ?was, VIEW_UI);
-    if (!r.fresh) {
+    if (!atomic.cas(?r.slot, ?was, VIEW_UI)) {
         was = VIEW_FREE;
         if (!atomic.cas(?r.slot, ?was, VIEW_UI)) { ret false; }
     }
@@ -355,13 +360,15 @@ pub fun view(r: *Runner, look: gpu.Look) bool {
     ret true;
 }
 
-# copy what the interface shows of the world, when the view took a generation
-# posted since the last copy; call between view and unview
+# copy what the interface shows of the world, when a step posted it since the
+# last copy; call between view and unview
 # ---
 # r:   the runner
 # out: receives it
 pub fun seen(r: *Runner, out: *world.Shown) {
-    if (r.fresh) { @out = r.shown; }
+    if (!r.posted) { ret; }
+    @out     = r.shown;
+    r.posted = false;
 }
 
 # give the view back after view, for the next step to post into
