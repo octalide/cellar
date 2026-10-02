@@ -70,6 +70,11 @@ rec Tile {
     v: [TILE_ROWS * TILE_WORDS]u32;
 }
 
+# the weighted sums of an invocation's 8 cells
+rec Sums {
+    v: [8]i32;
+}
+
 # the band's live cells and its apron's, bit c + 32 of a row's words the cell
 # at column c, and a cell past a plane's dead edge as the form holds the edge
 #[shared]
@@ -244,32 +249,51 @@ fun comp_main() {
     }
     sy.workgroup_barrier();
 
+    # every weight is loaded once and applied to the run's 8 cells: cell c's
+    # footprint row starts at bit sh + c of word ws of its tile row. the run
+    # starts on a multiple of 8, so sh + r is one no larger than 40, and the
+    # row's footprints end by bit r + 47 of the two words, inside them
+    # while the radius is at most word.RADIUS_MAX
+    var sums: Sums;
+    var c:    u32 = 0;
+    for (c < 8) {
+        sums.v[c] = 0;
+        c         = c + 1;
+    }
+    val at: u32 = (x0::i32 - r + 32)::u32;
+    val ws: u32 = at / 32;
+    val sh: u32 = at % 32;
+    var dy: i32 = 0 - r;
+    for (dy <= r) {
+        val t: u32 = (ly - band + dy + r)::u32 * TILE_WORDS + ws;
+        val a: u32 = tile.v[t];
+        val b: u32 = tile.v[t + 1];
+        var j: i32 = 0;
+        for (j < width) {
+            val w: i32 = table.v[2 * words + ((dy + r) * width + j)::u32]:~i32;
+            if (w != 0) {
+                # the 8 bits from p, bit c the cell c's footprint reads at j
+                val p:   u32 = sh + j::u32;
+                var run: u32 = 0;
+                if (p >= 32) { run = b >> (p - 32); }
+                or {
+                    run = a >> p;
+                    if (p > 24) { run = run | (b << (32 - p)); }
+                }
+                c = 0;
+                for (c < 8) {
+                    sums.v[c] = sums.v[c] + w * ((run >> c) & 1)::i32;
+                    c         = c + 1;
+                }
+            }
+            j = j + 1;
+        }
+        dy = dy + 1;
+    }
+
     for (x < x0 + 8) {
         val lx:  i32 = x::i32;
-        var sum: i32 = 0;
-        # the footprint's row runs from bit sh of word ws of its tile row
-        val at: u32 = (lx - r + 32)::u32;
-        val ws: u32 = at / 32;
-        val sh: u32 = at % 32;
-        var dy: i32 = 0 - r;
-        for (dy <= r) {
-            val t: u32 = (ly - band + dy + r)::u32 * TILE_WORDS + ws;
-            val a: u32 = tile.v[t];
-            val b: u32 = tile.v[t + 1];
-            var j: i32 = 0;
-            for (j < width) {
-                val w: i32 = table.v[2 * words + ((dy + r) * width + j)::u32]:~i32;
-                if (w != 0) {
-                    val p:  u32 = sh + j::u32;
-                    var on: u32 = 0;
-                    if (p < 32)  { on = (a >> p) & 1; }
-                    or           { on = (b >> (p - 32)) & 1; }
-                    if (on != 0) { sum = sum + w; }
-                }
-                j = j + 1;
-            }
-            dy = dy + 1;
-        }
+        var sum: i32 = sums.v[x - x0];
 
         # a cell held inverted reads as its complement, its sum as total less the held one
         val cur:   u32 = src.v[row + x];
