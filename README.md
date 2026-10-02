@@ -64,6 +64,18 @@ there is read again each time its name is set, so an edit takes effect then.
 Every state but 0 is live, and a table whose empty neighbourhood gives a live
 cell is refused, since it would flip the unbounded background.
 
+Lenia rules are Bert Chan's continuous automata: a cell holds a value from 0
+to 1 and moves each generation by the growth of a smooth kernel's weighted sum
+around it. A rule is Chakazul's parameters as his Lenia writes them,
+`R=13,T=10,b=[1],m=0.15,s=0.015,kn=1,gn=1` for Orbium. R is the kernel's
+radius, up to 32. T is the generations to a unit of time. b holds the peaks of
+the kernel's rings. m and s are the growth's centre and width. kn and gn name
+the kernel core and growth function, numbered as his are. Cells are drawn by
+value on his colour map. Chakazul's patterns are Golly multi-state RLE of
+their values in 255ths, so they open as RLE files. Pattern formats keep the
+255ths, and a format with fewer states refuses the rule. A world file keeps
+every value exactly. Lenia runs on the CPU and the GPU, not on HashLife.
+
 Any rule runs on a bounded grid named after it as Golly writes one:
 `B3/S23:T100,100` is a 100 by 100 torus, `:P` a plane with dead edges, `:K`
 a Klein bottle whose starred size (`:K100*,80`) is the edge joined with a
