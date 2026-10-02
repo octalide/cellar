@@ -66,56 +66,47 @@ pub val MASK_RING: u32 = 0x729c0;
 # a halo mask asking for every chunk up to two away, the widest halo
 pub val MASK_HALO: u32 = 0x1ffefff;
 # a live chunk's halo, the chunks around it its live cells may spread into
-# before the next census settles the pool, as a mask with a bit per chunk of
-# the 5 by 5 block around it, row-major with the chunk itself at HALO_SELF
-pub val HALO_SIDE: u32 = 5;
-pub val HALO_SELF: u32 = 12;
-# cells of spread a pool holds room for once every live chunk has the ring
-# halo: an adjacent chunk is asked for when a live cell lies in the half of its
-# chunk toward it, so a chunk left out is more than half a chunk away
-pub val SPREAD_RING: u32 = 32;
-# cells of spread a pool holds room for once every live chunk has the wide
-# halo: the adjacent chunks always, and the second chunk on a side when a live
-# cell lies in the half toward it, so a chunk left out is more than a chunk and
-# a half away
+# before the next census settles the pool (cellar.layout.halo)
+pub val HALO_SIDE: u32 = layout.HALO_SIDE;
+pub val HALO_SELF: u32 = layout.HALO_SELF;
+# cells of spread the narrowest ring holds: an adjacent chunk is asked for when
+# a live cell lies in the half of its chunk toward it, so a chunk left out is
+# more than half a chunk away
+pub val SPREAD_RING: u32 = layout.SIDE / 2;
+# cells of spread the wide halo of a rule reaching no further than the
+# narrowest ring holds: the adjacent chunks always, and the second chunk on a
+# side when a live cell lies in the half toward it, so a chunk left out is more
+# than a chunk and a half away
 pub val SPREAD_WIDE: u32 = 96;
 
-# the halo row or column bits a live cell in the low or the high half of its
-# chunk along one axis needs, the chunk's own at bit 2
-fun halo_axis(high: u32, wide: bool) u32 {
-    if (wide) {
-        if (high != 0) { ret 0x1e; }
-        ret 0xf;
-    }
-    if (high != 0) { ret 0xc; }
-    ret 0x6;
+# cells of spread the ring of a rule reaching reach cells a generation holds,
+# so one generation never outruns it: the narrowest ring, or reach rounded up
+# to half a chunk, which at the farthest reach is every adjacent chunk
+pub fun ring(reach: usize) u32 {
+    val half: usize = SPREAD_RING::usize;
+    var r:    usize = (reach + half - 1) / half * half;
+    if (r < half) { r = half; }
+    ret r::u32;
+}
+
+# cells of spread the halo of a rule reaching reach cells holds: its ring, or
+# while wide a chunk more, up to every chunk two away
+pub fun halo_span(reach: usize, wide: bool) u32 {
+    var s: u32 = ring(reach);
+    if (wide)                  { s = s + layout.SIDE; }
+    if (s > layout.SPREAD_MAX) { s = layout.SPREAD_MAX; }
+    ret s;
 }
 
 # the halo mask for live cells in the quadrants of a chunk quads names
-# (cellar.layout.quadrant)
-# ---
-# wide: the wide halo, else the ring
-pub fun halo(quads: u32, wide: bool) u32 {
-    var m: u32 = 0;
-    var q: u32 = 0;
-    for (q < 4) {
-        if (((quads >> q) & 1) != 0) {
-            val xs: u32 = halo_axis(q & 1, wide);
-            val ys: u32 = halo_axis(q >> 1, wide);
-            var r:  u32 = 0;
-            for (r < HALO_SIDE) {
-                if (((ys >> r) & 1) != 0) { m = m | (xs << (r * HALO_SIDE)); }
-                r = r + 1;
-            }
-        }
-        q = q + 1;
-    }
-    ret m & ~(1 << HALO_SELF);
+# (cellar.layout.quadrant), holding span cells of spread
+pub fun halo(quads: u32, span: u32) u32 {
+    ret layout.halo(quads, span);
 }
 
 # the halo mask for the live cells an extent word describes
-pub fun halo_of(ext: u32, wide: bool) u32 {
-    ret halo(ext >> layout.EXTENT_QUADS, wide);
+pub fun halo_of(ext: u32, span: u32) u32 {
+    ret layout.halo(ext >> layout.EXTENT_QUADS, span);
 }
 
 # a neighbour that does not exist
@@ -188,6 +179,8 @@ pub rec Mirror {
 # serial:    the last incarnation handed out
 # stepped:   whether back is kept
 # sense:     how the census reads a cell, the running rule's
+# reach:     cells the running rule reaches a generation, whose ring a chunk
+#            counted or painted on the host asks for (span)
 # wide:      a chunk counted or painted on the host asks for the wide halo,
 #            as the GPU's census does while it steps uncapped
 # grid:      the grid the world runs on
@@ -219,6 +212,7 @@ pub rec Space {
     serial:    u32;
     stepped:   bool;
     sense:     layout.Sense;
+    reach:     usize;
     wide:      bool;
     grid:      topology.Grid;
     rim:       bool;
@@ -555,9 +549,10 @@ pub fun init(sp: *Space, a: *allo.Allocator, stepped: bool) err[allo.Error] {
     sp.mips_back = nil;
     sp.mip_on    = false;
     mem.zero[u8]((?sp.sense)::*u8, $size_of(layout.Sense));
-    sp.wide = false;
-    sp.grid = topology.open();
-    sp.rim  = false;
+    sp.reach = 1;
+    sp.wide  = false;
+    sp.grid  = topology.open();
+    sp.rim   = false;
     ret alloc_arrays(sp, FIRST_CAP);
 }
 
@@ -1129,12 +1124,18 @@ fun surround_grid(sp: *Space, s: usize, mask: u32) bool {
     ret ok;
 }
 
-# give a chunk every chunk of the halo the host asks for, the ring or the wide one
+# cells of spread the halo the host asks for holds: the running rule's ring,
+# or the wide halo
+pub fun span(sp: *Space) u32 {
+    ret halo_span(sp.reach, sp.wide);
+}
+
+# give a chunk every chunk the halo the host asks for could ask for, whichever
+# quadrants hold its live cells
 # ---
 # ret: false when the pool could not hold them
 pub fun surround(sp: *Space, s: usize) bool {
-    if (sp.wide) { ret surround_by(sp, s, MASK_HALO); }
-    ret surround_by(sp, s, MASK_RING);
+    ret surround_by(sp, s, halo(0xf, span(sp)));
 }
 
 # give a pool keeping its rim every seamed chunk on its grid, each marked asked
@@ -1286,7 +1287,7 @@ pub fun recount(sp: *Space, s: usize) {
         i = i + 1;
     }
     tally_census(?t, ?sp.census[s * CENSUS], incarnation(sp, s));
-    if (t.live != 0) { sp.census[s * CENSUS + 3] = halo(t.quads, sp.wide); }
+    if (t.live != 0) { sp.census[s * CENSUS + 3] = halo(t.quads, span(sp)); }
 }
 
 test alloc__links_neighbours_both_ways_and_release_unlinks {
@@ -1342,11 +1343,17 @@ test alloc__grows_the_pool_and_keeps_every_chunk_findable {
 test halo__asks_toward_the_quadrants_holding_live_cells {
     # a live cell in the north-west quadrant: west, north and north-west, and
     # with the wide halo the 4 by 4 block reaching two chunks that way
-    if (halo(1, false) != ((1 << 6) | (1 << 7) | (1 << 11))) { ret 1; }
-    if (halo(1, true) != (0x7bdef & ~(1 << HALO_SELF)))      { ret 2; }
-    if (halo(0xf, false) != MASK_RING)                       { ret 3; }
-    if (halo(0xf, true) != MASK_HALO)                        { ret 4; }
-    if (halo(0, true) != 0)                                  { ret 5; }
+    val wide: u32 = halo_span(1, true);
+    if (halo(1, SPREAD_RING) != ((1 << 6) | (1 << 7) | (1 << 11)))             { ret 1; }
+    if (wide != SPREAD_WIDE || halo(1, wide) != (0x7bdef & ~(1 << HALO_SELF))) { ret 2; }
+    if (halo(0xf, SPREAD_RING) != MASK_RING)                                   { ret 3; }
+    if (halo(0xf, wide) != MASK_HALO)                                          { ret 4; }
+    if (halo(0, wide) != 0)                                                    { ret 5; }
+    # a rule reaching past half a chunk rings every adjacent chunk whatever its
+    # quadrants, and widens to every chunk two away
+    if (ring(32) != SPREAD_RING || ring(33) != 64 || ring(layout.REACH_MAX::usize) != 64)      { ret 6; }
+    if (halo(1, ring(33)) != MASK_RING)                                                        { ret 7; }
+    if (halo_span(64, true) != layout.SPREAD_MAX || halo(1, halo_span(64, true)) != MASK_HALO) { ret 8; }
     ret 0;
 }
 
