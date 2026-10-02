@@ -16,6 +16,13 @@
 # grid is cleared before the census is taken. a cell past a plane's dead edge
 # is gathered as the rule holds the edge at the generation (rule.outside).
 #
+# on a pool held whole (cellar.space.cover) only the due chunks are stepped
+# (space.plan): those that may hold anything in either cells, and those their
+# live cells may spread into. every other chunk holds zeros in both cells with
+# nothing alive near it, so its step would write the zeros it holds already,
+# as the GPU skips a chunk cold for two steps, and a sparse world in a large
+# grid costs what it would in a pool allocated around it.
+#
 # a chunk whose cells the step changed is marked space.DIRTY_CELLS, since the
 # host's cells are the world's, so a GPU that only draws sends only those.
 #
@@ -50,18 +57,35 @@ use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
+use std.types.result.res;
 use std.types.size.usize;
+use std.types.string.str;
 
+# a step under way
+# ---
+# sp:   the pool
+# r:    the rule
+# gen:  the generation the pool's cells hold
+# sens: how a cell is read
+# list: the slots it steps, the pool's due ones, or nil for every slot
 rec Round {
     sp:   *space.Space;
     r:    *rule.Rule;
     gen:  u64;
     sens: layout.Sense;
+    list: *u32;
 }
 
-fun step_slot(arg: *u8, s: usize) {
+# the slot a step's i-th job steps
+fun slot_of(rd: *Round, i: usize) usize {
+    if (rd.list == nil) { ret i; }
+    ret rd.list[i]::usize;
+}
+
+fun step_slot(arg: *u8, i: usize) {
     val rd: *Round       = arg::*Round;
     val sp: *space.Space = rd.sp;
+    val s:  usize        = slot_of(rd, i);
     val e:  *u32         = ?sp.table[s * space.ENTRY];
     val cn: *u32         = ?sp.census[s * space.CENSUS];
     if (e[layout.INCARNATION_AT::usize] == 0 || space.seamed(sp, s)) { ret; }
@@ -98,8 +122,12 @@ fun build(sp: *space.Space, s: usize, sn: layout.Sense) {
 # so, from its census before and after the step, so only a changed chunk is
 # sent to the draw again, and DIRTY_MIP where its pyramid was built with it
 fun note_changes(sp: *space.Space) {
-    var s: usize = 0;
-    for (s < sp.hi) {
+    var n: usize = sp.hi;
+    if (sp.whole) { n = sp.ndue; }
+    var i: usize = 0;
+    for (i < n) {
+        var s: usize = i;
+        if (sp.whole) { s = sp.due[i]::usize; }
         val was: *u32 = ?sp.before[s * space.CENSUS];
         val now: *u32 = ?sp.census[s * space.CENSUS];
         if (space.used(sp, s) && (was[0] != 0 || was[1] != 0 || now[0] != 0 || now[1] != 0)) {
@@ -107,7 +135,7 @@ fun note_changes(sp: *space.Space) {
             if (space.builds_pyramid(sp, s)) { sp.dirty[s] = sp.dirty[s] | space.DIRTY_MIP; }
             or                               { sp.dirty[s] = sp.dirty[s] & ~space.DIRTY_MIP; }
         }
-        s = s + 1;
+        i = i + 1;
     }
 }
 
@@ -162,14 +190,25 @@ fun step_seamed(rd: *Round, s: usize, fr: *u32) {
 # step every seamed chunk of the pool, after the rest, until stop is raised
 # ---
 # ret: every seamed chunk was stepped
-fun step_seams(rd: *Round, stop: *i64) bool {
+fun step_seams(rd: *Round, n: usize, stop: *i64) bool {
+    val sp: *space.Space = rd.sp;
+    var i:  usize        = 0;
+    for (i < n && !(space.used(sp, slot_of(rd, i)) && space.seamed(sp, slot_of(rd, i)))) { i = i + 1; }
+    if (i == n) { ret true; }
+    ret step_seams_from(rd, i, n, stop);
+}
+
+# step_seams from the i-th slot, the first seamed one, so the frames are made
+# only when a seamed chunk is stepped
+fun step_seams_from(rd: *Round, first: usize, n: usize, stop: *i64) bool {
     var fr: [FRAMES]u32;
     val sp: *space.Space = rd.sp;
-    var s:  usize        = 0;
-    for (s < sp.hi) {
-        if (stop != nil && atomic.load(stop) != 0)    { ret false; }
+    var i:  usize        = first;
+    for (i < n) {
+        if (stop != nil && atomic.load(stop) != 0) { ret false; }
+        val s: usize = slot_of(rd, i);
         if (space.used(sp, s) && space.seamed(sp, s)) { step_seamed(rd, s, ?fr[0]); }
-        s = s + 1;
+        i = i + 1;
     }
     ret true;
 }
@@ -206,11 +245,40 @@ pub fun compute(sp: *space.Space, r: *rule.Rule, gen: u64, t: *team.Team, stop: 
     rd.r    = r;
     rd.gen  = gen;
     rd.sens = sp.sense;
-    mem.copy[u32](sp.before, sp.census, sp.hi * space.CENSUS);
-    var done: bool = team.run_until(t, step_slot, (?rd)::*u8, sp.hi, stop);
-    if (done && topology.bounded(?sp.grid)) { done = step_seams(?rd, stop); }
-    if (!done)                              { mem.copy[u32](sp.census, sp.before, sp.hi * space.CENSUS); }
+    rd.list = nil;
+    var n: usize = sp.hi;
+    if (sp.whole) {
+        space.plan(sp);
+        rd.list = sp.due;
+        n       = sp.ndue;
+    }
+    keep(?rd, n, sp.before, sp.census);
+    var done: bool = team.run_until(t, step_slot, (?rd)::*u8, n, stop);
+    if (done && topology.bounded(?sp.grid)) { done = step_seams(?rd, n, stop); }
+    if (!done) {
+        keep(?rd, n, sp.census, sp.before);
+        # a slot stepped before the cancel may hold anything in its back cells
+        var i: usize = 0;
+        for (sp.whole && i < n) {
+            space.wake(sp, slot_of(?rd, i));
+            i = i + 1;
+        }
+    }
     ret done;
+}
+
+# copy the census of a step's n slots from one array to another
+fun keep(rd: *Round, n: usize, to: *u32, from: *u32) {
+    if (rd.list == nil) {
+        mem.copy[u32](to, from, n * space.CENSUS);
+        ret;
+    }
+    var i: usize = 0;
+    for (i < n) {
+        val s: usize = rd.list[i]::usize * space.CENSUS;
+        mem.copy[u32](?to[s], ?from[s], space.CENSUS);
+        i = i + 1;
+    }
 }
 
 # the second half of a step: the back cells compute wrote become the front, and
@@ -226,6 +294,7 @@ pub fun commit(sp: *space.Space) bool {
     val mips: *u32 = sp.mips;
     sp.mips      = sp.mips_back;
     sp.mips_back = mips;
+    if (sp.whole) { space.doze(sp); }
     ret space.settle(sp, sp.census, sp.hi, true);
 }
 
@@ -282,6 +351,46 @@ test step__a_glider_crosses_chunk_borders_and_the_pool_and_its_pyramids_follow {
     if ((sp.dirty[o::usize] & space.DIRTY_MIP) == 0)                          { ret 10; }
     val w: u32 = space.find(?sp, -1, -1);
     if (w == space.NONE || (sp.dirty[w::usize] & space.DIRTY_MIP) != 0) { ret 11; }
+    team.stop(?t);
+    space.dnit(?sp);
+    ret 0;
+}
+
+test step__a_glider_on_a_grid_held_whole_steps_only_the_chunks_near_it {
+    var a: allo.Allocator;
+    page.make(?a);
+    var sp:   space.Space;
+    val made: err[allo.Error] = space.init(?sp, ?a, true);
+    if (sel made.err) { ret 1; }
+    var t: team.Team;
+    team.start(?t);
+    var r: rule.Rule = rule.of(rule.Kind.weighted{weighted.life()});
+    sp.sense = rule.sense(?r);
+    # a 1024 by 1024 torus is held whole, 16 by 16 chunks
+    val g: res[topology.Grid, str] = topology.parse("T1024,1024");
+    if (sel g.err) { ret 2; }
+    space.set_grid(?sp, g.ok);
+    if (!sp.whole || sp.live != 256) { ret 3; }
+    # a south-east glider just west and north of the origin's chunk corner
+    val s: usize = space.find(?sp, -1, -1)::usize;
+    val c: *u32  = ?sp.cells[s * space.CELLS];
+    c[60 * 64 + 61] = rule.word(?r, 1);
+    c[61 * 64 + 62] = rule.word(?r, 1);
+    c[62 * 64 + 60] = rule.word(?r, 1);
+    c[62 * 64 + 61] = rule.word(?r, 1);
+    c[62 * 64 + 62] = rule.word(?r, 1);
+    space.recount(?sp, s);
+    # it never spans more than 2 by 2 chunks, whose ring is 4 by 4
+    var n: usize = 0;
+    for (n < 40) {
+        if (!step(?sp, ?r, n::u64, ?t)) { ret 4; }
+        if (sp.ndue > 16)               { ret 5; }
+        n = n + 1;
+    }
+    if (space.population(?sp) != 5 || sp.live != 256) { ret 6; }
+    val d: *u32 = ?sp.cells[space.find(?sp, 0, 0)::usize * space.CELLS];
+    if (!space.live(?sp, d[6 * 64 + 7]) || !space.live(?sp, d[7 * 64 + 8]) || !space.live(?sp, d[8 * 64 + 6])) { ret 7; }
+    if (!space.live(?sp, d[8 * 64 + 7]) || !space.live(?sp, d[8 * 64 + 8]))                                    { ret 8; }
     team.stop(?t);
     space.dnit(?sp);
     ret 0;
