@@ -48,7 +48,11 @@
 # the host hands it back by changing it: the next flush uploads what it wrote
 # and seeds the GPU's hash and free bits from the table again. between the two
 # the host writes only its own words of the status head, in order with the
-# GPU's work, so the two never write the same word at once.
+# GPU's work, so the two never write the same word at once. the pool grows
+# while the GPU owns it without the host: the capacity grows ahead of the top,
+# the GPU carries its own page table and allocator's words into the larger
+# buffers (carry_comp) and keeps owning the pool, and the host's mirror, its
+# cells with it, grows only once take next brings it level.
 #
 # a pass runs between generations, before the spread recorded since the last
 # would pass what the halo it left holds: each live chunk asks for the rule's
@@ -130,6 +134,8 @@ use std.types.string.str;
 val CLEAR_SPV:  [_]u8;
 #[embed("{artifact.stage-grow_comp.out}")]
 val GROW_SPV:   [_]u8;
+#[embed("{artifact.stage-carry_comp.out}")]
+val CARRY_SPV:  [_]u8;
 #[embed("{artifact.stage-census_comp.out}")]
 val CENSUS_SPV: [_]u8;
 #[embed("{artifact.stage-reduce_comp.out}")]
@@ -339,8 +345,10 @@ rec Write {
 # (cellar.runner), so a growth asked there touches nothing here: it is owed
 # (owe) and the next frame makes the buffers (flush). a growth is made at once
 # (reserve) only while the GPU steps the world, when the render thread holds
-# the world for every change. the pool is handed back (take) only while the GPU
-# owns it, which it does only while it steps the world.
+# the world for every change. while the GPU owns the pool, which it does only
+# while it steps the world, the render thread grows it on its own (make_room)
+# and the host's pool does not grow with it, and the pool is handed back
+# (take) only then.
 # ---
 # cells:  the two cell pools stepped between
 # meta:   the rule and the page table
@@ -396,6 +404,8 @@ rec Pool {
 # srgb:     the renderer's target encodes sRGB, so colours go up linear
 # clear:    the clear stage
 # grow:     the stage that carries the world into larger buffers
+# carry:    the stage that carries the page table and the allocator's words
+#           into larger buffers while the GPU owns the pool
 # census:   the census stage
 # reduce:   the stage that builds the coverage pyramids
 # draw:     the cell shader
@@ -508,6 +518,7 @@ pub rec Gpu {
     srgb:     bool;
     clear:    gfx.Compute;
     grow:     gfx.Compute;
+    carry:    gfx.Compute;
     census:   gfx.Compute;
     reduce:   gfx.Compute;
     draw:     gfx.Shader;
@@ -953,13 +964,18 @@ fun stage_of(g: *Gpu, i: usize, spv: **u8, len: *usize) *gfx.Compute {
         @len = $length_of(SEED_SPV);
         ret ?g.seed;
     }
-    @spv = ?GATHER_SPV[0];
-    @len = $length_of(GATHER_SPV);
-    ret ?g.gather;
+    if (i == 10) {
+        @spv = ?GATHER_SPV[0];
+        @len = $length_of(GATHER_SPV);
+        ret ?g.gather;
+    }
+    @spv = ?CARRY_SPV[0];
+    @len = $length_of(CARRY_SPV);
+    ret ?g.carry;
 }
 
 # the shared compute stages
-val STAGES: usize = 11;
+val STAGES: usize = 12;
 
 # build every shared compute stage, all of them or none
 fun build_stages(g: *Gpu) bool {
@@ -1460,8 +1476,9 @@ pub fun collect(g: *Gpu, sp: *space.Space) Landed {
         if (gate) {
             take(g, sp);
             make_room(g, sp, g.top + slack(g.top));
-            # a pool at its ceiling with no slot free below the top cannot hold the world
-            ret Landed{fresh: false, fits: sp.live < g.top, behind: 0};
+            # a pool at its ceiling with no slot free below the top, and no
+            # growth coming, cannot hold the world
+            ret Landed{fresh: false, fits: sp.live < g.top || g.reserved, behind: 0};
         }
         # a census taken before an edit is no count of the world after it
         if (snap.edits == g.edits) {
@@ -1488,28 +1505,32 @@ pub fun collect(g: *Gpu, sp: *space.Space) Landed {
     ret Landed{fresh: true, fits: ok, behind: g.gens - snap.gens};
 }
 
-# raise the top to want slots while the GPU owns the pool, taking the pool
-# back and growing it when its buffers hold fewer
+# raise the top toward want slots while the GPU owns the pool, and make
+# larger buffers ahead of it, when the buffers would leave less than its slack
+# above it
 #
 # a raised top only lets the passes claim higher, since every free slot of the
-# capacity has its free bit, so it takes no seeding. a pool growing moves into
-# larger buffers, which takes the device idle.
+# capacity has its free bit, so it takes no seeding. the next flush moves the
+# pool into the larger buffers on the GPU (carry_comp), so a growth neither
+# takes the pool back nor grows the host's, and the top passes the old
+# capacity once a census finds the pool there.
 fun make_room(g: *Gpu, sp: *space.Space, want: usize) {
-    var top: usize = want;
-    if (top > g.p.cap) {
-        take(g, sp);
+    val ahead: usize = want + slack(want);
+    if (ahead > g.p.cap) {
         var cap: usize = g.p.cap;
-        for (cap < top && cap < sp.max_slots) { cap = cap * 2; }
-        if (cap > sp.max_slots)   { cap = sp.max_slots; }
-        if (!space.grow(sp, cap)) { cap = g.p.cap; }
-        if (top > cap)            { top = cap; }
-        g.reseed = true;
+        for (cap < ahead && cap < sp.max_slots) { cap = cap * 2; }
+        if (cap > sp.max_slots) { cap = sp.max_slots; }
+        # a refusal leaves the pool its buffers, the top held below them
+        reserve(g, cap);
     }
-    if (top > g.top) { g.top = top; }
+    var top: usize = want;
+    if (top > g.p.cap) { top = g.p.cap; }
+    if (top > g.top)   { g.top = top; }
 }
 
 # take the pool back from the GPU while it owns it, so the host's page table
-# is the GPU's: a stall, which reads the page table and the allocator's words
+# is the GPU's: a stall, which reads the page table and the allocator's words,
+# first growing the host's pool to the GPU's capacity, which grew without it
 #
 # a closed gate voided every step recorded after the pass that closed it, so
 # the count of generations, the serial and the front go back to that pass,
@@ -1524,7 +1545,8 @@ pub fun take(g: *Gpu, sp: *space.Space) {
     val eh: err[gfx.Error] = gfx.storage_buffer_read(g.d, ?g.p.status, 0, (?g.ctl[0])::*u8, 64);
     if (sel eh.err) { ret; }
     var n: usize = g.top;
-    if (n > sp.cap) { n = sp.cap; }
+    # a host refused the memory takes back only the slots it holds
+    if (n > sp.cap && !space.grow(sp, g.p.cap)) { n = sp.cap; }
     if (n != 0) {
         val et: err[gfx.Error] = gfx.storage_buffer_read(g.d, ?g.p.meta, HEAD * 4, sp.table::*u8, n * space.ENTRY * 4);
         if (sel et.err) { ret; }
@@ -1695,9 +1717,13 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
         drop_pool(g, ?g.old);
         g.retired = false;
     }
+    # the GPU owned the pool before this frame, so its page table is the one
+    # a growth carries
+    var held: bool = g.owns;
     if (g.owns && !owns) {
         take(g, sp);
         g.owns = false;
+        held   = false;
     }
     if (!g.owns && owns) {
         # the host's halo is the rule's ring from here on, as the passes keep it
@@ -1716,33 +1742,58 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
     g.owed = 0;
     val grew: bool = g.reserved;
     if (grew) {
-        # the world moves into the larger buffers reserve made, and only the
-        # page table goes up again
+        # the world moves into the larger buffers reserve made
         g.old      = g.p;
         g.retired  = true;
         g.p        = g.next;
         g.reserved = false;
         g.est      = UNKNOWN;
         forget_censuses(g);
-        if (g.hi != 0 && g.stepping) {
+        # a gate closed in a frame no census has shown yet voided steps the
+        # front was turned for, so while the GPU owned the pool either cells may
+        # hold the world, and both go
+        var pools: usize = 1;
+        if (held) { pools = 2; }
+        var k: usize = 0;
+        for (g.hi != 0 && g.stepping && k < pools) {
+            val c:  usize = (g.front + k) % 2;
             var gb: [4]*gfx.StorageBuffer;
-            gb[0] = ?g.old.cells[g.front];
-            gb[1] = ?g.p.cells[g.front];
+            gb[0] = ?g.old.cells[c];
+            gb[1] = ?g.p.cells[c];
             gb[2] = ?g.old.flags;
             gb[3] = ?g.p.flags;
             val eg: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.grow, ?gb[0], 4, 64, g.hi::u32, 1);
             if (sel eg.err) { ret eg; }
+            k = k + 1;
         }
-        var t: usize = 0;
-        for (t < sp.hi) {
-            sp.dirty[t] = sp.dirty[t] | space.DIRTY_ENTRY;
-            t           = t + 1;
+        if (held) {
+            # the GPU carries its own page table, which the host's may lag, and
+            # keeps owning the pool, its hash and free bits seeded again for
+            # the larger capacity
+            var cb: [4]*gfx.StorageBuffer;
+            cb[0] = ?g.old.meta;
+            cb[1] = ?g.p.meta;
+            cb[2] = ?g.old.status;
+            cb[3] = ?g.p.status;
+            val ec: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.carry, ?cb[0], 4, 1, g.old.cap::u32, 1);
+            if (sel ec.err) { ret ec; }
+            g.rehash = true;
         }
-        if (g.owns) { g.reseed = true; }
+        or {
+            # the host's page table is the world's, and goes up again
+            var t: usize = 0;
+            for (t < sp.hi) {
+                sp.dirty[t] = sp.dirty[t] | space.DIRTY_ENTRY;
+                t           = t + 1;
+            }
+            if (g.owns) { g.reseed = true; }
+        }
     }
 
+    # the GPU's top may lie past the host's capacity, which did not grow with it
     var top: usize = sp.hi;
-    if (g.hi > top) { top = g.hi; }
+    if (g.hi > top)   { top = g.hi; }
+    if (top > sp.cap) { top = sp.cap; }
     var entries: usize = 0;
     var chunks:  usize = 0;
     var s:       usize = 0;
@@ -1907,23 +1958,27 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
 # the hash and the free bits seeded from the page table just uploaded. the next
 # generation waits for a pass, which gives the host's chunks their halo
 fun hand_back(g: *Gpu, sp: *space.Space) err[gfx.Error] {
-    var w: [6]u32;
+    var w: [4]u32;
     w[0] = 0;
     w[1] = 0;
     w[2] = 0;
     w[3] = sp.serial;
-    w[4] = g.top::u32;
-    w[5] = g.p.cap::u32;
-    val ew: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.status, layout.CTL_GATE::usize * 4, (?w[0])::*u8, 24);
+    val ew: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.status, layout.CTL_GATE::usize * 4, (?w[0])::*u8, 16);
     if (sel ew.err) { ret ew; }
     g.reseed  = false;
     g.grouped = MAX_SPAN;
     ret rehash(g);
 }
 
-# seed the GPU's hash and free bits from its page table again, which also
-# clears the tombstones out of the hash
+# seed the GPU's hash and free bits from its page table again, for the top
+# and the capacity written ahead of it, which also clears the tombstones out of
+# the hash
 fun rehash(g: *Gpu) err[gfx.Error] {
+    var w: [2]u32;
+    w[0] = g.top::u32;
+    w[1] = g.p.cap::u32;
+    val et: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.status, layout.CTL_TOP::usize * 4, (?w[0])::*u8, 8);
+    if (sel et.err) { ret et; }
     var wb: [1]*gfx.StorageBuffer;
     wb[0] = ?g.p.status;
     val ew: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.wipe, ?wb[0], 1, layout.HASH / 64, 1, 1);
