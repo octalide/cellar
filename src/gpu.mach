@@ -20,10 +20,13 @@
 #
 # a frame steps no more than its span of slots, counting every generation's
 # slots, so one generation over a large pool is dispatched in ranges of its
-# active list across several frames. the span follows the frame time against the display's
-# refresh interval: the time a frame's dispatches take shows as the next
-# frames arriving late, which cuts the span, and frames on time that the span
-# cut short let it grow. while a generation is part way through, its finished
+# active list across several frames. the span is what fits a share of the
+# display's refresh interval at what a slot costs on the GPU, timed by the
+# device's timestamps and smoothed, so it follows the cost both ways with no
+# band where an overrun is let stand. a device without timestamps falls back
+# to the frame time: a frame over the interval cuts the span in proportion to
+# its overrun, and frames on time that the span cut short let it grow. while a
+# generation is part way through, its finished
 # ranges lie in the back cells, so the draw, the census and the pyramids read
 # the front, the last completed generation, and only a frame that completes
 # one counts and reduces it again. an edit, a growth or another rule since the
@@ -112,6 +115,7 @@ use cellar.space;
 use cellar.theme;
 use cellar.topology;
 use allo: std.allocator;
+use std.chrono.duration.Duration;
 use std.chrono.time;
 use std.chrono.time.Instant;
 use std.collections.sort;
@@ -175,18 +179,31 @@ val FRAME_SETS: usize = 8;
 pub val MAX_STEPS: usize = 248;
 # dispatches a pass records, and one more for the first of a frame, which frees
 pub val PASS_CALLS: usize = 3;
-# the span a frame starts with, before the frame time has adapted it
+# the span a frame starts with, before a frame has been measured
 val FIRST_SPAN: usize = 4096;
 # the least a span shrinks to
 val MIN_SPAN: usize = 64;
 # the most a span grows to: every generation a frame may record of the largest
 # pool
 pub val MAX_SPAN: usize = layout.MAX_SLOTS::usize * MAX_STEPS;
+# the share of the refresh interval a frame's stepping may take on the GPU,
+# STEP_SHARE over SHARE_OF, the rest left to the draw, the census and the
+# compositor
+val STEP_SHARE: u64 = 7;
+val SHARE_OF:   u64 = 8;
+# timers a frame's stepping is measured by in turn, one more than the frames in
+# flight, so a timer's last range has always finished by its next turn
+val TIMERS: usize = 3;
+# a slot's measured cost moves toward a dearer measure by this share of the
+# difference and toward a cheaper one by the other, so an overrun is followed
+# within a frame or two and a single cheap frame does not undo it
+val RISE: u64 = 2;
+val FALL: u64 = 16;
 # frames recorded before a late one is seen, whose lateness the span was
-# already cut for
+# already cut for, when the frame time paces it
 val CALM: u32 = 2;
 # the share a span grows by each frame on time it cut short, until a frame
-# first comes late and after
+# first comes late and after, when the frame time paces it
 val GROW_FAST: usize = 8;
 val GROW_SLOW: usize = 64;
 # consecutive uncapped frames the budget cut short before the halo widens
@@ -434,15 +451,22 @@ rec Pool {
 # stamp:    the current serial, twice for every slot a run of stamps covers
 # pyrs:     pyramids built in the frame, staged for upload
 # span:     slots the next frame may step, over every generation it records
-# fixed:    span is held where it was set rather than following the frame time
-# found:    a frame came late since the span began following it
+# fixed:    span is held where it was set rather than following what frames cost
+# cost:     picoseconds of GPU time a slot is measured to cost, smoothed, 0
+#           before the first measure
+# clocks:   the timers measuring each frame's stepping in turn
+# clocked:  the device writes timestamps and clocks are held, so cost paces
+#           the span rather than the frame time
+# paid:     slots the frame each clock last measured stepped, 0 for none
+# turn:     the clock the next frame measures with
+# found:    a frame came late since the frame time began pacing the span
 # calm:     frames left before lateness cuts the span again
 # worked:   slots the last frame stepped
 # limited:  the span cut the last frame's steps short
 # quick:    the last frame kept up with the display
 # last:     when the last frame was recorded
 # timed:    last holds a frame
-# pace_us:  the frame-time thresholds for the display
+# pace_us:  the refresh interval and the frame-time threshold for the display
 # going:    a generation is part way through: front holds the one before it and
 #           the back the ranges finished so far
 # at:       the slot the generation going resumes from
@@ -551,6 +575,11 @@ pub rec Gpu {
     pyrs:     Vector[u32];
     span:     usize;
     fixed:    bool;
+    cost:     u64;
+    clocks:   [3]gfx.GpuTimer;
+    clocked:  bool;
+    paid:     [3]usize;
+    turn:     usize;
     found:    bool;
     calm:     u32;
     worked:   usize;
@@ -602,25 +631,24 @@ pub rec Gpu {
 
 # how long frames may take against the display's refresh interval
 #
-# slow_us:  a frame this many microseconds apart from the last has missed its
-#           budget
-# quick_us: a frame no more than this many microseconds apart from the last
-#           kept up with the display, so frame time is not what bounds it
+# interval_us: the display's refresh interval in microseconds
+# quick_us:    a frame no more than this many microseconds apart from the last
+#              kept up with the display, and one further apart missed it
 pub rec Pace {
-    slow_us:  u64;
-    quick_us: u64;
+    interval_us: u64;
+    quick_us:    u64;
 }
 
 # the frame-time thresholds for a display refreshing at hz, which fall back to
 # 60 Hz when hz is not a rate. a frame that keeps up is within 1.08 refresh
-# intervals and one that misses is past 1.44
+# intervals, the slack a frame's timing jitters by
 # ---
 # hz: the display's refresh rate in hertz, zero or less when unknown
 pub fun pace_for(hz: f32) Pace {
     var rate: f32 = FALLBACK_HZ;
     if (hz > 0.0) { rate = hz; }
     val interval: u64 = (1000000.0 / rate + 0.5)::u64;
-    ret Pace{slow_us: interval * 36 / 25, quick_us: interval * 27 / 25};
+    ret Pace{interval_us: interval, quick_us: interval * 27 / 25};
 }
 
 # follow the display's refresh rate, which a window can change by moving to
@@ -853,6 +881,9 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     g.cut      = false;
     g.span     = FIRST_SPAN;
     g.fixed    = false;
+    g.cost     = 0;
+    g.clocked  = false;
+    g.turn     = 0;
     g.found    = false;
     g.calm     = 0;
     g.worked   = 0;
@@ -903,6 +934,7 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
         if (build_stages(g)) { g.stepping = true; }
         or                   { drop_steps(g, rule.FAMILIES); }
     }
+    if (g.stepping) { hold_clocks(g); }
 
     val e7: err[gfx.Error] = make(g.d, (INK_AT + SHADES * 4) * 4, ?g.view);
     if (sel e7.err) { ret e7; }
@@ -974,6 +1006,34 @@ fun stage_of(g: *Gpu, i: usize, spv: **u8, len: *usize) *gfx.Compute {
 
 # the shared compute stages
 val STAGES: usize = 11;
+
+# hold the clocks a frame's stepping is timed by, all of them or none, none on
+# a device whose queue writes no timestamps, which leaves the frame time to
+# pace the span
+fun hold_clocks(g: *Gpu) {
+    g.clocked = false;
+    var i: usize = 0;
+    for (i < TIMERS) {
+        val e: err[gfx.Error] = gfx.renderer_timer(g.r, ?g.clocks[i]);
+        if (sel e.err) {
+            drop_clocks(g, i);
+            ret;
+        }
+        g.paid[i] = 0;
+        i         = i + 1;
+    }
+    g.clocked = true;
+}
+
+# give the first n clocks back
+fun drop_clocks(g: *Gpu, n: usize) {
+    var i: usize = 0;
+    for (i < n) {
+        gfx.renderer_timer_delete(g.r, ?g.clocks[i]);
+        i = i + 1;
+    }
+    g.clocked = false;
+}
 
 # build every shared compute stage, all of them or none
 fun build_stages(g: *Gpu) bool {
@@ -1245,6 +1305,7 @@ pub fun dnit(g: *Gpu) {
         drop_steps(g, rule.FAMILIES);
         drop_stages(g, STAGES);
     }
+    if (g.clocked) { drop_clocks(g, TIMERS); }
     vector.dnit[Write](?g.writes);
     vector.dnit[u32](?g.zeros);
     vector.dnit[u32](?g.stamped);
@@ -1309,45 +1370,99 @@ pub fun squeeze(g: *Gpu, slots: usize) {
     g.squeeze = slots;
 }
 
-# time the frame against the last, and follow the span to it
+# time the frame against the last, and pace the span by what frames cost
 #
-# a late frame cuts the span to three quarters of what the last frame stepped,
-# then waits out the frames already recorded before another cut. a frame on
-# time that the span cut short grows it by an eighth until the first late
-# frame and by a sixty-fourth after, so the frames settle just inside the
-# refresh interval and seldom miss it.
+# with clocks, the span is what fits the stepping's share of the refresh
+# interval at a slot's measured cost, refitted every frame. without, the frame
+# time paces it (pace_by_frame).
 fun follow(g: *Gpu) {
     val now: time.InstantClock = time.instant();
     if (sel now.err) { ret; }
-    var quick: bool = false;
-    var slow:  bool = false;
-    if (g.timed) {
-        val us: u64 = (time.instant_sub(now.ok, g.last) / 1000)::u64;
-        quick = us <= g.pace_us.quick_us;
-        slow  = us > g.pace_us.slow_us;
-    }
+    var us: u64 = 0;
+    if (g.timed) { us = (time.instant_sub(now.ok, g.last) / 1000)::u64; }
+    val late: bool = g.timed && us > g.pace_us.quick_us;
+    g.quick = g.timed && !late;
     g.last  = now.ok;
     g.timed = true;
-    g.quick = quick;
     if (g.fixed) { ret; }
+    if (g.clocked) {
+        measure(g);
+        if (g.cost != 0) { g.span = fit_span(g.pace_us.interval_us * 1000 * STEP_SHARE / SHARE_OF, g.cost); }
+        ret;
+    }
+    pace_by_frame(g, late, us);
+}
+
+# take what the clocks measured since the last frame into a slot's cost
+fun measure(g: *Gpu) {
+    var i: usize = 0;
+    for (i < TIMERS) {
+        val took: opt[Duration] = gfx.renderer_timer_take(g.r, ?g.clocks[i]);
+        if (sel took.some) {
+            if (g.paid[i] != 0) {
+                var ps: u64 = took.some::u64 * 1000 / g.paid[i]::u64;
+                if (ps == 0) { ps = 1; }
+                g.cost = smooth(g.cost, ps);
+            }
+        }
+        i = i + 1;
+    }
+}
+
+# pace the span by the frame time, where the device writes no timestamps
+#
+# a frame later than the display cuts the span to the share of what the last
+# frame stepped that would have fit the refresh interval, in proportion to how
+# late it came, then waits out the frames already recorded before another cut.
+# a frame on time that the span cut short grows it by an eighth until the
+# first late frame and by a sixty-fourth after, since a frame on time shows no
+# room to spare when the display paces it.
+# ---
+# late: the frame came later than the display
+# us:   microseconds since the frame before
+fun pace_by_frame(g: *Gpu, late: bool, us: u64) {
     if (g.calm > 0) {
         g.calm = g.calm - 1;
         ret;
     }
-    if (slow && g.worked != 0) {
+    if (late && g.worked != 0) {
         var was: usize = g.span;
         if (g.worked < was) { was = g.worked; }
-        g.span = was - was / 4;
-        if (g.span < MIN_SPAN) { g.span = MIN_SPAN; }
+        g.span  = cut_span(was, us, g.pace_us.interval_us);
         g.calm  = CALM;
         g.found = true;
     }
-    or (quick && g.limited) {
+    or (g.quick && g.limited) {
         var share: usize = GROW_FAST;
         if (g.found) { share = GROW_SLOW; }
         g.span = g.span + g.span / share + 1;
         if (g.span > MAX_SPAN) { g.span = MAX_SPAN; }
     }
+}
+
+# the span that steps what fits budget_ns of GPU time at cost_ps a slot
+fun fit_span(budget_ns: u64, cost_ps: u64) usize {
+    if (cost_ps == 0) { ret MAX_SPAN; }
+    val n: u64 = budget_ns * 1000 / cost_ps;
+    if (n < MIN_SPAN::u64) { ret MIN_SPAN; }
+    if (n > MAX_SPAN::u64) { ret MAX_SPAN; }
+    ret n::usize;
+}
+
+# a slot's cost moved toward a measure of it: most of the way toward a dearer
+# one, a little toward a cheaper one, and all the way from no cost yet
+fun smooth(cost_ps: u64, measure_ps: u64) u64 {
+    if (cost_ps == 0)         { ret measure_ps; }
+    if (measure_ps > cost_ps) { ret cost_ps + (measure_ps - cost_ps + RISE - 1) / RISE; }
+    ret cost_ps - (cost_ps - measure_ps) / FALL;
+}
+
+# the slots of worked that would have fit interval_us in a frame us long
+fun cut_span(worked: usize, us: u64, interval_us: u64) usize {
+    var n: u64 = worked::u64;
+    if (us > interval_us)  { n = worked::u64 * interval_us / us; }
+    if (n < MIN_SPAN::u64) { ret MIN_SPAN; }
+    ret n::usize;
 }
 
 # follow how the uncapped frames are running with the halo, once per uncapped
@@ -2318,6 +2433,24 @@ fun record_ops(g: *Gpu, step: *gfx.Compute, bound: usize) err[gfx.Error] {
     ret err[gfx.Error].ok{};
 }
 
+# record the frame's planned dispatches, timed by the frame's turn of the
+# clocks when it steps any slots, for what a slot costs (measure)
+fun timed_ops(g: *Gpu, step: *gfx.Compute, bound: usize) err[gfx.Error] {
+    if (!g.clocked) { ret record_ops(g, step, bound); }
+    val c: usize = g.turn;
+    g.turn    = (c + 1) % TIMERS;
+    g.paid[c] = 0;
+    if (g.worked == 0) { ret record_ops(g, step, bound); }
+    val eb: err[gfx.Error] = gfx.renderer_timer_begin(g.r, ?g.clocks[c]);
+    if (sel eb.err) { ret eb; }
+    val eo: err[gfx.Error] = record_ops(g, step, bound);
+    if (sel eo.err) { ret eo; }
+    val ee: err[gfx.Error] = gfx.renderer_timer_end(g.r, ?g.clocks[c]);
+    if (sel ee.err) { ret ee; }
+    g.paid[c] = g.worked;
+    ret err[gfx.Error].ok{};
+}
+
 # record a frame's work: bring the pool level, step, count, and set the view
 #
 # call once a frame between renderer_begin_frame and the first pass, after
@@ -2467,7 +2600,7 @@ pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, 
         n          = n + 1;
     }
     g.stepped = n::u64 * radius::u64;
-    val eo: err[gfx.Error] = record_ops(g, step, bound);
+    val eo: err[gfx.Error] = timed_ops(g, step, bound);
     if (sel eo.err) { ret res[usize, gfx.Error].err{eo.err}; }
     if (g.going) {
         # the census, the reduction and the draw read the completed generation
@@ -2576,13 +2709,48 @@ pub fun draw(g: *Gpu, p: *gfx.Pass) {
 
 test pace_for__follows_the_refresh_interval_and_falls_back_to_sixty {
     val slow: Pace = pace_for(30.0);
-    if (slow.quick_us != 35999 || slow.slow_us != 47999) { ret 1; }
+    if (slow.interval_us != 33333 || slow.quick_us != 35999) { ret 1; }
     val base: Pace = pace_for(60.0);
-    if (base.quick_us != 18000 || base.slow_us != 24000) { ret 2; }
+    if (base.interval_us != 16667 || base.quick_us != 18000) { ret 2; }
     val fast: Pace = pace_for(144.0);
-    if (fast.quick_us != 7499 || fast.slow_us != 9999) { ret 3; }
+    if (fast.interval_us != 6944 || fast.quick_us != 7499) { ret 3; }
     val none: Pace = pace_for(0.0);
-    if (none.quick_us != base.quick_us || none.slow_us != base.slow_us) { ret 4; }
+    if (none.interval_us != base.interval_us || none.quick_us != base.quick_us) { ret 4; }
+    ret 0;
+}
+
+test fit_span__steps_what_the_budget_holds_at_the_cost {
+    # 8 ms at 50 ns a slot
+    if (fit_span(8000000, 50000) != 160000)  { ret 1; }
+    if (fit_span(8000000, 0) != MAX_SPAN)    { ret 2; }
+    if (fit_span(1000, 50000) != MIN_SPAN)   { ret 3; }
+    if (fit_span(0xffffffff, 1) != MAX_SPAN) { ret 4; }
+    ret 0;
+}
+
+test smooth__follows_a_dearer_cost_fast_and_a_cheaper_one_slowly {
+    if (smooth(0, 700) != 700) { ret 1; }
+    # half of a rise at once, a sixteenth of a fall
+    if (smooth(1000, 3000) != 2000) { ret 2; }
+    if (smooth(1600, 0) != 1500)    { ret 3; }
+    # a single frame over the cost moves it, however little over
+    if (smooth(1000, 1001) != 1001) { ret 4; }
+    if (smooth(1000, 1000) != 1000) { ret 5; }
+    ret 0;
+}
+
+test cut_span__is_in_proportion_to_any_overrun {
+    # a frame of twice the interval halves what it stepped
+    if (cut_span(10000, 33334, 16667) != 5000) { ret 1; }
+    # a frame barely over is cut barely
+    if (cut_span(10000, 18334, 16667) != 9090)   { ret 2; }
+    if (cut_span(10000, 16000, 16667) != 10000)  { ret 3; }
+    if (cut_span(100, 33334, 16667) != MIN_SPAN) { ret 4; }
+    ret 0;
+}
+
+test timers__outnumber_the_frames_in_flight {
+    if (TIMERS != gfx.MAX_FRAMES_IN_FLIGHT + 1) { ret 1; }
     ret 0;
 }
 
