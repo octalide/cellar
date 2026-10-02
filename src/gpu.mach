@@ -126,6 +126,7 @@ use std.collections.sort;
 use std.collections.vector;
 use std.collections.vector.Vector;
 use mem: std.memory;
+use std.sync.atomic;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -357,8 +358,9 @@ rec Write {
 # records every dispatch into the frame's one command buffer on the one queue
 # that thread submits, with no locking across threads. the host's pool may
 # change on the simulation thread whenever the GPU does not step the world
-# (cellar.runner), so a growth asked there touches nothing here: it is owed
-# (owe) and the next frame makes the buffers (flush). a growth is made at once
+# (cellar.runner), so a growth asked there touches nothing here but one atomic
+# word: it is owed (owe), and the next frame takes what is owed with an
+# exchange and makes the buffers (flush). a growth is made at once
 # (reserve) only while the GPU steps the world, when the render thread holds
 # the world for every change. while the GPU owns the pool, which it does only
 # while it steps the world, the render thread grows it on its own (make_room)
@@ -430,7 +432,8 @@ rec Pool {
 # front:    which of cells holds the world
 # stepping: the compute stages built, so the GPU steps
 # owed:     slots a growth asked for while the GPU does not step the world,
-#           which the next frame makes the buffers for
+#           which the next frame makes the buffers for, atomic: the one word
+#           another thread writes (owe)
 # drawn:    the sense the held pyramids were built with
 # serial:   the serial of the last step recorded; stamps equal to it are current
 # ring:     recent censuses
@@ -558,7 +561,7 @@ pub rec Gpu {
     hi:       usize;
     front:    usize;
     stepping: bool;
-    owed:     usize;
+    owed:     i64;
     drawn:    layout.Sense;
     serial:   u32;
     ring:     [8]Snap;
@@ -1286,9 +1289,9 @@ pub fun reserve(g: *Gpu, cap: usize) bool {
 # cap: slots the host's pool grows to
 # ret: false when cap is past the device's ceiling
 pub fun owe(g: *Gpu, cap: usize) bool {
-    if (cap <= g.p.cap || (g.reserved && cap <= g.next.cap)) { ret true; }
-    if (cap > g.slots)                                       { ret false; }
-    if (cap > g.owed)                                        { g.owed = cap; }
+    if (cap > g.slots) { ret false; }
+    var was: i64 = atomic.load(?g.owed);
+    for (cap::i64 > was && !atomic.cas(?g.owed, ?was, cap::i64)) {}
     ret true;
 }
 
@@ -1974,10 +1977,10 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
         sp.wide  = false;
         g.listed = false;
     }
-    if (g.owed > g.p.cap && !(g.reserved && g.owed <= g.next.cap) && !make_next(g, g.owed, true)) {
-        ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.overrun{(g.owed * space.CELLS * 4)::u64}}};
+    val owed: usize = atomic.exchange(?g.owed, 0)::usize;
+    if (owed > g.p.cap && !(g.reserved && owed <= g.next.cap) && !make_next(g, owed, true)) {
+        ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.overrun{(owed * space.CELLS * 4)::u64}}};
     }
-    g.owed = 0;
     val grew: bool = g.reserved;
     if (grew) {
         # the world moves into the larger buffers reserve made
