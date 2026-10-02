@@ -688,17 +688,17 @@ fun tree_step(s: *Sim, descend: bool) bool {
 }
 
 # the tree's step itself, which leaves the generation and the drawn pool alone,
-# collecting and trying once more when its table or the memory ceiling's
-# budget fills part way
+# collecting and trying once more when its table fills to its max part way
 #
 # the step is cancelled part way as it would pass the memory ceiling's budget
-# or the step ceiling's time (hashlife's cancel point), leaving the world as it
-# was and nothing for commit, and the run pauses at that ceiling. a step
-# cancelled by an ask is left to whoever asked.
+# even after a collection (hashlife.step), or the step ceiling's time
+# (hashlife's cancel point), leaving the world as it was and nothing for
+# commit, and the run pauses at that ceiling. a step cancelled by an ask is
+# left to whoever asked.
 # ---
 # s:       simulation on the tree
 # descend: a step the memory or step ceiling cancels is to be halved, so it
-#          neither retries nor pauses, and cancelled says so
+#          does not pause, and cancelled says so
 # ret:     whether the step was taken, for commit to count
 fun tree_advance(s: *Sim, descend: bool) bool {
     val t: *hashlife.Tree = ?s.tree;
@@ -709,23 +709,18 @@ fun tree_advance(s: *Sim, descend: bool) bool {
         if (!s.past[k]) { at = opt[time.Instant].some{hashlife.deadline_after(s.began.some, s.ceil.limit[k])}; }
     }
     hashlife.set_deadline(t, at);
-    var ok:    bool = hashlife.step(t);
-    val why:   u8   = hashlife.cancelled(t);
-    val halve: bool = descend && t.k > 0 && (why == hashlife.CANCEL_BUDGET || why == hashlife.CANCEL_TIME);
-    if (!ok && !halve && why != hashlife.CANCEL_TIME && why != hashlife.CANCEL_ASKED) {
+    var ok: bool = hashlife.step(t);
+    if (!ok && hashlife.cancelled(t) == hashlife.CANCEL_NONE) {
         # what earlier steps left behind may be what filled it
         hashlife.collect(t, hashlife.NONE);
         ok = hashlife.step(t);
     }
     if (ok) { ret true; }
-    val again: u8 = hashlife.cancelled(t);
-    if (again == hashlife.CANCEL_BUDGET) {
-        # what the cancelled step made is garbage
-        hashlife.collect(t, hashlife.NONE);
-        if (!halve) { trip(s, ceiling.MEMORY); }
-    }
-    or (again == hashlife.CANCEL_TIME && !halve) { trip(s, ceiling.STEP); }
-    or (again == hashlife.CANCEL_NONE)           { overflow(s); }
+    val why:   u8   = hashlife.cancelled(t);
+    val halve: bool = descend && t.k > 0 && (why == hashlife.CANCEL_BUDGET || why == hashlife.CANCEL_TIME);
+    if (why == hashlife.CANCEL_BUDGET && !halve) { trip(s, ceiling.MEMORY); }
+    or (why == hashlife.CANCEL_TIME && !halve)   { trip(s, ceiling.STEP); }
+    or (why == hashlife.CANCEL_NONE)             { overflow(s); }
     ret false;
 }
 
@@ -2837,6 +2832,32 @@ test ceiling__hashlife_growth_counts_the_copy_it_makes_against_the_budget {
         dnit(?t);
         mode = mode + 1;
     }
+    ret 0;
+}
+
+test hashlife__a_collection_keeps_the_results_the_world_reaches {
+    var a: allo.Allocator;
+    page.make(?a);
+    var t:  Sim;
+    val m0: err[allo.Error] = init(?t, ?a);
+    if (sel m0.err) { ret 1; }
+    paint(?t, -1, 0, 1);
+    paint(?t, 0, 0, 1);
+    paint(?t, 1, 0, 1);
+    if (!use_hashlife(?t, true)) { ret 2; }
+    val tr: *hashlife.Tree = ?t.tree;
+    # a blinker stepped by its period comes back to the root it left, whose
+    # result is then known, so a step makes nothing
+    hashlife.set_exponent(tr, 1);
+    if (!hashlife.step(tr) || !hashlife.step(tr)) { ret 3; }
+    val was: usize = tr.used;
+    if (!hashlife.step(tr) || tr.used != was) { ret 4; }
+    # a collection keeps that result though nothing else reaches it
+    hashlife.collect(tr, hashlife.NONE);
+    val kept: usize = tr.used;
+    if (!hashlife.step(tr) || tr.used != kept) { ret 5; }
+    if (hashlife.population(tr) != 3)          { ret 6; }
+    dnit(?t);
     ret 0;
 }
 
