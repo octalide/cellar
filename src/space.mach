@@ -36,6 +36,12 @@
 # whichever its budget runs within, and a chunk counted on the host asks for
 # the same. on the unbounded plane the GPU settles its pool itself instead,
 # and the pool here mirrors it (see Mirror and adopt).
+#
+# a grid bounded both ways whose chunks fit the pool's ceiling is held whole
+# instead (cover): every chunk on it is allocated and linked when the pool takes
+# the grid or is emptied, and stays, so settling neither surrounds nor frees
+# anything and no census need make room before a step. its census still counts
+# the live cells, and its empty chunks stay allocated.
 
 use cellar.layout;
 use cellar.topology;
@@ -50,6 +56,7 @@ use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
+use std.types.string.str;
 
 # side of a chunk in cells
 pub val SIDE: i64 = layout.SIDE::i64;
@@ -186,6 +193,8 @@ pub rec Mirror {
 # grid:      the grid the world runs on
 # rim:       every chunk along the grid's plane edge is kept, for a rule whose
 #            step reads the edge live (see keep_rim)
+# whole:     every chunk on the grid is held and stays, so nothing is allocated
+#            or freed while the world steps (cover)
 pub rec Space {
     a:         *allo.Allocator;
     cap:       usize;
@@ -216,6 +225,7 @@ pub rec Space {
     wide:      bool;
     grid:      topology.Grid;
     rim:       bool;
+    whole:     bool;
 }
 
 # one chunk's step, as a rule family's CPU step sees it
@@ -553,19 +563,59 @@ pub fun init(sp: *Space, a: *allo.Allocator, stepped: bool) err[allo.Error] {
     sp.wide  = false;
     sp.grid  = topology.open();
     sp.rim   = false;
+    sp.whole = false;
     ret alloc_arrays(sp, FIRST_CAP);
 }
 
 # hand the pool a mirror that must make room before it grows, and the ceiling
-# the mirror holds it to
+# the mirror holds it to (limit)
 # ---
 # sp:        the pool, holding no more than max_slots
 # m:         the mirror, already holding the pool's capacity
 # max_slots: the most slots the mirror can hold
 pub fun set_mirror(sp: *Space, m: Mirror, max_slots: usize) {
+    limit(sp, max_slots);
     sp.mirror   = m;
     sp.mirrored = true;
-    if (max_slots < sp.max_slots) { sp.max_slots = max_slots; }
+}
+
+# hold the pool to a ceiling of slots, where that is below its own, ahead of a
+# mirror that holds no more
+#
+# a grid held whole with more chunks than that lets them go: its empty chunks
+# are freed, its live ones counted and surrounded and its rim kept as on any
+# grid that does not fit, and the arrays shrink to what is left. a pool whose
+# chunks in use still do not fit keeps its capacity, which a mirror then
+# refuses.
+# ---
+# sp:    the pool
+# slots: the ceiling
+pub fun limit(sp: *Space, slots: usize) {
+    if (slots < sp.max_slots)                               { sp.max_slots = slots; }
+    if (!sp.whole || grid_chunks(?sp.grid) <= sp.max_slots) { ret; }
+    own(sp);
+    sp.whole = false;
+    var s: usize = 0;
+    for (s < sp.hi) {
+        if (used(sp, s)) {
+            val c:   *u32  = ?sp.cells[s * CELLS];
+            var any: bool  = false;
+            var i:   usize = 0;
+            for (!any && i < CELLS) {
+                any = c[i] != 0;
+                i   = i + 1;
+            }
+            if (any) { recount(sp, s); }
+            or       { release(sp, s); }
+        }
+        s = s + 1;
+    }
+    compact(sp);
+    settle(sp, sp.census, sp.hi, false);
+    var cap: usize = FIRST_CAP;
+    for (cap < sp.hi) { cap = cap * 2; }
+    if (cap > sp.max_slots)           { cap = sp.max_slots; }
+    if (cap < sp.cap && sp.hi <= cap) { alloc_arrays(sp, cap); }
 }
 
 # release every array
@@ -729,7 +779,8 @@ pub fun touch(sp: *Space, s: usize) {
     sp.dirty[s] = (sp.dirty[s] | DIRTY_CELLS) & ~DIRTY_MIP;
 }
 
-# free every slot, keeping the capacity
+# free every slot, keeping the capacity, and on a grid held whole hold every
+# chunk again, empty
 pub fun reset(sp: *Space) {
     own(sp);
     mem.zero[u32](sp.table, sp.hi * ENTRY);
@@ -743,6 +794,7 @@ pub fun reset(sp: *Space) {
     sp.live  = 0;
     sp.nfree = 0;
     sp.hi    = 0;
+    cover(sp);
 }
 
 # whether a slot's chunk is read through its links (cellar.layout.seamed)
@@ -826,8 +878,8 @@ pub fun mask(sp: *Space, s: usize) {
 }
 
 # put the world on a grid: the chunks off it are freed, every other chunk is
-# relinked and its cells off it cleared. the census is left as it was, for the
-# caller to recount.
+# relinked and its cells off it cleared, and a grid that fits the pool is held
+# whole (cover). the census is left as it was, for the caller to recount.
 # ---
 # sp: the pool
 # g:  the grid
@@ -848,6 +900,48 @@ pub fun set_grid(sp: *Space, g: topology.Grid) {
         s = s + 1;
     }
     compact(sp);
+    cover(sp);
+}
+
+# the chunks holding a cell of a grid bounded both ways, 0 for any other grid
+pub fun grid_chunks(g: *topology.Grid) usize {
+    if (!topology.finite(g)) { ret 0; }
+    val w: i64 = chunk_of(topology.left(g) + g.w - 1) - chunk_of(topology.left(g)) + 1;
+    val h: i64 = chunk_of(topology.top(g) + g.h - 1) - chunk_of(topology.top(g)) + 1;
+    ret (w * h)::usize;
+}
+
+# hold every chunk of a grid bounded both ways, when they fit the pool's
+# ceiling, so stepping it never allocates or frees one (whole)
+#
+# the pool grows once to the grid's chunks, the mirror making room first, each
+# chunk missing is allocated empty, and every slot is linked through the seams.
+# a grid with an unbounded axis or more chunks than the ceiling, or a growth
+# either side refuses, is left to allocate around its live cells.
+fun cover(sp: *Space) {
+    sp.whole = false;
+    val g: *topology.Grid = ?sp.grid;
+    val n: usize          = grid_chunks(g);
+    if (n == 0 || n > sp.max_slots || !grow(sp, n)) { ret; }
+    val cx0: i64 = chunk_of(topology.left(g));
+    val cx1: i64 = chunk_of(topology.left(g) + g.w - 1);
+    val cy0: i64 = chunk_of(topology.top(g));
+    val cy1: i64 = chunk_of(topology.top(g) + g.h - 1);
+    var cy:  i64 = cy0;
+    for (cy <= cy1) {
+        var cx: i64 = cx0;
+        for (cx <= cx1) {
+            if (find(sp, cx, cy) == NONE) { claim(sp, cx, cy); }
+            cx = cx + 1;
+        }
+        cy = cy + 1;
+    }
+    var s: usize = 0;
+    for (s < sp.hi) {
+        if (used(sp, s)) { link(sp, s); }
+        s = s + 1;
+    }
+    sp.whole = true;
 }
 
 # the word of the cell at (x, y) of a slot's frame, taken through the links
@@ -950,6 +1044,48 @@ pub fun alloc(sp: *Space, cx: i64, cy: i64) u32 {
     if (have != NONE) { ret have; }
     val bounded: bool = topology.bounded(?sp.grid);
     if (bounded && !topology.inside(?sp.grid, cx, cy)) { ret NONE; }
+    val t: u32 = claim(sp, cx, cy);
+    if (t == NONE) { ret NONE; }
+    val s: usize = t::usize;
+    val e: *u32  = ?sp.table[s * ENTRY];
+    if (bounded) {
+        link(sp, s);
+        var j: usize = 0;
+        for (j < 9) {
+            val n: u32 = e[j];
+            if (j != 4 && n != NONE && (e[layout.LINK_AT::usize + j] & layout.LINK_SEAM) == 0) {
+                sp.table[n::usize * ENTRY + 8 - j] = s::u32;
+                sp.dirty[n::usize]                 = sp.dirty[n::usize] | DIRTY_ENTRY;
+            }
+            j = j + 1;
+        }
+        if (seamed(sp, s)) { relink_near(sp, cx, cy); }
+        ret s::u32;
+    }
+    e[layout.EDGE_AT::usize] = layout.EDGE_WHOLE;
+    var k: usize = 0;
+    for (k < 9) {
+        e[layout.LINK_AT::usize + k] = layout.plain_link(k::u32);
+        val dx: i64 = (k % 3)::i64 - 1;
+        val dy: i64 = (k / 3)::i64 - 1;
+        var n:  u32 = s::u32;
+        if (k != 4) { n = find(sp, cx + dx, cy + dy); }
+        e[k] = n;
+        if (n != NONE && k != 4) {
+            sp.table[n::usize * ENTRY + 8 - k] = s::u32;
+            sp.dirty[n::usize]                 = sp.dirty[n::usize] | DIRTY_ENTRY;
+        }
+        k = k + 1;
+    }
+    ret s::u32;
+}
+
+# take a free slot for the chunk at (cx, cy), which does not exist yet, growing
+# the pool when none is free, and make it there empty and unlinked, marked dirty
+# ---
+# ret: the slot, or NONE when the pool is at its ceiling, or the allocator or
+#      the mirror refused to grow it
+fun claim(sp: *Space, cx: i64, cy: i64) u32 {
     var s: usize = 0;
     if (sp.nfree != 0) {
         sp.nfree = sp.nfree - 1;
@@ -981,36 +1117,6 @@ pub fun alloc(sp: *Space, cx: i64, cy: i64) u32 {
     if (sp.mips != nil) {
         mem.zero[u32](?sp.mips[s * MIP], MIP);
         sp.dirty[s] = sp.dirty[s] | DIRTY_MIP;
-    }
-
-    if (bounded) {
-        link(sp, s);
-        var j: usize = 0;
-        for (j < 9) {
-            val n: u32 = e[j];
-            if (j != 4 && n != NONE && (e[layout.LINK_AT::usize + j] & layout.LINK_SEAM) == 0) {
-                sp.table[n::usize * ENTRY + 8 - j] = s::u32;
-                sp.dirty[n::usize]                 = sp.dirty[n::usize] | DIRTY_ENTRY;
-            }
-            j = j + 1;
-        }
-        if (seamed(sp, s)) { relink_near(sp, cx, cy); }
-        ret s::u32;
-    }
-    e[layout.EDGE_AT::usize] = layout.EDGE_WHOLE;
-    var k: usize = 0;
-    for (k < 9) {
-        e[layout.LINK_AT::usize + k] = layout.plain_link(k::u32);
-        val dx: i64 = (k % 3)::i64 - 1;
-        val dy: i64 = (k / 3)::i64 - 1;
-        var n:  u32 = s::u32;
-        if (k != 4) { n = find(sp, cx + dx, cy + dy); }
-        e[k] = n;
-        if (n != NONE && k != 4) {
-            sp.table[n::usize * ENTRY + 8 - k] = s::u32;
-            sp.dirty[n::usize]                 = sp.dirty[n::usize] | DIRTY_ENTRY;
-        }
-        k = k + 1;
     }
     ret s::u32;
 }
@@ -1061,11 +1167,13 @@ pub fun compact(sp: *Space) {
     }
 }
 
-# give a chunk the chunks a halo mask asks for, and mark each asked for
+# give a chunk the chunks a halo mask asks for, and mark each asked for; a
+# pool held whole has every one already
 # ---
 # mask: a bit per chunk of the 5 by 5 block around it, its own ignored
 # ret:  false when the pool could not hold them
 pub fun surround_by(sp: *Space, s: usize, mask: u32) bool {
+    if (sp.whole)                   { ret true; }
     if (topology.bounded(?sp.grid)) { ret surround_grid(sp, s, mask); }
     val cx: i64   = slot_x(sp, s);
     val cy: i64   = slot_y(sp, s);
@@ -1145,10 +1253,11 @@ pub fun surround(sp: *Space, s: usize) bool {
 # step reads the edge from is kept, and stepped, as seamed chunks always are.
 # only a chunk within one of a chunk not whole on the grid is seamed, so the
 # rim is the two chunk rows and columns at each end of a plane bounded both ways.
+# a pool held whole keeps it already.
 # ---
 # ret: false when the pool could not hold them
 pub fun keep_rim(sp: *Space) bool {
-    if (!sp.rim) { ret true; }
+    if (!sp.rim || sp.whole) { ret true; }
     val g:   *topology.Grid = ?sp.grid;
     val cx0: i64            = chunk_of(topology.left(g));
     val cx1: i64            = chunk_of(topology.left(g) + g.w - 1);
@@ -1184,8 +1293,8 @@ fun current(sp: *Space, census: *u32, n: usize, s: usize) bool {
 # for. then, when frees is set, every chunk the census saw empty and cold that
 # no such mask asked for is freed; a chunk allocated since the census was taken
 # did not exist then, so it counts as empty. a pool keeping its rim gets it
-# and keeps it (keep_rim). the census is copied into the pool's own for the
-# slots it describes.
+# and keeps it (keep_rim). a pool held whole has nothing to give and frees
+# nothing. the census is copied into the pool's own for the slots it describes.
 # ---
 # sp:     the pool
 # census: CENSUS words per slot
@@ -1209,7 +1318,7 @@ pub fun settle(sp: *Space, census: *u32, n: usize, frees: bool) bool {
     }
     if (!keep_rim(sp)) { ok = false; }
     if (mine)          { c = sp.census; }
-    if (frees) {
+    if (frees && !sp.whole) {
         val had: usize = sp.nfree;
         s = 0;
         for (s < n && s < sp.hi) {
@@ -1404,6 +1513,46 @@ test settle__gives_a_live_chunk_only_the_neighbours_its_mask_asks_for {
     sp.census[s * CENSUS]     = 0;
     sp.census[s * CENSUS + 1] = 0;
     if (!settle(?sp, sp.census, sp.hi, true)) { ret 5; }
+    dnit(?sp);
+    ret 0;
+}
+
+test cover__holds_every_chunk_of_a_grid_that_fits_until_its_ceiling_drops {
+    var a: allo.Allocator;
+    page.make(?a);
+    var sp:   Space;
+    val made: err[allo.Error] = init(?sp, ?a, true);
+    if (sel made.err) { ret 1; }
+    # a 200 by 120 torus spans 4 by 2 chunks, every one linked across the seams
+    val t: res[topology.Grid, str] = topology.parse("T200,120");
+    if (sel t.err) { ret 2; }
+    set_grid(?sp, t.ok);
+    if (!sp.whole || sp.live != 8 || grid_chunks(?sp.grid) != 8) { ret 3; }
+    val w: u32 = find(?sp, -2, 0);
+    if (w == NONE || sp.table[w::usize * ENTRY + 3] != find(?sp, 1, 0)) { ret 4; }
+    # an empty census frees nothing, and a clear holds every chunk again
+    val serial: u32 = sp.serial;
+    if (!settle(?sp, sp.census, sp.hi, true) || sp.live != 8 || sp.serial != serial) { ret 5; }
+    reset(?sp);
+    if (!sp.whole || sp.live != 8) { ret 6; }
+    # a ceiling lowered below the grid lets go of every chunk but the live one
+    # and its halo, and shrinks the pool to it
+    sp.sense.live_mask                            = 1;
+    sp.sense.live_lo                              = 1;
+    sp.sense.live_hi                              = 1;
+    sp.sense.warm_mask                            = 1;
+    sp.cells[find(?sp, 0, 0)::usize * CELLS + 65] = 1;
+    limit(?sp, 7);
+    val o: u32 = find(?sp, 0, 0);
+    if (sp.whole || sp.live >= 8 || sp.cap != 7 || o == NONE || sp.cells[o::usize * CELLS + 65] != 1) { ret 7; }
+    # a grid past the ceiling, or with an unbounded axis, is not held whole
+    set_grid(?sp, t.ok);
+    if (sp.whole) { ret 10; }
+    sp.max_slots = HOST_SLOTS;
+    val p: res[topology.Grid, str] = topology.parse("P200,0");
+    if (sel p.err) { ret 8; }
+    set_grid(?sp, p.ok);
+    if (sp.whole || grid_chunks(?sp.grid) != 0) { ret 9; }
     dnit(?sp);
     ret 0;
 }
