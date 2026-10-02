@@ -250,7 +250,11 @@ or at `speed` generations a second. The worlds:
   step shader.
 - `torus`: a 512 by 512 random soup filling a 512 by 512 torus (`:T512,512`).
 - `plane`: Gosper's glider gun on a 1024 by 512 plane (`:P1024,512`), its
-  gliders dying at the edge. These two measure a bounded grid.
+  gliders dying at the edge.
+- `box`: a glider on an 8192 by 8192 torus (`:T8192,8192`), a sparse world in
+  a large box.
+
+The last three measure a bounded grid.
 
 The other worlds run Life with its eight weights widened to the radius, one by
 default, so a wider radius costs its spread but reads the same eight cells.
