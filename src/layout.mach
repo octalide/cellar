@@ -14,6 +14,9 @@
 pub val SIDE: u32 = 64;
 # cells in a chunk
 pub val CELLS: u32 = 4096;
+# the farthest any rule may reach in a generation: a step reads the 3 by 3
+# block of chunks around its own, so a cell reads no further than a chunk away
+pub val REACH_MAX: u32 = SIDE;
 # page-table words per slot (see Meta)
 pub val ENTRY: u32 = 22;
 # the entry's word of the slot's incarnation, zero while the slot is free
@@ -103,6 +106,50 @@ pub val EXTENT_QUADS: u32 = 24;
 # the quadrant bit of the cell at (x, y) inside its chunk
 pub fun quadrant(x: u32, y: u32) u32 {
     ret 1 << ((y / (SIDE / 2)) * 2 + x / (SIDE / 2));
+}
+
+# a live chunk's halo, the chunks around it its live cells may spread into
+# before the pool is next settled, is a mask with a bit per chunk of the 5 by 5
+# block around it, row-major with the chunk itself at HALO_SELF
+pub val HALO_SIDE: u32 = 5;
+pub val HALO_SELF: u32 = 12;
+# the most cells of spread a halo holds, every chunk two away
+pub val SPREAD_MAX: u32 = 2 * SIDE;
+
+# the halo row or column bits, the chunk's own at bit 2, a live cell in the
+# low or the high half of its chunk along one axis needs to spread span cells
+# either way: the chunks from its half's first cell less span to its last cell
+# plus span, so a chunk left out is more than span cells away
+fun halo_axis(high: u32, span: u32) u32 {
+    var s: u32 = span;
+    if (s > SPREAD_MAX) { s = SPREAD_MAX; }
+    val first: u32 = high * (SIDE / 2) + SPREAD_MAX;
+    val lo:    u32 = (first - s) / SIDE;
+    var hi:    u32 = (first + SIDE / 2 - 1 + s) / SIDE;
+    if (hi >= HALO_SIDE) { hi = HALO_SIDE - 1; }
+    ret ((2 << hi) - 1) & ~((1 << lo) - 1);
+}
+
+# the halo mask for live cells in the quadrants of a chunk quads names
+# (quadrant), which holds span cells of spread, at most SPREAD_MAX. a span of
+# half a chunk asks only for the chunks the live cells lean toward, and one of
+# a chunk for every adjacent chunk
+pub fun halo(quads: u32, span: u32) u32 {
+    var m: u32 = 0;
+    var q: u32 = 0;
+    for (q < 4) {
+        if (((quads >> q) & 1) != 0) {
+            val xs: u32 = halo_axis(q & 1, span);
+            val ys: u32 = halo_axis(q >> 1, span);
+            var r:  u32 = 0;
+            for (r < HALO_SIDE) {
+                if (((ys >> r) & 1) != 0) { m = m | (xs << (r * HALO_SIDE)); }
+                r = r + 1;
+            }
+        }
+        q = q + 1;
+    }
+    ret m & ~(1 << HALO_SELF);
 }
 
 # the extent word for live cells spanning columns x0 to x1 and rows y0 to y1,
@@ -363,12 +410,14 @@ pub val CTL_TOP: u32 = 5;
 pub val CTL_CAP: u32 = 6;
 # the pass header, which the host resets before every pass: slots claimed so
 # far, the pass id (never 0), the serial of the step that left the front, the
-# generations recorded before the pass, and the frame's first step after it
+# generations recorded before the pass, the frame's first step after it, and
+# the cells of spread the halo it leaves must hold (halo)
 pub val CTL_FRESH: u32 = 8;
 pub val CTL_PASS:  u32 = 9;
 pub val CTL_NOW:   u32 = 10;
 pub val CTL_GENS:  u32 = 11;
 pub val CTL_NEXT:  u32 = 12;
+pub val CTL_SPAN:  u32 = 13;
 # the indirect arguments of the settle stage, one workgroup per 64 slots
 # claimed, and of the clear stage, one per settled slot, three words each
 pub val ARGS_SETTLE: u32 = 16;
