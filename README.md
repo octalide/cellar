@@ -207,6 +207,38 @@ ceilings, which `--max-population`, `--max-chunks`, `--max-memory` (MiB) and
 `--max-step-ms` set to a limit or `off` for that run. A run that crosses one
 stops there, writes the world as it stood, says which and exits with status 3.
 
+## Bench
+
+`cellar --bench <gpu|cpu> <world> [seconds [radius [speed]]]` runs a world on
+that engine for ten seconds or the seconds given, after a warmup of 30 frames,
+prints one line and exits, leaving the saved settings alone. It runs uncapped,
+or at `speed` generations a second. The worlds:
+
+- `dense`: a 512 by 512 random soup.
+- `sparse`: 400 small soups a thousand cells apart.
+- `gun`: Gosper's glider gun, growing a glider at a time.
+- `footprint`: a live 1024 by 1024 square under a vote over the whole (2r+1)
+  by (2r+1) square at the radius, centre included: a dead cell is born where
+  most of its square is live, and a live one survives where more than a third
+  is. Every weight is nonzero, so each cell reads its whole footprint, and the
+  square holds still once the tips of its corners fall, so each generation
+  steps the same chunks in full. On the unbounded plane the GPU allocates its
+  own chunks, so no census budget bounds the generations, and at wider radii
+  the rate is the step stage's. This is the world for measuring a change to a
+  step shader.
+
+The other worlds run Life with its eight weights widened to the radius, one by
+default, so a wider radius costs its spread but reads the same eight cells.
+
+The line reads `bench <engine> radius <r> chunks <n> population <n> gens/s <n>
+step us <n> cells/s <n> frame us <n>`: chunks and population as the run ended,
+generations a second, the time a generation took on average, the cells of the
+chunks the pool held stepped a second, and the time a frame took on average.
+
+`cellar --bench <gpu|cpu> pause [seconds]` runs Seeds from a soup, pauses it
+after each run of that long and resumes it, and prints how long each pause took
+to apply. With `--engine hashlife` it runs on the tree.
+
 ## Install
 
 Release archives for linux (x86-64 and arm64), windows (x86-64) and macOS
