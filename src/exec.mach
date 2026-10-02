@@ -210,8 +210,10 @@ fun open(a: *app.App, s: *sim.Sim, d: *Deps, path: str) Change {
 }
 
 # put a pattern on the clipboard as RLE, with its rule, for the frame to hand
-# the window
+# the window. RLE holds states, which other apps read, so a pattern holding
+# words is remembered beside the text, and a paste of that same text takes it
 fun clip(a: *app.App, d: *Deps, p: *pattern.Pattern) bool {
+    pattern.resize(?a.copied, 0, 0);
     var f: format.Format;
     if (!formats.by_id("rle", ?f)) { ret false; }
     vector.clear[u8](?a.clip);
@@ -219,7 +221,26 @@ fun clip(a: *app.App, d: *Deps, p: *pattern.Pattern) bool {
     if (sel enc.err) { ret false; }
     val end: res[usize, allo.Error] = vector.push[u8](?a.clip, 0);
     if (sel end.err) { ret false; }
+    if (pattern.exact(p)) {
+        var kept: pattern.Pattern;
+        val made: err[allo.Error] = pattern.clone(?kept, a.alloc, p);
+        if (sel made.ok) {
+            pattern.dnit(?a.copied);
+            a.copied = kept;
+        }
+    }
     a.clip_ready = true;
+    ret true;
+}
+
+# whether clipboard text is what clip last wrote for a pattern it remembered
+fun recalled(a: *app.App, c: *command.Paste) bool {
+    if (!pattern.exact(?a.copied) || a.clip.len != c.text.len + 1) { ret false; }
+    var i: usize = 0;
+    for (i < c.text.len) {
+        if (a.clip.data[i] != c.text.data[i]) { ret false; }
+        i = i + 1;
+    }
     ret true;
 }
 
@@ -255,15 +276,19 @@ fun take(a: *app.App, s: *sim.Sim, d: *Deps, b: space.Box, cut: bool) {
 }
 
 # read clipboard text as a pattern and make it the stamp, taking its rule when
-# asked. the stamp only changes when the whole text is a pattern that fits
+# asked. the stamp only changes when the whole text is a pattern that fits.
+# text cellar wrote for a pattern holding words is that pattern, words and all
 fun paste(a: *app.App, s: *sim.Sim, d: *Deps, c: *command.Paste) Change {
     var p:    pattern.Pattern;
-    val made: err[allo.Error] = pattern.init(?p, a.alloc, 0, 0, "clipboard");
+    var made: err[allo.Error] = err[allo.Error].ok{};
+    if (recalled(a, c)) { made = pattern.clone(?p, a.alloc, ?a.copied); }
+    or                  { made = pattern.init(?p, a.alloc, 0, 0, "clipboard"); }
     if (sel made.err) {
         app.say(a, "out of memory");
         ret Change.none{};
     }
-    val got: err[persist.Error] = persist.pattern_from(d.a, ?p, c.text.data, c.text.len);
+    var got: err[persist.Error] = err[persist.Error].ok{};
+    if (!pattern.exact(?p)) { got = persist.pattern_from(d.a, ?p, c.text.data, c.text.len); }
     if (sel got.err) {
         pattern.dnit(?p);
         if (sel got.err.format) {
@@ -827,8 +852,78 @@ test run__pastes_a_pattern_as_the_stamp_and_a_copy_pastes_back_exactly {
         i = i + 1;
     }
     if (pattern.get(?ap.custom, 1, 1) != 1 || pattern.get(?ap.custom, 2, 3) != 1) { ret 15; }
+    # a rule of states alone copies states, as the clipboard does
+    if (pattern.exact(?copied)) { ret 16; }
 
     pattern.dnit(?copied);
+    app.dnit(?ap);
+    sim.dnit(?s);
+    ret 0;
+}
+
+test run__a_lenia_selection_copies_pastes_and_stamps_back_its_exact_values {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    var ap: app.App;
+    app.init(?ap);
+    val shown: err[format.Error] = app.attach(?ap, ?a);
+    if (sel shown.err) { ret 1; }
+    var d: Deps                = Deps{a: ?a};
+    val r: res[rule.Rule, str] = rule.parse(rule.sample(4, 0));
+    if (sel r.err)               { ret 1; }
+    if (!sim.set_rule(?s, r.ok)) { ret 1; }
+
+    # values between the 255ths, and two too small to have a state but 0
+    var vals: [12]u32 = [12]u32{1, 12345, 5592405, 16777216, 0, 7, 8388608, 0, 3, 9999999, 0, 16777215};
+    if (!sim.edit_begin(?s, 0, 0, 4, 3)) { ret 2; }
+    var y: usize = 0;
+    for (y < 3) {
+        sim.edit_words(?s, 0, y::i64, 4, ?vals[y * 4]);
+        y = y + 1;
+    }
+    if (!sim.edit_end(?s)) { ret 2; }
+    app.select(?ap, 0, 0, 3, 2);
+    app.area(?ap, command.AREA_COPY);
+    run(?ap, ?s, ?d);
+    if (!pattern.exact(?ap.custom) || ap.custom.w != 4 || ap.custom.h != 3) { ret 3; }
+    if (!ap.clip_ready)                                                     { ret 3; }
+
+    # the clipboard's text, pasted back, is the copy, words and all
+    pattern.clear(?ap.custom);
+    app.paste(?ap, clipboard(?ap, ap.clip.data::str), false);
+    run(?ap, ?s, ?d);
+    if (!pattern.exact(?ap.custom) || ap.custom.w != 4 || ap.custom.h != 3) { ret 6; }
+
+    # stamped as copied with its top-left at (100, 50), and turned a quarter
+    # clockwise with its top-left at (200, 50)
+    app.stamp(?ap, ?ap.custom, 0, 102, 51);
+    app.stamp(?ap, ?ap.custom, 1, 201, 52);
+    run(?ap, ?s, ?d);
+    y = 0;
+    for (y < 3) {
+        var x: usize = 0;
+        for (x < 4) {
+            val c: u32 = vals[y * 4 + x];
+            if (sim.cell(?s, 100 + x::i64, 50 + y::i64) != c) { ret 4; }
+            # turned clockwise, the old (x, y) lies at (h - 1 - y, x)
+            if (sim.cell(?s, 200 + (2 - y)::i64, 50 + x::i64) != c) { ret 5; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+
+    # text another app changed is read as the RLE it is, in 255ths
+    var other: [512]u8;
+    var o:     usize = text.buf_str(?other[0], 0, "#C edited\n");
+    o        = text.buf_str(?other[0], o, ap.clip.data::str);
+    other[o] = 0;
+    app.paste(?ap, clipboard(?ap, ?other[0]), false);
+    run(?ap, ?s, ?d);
+    if (pattern.exact(?ap.custom) || ap.custom.w != 4) { ret 7; }
+
     app.dnit(?ap);
     sim.dnit(?s);
     ret 0;

@@ -6,7 +6,15 @@
 # readers fill cells through set or a whole row at a time, writers walk a row as
 # runs of equal states with run, and place writes a pattern onto the unbounded
 # world through the simulation's bulk edit, so a large pattern costs one edit.
+#
+# a pattern may hold its cells' words beside their states: the words of the
+# rule it names, a continuous rule's exact values (rule.Caps), which its states
+# only approximate. capture reads them from a world whose rule is continuous,
+# and place writes them back exactly onto a world whose rule reads them alike
+# (rule.alike), and the states otherwise. a rule of states alone never gives a
+# pattern words, so its patterns hold states as they always have.
 
+use rules: cellar.rule;
 use cellar.sim;
 use allo: std.allocator;
 use std.allocator.page;
@@ -31,6 +39,8 @@ pub val MAX_CELLS: usize = 1073741824;
 # ---
 # a:        allocator backing the cells and text; nil before init
 # cells:    row-major states, length w*h, nil when empty
+# words:    row-major words of the rule the pattern names, length w*h, nil
+#           when it holds states alone
 # w:        width in cells
 # h:        height in cells
 # x:        the world column the source placed the top-left cell at, 0 when it gave none
@@ -42,6 +52,7 @@ pub val MAX_CELLS: usize = 1073741824;
 pub rec Pattern {
     a:        *allo.Allocator;
     cells:    *u8;
+    words:    *u32;
     w:        usize;
     h:        usize;
     x:        i64;
@@ -78,6 +89,7 @@ fun assign(a: *allo.Allocator, o: *OwnedString, s: str) err[allo.Error] {
 pub fun init(p: *Pattern, a: *allo.Allocator, w: usize, h: usize, name: str) err[allo.Error] {
     p.a        = a;
     p.cells    = nil;
+    p.words    = nil;
     p.w        = 0;
     p.h        = 0;
     p.seen     = 0;
@@ -100,6 +112,7 @@ pub fun init(p: *Pattern, a: *allo.Allocator, w: usize, h: usize, name: str) err
 pub fun dnit(p: *Pattern) {
     if (p.a == nil)     { ret; }
     if (p.cells != nil) { allo.deallocate[u8](p.a, p.cells, p.w * p.h); }
+    drop_words(p);
     string.owned_release(?p.name);
     string.owned_release(?p.rule);
     string.owned_release(?p.comments);
@@ -115,7 +128,8 @@ pub fun holds(w: u64, h: u64) bool {
     ret w == 0 || h <= MAX_CELLS::u64 / w;
 }
 
-# give a pattern new dimensions with every cell dead, keeping its metadata
+# give a pattern new dimensions with every cell dead, holding states alone,
+# keeping its metadata
 # ---
 # p:   pattern
 # w:   new width, see holds
@@ -130,11 +144,35 @@ pub fun resize(p: *Pattern, w: usize, h: usize) err[allo.Error] {
         fresh = r.ok;
     }
     if (p.cells != nil) { allo.deallocate[u8](p.a, p.cells, p.w * p.h); }
+    drop_words(p);
     p.cells = fresh;
     p.w     = w;
     p.h     = h;
     p.seen  = 0;
     ret err[allo.Error].ok{};
+}
+
+# whether a pattern holds its cells' words beside their states
+pub fun exact(p: *Pattern) bool {
+    ret p.words != nil;
+}
+
+# give a pattern words, every one 0, the quiescent background, unless it has them
+# ---
+# p:   pattern, whose cells are all dead
+# ret: ok, or the allocator's refusal, leaving p as it was
+pub fun hold_words(p: *Pattern) err[allo.Error] {
+    if (p.words != nil || p.w * p.h == 0) { ret err[allo.Error].ok{}; }
+    val r: res[*u32, allo.Error] = allo.zallocate[u32](p.a, p.w * p.h);
+    if (sel r.err) { ret err[allo.Error].err{r.err}; }
+    p.words = r.ok;
+    ret err[allo.Error].ok{};
+}
+
+# let a pattern hold states alone
+fun drop_words(p: *Pattern) {
+    if (p.words != nil) { allo.deallocate[u32](p.a, p.words, p.w * p.h); }
+    p.words = nil;
 }
 
 # copy a pattern's cells, dimensions and metadata into dst
@@ -147,6 +185,14 @@ pub fun clone(dst: *Pattern, a: *allo.Allocator, src: *Pattern) err[allo.Error] 
     val e: err[allo.Error] = init(dst, a, src.w, src.h, name(src));
     if (sel e.err)        { ret e; }
     if (src.cells != nil) { mem.copy[u8](dst.cells, src.cells, src.w * src.h); }
+    if (src.words != nil) {
+        val held: err[allo.Error] = hold_words(dst);
+        if (sel held.err) {
+            dnit(dst);
+            ret held;
+        }
+        mem.copy[u32](dst.words, src.words, src.w * src.h);
+    }
     dst.x = src.x;
     dst.y = src.y;
     val r: err[allo.Error] = set_rule(dst, rule(src));
@@ -197,6 +243,7 @@ pub fun set_comments(p: *Pattern, s: str) err[allo.Error] {
 # p: pattern to clear
 pub fun clear(p: *Pattern) {
     if (p.cells != nil) { mem.zero[u8](p.cells, p.w * p.h); }
+    if (p.words != nil) { mem.zero[u32](p.words, p.w * p.h); }
     p.seen = 0;
 }
 
@@ -210,13 +257,33 @@ pub fun get(p: *Pattern, x: usize, y: usize) u8 {
     ret p.cells[y * p.w + x];
 }
 
-# write state v to the cell at (x, y)
+# write state v to the cell at (x, y). a state alone has no word, so a pattern
+# holding words holds states alone from then on
 # ---
 # p: pattern
 # x: column in [0, w)
 # y: row in [0, h)
 # v: new state
 pub fun set(p: *Pattern, x: usize, y: usize, v: u8) {
+    drop_words(p);
+    p.cells[y * p.w + x] = v;
+    p.seen               = 0;
+}
+
+# the word at (x, y) of a pattern holding words. caller guarantees x < w and y < h
+pub fun word(p: *Pattern, x: usize, y: usize) u32 {
+    ret p.words[y * p.w + x];
+}
+
+# write word c, which holds state v, to the cell at (x, y) of a pattern holding words
+# ---
+# p: pattern, exact
+# x: column in [0, w)
+# y: row in [0, h)
+# c: the word, of the rule the pattern names
+# v: the state it holds
+pub fun set_word(p: *Pattern, x: usize, y: usize, c: u32, v: u8) {
+    p.words[y * p.w + x] = c;
     p.cells[y * p.w + x] = v;
     p.seen               = 0;
 }
@@ -240,11 +307,38 @@ pub fun run(p: *Pattern, x: usize, y: usize, n: *usize) u8 {
     ret v;
 }
 
+# the word at (x, y) of a pattern holding words, and how many cells from there
+# along the row hold it too
+# ---
+# p:   pattern, exact
+# x:   column in [0, w)
+# y:   row in [0, h)
+# n:   receives the run's length, at least 1, reaching no further than the row's end
+# ret: the word the run holds
+pub fun run_word(p: *Pattern, x: usize, y: usize, n: *usize) u32 {
+    val row: *u32  = ?p.words[y * p.w];
+    val c:   u32   = row[x];
+    var i:   usize = x + 1;
+    for (i < p.w && row[i] == c) { i = i + 1; }
+    @n = i - x;
+    ret c;
+}
+
+# whether a pattern's words read alike under the world's rule, so place writes them
+fun fits_words(s: *sim.Sim, p: *Pattern) bool {
+    if (p.words == nil || sim.flipped(s)) { ret false; }
+    val named: res[rules.Rule, str] = rules.parse(rule(p));
+    if (sel named.err) { ret false; }
+    ret rules.alike(?named.ok, ?s.rule);
+}
+
 # write a pattern onto the world with its top-left at (ox, oy), in one bulk edit
 #
 # runs of live cells are written as runs. with replace the pattern's dead cells
 # erase what they cover, otherwise they leave the world untouched and the
-# pattern overlays it. a state is written as live whatever its value.
+# pattern overlays it. a state is written as live whatever its value. a
+# pattern's words are written as they are where the world's rule reads them
+# alike, and a cell whose word is not 0 is not dead though its state is.
 # ---
 # s:       simulation to write onto
 # p:       pattern to place
@@ -253,15 +347,26 @@ pub fun run(p: *Pattern, x: usize, y: usize, n: *usize) u8 {
 # replace: dead pattern cells erase
 # ret:     false when the edit could not be made or the pool could not hold it all
 pub fun place(s: *sim.Sim, p: *Pattern, ox: i64, oy: i64, replace: bool) bool {
-    if (p.w == 0 || p.h == 0)                                     { ret true; }
+    if (p.w == 0 || p.h == 0) { ret true; }
+    val words: bool = fits_words(s, p);
     if (!sim.edit_begin(s, ox, oy, ox + p.w::i64, oy + p.h::i64)) { ret false; }
     var y: usize = 0;
     for (y < p.h) {
         var x: usize = 0;
         for (x < p.w) {
             var n: usize = 0;
-            val v: u8    = run(p, x, y, ?n);
-            if (v != 0 || replace) { sim.edit_run(s, ox + x::i64, oy + y::i64, n, v); }
+            if (words) {
+                # a stretch of cells that are not 0, or the rest of the row
+                var e: usize = x;
+                for (e < p.w && (replace || word(p, e, y) != 0)) { e = e + 1; }
+                if (e > x) { sim.edit_words(s, ox + x::i64, oy + y::i64, e - x, ?p.words[y * p.w + x]); }
+                n = e - x;
+                if (n == 0) { run_word(p, x, y, ?n); }
+            }
+            or {
+                val v: u8 = run(p, x, y, ?n);
+                if (v != 0 || replace) { sim.edit_run(s, ox + x::i64, oy + y::i64, n, v); }
+            }
             x = x + n;
         }
         y = y + 1;
@@ -272,7 +377,9 @@ pub fun place(s: *sim.Sim, p: *Pattern, ox: i64, oy: i64, replace: bool) bool {
 # read the cells of [x0, x1) by [y0, y1) into a pattern, the reverse of place
 #
 # the pattern takes the area's size and its origin, keeping its metadata, and
-# the cells are read through the simulation's open read, which must cover the area.
+# the cells are read through the simulation's open read, which must cover the
+# area. under a continuous rule the words are read too, and the pattern names
+# the rule they are read under.
 # ---
 # p:   pattern to fill, initialized
 # s:   simulation with a read open over the area
@@ -294,9 +401,19 @@ pub fun capture(p: *Pattern, s: *sim.Sim, x0: i64, y0: i64, x1: i64, y1: i64) er
     if (sel e.err) { ret e; }
     p.x = x0;
     p.y = y0;
+    val words: bool = rules.caps(?s.rule).continuous && !sim.flipped(s);
+    if (words) {
+        var text:  [rules.FORMAT_MAX + 1]u8;
+        val named: err[allo.Error] = set_rule(p, rules.format(?s.rule, ?text[0]));
+        if (sel named.err) { ret named; }
+        val held: err[allo.Error] = hold_words(p);
+        if (sel held.err) { ret held; }
+    }
     var y: usize = 0;
     for (y < h) {
-        if (!sim.read_run(s, x0, y0 + y::i64, w, ?p.cells[y * w])) {
+        var ok: bool = sim.read_run(s, x0, y0 + y::i64, w, ?p.cells[y * w]);
+        if (ok && words) { ok = sim.read_words(s, x0, y0 + y::i64, w, ?p.words[y * w]); }
+        if (!ok) {
             resize(p, 0, 0);
             ret err[allo.Error].err{allo.Error.invalid{}};
         }
@@ -344,6 +461,11 @@ pub fun height(p: *Pattern, o: u8) usize {
 # y:   row in [0, height(p, o))
 # ret: the state, 0 when dead
 pub fun get_oriented(p: *Pattern, o: u8, x: usize, y: usize) u8 {
+    ret p.cells[oriented(p, o, x, y)];
+}
+
+# the index into a pattern's cells of (x, y) of it laid down in orientation o
+fun oriented(p: *Pattern, o: u8, x: usize, y: usize) usize {
     # undo the turns to find the cell in the mirrored pattern, then undo the mirror
     val t:  u8    = o & ORIENT_TURNS;
     var sx: usize = x;
@@ -361,10 +483,10 @@ pub fun get_oriented(p: *Pattern, o: u8, x: usize, y: usize) u8 {
         sy = x;
     }
     if ((o & ORIENT_FLIP) != 0) { sx = p.w - 1 - sx; }
-    ret get(p, sx, sy);
+    ret sy * p.w + sx;
 }
 
-# make dst the pattern p laid down in orientation o, with p's metadata
+# make dst the pattern p laid down in orientation o, with p's metadata and words
 # ---
 # dst: pattern to initialize; it owns the copy until dnit
 # a:   allocator for the copy
@@ -381,11 +503,20 @@ pub fun orient(dst: *Pattern, a: *allo.Allocator, p: *Pattern, o: u8) err[allo.E
         dnit(dst);
         ret r;
     }
+    if (p.words != nil) {
+        val held: err[allo.Error] = hold_words(dst);
+        if (sel held.err) {
+            dnit(dst);
+            ret held;
+        }
+    }
     var y: usize = 0;
     for (y < h) {
         var x: usize = 0;
         for (x < w) {
-            set(dst, x, y, get_oriented(p, o, x, y));
+            val i: usize = oriented(p, o, x, y);
+            dst.cells[y * w + x] = p.cells[i];
+            if (p.words != nil) { dst.words[y * w + x] = p.words[i]; }
             x = x + 1;
         }
         y = y + 1;
