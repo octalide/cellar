@@ -895,7 +895,7 @@ fun tree_load(a: *allo.Allocator, text: str, dx: i64, dy: i64, runs: bool, out: 
     var src: adapt.WorldSource;
     var got: format.Info;
     format.info_init(?got, a);
-    val w: res[*format.Source, format.Error] = adapt.world_source(?src, ?s, a);
+    val w: res[*format.Source, format.Error] = adapt.world_source(?src, ?s, a, f.words);
     if (sel w.err) { ok = false; }
     if (sel w.ok) {
         if (ok) {
@@ -1042,7 +1042,7 @@ fun save_world(a: *allo.Allocator, s: *sim.Sim, reads: *allo.Allocator, out: *Ve
     format.info_init(?info, a);
     var ws:  adapt.WorldSource;
     var r:   err[format.Error]                 = err[format.Error].ok{};
-    val src: res[*format.Source, format.Error] = adapt.world_source(?ws, s, reads);
+    val src: res[*format.Source, format.Error] = adapt.world_source(?ws, s, reads, f.words);
     if (sel src.err) { r = err[format.Error].err{src.err}; }
     if (sel src.ok)  { r = save(a, ?f, src.ok, ?info, out); }
     adapt.world_source_dnit(?ws);
@@ -1415,7 +1415,7 @@ test save__a_lenia_world_writes_its_255ths_and_a_two_state_format_refuses_it {
         var info: format.Info;
         format.info_init(?info, ?a);
         var out: Vector[u8]                        = vector.init[u8](?a);
-        val w:   res[*format.Source, format.Error] = adapt.world_source(?src, ?s, ?a);
+        val w:   res[*format.Source, format.Error] = adapt.world_source(?src, ?s, ?a, f.words);
         if (sel w.err) { ret 3; }
         var e: err[format.Error] = err[format.Error].ok{};
         if (sel w.ok) { e = save(?a, ?f, w.ok, ?info, ?out); }
@@ -1625,5 +1625,71 @@ test rlw__writes_a_pattern_of_states_as_its_rules_words_and_refuses_bad_files {
     vector.dnit[u8](?out);
     pattern.dnit(?p);
     pattern.dnit(?q);
+    ret 0;
+}
+
+test rlw__a_lenia_world_run_on_saves_and_loads_back_every_word {
+    var a: allo.Allocator;
+    page.make(?a);
+    val lenia: str                 = "R=13,T=10,b=[1],m=0.15,s=0.015,kn=1,gn=1";
+    val r:     res[rule.Rule, str] = rule.parse(lenia);
+    if (sel r.err) { ret 1; }
+    var f: format.Format;
+    if (!by_id("rlw", ?f)) { ret 1; }
+    var s:  sim.Sim;
+    var t:  sim.Sim;
+    val ms: err[allo.Error] = sim.init(?s, ?a);
+    val mt: err[allo.Error] = sim.init(?t, ?a);
+    if (sel ms.err || sel mt.err) { ret 1; }
+    sim.set_rule(?s, r.ok);
+    sim.set_rule(?t, r.ok);
+    seed_orbium(?s);
+    var g: usize = 0;
+    for (g < 20) {
+        sim.step(?s);
+        g = g + 1;
+    }
+    # a value too small to have a state but 0, in a chunk of its own
+    var speck: u32 = 7;
+    if (!sim.edit_begin(?s, 100, 90, 101, 91)) { ret 1; }
+    sim.edit_words(?s, 100, 90, 1, ?speck);
+    if (!sim.edit_end(?s)) { ret 1; }
+
+    var info: format.Info;
+    format.info_init(?info, ?a);
+    format.set_str(?a, ?info.rule, lenia);
+    var ws:  adapt.WorldSource;
+    var out: Vector[u8]                        = vector.init[u8](?a);
+    var e:   err[format.Error]                 = err[format.Error].ok{};
+    val src: res[*format.Source, format.Error] = adapt.world_source(?ws, ?s, ?a, f.words);
+    if (sel src.err) { ret 2; }
+    if (sel src.ok)  { e = save(?a, ?f, src.ok, ?info, ?out); }
+    adapt.world_source_dnit(?ws);
+    format.info_dnit(?info);
+    if (sel e.err) { ret 3; }
+
+    var sink: adapt.WorldSink;
+    var got:  format.Info;
+    format.info_init(?got, ?a);
+    val l: err[format.Error] = load(?a, ?f, out.data, out.len, adapt.world_sink(?sink, ?t, 0, 0), ?got);
+    format.info_dnit(?got);
+    if (sel l.err) { ret 4; }
+    # every word comes back, the speck among them
+    var faint: usize = 0;
+    var y:     i64   = -64;
+    for (y < 128) {
+        var x: i64 = -64;
+        for (x < 128) {
+            val c: u32 = sim.cell(?s, x, y);
+            if (sim.cell(?t, x, y) != c)               { ret 5; }
+            if (c != 0 && rule.state(?s.rule, c) == 0) { faint = faint + 1; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    if (faint != 1 || sim.cell(?t, 100, 90) != speck) { ret 6; }
+    vector.dnit[u8](?out);
+    sim.dnit(?s);
+    sim.dnit(?t);
     ret 0;
 }

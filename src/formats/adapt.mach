@@ -409,7 +409,8 @@ pub fun pattern_source(s: *PatternSource, p: *pattern.Pattern) *format.Source {
     ret ?s.source;
 }
 
-# a chunk holding a state but 0, where a WorldSource reads it
+# a chunk holding a state but 0, or in word mode a word but 0, where a
+# WorldSource reads it
 # ---
 # cx: chunk column
 # cy: chunk row
@@ -431,11 +432,18 @@ rec Held {
 # rewind also makes room for the cells of the widest chunk row, so a save
 # without the memory fails there rather than writing the runs short. the world
 # must not change while the source is in use.
+#
+# asked for words under a continuous rule, it offers them too: its chunks and
+# its extent are then those holding a word but 0, so a value too small to have
+# a state but 0 is kept, listed as the source is made, and its runs, which
+# carry their words, end at a chunk's edge.
 # ---
 # s:      simulation to read
+# exact:  word mode: the chunks and extent are by word, and words are offered
 # listed: held holds the chunks
-# held:   the chunks holding a state, ordered
+# held:   the chunks holding a state, or a word, ordered
 # cells:  the states of the chunks of the row being read, in order
+# words:  in word mode, their words in place of the states
 # band:   the first chunk of the chunk row being read
 # end:    the chunk after that row's last
 # ly:     the row within the chunk row
@@ -445,9 +453,11 @@ rec Held {
 # source: the source to hand to formats.save
 pub rec WorldSource {
     s:      *sim.Sim;
+    exact:  bool;
     listed: bool;
     held:   Vector[Held];
     cells:  Vector[u8];
+    words:  Vector[u32];
     band:   usize;
     end:    usize;
     ly:     i64;
@@ -467,27 +477,34 @@ fun held_order(a: *Held, b: *Held) i64 {
     ret 0;
 }
 
-# the chunk after the chunk row starting at from, whose chunks' cells are read
-# into cells, which rewind made room for
+# the chunk after the chunk row starting at from, whose chunks' cells, or
+# words in word mode, are read into the room rewind made
 fun band_end(w: *WorldSource, from: usize) usize {
     var e: usize = from;
     for (e < w.held.len && w.held.data[e].cy == w.held.data[from].cy) { e = e + 1; }
     var k: usize = from;
     for (k < e) {
-        sim.world_chunk_cells(w.s, w.held.data[k].cx, w.held.data[k].cy, ?w.cells.data[(k - from) * space.CELLS]);
+        val c: *Held = ?w.held.data[k];
+        if (w.exact) { sim.chunk_words(w.s, c.cx, c.cy, ?w.words.data[(k - from) * space.CELLS]); }
+        or           { sim.world_chunk_cells(w.s, c.cx, c.cy, ?w.cells.data[(k - from) * space.CELLS]); }
         k = k + 1;
     }
-    w.cells.len = (e - from) * space.CELLS;
+    if (w.exact) { w.words.len = (e - from) * space.CELLS; }
+    or           { w.cells.len = (e - from) * space.CELLS; }
     ret e;
 }
 
 # the chunks a WorldSource is listing
 # ---
-# held: the list
-# ok:   every chunk was kept
+# held:  the list
+# ok:    every chunk was kept
+# boxed: box holds the extent of the words listed
+# box:   the cells holding a word but 0, half-open
 rec Listed {
-    held: *Vector[Held];
-    ok:   bool;
+    held:  *Vector[Held];
+    ok:    bool;
+    boxed: bool;
+    box:   space.Box;
 }
 
 fun list_chunk(ctx: *u8, cx: i64, cy: i64, cells: *u8) {
@@ -496,25 +513,53 @@ fun list_chunk(ctx: *u8, cx: i64, cy: i64, cells: *u8) {
     if (sel put.err) { at.ok = false; }
 }
 
+# list a chunk holding a word but 0, widening the extent to its words
+fun list_words(ctx: *u8, cx: i64, cy: i64, cells: *u32) {
+    val at:  *Listed                = ctx::*Listed;
+    val put: res[usize, allo.Error] = vector.push[Held](at.held, Held{cx: cx, cy: cy});
+    if (sel put.err) { at.ok = false; }
+    var i: usize = 0;
+    for (i < space.CELLS) {
+        if (cells[i] != 0) {
+            val x: i64 = cx * space.SIDE + (i % space.SIDE::usize)::i64;
+            val y: i64 = cy * space.SIDE + (i / space.SIDE::usize)::i64;
+            if (!at.boxed || x < at.box.x0)     { at.box.x0 = x; }
+            if (!at.boxed || y < at.box.y0)     { at.box.y0 = y; }
+            if (!at.boxed || x + 1 > at.box.x1) { at.box.x1 = x + 1; }
+            if (!at.boxed || y + 1 > at.box.y1) { at.box.y1 = y + 1; }
+            at.boxed = true;
+        }
+        i = i + 1;
+    }
+}
+
 fun world_rewind(ctx: *u8) err[format.Error] {
     val w: *WorldSource = ctx::*WorldSource;
     if (!w.listed) {
-        var at: Listed = Listed{held: ?w.held, ok: true};
+        var at: Listed = Listed{held: ?w.held, ok: true, boxed: false, box: space.Box{x0: 0, y0: 0, x1: 0, y1: 0}};
         sim.world_chunks(w.s, list_chunk, (?at)::*u8);
         if (!at.ok) { ret err[format.Error].err{format.Error.alloc{allo.Error.exhausted{}}}; }
         sort.sort_by[Held](w.held.data, w.held.len, held_order);
-        # room for the widest chunk row, so reading the runs never allocates
-        var widest: usize = 0;
-        var from:   usize = 0;
-        for (from < w.held.len) {
-            var e: usize = from;
-            for (e < w.held.len && w.held.data[e].cy == w.held.data[from].cy) { e = e + 1; }
-            if (e - from > widest) { widest = e - from; }
-            from = e;
-        }
+        w.listed = true;
+    }
+    # room for the widest chunk row, so reading the runs never allocates
+    var widest: usize = 0;
+    var from:   usize = 0;
+    for (from < w.held.len) {
+        var e: usize = from;
+        for (e < w.held.len && w.held.data[e].cy == w.held.data[from].cy) { e = e + 1; }
+        if (e - from > widest) { widest = e - from; }
+        from = e;
+    }
+    w.words.len = 0;
+    w.cells.len = 0;
+    if (w.exact) {
+        val room: res[usize, allo.Error] = vector.reserve[u32](?w.words, widest * space.CELLS);
+        if (sel room.err) { ret err[format.Error].err{format.Error.alloc{room.err}}; }
+    }
+    or {
         val room: res[usize, allo.Error] = vector.reserve[u8](?w.cells, widest * space.CELLS);
         if (sel room.err) { ret err[format.Error].err{format.Error.alloc{room.err}}; }
-        w.listed = true;
     }
     w.band = 0;
     w.end  = band_end(w, 0);
@@ -524,9 +569,15 @@ fun world_rewind(ctx: *u8) err[format.Error] {
     ret err[format.Error].ok{};
 }
 
-# the state of a cell of chunk k of the row being read
+# the state of a cell of chunk k of the row being read, its word's in word mode
 fun state_at(w: *WorldSource, k: usize, lx: i64, ly: i64) u8 {
+    if (w.exact) { ret rule.state(?w.s.rule, word_at(w, k, lx, ly))::u8; }
     ret w.cells.data[(k - w.band) * space.CELLS + (ly * space.SIDE + lx)::usize];
+}
+
+# the word of a cell of chunk k of the row being read, in word mode
+fun word_at(w: *WorldSource, k: usize, lx: i64, ly: i64) u32 {
+    ret w.words.data[(k - w.band) * space.CELLS + (ly * space.SIDE + lx)::usize];
 }
 
 # how many cells of state v run from column lx of a chunk's row, to its edge at most
@@ -534,6 +585,20 @@ fun run_of(w: *WorldSource, k: usize, lx: i64, ly: i64, v: u8) i64 {
     var x: i64 = lx;
     for (x < space.SIDE && state_at(w, k, x, ly) == v) { x = x + 1; }
     ret x - lx;
+}
+
+# move the cursor to the next row of the chunk rows, and the next chunk row
+# past a chunk row's last
+fun next_row(w: *WorldSource) {
+    w.ly = w.ly + 1;
+    w.k  = w.band;
+    w.lx = 0;
+    if (w.ly == space.SIDE) {
+        w.band = w.end;
+        w.end  = band_end(w, w.band);
+        w.ly   = 0;
+        w.k    = w.band;
+    }
 }
 
 fun world_next(ctx: *u8, r: *format.Run) bool {
@@ -565,15 +630,34 @@ fun world_next(ctx: *u8, r: *format.Run) bool {
             r.n = n::usize;
             ret true;
         }
-        w.ly = w.ly + 1;
-        w.k  = w.band;
-        w.lx = 0;
-        if (w.ly == space.SIDE) {
-            w.band = w.end;
-            w.end  = band_end(w, w.band);
-            w.ly   = 0;
-            w.k    = w.band;
+        next_row(w);
+    }
+    ret false;
+}
+
+# the next run of cells of one state whose words are not 0, within a chunk
+fun world_next_words(ctx: *u8, r: *format.Run) bool {
+    val w: *WorldSource = ctx::*WorldSource;
+    for (w.band < w.held.len) {
+        for (w.k < w.end) {
+            val c: *Held = ?w.held.data[w.k];
+            for (w.lx < space.SIDE && word_at(w, w.k, w.lx, w.ly) == 0) { w.lx = w.lx + 1; }
+            if (w.lx == space.SIDE) {
+                w.k  = w.k + 1;
+                w.lx = 0;
+                cnt;
+            }
+            val at: i64 = w.lx;
+            val v:  u32 = rule.state(?w.s.rule, word_at(w, w.k, at, w.ly));
+            for (w.lx < space.SIDE && word_at(w, w.k, w.lx, w.ly) != 0 && rule.state(?w.s.rule, word_at(w, w.k, w.lx, w.ly)) == v) { w.lx = w.lx + 1; }
+            r.x = c.cx * space.SIDE + at;
+            r.y = c.cy * space.SIDE + w.ly;
+            r.n = (w.lx - at)::usize;
+            r.v = v::u8;
+            r.w = ?w.words.data[(w.k - w.band) * space.CELLS + (w.ly * space.SIDE + at)::usize];
+            ret true;
         }
+        next_row(w);
     }
     ret false;
 }
@@ -603,23 +687,39 @@ pub fun quadtree(q: *format.Quadtree, t: *hashlife.Tree) *format.Quadtree {
 }
 
 # point a WorldSource at a simulation, its extent the box of its cells in a
-# state but 0
+# state but 0, or in word mode a word but 0
 #
 # the cells are brought from the GPU first when it steps, and the tree is
-# offered as well when HashLife holds the world.
+# offered as well when HashLife holds the world. words are offered when asked
+# for under a continuous rule on a world that is not flipped, whose held words
+# would be its complement's.
 # ---
-# w:   source record; world_source_dnit releases it, whether this succeeded or not
-# s:   simulation to write out, left as it is
-# a:   allocator for the chunk list
-# ret: the source, or why the cells could not be read
-pub fun world_source(w: *WorldSource, s: *sim.Sim, a: *allo.Allocator) res[*format.Source, format.Error] {
+# w:     source record; world_source_dnit releases it, whether this succeeded or not
+# s:     simulation to write out, left as it is
+# a:     allocator for the chunk list
+# words: offer the cells' words, for a format that records them (format.Format.words)
+# ret:   the source, or why the cells could not be read
+pub fun world_source(w: *WorldSource, s: *sim.Sim, a: *allo.Allocator, words: bool) res[*format.Source, format.Error] {
     w.s      = s;
+    w.exact  = words && rule.caps(?s.rule).continuous && !sim.flipped(s);
     w.listed = false;
     w.held   = vector.init[Held](a);
     w.cells  = vector.init[u8](a);
+    w.words  = vector.init[u32](a);
     val synced: err[gfx.Error] = sim.sync(s);
     if (sel synced.err) { ret res[*format.Source, format.Error].err{format.Error.sink{}}; }
-    val box: opt[space.Box] = sim.state_bounds(s);
+    var box: opt[space.Box] = opt[space.Box].none{};
+    if (w.exact) {
+        # the chunks are listed now, since the extent is theirs
+        val reach: i64    = space.chunk_of(space.REACH) + 1;
+        var at:    Listed = Listed{held: ?w.held, ok: true, boxed: false, box: space.Box{x0: 0, y0: 0, x1: 0, y1: 0}};
+        sim.chunks_in(s, space.Box{x0: 0 - reach, y0: 0 - reach, x1: reach, y1: reach}, list_words, (?at)::*u8);
+        if (!at.ok) { ret res[*format.Source, format.Error].err{format.Error.alloc{allo.Error.exhausted{}}}; }
+        sort.sort_by[Held](w.held.data, w.held.len, held_order);
+        w.listed = true;
+        if (at.boxed) { box = opt[space.Box].some{at.box}; }
+    }
+    or { box = sim.state_bounds(s); }
     w.source.ctx  = w::*u8;
     w.source.x0   = 0;
     w.source.y0   = 0;
@@ -633,19 +733,21 @@ pub fun world_source(w: *WorldSource, s: *sim.Sim, a: *allo.Allocator) res[*form
         w.source.y1 = box.some.y1;
     }
     val t: *hashlife.Tree = sim.quadtree(s);
-    if (t != nil) { w.source.tree = quadtree(?w.quad, t); }
+    if (t != nil && !w.exact) { w.source.tree = quadtree(?w.quad, t); }
     w.source.states     = rule.states(?s.rule);
     w.source.continuous = rule.caps(?s.rule).continuous;
     w.source.rewind     = world_rewind;
     w.source.next       = world_next;
     w.source.words      = nil;
-    w.band              = 0;
-    w.end               = 0;
+    if (w.exact) { w.source.words = world_next_words; }
+    w.band = 0;
+    w.end  = 0;
     ret res[*format.Source, format.Error].ok{?w.source};
 }
 
-# release a WorldSource's chunk list and cells
+# release a WorldSource's chunk list, cells and words
 pub fun world_source_dnit(w: *WorldSource) {
     vector.dnit[Held](?w.held);
     vector.dnit[u8](?w.cells);
+    vector.dnit[u32](?w.words);
 }
