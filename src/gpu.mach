@@ -474,6 +474,8 @@ rec Pool {
 #           the gate, so the allocator's words are written and the hash seeded
 # rehash:   tombstones piled up in the hash, which the next flush seeds again
 # top:      while owned, the slots every stage covers and below which a pass claims
+# aim:      the top the newest census asked for, which a growth under way
+#           lets the next flush reach
 # pass:     the last pass id
 # grouped:  cells of spread recorded since the last pass
 # passed:   cells of spread the halo the last pass left holds
@@ -582,6 +584,7 @@ pub rec Gpu {
     reseed:   bool;
     rehash:   bool;
     top:      usize;
+    aim:      usize;
     pass:     u32;
     grouped:  usize;
     passed:   usize;
@@ -694,26 +697,36 @@ fun forget_censuses(g: *Gpu) {
     }
 }
 
-# the buffers sized for cap slots, into pp
-fun make_pool(g: *Gpu, pp: *Pool, cap: usize) err[gfx.Error] {
+# a pool's buffer, made inside the frame when framed so nothing waits for the
+# device, else outside one, which drains the queue
+fun make_framed(g: *Gpu, framed: bool, size: usize, out: *gfx.StorageBuffer) err[gfx.Error] {
+    if (!framed) { ret make(g.d, size, out); }
+    val made: res[gfx.StorageBuffer, gfx.Error] = gfx.renderer_storage_buffer(g.r, size);
+    if (sel made.err) { ret err[gfx.Error].err{made.err}; }
+    @out = made.ok;
+    ret err[gfx.Error].ok{};
+}
+
+# the buffers sized for cap slots, into pp, made inside the frame when framed
+fun make_pool(g: *Gpu, pp: *Pool, cap: usize, framed: bool) err[gfx.Error] {
     pp.got    = nil;
     pp.landed = nil;
     pp.held   = nil;
     pp.cap    = 0;
-    val e1: err[gfx.Error] = make(g.d, cap * space.CELLS * 4, ?pp.cells[0]);
+    val e1: err[gfx.Error] = make_framed(g, framed, cap * space.CELLS * 4, ?pp.cells[0]);
     if (sel e1.err) { ret e1; }
-    val e2: err[gfx.Error] = make(g.d, cap * space.CELLS * 4, ?pp.cells[1]);
+    val e2: err[gfx.Error] = make_framed(g, framed, cap * space.CELLS * 4, ?pp.cells[1]);
     if (sel e2.err) {
         gfx.storage_buffer_delete(g.d, ?pp.cells[0]);
         ret e2;
     }
-    val e3: err[gfx.Error] = make(g.d, (HEAD + cap * space.ENTRY) * 4, ?pp.meta);
+    val e3: err[gfx.Error] = make_framed(g, framed, (HEAD + cap * space.ENTRY) * 4, ?pp.meta);
     if (sel e3.err) {
         gfx.storage_buffer_delete(g.d, ?pp.cells[0]);
         gfx.storage_buffer_delete(g.d, ?pp.cells[1]);
         ret e3;
     }
-    val e4: err[gfx.Error] = make(g.d, layout.STATUS_WORDS::usize * 4, ?pp.status);
+    val e4: err[gfx.Error] = make_framed(g, framed, layout.STATUS_WORDS::usize * 4, ?pp.status);
     if (sel e4.err) {
         gfx.storage_buffer_delete(g.d, ?pp.cells[0]);
         gfx.storage_buffer_delete(g.d, ?pp.cells[1]);
@@ -728,7 +741,7 @@ fun make_pool(g: *Gpu, pp: *Pool, cap: usize) err[gfx.Error] {
         gfx.storage_buffer_delete(g.d, ?pp.status);
         ret e5;
     }
-    val e5f: err[gfx.Error] = make(g.d, layout.FLAGS_WORDS::usize * 4, ?pp.flags);
+    val e5f: err[gfx.Error] = make_framed(g, framed, layout.FLAGS_WORDS::usize * 4, ?pp.flags);
     if (sel e5f.err) {
         gfx.readback_delete(?pp.rb, g.d);
         gfx.storage_buffer_delete(g.d, ?pp.cells[0]);
@@ -737,7 +750,7 @@ fun make_pool(g: *Gpu, pp: *Pool, cap: usize) err[gfx.Error] {
         gfx.storage_buffer_delete(g.d, ?pp.status);
         ret e5f;
     }
-    val e5l: err[gfx.Error] = make(g.d, cap * 4, ?pp.list);
+    val e5l: err[gfx.Error] = make_framed(g, framed, cap * 4, ?pp.list);
     if (sel e5l.err) {
         gfx.storage_buffer_delete(g.d, ?pp.flags);
         gfx.readback_delete(?pp.rb, g.d);
@@ -747,7 +760,7 @@ fun make_pool(g: *Gpu, pp: *Pool, cap: usize) err[gfx.Error] {
         gfx.storage_buffer_delete(g.d, ?pp.status);
         ret e5l;
     }
-    val e5m: err[gfx.Error] = make(g.d, cap * MIP * 4, ?pp.mip);
+    val e5m: err[gfx.Error] = make_framed(g, framed, cap * MIP * 4, ?pp.mip);
     if (sel e5m.err) {
         gfx.storage_buffer_delete(g.d, ?pp.list);
         gfx.storage_buffer_delete(g.d, ?pp.flags);
@@ -868,6 +881,7 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     g.reseed   = false;
     g.rehash   = false;
     g.top      = 0;
+    g.aim      = 0;
     g.pass     = 0;
     g.grouped  = 0;
     g.passed   = 0;
@@ -909,7 +923,7 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     if (sel e9.err)    { ret e9; }
     if (cap > g.slots) { ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.overrun{(cap * space.CELLS * 4)::u64}}}; }
     forget_censuses(g);
-    ret make_pool(g, ?g.p, cap);
+    ret make_pool(g, ?g.p, cap, false);
 }
 
 # the shared compute stages, in the order build_stages makes them
@@ -1173,7 +1187,7 @@ fun fill_shades(pal: *f32) {
 # ret: false when the device refused the buffers
 pub fun reserve(g: *Gpu, cap: usize) bool {
     if (cap <= g.p.cap || (g.reserved && cap <= g.next.cap)) { ret true; }
-    ret make_next(g, cap);
+    ret make_next(g, cap, false);
 }
 
 # owe room for a pool of cap slots to the next frame, ahead of the host's pool
@@ -1191,14 +1205,15 @@ pub fun owe(g: *Gpu, cap: usize) bool {
     ret true;
 }
 
-# make the buffers a growth to cap slots moves the world into
-fun make_next(g: *Gpu, cap: usize) bool {
+# make the buffers a growth to cap slots moves the world into, inside the frame
+# when framed
+fun make_next(g: *Gpu, cap: usize, framed: bool) bool {
     # nothing has been recorded into a pool made since the last frame
     if (g.reserved) {
         drop_pool(g, ?g.next);
         g.reserved = false;
     }
-    val made: err[gfx.Error] = make_pool(g, ?g.next, cap);
+    val made: err[gfx.Error] = make_pool(g, ?g.next, cap, framed);
     if (sel made.err) { ret false; }
     g.reserved = true;
     ret true;
@@ -1520,9 +1535,11 @@ fun make_room(g: *Gpu, sp: *space.Space, want: usize) {
         var cap: usize = g.p.cap;
         for (cap < ahead && cap < sp.max_slots) { cap = cap * 2; }
         if (cap > sp.max_slots) { cap = sp.max_slots; }
-        # a refusal leaves the pool its buffers, the top held below them
-        reserve(g, cap);
+        # made in the frame, so nothing waits for the device. a refusal leaves
+        # the pool its buffers, the top held below them
+        if (cap > g.p.cap && !(g.reserved && cap <= g.next.cap)) { make_next(g, cap, true); }
     }
+    if (want > g.aim) { g.aim = want; }
     var top: usize = want;
     if (top > g.p.cap) { top = g.p.cap; }
     if (top > g.top)   { g.top = top; }
@@ -1731,12 +1748,13 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
         g.moved  = false;
         g.reseed = true;
         g.top    = 0;
+        g.aim    = 0;
         g.want   = false;
         g.wide   = false;
         sp.wide  = false;
         g.listed = false;
     }
-    if (g.owed > g.p.cap && !(g.reserved && g.owed <= g.next.cap) && !make_next(g, g.owed)) {
+    if (g.owed > g.p.cap && !(g.reserved && g.owed <= g.next.cap) && !make_next(g, g.owed, true)) {
         ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.overrun{(g.owed * space.CELLS * 4)::u64}}};
     }
     g.owed = 0;
@@ -1936,7 +1954,8 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
     }
     g.hi = sp.hi;
     if (g.owns) {
-        val want: usize = sp.hi + slack(sp.hi);
+        var want: usize = sp.hi + slack(sp.hi);
+        if (want < g.aim)                                              { want = g.aim; }
         if (g.top < want)                                              { g.top = want; }
         if (g.top > g.p.cap)                                           { g.top = g.p.cap; }
         if (g.squeeze != 0 && g.top > g.squeeze && g.squeeze >= sp.hi) { g.top = g.squeeze; }
