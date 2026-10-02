@@ -1,0 +1,82 @@
+# the last stage of a pass but the clear: every slot the mark stage claimed
+# keeps its chunk, or gives it back to a twin
+#
+# an invocation is one claimed slot. the slots claimed for the same chunk all
+# lie on its probe in the hash, and the lowest of them keeps it. the others
+# leave a tombstone in their bucket, free their entry and set their free bit.
+# the one that keeps it links it into the page table as space.alloc links a
+# chunk of the unbounded plane: each neighbour found in the hash, the lowest
+# slot of its chunk where twins of a chunk claimed this pass have not all left
+# yet, is named in the entry and names it back, every link moves by a chunk,
+# and the window is whole. it is listed for the clear stage, whose argument
+# counts it.
+
+use cellar.layout;
+use cellar.layout.List;
+use cellar.layout.Meta;
+use cellar.layout.Status;
+use at: shader.atomic;
+use sy: shader.sync;
+
+#[storage(1, 0)]
+var meta:   Meta;
+#[storage(1, 1)]
+var status: Status;
+#[storage(1, 2)]
+var list:   List;
+
+#[builtin("global_invocation")]
+var gid: u32x3;
+
+val DEV: u32 = sy.SCOPE_DEVICE;
+val BUF: u32 = sy.SEMANTICS_UNIFORM_MEMORY;
+
+# the lowest live slot holding the chunk at biased (bx, by), or NONE
+fun lowest(bx: u32, by: u32) u32 {
+    var best: u32 = layout.NONE;
+    var b:    u32 = layout.bucket(bx, by);
+    var v:    u32 = at.atomic_load_u32(?status.hash[b], DEV, sy.SEMANTICS_ACQUIRE | BUF);
+    for (v != layout.EMPTY) {
+        if (v != layout.TOMB && v < best) {
+            val e: u32 = v * layout.ENTRY;
+            if (meta.table[e + 9] == bx && meta.table[e + 10] == by && meta.table[e + layout.INCARNATION_AT] != 0) { best = v; }
+        }
+        b = (b + 1) & (layout.HASH - 1);
+        v = at.atomic_load_u32(?status.hash[b], DEV, sy.SEMANTICS_ACQUIRE | BUF);
+    }
+    ret best;
+}
+
+#[stage("compute")]
+#[workgroup(64, 1, 1)]
+fun comp_main() {
+    val i: u32 = gid[0];
+    if (i >= status.head[layout.CTL_FRESH]) { ret; }
+    val s:  u32 = status.fresh[i];
+    val e:  u32 = s * layout.ENTRY;
+    val bx: u32 = meta.table[e + 9];
+    val by: u32 = meta.table[e + 10];
+    if (lowest(bx, by) != s) {
+        var b: u32 = layout.bucket(bx, by);
+        for (at.atomic_load_u32(?status.hash[b], DEV, sy.SEMANTICS_ACQUIRE | BUF) != s) { b = (b + 1) & (layout.HASH - 1); }
+        at.atomic_store_u32(?status.hash[b], DEV, sy.SEMANTICS_RELEASE | BUF, layout.TOMB);
+        at.atomic_add_u32(?status.head[layout.CTL_TOMBS], DEV, sy.SEMANTICS_RELAXED, 1);
+        meta.table[e + layout.INCARNATION_AT] = 0;
+        at.atomic_or_u32(?status.bitmap[s / 32], DEV, sy.SEMANTICS_ACQUIRE_RELEASE | BUF, 1 << (s % 32));
+        ret;
+    }
+    var k: u32 = 0;
+    for (k < 9) {
+        meta.table[e + layout.LINK_AT + k] = layout.plain_link(k);
+        if (k != 4) {
+            val n: u32 = lowest(bx + k % 3 - 1, by + k / 3 - 1);
+            meta.table[e + k] = n;
+            if (n != layout.NONE) { meta.table[n * layout.ENTRY + 8 - k] = s; }
+        }
+        k = k + 1;
+    }
+    meta.table[e + 4]              = s;
+    meta.table[e + layout.EDGE_AT] = layout.EDGE_WHOLE;
+    val c: u32 = at.atomic_add_u32(?status.head[layout.ARGS_CLEAR + 1], DEV, sy.SEMANTICS_RELAXED, 1);
+    list.v[c] = s;
+}
