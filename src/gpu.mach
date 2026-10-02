@@ -568,8 +568,8 @@ pub rec Gpu {
     old:      Pool;
     retired:  bool;
     view:     gfx.StorageBuffer;
-    steps:    [rule.FAMILIES]gfx.Compute;
-    ready:    [rule.FAMILIES]bool;
+    steps:    [rule.FAMILIES_MAX]gfx.Compute;
+    ready:    [rule.FAMILIES_MAX]bool;
     most:     usize;
     table:    gfx.StorageBuffer;
     words:    usize;
@@ -1003,7 +1003,7 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     g.stepping = false;
     if (build_steps(g)) {
         if (build_stages(g)) { g.stepping = true; }
-        or                   { drop_steps(g, rule.FAMILIES); }
+        or                   { drop_steps(g, rule.FAMILIES_MAX); }
     }
     if (g.stepping) { hold_clocks(g); }
 
@@ -1142,22 +1142,23 @@ fun drop_stages(g: *Gpu, n: usize) {
     }
 }
 
-# build the step stage of every rule family whose bindings the device's
-# dispatches hold, all of those or none
+# build the step stage of every rule family that has one and whose bindings
+# the device's dispatches hold, all of those or none. a family registered
+# later has none built, and the CPU steps it
 fun build_steps(g: *Gpu) bool {
     val most: usize = gfx.renderer_limits(g.r).max_dispatch_bindings;
     g.most = most;
     var i: usize = 0;
-    for (i < rule.FAMILIES) {
+    for (i < rule.FAMILIES_MAX) {
         g.ready[i] = false;
         i          = i + 1;
     }
     i = 0;
-    for (i < rule.FAMILIES) {
-        if (rule.bindings(i) <= most) {
-            var len: usize          = 0;
-            val spv: *u8            = rule.stage(i, ?len);
-            val sc:  err[gfx.Error] = gfx.compute(?g.steps[i], g.d, spv, len);
+    for (i < rule.families()) {
+        var len: usize = 0;
+        val spv: *u8   = rule.stage(i, ?len);
+        if (spv != nil && rule.bindings(i) <= most) {
+            val sc: err[gfx.Error] = gfx.compute(?g.steps[i], g.d, spv, len);
             if (sel sc.err) {
                 drop_steps(g, i);
                 ret false;
@@ -1185,14 +1186,17 @@ pub fun steps(g: *Gpu, f: usize) bool {
 }
 
 # why the GPU cannot step a rule, or nil when it can or does not step: its
-# family's stage, or the layers the rule stores its cells in, bind more
-# storage buffers than the device's dispatches can
+# family has no stage built, or its family's stage, or the layers the rule
+# stores its cells in, bind more storage buffers than the device's
+# dispatches can
 pub fun refusal(g: *Gpu, r: *rule.Rule) str {
     if (!g.stepping) { ret nil; }
     val f:   usize     = rule.family_of(r);
     var set: plane.Set = rule.layers(r);
     var tab: u32       = 0;
     if (rule.table(f)) { tab = 1; }
+    var len: usize = 0;
+    if (rule.stage(f, ?len) == nil) { ret "this rule's family has no GPU stage, so it cannot run while the GPU steps the world"; }
     # a family's stage was built only where its state layer's bindings fit
     if (g.ready[f] && (set.n == 1 || layer.bindings(set.n::u32, tab)::usize <= g.most)) { ret nil; }
     ret "this GPU's compute stages bind too few storage buffers for the rule buffer and layers this rule needs, so it cannot run while it steps the world";
@@ -1377,7 +1381,7 @@ pub fun mirror(g: *Gpu, sp: *space.Space) {
 # measure the CPU engine against the GPU's
 pub fun forgo_compute(g: *Gpu) {
     if (!g.stepping) { ret; }
-    drop_steps(g, rule.FAMILIES);
+    drop_steps(g, rule.FAMILIES_MAX);
     drop_stages(g, STAGES);
     g.stepping = false;
 }
@@ -1393,7 +1397,7 @@ pub fun dnit(g: *Gpu) {
     if (g.words != 0) { gfx.storage_buffer_delete(g.d, ?g.table); }
     vector.dnit[u32](?g.packed);
     if (g.stepping) {
-        drop_steps(g, rule.FAMILIES);
+        drop_steps(g, rule.FAMILIES_MAX);
         drop_stages(g, STAGES);
     }
     if (g.clocked) { drop_clocks(g, TIMERS); }
