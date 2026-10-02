@@ -126,7 +126,7 @@ dropped.
 | `F`                      | frame the randomize area                                         |
 | `M`                      | next colour mode                                                 |
 | `G`                      | grid lines                                                       |
-| `Tab`                    | hide / show the panels                                           |
+| `Tab`                    | hide / show the toolbar and panels                               |
 | `H`, `F1`                | key reference                                                    |
 | `F11`                    | toggle borderless fullscreen                                     |
 | `F12`                    | screenshot                                                       |
