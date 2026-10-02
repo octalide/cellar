@@ -5117,6 +5117,39 @@ test plane__life_highlife_and_larger_than_life_match_an_unbounded_plane_on_both_
     ret 0;
 }
 
+# draw one frame of a world with a GPU attached, waiting for the frame to begin
+#[testing]
+fun draw_frame(s: *Sim, r: *gfx.Renderer, look: *gpu.Look) i32 {
+    var drawn: bool = false;
+    for (!drawn) {
+        window.window_poll();
+        val br: res[bool, gfx.Error] = gfx.renderer_begin_frame(r);
+        if (sel br.err) { ret 6; }
+        drawn = br.ok;
+        if (drawn) {
+            collect(s);
+            val rec: err[gfx.Error] = record(s, false, look);
+            if (sel rec.err) { ret 7; }
+            val ended: err[gfx.Error] = gfx.renderer_end_frame(r);
+            if (sel ended.err) { ret 7; }
+        }
+    }
+    ret 0;
+}
+
+# whether the GPU has been sent every chunk within two of the origin
+#[testing]
+fun view_held(s: *Sim, g: *gpu.Gpu) bool {
+    var sl: usize = 0;
+    for (sl < s.space.hi) {
+        val x: i64 = space.slot_x(?s.space, sl);
+        val y: i64 = space.slot_y(?s.space, sl);
+        if (space.used(?s.space, sl) && x >= -2 && x <= 2 && y >= -2 && y <= 2 && g.p.held[sl] == 0) { ret false; }
+        sl = sl + 1;
+    }
+    ret true;
+}
+
 test record__the_draw_holds_what_the_cpu_steps_and_is_sent_only_changed_chunks {
     var a: allo.Allocator;
     page.make(?a);
@@ -5169,22 +5202,18 @@ test record__the_draw_holds_what_the_cpu_steps_and_is_sent_only_changed_chunks {
             if ((s.space.dirty[far::usize] & space.DIRTY_CELLS) == 0)   { ret 4; }
             if ((s.space.dirty[empty::usize] & space.DIRTY_CELLS) != 0) { ret 5; }
         }
-        var drawn: bool = false;
-        for (!drawn) {
-            window.window_poll();
-            val br: res[bool, gfx.Error] = gfx.renderer_begin_frame(?r);
-            if (sel br.err) { ret 6; }
-            drawn = br.ok;
-            if (drawn) {
-                collect(?s);
-                val rec: err[gfx.Error] = record(?s, false, ?look);
-                if (sel rec.err) { ret 7; }
-                val ended: err[gfx.Error] = gfx.renderer_end_frame(?r);
-                if (sel ended.err) { ret 7; }
-            }
-        }
+        val fr: i32 = draw_frame(?s, ?r, ?look);
+        if (fr != 0) { ret fr; }
         gen = gen + 1;
     }
+    # the upload sends within a time budget, so later frames finish what a loaded machine deferred
+    var extra: usize = 0;
+    for (!view_held(?s, ?g) && extra < 1000) {
+        val fr: i32 = draw_frame(?s, ?r, ?look);
+        if (fr != 0) { ret fr; }
+        extra = extra + 1;
+    }
+    if (!view_held(?s, ?g)) { ret 12; }
     gfx.renderer_wait_idle(?r);
     # every chunk in view holds the host's cells on the GPU, and the far one was never sent
     if (g.p.held[far::usize] != 0) { ret 8; }
