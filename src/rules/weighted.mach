@@ -1433,13 +1433,13 @@ pub fun path(k: *Kernel, sh: *Shape) u32 {
 # b: the chunk's block and back cells, at generation b.gen
 # t: the tally of the cells written
 pub fun step_chunk(k: *Kernel, b: *space.Block, t: *space.Tally) {
-    val own: plane.Plane = space.block_own(b, 0);
-    val out: plane.Plane = space.block_out(b, 0);
+    val own: *u32 = space.block_own(b, 0).w;
+    val out: *u32 = space.block_out(b, 0).w;
     if (!b.busy) {
         var i: usize = 0;
         for (i < space.CELLS) {
-            val v: u32 = word.cool(plane.get_as(own, word.WIDTH, i));
-            plane.put_as(out, word.WIDTH, i, v);
+            val v: u32 = word.cool(plane.load(own, word.WIDTH, i));
+            plane.store(out, word.WIDTH, i, v);
             if (v != 0) { t.warm = 1; }
             i = i + 1;
         }
@@ -1472,13 +1472,13 @@ fun lit(c: u32) u64 {
 # own: the chunk's state layer
 # y:   the row
 # any: receives every bit set in any of the row's cells
-fun own_row(own: plane.Plane, y: i64, any: *u32) u64 {
+fun own_row(own: *u32, y: i64, any: *u32) u64 {
     val at: usize = (y * 64)::usize;
     var m:  u64   = 0;
     var o:  u32   = 0;
     var x:  usize = 0;
     for (x < 64) {
-        val c: u32 = plane.get_as(own, word.WIDTH, at + x);
+        val c: u32 = plane.load(own, word.WIDTH, at + x);
         o = o | c;
         m = m | (lit(c) << x::u64);
         x = x + 1;
@@ -1492,7 +1492,7 @@ fun edge_row(b: *space.Block, y: i64) u64 {
     var m: u64 = 0;
     var x: i64 = 0;
     for (x < 64) {
-        m = m | (lit(space.block_cell(b, x, y)) << x::u64);
+        m = m | (lit(space.block_cell(b, word.WIDTH, x, y)) << x::u64);
         x = x + 1;
     }
     ret m;
@@ -1506,17 +1506,17 @@ fun edge_row(b: *space.Block, y: i64) u64 {
 # live: the row's cells live one generation on, as held, bit x for column x
 # any:  every bit set in any of the row's cells as they were
 # t:    the tally
-fun emit_row(own: plane.Plane, out: plane.Plane, y: i64, live: u64, any: u32, t: *space.Tally) {
+fun emit_row(own: *u32, out: *u32, y: i64, live: u64, any: u32, t: *space.Tally) {
     val at: usize = (y * 64)::usize;
     if (live == 0 && any == 0) {
-        plane.fill(out, at, 64, 0);
+        plane.blank(out, word.WIDTH, at, 64);
         ret;
     }
     var warm: u32   = 0;
     var x:    usize = 0;
     for (x < 64) {
-        val v: u32 = word.become(plane.get_as(own, word.WIDTH, at + x), ((live >> x::u64) & 1)::u32);
-        plane.put_as(out, word.WIDTH, at + x, v);
+        val v: u32 = word.become(plane.load(own, word.WIDTH, at + x), ((live >> x::u64) & 1)::u32);
+        plane.store(out, word.WIDTH, at + x, v);
         warm = warm | v;
         x    = x + 1;
     }
@@ -1553,9 +1553,9 @@ fun counted(set: *Sums, s0: u64, s1: u64, s2: u64, s3: u64) u64 {
 # the world is read through the held cells, inverted where they hold its
 # complement, so the rule applies as written and its result is held back.
 fun step_sliced(k: *Kernel, b: *space.Block, t: *space.Tally, inv_in: u32, inv_out: u32) {
-    val own:  plane.Plane = space.block_own(b, 0);
-    val fin:  u64         = 0 - inv_in::u64;
-    val fout: u64         = 0 - inv_out::u64;
+    val own:  *u32 = space.block_own(b, 0).w;
+    val fin:  u64  = 0 - inv_in::u64;
+    val fout: u64  = 0 - inv_out::u64;
     # rows -1 to 64 of the world's live cells, and the cells just west and east
     # of each
     var mid:  [66]u64;
@@ -1569,8 +1569,8 @@ fun step_sliced(k: *Kernel, b: *space.Block, t: *space.Tally, inv_in: u32, inv_o
         if (y >= 0 && y < 64) { m = own_row(own, y, ?any[y::usize]); }
         or                    { m = edge_row(b, y); }
         mid[j]  = m ^ fin;
-        west[j] = (lit(space.block_cell(b, -1, y)) ^ fin) & 1;
-        east[j] = (lit(space.block_cell(b, 64, y)) ^ fin) & 1;
+        west[j] = (lit(space.block_cell(b, word.WIDTH, -1, y)) ^ fin) & 1;
+        east[j] = (lit(space.block_cell(b, word.WIDTH, 64, y)) ^ fin) & 1;
         y       = y + 1;
     }
     y = 0;
@@ -1603,7 +1603,7 @@ fun step_sliced(k: *Kernel, b: *space.Block, t: *space.Tally, inv_in: u32, inv_o
         val s3:   u64 = v & w;
         val born: u64 = ~c & counted(?k.birth, s0, s1, s2, s3);
         val kept: u64 = c & counted(?k.survive, s0, s1, s2, s3);
-        emit_row(own, space.block_out(b, 0), y, (born | kept) ^ fout, any[j], t);
+        emit_row(own, space.block_out(b, 0).w, y, (born | kept) ^ fout, any[j], t);
         y = y + 1;
     }
 }
@@ -1615,10 +1615,10 @@ val PRE_SIDE: usize = 64 + 2 * MAX_RADIUS + 1;
 # chunk, from which a run of the footprint's row counts in one subtraction, so
 # a cell costs a subtraction per row of its footprint rather than per cell
 fun step_rows(k: *Kernel, sh: *Shape, b: *space.Block, t: *space.Tally, inv_in: u32, inv_out: u32) {
-    val own:  plane.Plane = space.block_own(b, 0);
-    val e:    i64         = sh.reach;
-    val side: i64         = 64 + 2 * e;
-    val fin:  u32         = inv_in & 1;
+    val own:  *u32 = space.block_own(b, 0).w;
+    val e:    i64  = sh.reach;
+    val side: i64  = 64 + 2 * e;
+    val fin:  u32  = inv_in & 1;
     # pre[row * PRE_SIDE + n]: the world's live cells among the first n of the
     # row, rows and columns from -e
     var pre: [PRE_SIDE * (PRE_SIDE - 1)]u32;
@@ -1635,10 +1635,10 @@ fun step_rows(k: *Kernel, sh: *Shape, b: *space.Block, t: *space.Tally, inv_in: 
             val x: i64 = xx - e;
             var c: u32 = 0;
             if (y >= 0 && y < 64 && x >= 0 && x < 64) {
-                c = plane.get_as(own, word.WIDTH, (y * 64 + x)::usize);
+                c = plane.load(own, word.WIDTH, (y * 64 + x)::usize);
                 o = o | c;
             }
-            or { c = space.block_cell(b, x, y); }
+            or { c = space.block_cell(b, word.WIDTH, x, y); }
             n                         = n + (lit(c)::u32 ^ fin);
             pre[base + xx::usize + 1] = n;
             xx                        = xx + 1;
@@ -1680,19 +1680,19 @@ fun step_rows(k: *Kernel, sh: *Shape, b: *space.Block, t: *space.Tally, inv_in: 
             live = live | (next::u64 << x::u64);
             x    = x + 1;
         }
-        emit_row(own, space.block_out(b, 0), y, live ^ fout, any[y::usize], t);
+        emit_row(own, space.block_out(b, 0).w, y, live ^ fout, any[y::usize], t);
         y = y + 1;
     }
 }
 
 # the GENERAL step: every weight of the footprint, cell by cell
 fun step_general(k: *Kernel, b: *space.Block, t: *space.Tally, inv_in: u32, inv_out: u32) {
-    val own:   plane.Plane = space.block_own(b, 0);
-    val out:   plane.Plane = space.block_out(b, 0);
-    val r:     i64         = k.radius::i64;
-    val width: i64         = 2 * r + 1;
-    val all:   i32         = total(k);
-    var ly:    i64         = 0;
+    val own:   *u32 = space.block_own(b, 0).w;
+    val out:   *u32 = space.block_out(b, 0).w;
+    val r:     i64  = k.radius::i64;
+    val width: i64  = 2 * r + 1;
+    val all:   i32  = total(k);
+    var ly:    i64  = 0;
     for (ly < 64) {
         var lx: i64 = 0;
         for (lx < 64) {
@@ -1705,8 +1705,8 @@ fun step_general(k: *Kernel, b: *space.Block, t: *space.Tally, inv_in: u32, inv_
                     val w: i32 = k.weights[((dy + r) * width + dx + r)::usize];
                     if (w != 0) {
                         var c: u32 = 0;
-                        if (inside)         { c = plane.get_as(own, word.WIDTH, ((ly + dy) * 64 + lx + dx)::usize); }
-                        or                  { c = space.block_cell(b, lx + dx, ly + dy); }
+                        if (inside)         { c = plane.load(own, word.WIDTH, ((ly + dy) * 64 + lx + dx)::usize); }
+                        or                  { c = space.block_cell(b, word.WIDTH, lx + dx, ly + dy); }
                         if (c >= word.LIVE) { sum = sum + w; }
                     }
                     dx = dx + 1;
@@ -1714,8 +1714,8 @@ fun step_general(k: *Kernel, b: *space.Block, t: *space.Tally, inv_in: u32, inv_
                 dy = dy + 1;
             }
             val i: usize = (ly * 64 + lx)::usize;
-            val v: u32   = next(k, plane.get_as(own, word.WIDTH, i), sum, all, inv_in, inv_out);
-            plane.put_as(out, word.WIDTH, i, v);
+            val v: u32   = next(k, plane.load(own, word.WIDTH, i), sum, all, inv_in, inv_out);
+            plane.store(out, word.WIDTH, i, v);
             space.note(t, v, lx::u32, ly::u32);
             lx = lx + 1;
         }
@@ -2212,9 +2212,10 @@ test step_chunk__every_path_steps_as_the_naive_footprint_sum_does {
         for (round < 4) {
             # dense and sparse cells, live at any age and dead at any heat, and
             # a missing chunk on a different side each round
-            var set: plane.Set   = layers(?k);
-            var b:   space.Block = space.block(?set, round);
-            var q:   usize       = 0;
+            var set: plane.Set = layers(?k);
+            var b:   space.Block;
+            space.block(?b, ?set, round);
+            var q: usize = 0;
             for (q < 9 * 4096) {
                 var c: u32 = rand.range(?rng, 0, word.HEAT_MASK::i64 + 1)::u32;
                 if (rand.range(?rng, 0, 100) < 20 + round::i64 * 15) { c = (rand.range(?rng, 1, 1000)::u32 << word.AGE_SHIFT) | word.HEAT_MASK; }

@@ -212,6 +212,9 @@ pub rec Mirror {
 # due:       on a pool held whole, the slots the CPU's step steps (plan): the
 #            awake ones, the chunks their live cells may spread into and the rim
 # ndue:      how many due holds
+# frames:    words the CPU's step gathers a seamed chunk's block into, kept
+#            between steps (scratch), or nil
+# nframes:   how many frames holds
 pub rec Space {
     a:         *allo.Allocator;
     cap:       usize;
@@ -249,6 +252,8 @@ pub rec Space {
     woke:      *u8;
     due:       *u32;
     ndue:      usize;
+    frames:    *u32;
+    nframes:   usize;
 }
 
 # one chunk's step, as a rule family's CPU step sees it
@@ -273,25 +278,23 @@ pub rec Block {
     gen:  u64;
 }
 
-# a block with no chunk, of a set's layers, whose spans the caller names
-pub fun block(set: *plane.Set, gen: u64) Block {
-    var b: Block;
+# make b a block with no chunk, of a set's layers, whose spans the caller
+# names
+pub fun block(b: *Block, set: *plane.Set, gen: u64) {
     b.set  = set;
     b.busy = false;
     b.gen  = gen;
-    var i: usize = 0;
-    for (i < layer.LAYERS_MAX::usize * 9) {
-        b.nb[i] = nil;
-        i       = i + 1;
+    var k: usize = 0;
+    for (k < set.n) {
+        var q: usize = 0;
+        for (q < 9) {
+            b.nb[k * 9 + q] = nil;
+            q               = q + 1;
+        }
+        b.out[k]  = nil;
+        b.wide[k] = set.at[k].width;
+        k         = k + 1;
     }
-    i = 0;
-    for (i < layer.LAYERS_MAX::usize) {
-        b.out[i]  = nil;
-        b.wide[i] = 0;
-        if (i < set.n) { b.wide[i] = set.at[i].width; }
-        i = i + 1;
-    }
-    ret b;
 }
 
 # layer k's span of block chunk q, row-major with the chunk itself at 4; its
@@ -312,18 +315,44 @@ pub fun block_out(b: *Block, k: usize) plane.Plane {
 }
 
 # the state layer's value of a cell of a block, in its chunk's coordinates,
-# which a family's step reads every cell outside its own chunk through
+# which a family's step reads every cell outside its own chunk through, at the
+# width the family declared for its state layer, so a word-wide one is read a
+# word a cell
 # ---
-# b:   the block
-# x:   the column, in [-SIDE, 2 * SIDE)
-# y:   the row, in [-SIDE, 2 * SIDE)
-# ret: the cell, zero in a chunk that does not exist
+# b:     the block
+# width: the state layer's width, as the family declared it
+# x:     the column, in [-SIDE, 2 * SIDE)
+# y:     the row, in [-SIDE, 2 * SIDE)
+# ret:   the cell, zero in a chunk that does not exist
 #[inline]
-pub fun block_cell(b: *Block, x: i64, y: i64) u32 {
-    ret block_value(b, 0, x, y);
+pub fun block_cell(b: *Block, width: u32, x: i64, y: i64) u32 {
+    var lx: i64   = x;
+    var ly: i64   = y;
+    var cx: usize = 1;
+    var cy: usize = 1;
+    if (lx < 0) {
+        lx = lx + SIDE;
+        cx = 0;
+    }
+    or (lx >= SIDE) {
+        lx = lx - SIDE;
+        cx = 2;
+    }
+    if (ly < 0) {
+        ly = ly + SIDE;
+        cy = 0;
+    }
+    or (ly >= SIDE) {
+        ly = ly - SIDE;
+        cy = 2;
+    }
+    val src: *u32 = b.nb[cy * 3 + cx];
+    if (src == nil) { ret 0; }
+    ret plane.load(src, width, (ly * SIDE + lx)::usize);
 }
 
-# layer k's value of a cell of a block, as block_cell reads the state layer's
+# layer k's value of a cell of a block, as block_cell reads the state layer's,
+# at the width the block's set holds
 #[inline]
 pub fun block_value(b: *Block, k: usize, x: i64, y: i64) u32 {
     var lx: i64   = x;
@@ -346,9 +375,9 @@ pub fun block_value(b: *Block, k: usize, x: i64, y: i64) u32 {
         ly = ly - SIDE;
         cy = 2;
     }
-    val src: plane.Plane = block_plane(b, k, cy * 3 + cx);
-    if (src.w == nil) { ret 0; }
-    ret plane.get(src, (ly * SIDE + lx)::usize);
+    val src: *u32 = b.nb[k * 9 + cy * 3 + cx];
+    if (src == nil) { ret 0; }
+    ret plane.load(src, b.wide[k], (ly * SIDE + lx)::usize);
 }
 
 # a chunk's census as its cells are written, which a step keeps while it goes
@@ -439,17 +468,20 @@ pub fun layers(sp: *Space) *plane.Set {
 }
 
 # words of a slot's span of the pool's layer k
+#[inline]
 fun span_of(sp: *Space, k: usize) usize {
     ret plane.span_words(sp.set.at[k].width);
 }
 
 # layer k's front span of slot s, the world as it stands
+#[inline]
 pub fun plane_of(sp: *Space, k: usize, s: usize) plane.Plane {
     ret plane.at(?sp.fronts[k][s * span_of(sp, k)], sp.set.at[k].width);
 }
 
 # layer k's back span of slot s, which the CPU's step writes; the pool must
 # keep back cells
+#[inline]
 pub fun back_of(sp: *Space, k: usize, s: usize) plane.Plane {
     ret plane.at(?sp.backs[k][s * span_of(sp, k)], sp.set.at[k].width);
 }
@@ -462,6 +494,7 @@ pub fun span_run(sp: *Space, k: usize, s: usize) *u32 {
 }
 
 # the value of cell i of slot s in the state layer, which the sense reads
+#[inline]
 pub fun sensed(sp: *Space, s: usize, i: usize) u32 {
     ret plane.get(plane_of(sp, 0, s), i);
 }
@@ -909,13 +942,15 @@ pub fun init(sp: *Space, a: *allo.Allocator, stepped: bool) err[allo.Error] {
     sp.mips_back = nil;
     sp.mip_on    = false;
     mem.zero[u8]((?sp.sense)::*u8, $size_of(layout.Sense));
-    sp.reach  = 1;
-    sp.wide   = false;
-    sp.grid   = topology.open();
-    sp.rim    = false;
-    sp.whole  = false;
-    sp.nawake = 0;
-    sp.ndue   = 0;
+    sp.reach   = 1;
+    sp.wide    = false;
+    sp.grid    = topology.open();
+    sp.rim     = false;
+    sp.whole   = false;
+    sp.nawake  = 0;
+    sp.ndue    = 0;
+    sp.frames  = nil;
+    sp.nframes = 0;
     # a 32-bit state layer until a rule names its own (relayer)
     sp.set = plane.state("cells", layer.WIDTH_MAX);
     var k: usize = 0;
@@ -1086,8 +1121,25 @@ pub fun set_views(sp: *Space, views: *plane.Set) err[allo.Error] {
     ret relayer(sp, ?set, nil, nil);
 }
 
+# words of scratch the CPU's step may use for as long as the pool lives, kept
+# between steps and grown to n when it holds fewer
+# ---
+# ret: the words, or nil when the allocator refused them
+pub fun scratch(sp: *Space, n: usize) *u32 {
+    if (n <= sp.nframes) { ret sp.frames; }
+    val got: *u32 = zwords(sp.a, n);
+    if (got == nil)       { ret nil; }
+    if (sp.frames != nil) { allo.deallocate[u32](sp.a, sp.frames, sp.nframes); }
+    sp.frames  = got;
+    sp.nframes = n;
+    ret got;
+}
+
 # release every array
 pub fun dnit(sp: *Space) {
+    if (sp.frames != nil) { allo.deallocate[u32](sp.a, sp.frames, sp.nframes); }
+    sp.frames  = nil;
+    sp.nframes = 0;
     if (sp.cap == 0) { ret; }
     free_arrays(sp);
     sp.cap  = 0;
@@ -1177,24 +1229,33 @@ pub fun set_pyramids(sp: *Space, on: bool) err[allo.Error] {
 # sn:    how a cell is read, the rule's sense
 # out:   receives MIP texels
 pub fun pyramid(cells: plane.Plane, sn: layout.Sense, out: *u32) {
+    # a word-wide layer named as such, so its cells are read a word each
+    if (cells.width == layer.WIDTH_MAX) {
+        pyramid_at(cells.w, layer.WIDTH_MAX, sn, out);
+        ret;
+    }
+    pyramid_at(cells.w, cells.width, sn, out);
+}
+
+# pyramid over a span's words w at a width
+#[inline]
+fun pyramid_at(w: *u32, wd: u32, sn: layout.Sense, out: *u32) {
     var live: [1024]u32;
     var heat: [1024]u32;
     var ages: [1024]u32;
     val side: u32 = layout.SIDE;
     var t:    u32 = 0;
-    # level 1 from the cells, two by two, a pair of rows read at a time
-    val s1:   u32 = layout.mip_side(1);
-    var rows: [128]u32;
+    # level 1 from the cells, two by two
+    val s1: u32 = layout.mip_side(1);
     for (t < s1 * s1) {
         val ox: u32 = (t % s1) * 2;
         val oy: u32 = (t / s1) * 2;
-        if (ox == 0) { plane.get_run(cells, (oy * side)::usize, (side * 2)::usize, ?rows[0]); }
-        var l: u32 = 0;
-        var h: u32 = 0;
-        var g: u32 = 0;
-        var i: u32 = 0;
+        var l:  u32 = 0;
+        var h:  u32 = 0;
+        var g:  u32 = 0;
+        var i:  u32 = 0;
         for (i < 4) {
-            val c: u32 = rows[((i / 2) * side + ox + i % 2)::usize];
+            val c: u32 = plane.load(w, wd, ((oy + i / 2) * side + ox + i % 2)::usize);
             if (layout.live(c, sn.live_mask, sn.live_lo, sn.live_hi) != 0) {
                 l = l + 1;
                 g = g + layout.texel_age(c, sn.age_shift, sn.age_mask);
@@ -1564,7 +1625,7 @@ pub fun resolve(sp: *Space, k: usize, s: usize, x: i32, y: i32, past: u32) u32 {
     for (true) {
         val e: *u32 = ?sp.table[sl * ENTRY];
         val q: u32  = layout.edge_side(e[layout.EDGE_AT::usize], px, py);
-        if (q == 4) { ret plane.get(plane_of(sp, k, sl), (py * 64 + px)::usize); }
+        if (q == 4) { ret plane.load(plane_of(sp, k, sl).w, sp.set.at[k].width, (py * 64 + px)::usize); }
         val t: u32 = e[layout.LINK_AT::usize + q::usize];
         if (e[q::usize] == NONE && (t & layout.LINK_EDGE) != 0) { ret past; }
         if (h == layout.HOPS || e[q::usize] == NONE)            { ret 0; }
@@ -2080,15 +2141,23 @@ fun slot_counted(sp: *Space, i: usize) usize {
     ret i;
 }
 
+# count every cell of a state layer's span w at a width into a tally
+#[inline]
+fun note_span(t: *Tally, w: *u32, width: u32) {
+    var i: usize = 0;
+    for (i < CELLS) {
+        note(t, plane.load(w, width, i), (i & 63)::u32, (i >> 6)::u32);
+        i = i + 1;
+    }
+}
+
 # count a slot's live and warm cells into its census from its front cells
 pub fun recount(sp: *Space, s: usize) {
     var t: Tally       = tally(sp.sense);
     val c: plane.Plane = plane_of(sp, 0, s);
-    var i: usize       = 0;
-    for (i < CELLS) {
-        note(?t, plane.get(c, i), (i & 63)::u32, (i >> 6)::u32);
-        i = i + 1;
-    }
+    # a word-wide layer named as such, so its cells are read a word each
+    if (c.width == layer.WIDTH_MAX) { note_span(?t, c.w, layer.WIDTH_MAX); }
+    or                              { note_span(?t, c.w, c.width); }
     tally_census(?t, ?sp.census[s * CENSUS], incarnation(sp, s));
     if (t.live != 0) { sp.census[s * CENSUS + 3] = halo(t.quads, span(sp)); }
     wake(sp, s);
