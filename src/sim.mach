@@ -407,7 +407,7 @@ pub fun set_rule(s: *Sim, r: rule.Rule) bool {
     val why: opt[str]  = rule.refusal(?new);
     if (sel why.some)            { ret false; }
     if (refusal(s, ?new) != nil) { ret false; }
-    val same:   bool = alike(?old, ?new);
+    val same:   bool = rule.alike(?old, ?new);
     val regrid: bool = !topology.same(?old.grid, ?new.grid);
     if (on_tree(s) && rule.caps(?new).no_tree != nil && !use_hashlife(s, false)) { ret false; }
     if (on_tree(s)) {
@@ -473,18 +473,6 @@ pub fun refusal(s: *Sim, r: *rule.Rule) str {
     # a rule the tree runs stays off the GPU, where any other goes
     if (on_tree(s) && rule.caps(r).no_tree == nil) { ret nil; }
     ret gpu.refusal(s.gpu, rule.family_of(r));
-}
-
-# whether two rules write every state as the same word, so cells of one read
-# alike under the other
-fun alike(a: *rule.Rule, b: *rule.Rule) bool {
-    if (rule.family_of(a) != rule.family_of(b) || rule.states(a) != rule.states(b)) { ret false; }
-    var st: u32 = 0;
-    for (st < rule.states(a)) {
-        if (rule.word(a, st) != rule.word(b, st)) { ret false; }
-        st = st + 1;
-    }
-    ret true;
 }
 
 # stop the team and release the pool and the tree
@@ -1700,6 +1688,45 @@ pub fun read_run(s: *Sim, x: i64, y: i64, n: usize, out: *u8) bool {
     ret true;
 }
 
+# the words of n cells of a row in the open read, from (x, y) rightward: a
+# continuous rule's exact values, which read_run's states only approximate
+# ---
+# s:   simulation
+# x:   first column
+# y:   row
+# n:   cells to read
+# out: receives n words of the rule running, 0 off the grid and where no chunk is
+# ret: false when any cell lies outside the area or the world is flipped,
+#      whose held words are its complement's (rule.Caps b0), leaving out untouched
+pub fun read_words(s: *Sim, x: i64, y: i64, n: usize, out: *u32) bool {
+    val r: *Read = ?s.read;
+    if (!r.open || y < r.y0 || y >= r.y1 || x < r.x0 || x + n::i64 > r.x1 || flipped(s)) { ret false; }
+    mem.zero[u32](out, n);
+    var at:  i64 = x;
+    var end: i64 = x + n::i64;
+    if (!topology.clip(?s.rule.grid, y, ?at, ?end)) { ret true; }
+    for (at < end) {
+        var stop: i64 = (space.chunk_of(at) + 1) * space.SIDE;
+        if (stop > end) { stop = end; }
+        val o: usize = (at - x)::usize;
+        val k: usize = (stop - at)::usize;
+        if (on_tree(s)) {
+            val p: *u8   = tree_chunk(s, at, y, false);
+            var i: usize = 0;
+            for (p != nil && i < k) {
+                out[o + i] = rule.word(?s.rule, p[space.local_of(y) * 64 + space.local_of(at) + i]::u32);
+                i          = i + 1;
+            }
+            at = stop;
+            cnt;
+        }
+        val sl: u32 = space.find(?s.space, space.chunk_of(at), space.chunk_of(y));
+        if (sl != space.NONE) { mem.copy[u32](?out[o], ?s.space.cells[sl::usize * space.CELLS + space.local_of(y) * 64 + space.local_of(at)], k); }
+        at = stop;
+    }
+    ret true;
+}
+
 # close the open read
 # ---
 # s:   simulation
@@ -1772,21 +1799,21 @@ pub fun edit_begin(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64) bool {
 }
 
 # write one cell of a small area, as a recorded write on the GPU
-fun put_sparse(s: *Sim, x: i64, y: i64, v: u8) bool {
+fun put_sparse(s: *Sim, x: i64, y: i64, c: u32) bool {
     val sp: *space.Space = ?s.space;
     if (!space.holds(sp, x, y)) { ret true; }
     val cx: i64 = space.chunk_of(x);
     val cy: i64 = space.chunk_of(y);
     var sl: u32 = space.find(sp, cx, cy);
     if (sl == space.NONE) {
-        if (v == 0) { ret true; }
+        if (c == 0) { ret true; }
         sl = space.alloc(sp, cx, cy);
         if (sl == space.NONE) { ret false; }
     }
     val slot: usize = sl::usize;
     val i:    usize = space.local_of(y) * 64 + space.local_of(x);
-    sp.cells[slot * space.CELLS + i] = cell_of(s, v);
-    if (v != 0) { space.surround(sp, slot); }
+    sp.cells[slot * space.CELLS + i] = c;
+    if (c != 0) { space.surround(sp, slot); }
     # the GPU's copy takes the cell alone while it steps, and the chunk whole
     # while it only draws
     if (on_gpu(s)) { gpu.note_write(s.gpu, sp, slot, i); }
@@ -1814,12 +1841,47 @@ pub fun edit_set(s: *Sim, x: i64, y: i64, v: u8) bool {
 # w:   state of the world, below the rule's states
 # ret: false when any cell lies outside the area or the pool or the tree was full
 pub fun edit_run(s: *Sim, x: i64, y: i64, n: usize, w: u8) bool {
+    if (!editing(s, x, y, n)) { ret false; }
+    val v: u8 = held(s, w);
+    ret put_run(s, x, y, n, cell_of(s, v), v);
+}
+
+# write n words to a row of the open edit, from (x, y) rightward, as they are
+# given: a continuous rule's exact values, which a state only approximates
+# ---
+# s:   simulation
+# x:   first column
+# y:   row
+# n:   cells to write
+# w:   n words of the rule running, 0 the quiescent background
+# ret: false when any cell lies outside the area, the world is flipped, whose
+#      held words are its complement's (rule.Caps b0), or the pool or the tree
+#      was full
+pub fun edit_words(s: *Sim, x: i64, y: i64, n: usize, w: *u32) bool {
+    if (!editing(s, x, y, n) || flipped(s)) { ret false; }
+    var ok: bool  = true;
+    var i:  usize = 0;
+    for (i < n) {
+        var k: usize = i + 1;
+        for (k < n && w[k] == w[i]) { k = k + 1; }
+        if (!put_run(s, x + i::i64, y, k - i, w[i], rule.state(?s.rule, w[i])::u8)) { ok = false; }
+        i = k;
+    }
+    ret ok;
+}
+
+# whether the open edit's area holds n cells of row y from column x
+fun editing(s: *Sim, x: i64, y: i64, n: usize) bool {
     val e: *Edit = ?s.edit;
-    val v: u8    = held(s, w);
-    if (!e.open || y < e.y0 || y >= e.y1 || x < e.x0 || x + n::i64 > e.x1) { ret false; }
-    var ok:  bool = true;
-    var at:  i64  = x;
-    val end: i64  = x + n::i64;
+    ret e.open && y >= e.y0 && y < e.y1 && x >= e.x0 && x + n::i64 <= e.x1;
+}
+
+# write word c, which holds state v, to n cells of a row inside the open edit
+fun put_run(s: *Sim, x: i64, y: i64, n: usize, c: u32, v: u8) bool {
+    val e:   *Edit = ?s.edit;
+    var ok:  bool  = true;
+    var at:  i64   = x;
+    val end: i64   = x + n::i64;
     for (at < end) {
         var stop: i64 = (space.chunk_of(at) + 1) * space.SIDE;
         if (stop > end) { stop = end; }
@@ -1833,10 +1895,10 @@ pub fun edit_run(s: *Sim, x: i64, y: i64, n: usize, w: u8) bool {
             or (v != 0) { ok = false; }
         }
         or (e.sparse) {
-            var c: i64 = at;
-            for (c < stop) {
-                if (!put_sparse(s, c, y, v)) { ok = false; }
-                c = c + 1;
+            var cx: i64 = at;
+            for (cx < stop) {
+                if (!put_sparse(s, cx, y, c)) { ok = false; }
+                cx = cx + 1;
             }
         }
         or {
@@ -1845,13 +1907,13 @@ pub fun edit_run(s: *Sim, x: i64, y: i64, n: usize, w: u8) bool {
             var b: i64 = stop;
             if (space.clip(?s.space, y, ?a, ?b)) {
                 var sl: u32 = space.find(?s.space, space.chunk_of(a), space.chunk_of(y));
-                if (sl == space.NONE && v != 0) { sl = space.alloc(?s.space, space.chunk_of(a), space.chunk_of(y)); }
+                if (sl == space.NONE && c != 0) { sl = space.alloc(?s.space, space.chunk_of(a), space.chunk_of(y)); }
                 if (sl != space.NONE) {
                     val i: usize = sl::usize * space.CELLS + space.local_of(y) * 64 + space.local_of(a);
-                    mem.fill[u32](?s.space.cells[i], cell_of(s, v), (b - a)::usize);
+                    mem.fill[u32](?s.space.cells[i], c, (b - a)::usize);
                     space.touch(?s.space, sl::usize);
                 }
-                or (v != 0) { ok = false; }
+                or (c != 0) { ok = false; }
             }
         }
         at = stop;
