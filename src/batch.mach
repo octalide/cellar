@@ -27,6 +27,7 @@ use cellar.rule;
 use cellar.rules.weighted;
 use cellar.sim;
 use cellar.space;
+use cellar.text;
 use allo: std.allocator;
 use std.allocator.page;
 use std.chrono.duration;
@@ -101,7 +102,7 @@ pub rec Job {
 # full:    the world outgrew the pool or HashLife's node table, so stepping
 #          on would go wrong
 # ceiling: the world crossed this ceiling
-# engine:  the engine asked for cannot run the rule or take the world
+# engine:  the engine asked for cannot run the rule, with caps.no_tree as its reason, or cannot take the world, with nil
 # format:  the world could not be written, see cellar.format.Error
 # write:   the output file could not be written
 # stdout:  standard output refused the result
@@ -113,17 +114,18 @@ pub tag Error: u8 {
     foreign;
     full;
     ceiling: usize;
-    engine;
-    format: format.Error;
-    write:  fs.FsError;
+    engine:  str;
+    format:  format.Error;
+    write:   fs.FsError;
     stdout;
 }
 
 # a one-line description of why a batch stopped
 # ---
 # e:   the failure
-# ret: static text, or the rule's own reason
-pub fun error_message(e: Error) str {
+# buf: at least 160 bytes, for a message built around a reason
+# ret: static text, the rule's own reason, or buf
+pub fun error_message(e: Error, buf: *u8) str {
     if (sel e.alloc)   { ret "out of memory"; }
     if (sel e.read)    { ret "the file could not be read"; }
     if (sel e.open)    { ret persist.error_message(e.open); }
@@ -131,9 +133,15 @@ pub fun error_message(e: Error) str {
     if (sel e.foreign) { ret "the file's rule is not one cellar can run; name one with --rule"; }
     if (sel e.full)    { ret "the world outgrew what cellar can hold"; }
     if (sel e.ceiling) { ret "the world crossed a ceiling"; }
-    if (sel e.engine)  { ret "HashLife cannot run the rule; it runs radius 1 rules without B0 on the unbounded plane"; }
-    if (sel e.format)  { ret format.error_message(e.format); }
-    if (sel e.write)   { ret "the output file could not be written"; }
+    if (sel e.engine) {
+        if (e.engine == nil) { ret "the world does not fit HashLife"; }
+        var o: usize = text.buf_str(buf, 0, "HashLife cannot run ");
+        o      = text.buf_str(buf, o, e.engine);
+        buf[o] = 0;
+        ret buf;
+    }
+    if (sel e.format) { ret format.error_message(e.format); }
+    if (sel e.write)  { ret "the output file could not be written"; }
     ret "standard output could not be written";
 }
 
@@ -208,7 +216,10 @@ pub fun set_rule(b: *Batch, text: str) err[Error] {
 # tree: HashLife
 # ret:  ok, or engine when HashLife cannot run the rule or take the world
 pub fun use_hashlife(b: *Batch, tree: bool) err[Error] {
-    if (!sim.use_hashlife(?b.s, tree)) { ret err[Error].err{Error.engine{}}; }
+    if (!sim.use_hashlife(?b.s, tree)) {
+        if (tree) { ret err[Error].err{Error.engine{rule.caps(?b.s.rule).no_tree}}; }
+        ret err[Error].err{Error.engine{nil}};
+    }
     ret err[Error].ok{};
 }
 
@@ -685,6 +696,8 @@ test run__on_hashlife_writes_what_the_chunk_engine_does {
     var torus: Job                = Job{pattern: "out/test/batch_engine/gun.rle", rule: "B3/S23:T200,200", gens: 10, engine: args.ENGINE_HASHLIFE, out: "out/test/batch_engine/torus.rle", ceil: ceiling.defaults()};
     val tr:    res[Report, Error] = run(?a, ?torus);
     if (!(sel tr.err && sel tr.err.engine)) { ret 9; }
+    var msg: [160]u8;
+    if (sel tr.err && !string.str_equals(error_message(tr.err, ?msg[0]), "HashLife cannot run a bounded grid")) { ret 14; }
     fs.remove_file("out/test/batch_engine/gun.rle");
     fs.remove_file("out/test/batch_engine/pool.rle");
     fs.remove_file("out/test/batch_engine/tree.rle");
