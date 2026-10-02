@@ -259,6 +259,9 @@ pub rec Watch {
 # pending:    generations asked of the GPU and not yet recorded
 # full:       the world outgrew the pool or the tree's table, and stepping
 #             stopped rather than go wrong
+# withheld:   the GPU keeps a pool the host could not take back, so the run
+#             paused and what needed the host's pool was refused, until a take
+#             next succeeds
 # generation: completed steps since the last clear or randomize
 # running:    1 while auto-stepping, else 0
 # edit:       the open bulk edit, if any
@@ -290,6 +293,7 @@ pub rec Sim {
     gpu:        *gpu.Gpu;
     pending:    usize;
     full:       bool;
+    withheld:   bool;
     generation: u64;
     running:    u8;
     edit:       Edit;
@@ -335,6 +339,7 @@ pub fun init(s: *Sim, a: *allo.Allocator) err[allo.Error] {
     s.gpu        = nil;
     s.pending    = 0;
     s.full       = false;
+    s.withheld   = false;
     s.generation = 0;
     s.running    = 0;
     s.edit.open  = false;
@@ -552,10 +557,11 @@ fun reserve_pool(ctx: *u8, cap: usize) bool {
     ret gpu.owe(s.gpu, cap);
 }
 
-# take the pool back from the GPU before the host reads or changes it
-fun own_pool(ctx: *u8) {
+# take the pool back from the GPU before the host reads or changes it, false
+# when the GPU keeps it (withhold)
+fun own_pool(ctx: *u8) bool {
     val s: *Sim = ctx::*Sim;
-    gpu.take(s.gpu, ?s.space);
+    ret own(s);
 }
 
 # write every live chunk of the pool into the tree, emptied first
@@ -1001,6 +1007,10 @@ pub fun collect(s: *Sim) {
         ret;
     }
     val got: gpu.Landed = gpu.collect(s.gpu, ?s.space);
+    if (got.kept) {
+        withhold(s);
+        ret;
+    }
     rewind(s);
     if (!got.fits)  { overflow(s); }
     if (!got.fresh) { ret; }
@@ -1303,7 +1313,7 @@ pub fun record(s: *Sim, uncapped: bool, look: *gpu.Look) err[gfx.Error] {
 # ret: ok, or why the read failed
 pub fun sync(s: *Sim) err[gfx.Error] {
     if (!on_gpu(s)) { ret err[gfx.Error].ok{}; }
-    own(s);
+    if (!own(s))    { ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.empty{}}}; }
     ret gpu.pull(s.gpu, ?s.space);
 }
 
@@ -1311,10 +1321,31 @@ pub fun sync(s: *Sim) err[gfx.Error] {
 # its page table, and take any generations a closed gate voided off the count
 # (gpu.take). call outside a frame, or in one before gpu frame has recorded
 # anything
-fun own(s: *Sim) {
-    if (!on_gpu(s)) { ret; }
-    gpu.take(s.gpu, ?s.space);
+# ---
+# ret: false when the GPU keeps the pool, the run then paused (withhold)
+fun own(s: *Sim) bool {
+    if (!on_gpu(s)) { ret true; }
+    if (!gpu.take(s.gpu, ?s.space)) {
+        withhold(s);
+        ret false;
+    }
+    s.withheld = false;
     rewind(s);
+    ret true;
+}
+
+# pause a run whose pool the GPU keeps because the host could not take it
+# back: the world is whole on the GPU, and only what needs the host's pool is
+# refused. the game layer says why (gpu.untaken)
+fun withhold(s: *Sim) {
+    s.withheld = true;
+    s.running  = 0;
+}
+
+# whether the GPU keeps a pool the host could not take back, and why
+pub fun withheld(s: *Sim) opt[str] {
+    if (!s.withheld || s.gpu == nil) { ret opt[str].none{}; }
+    ret opt[str].some{gpu.untaken(s.gpu)};
 }
 
 # take the generations a closed gate voided off the count, and owe them again
@@ -1329,7 +1360,7 @@ fun rewind(s: *Sim) {
 # ---
 # s: simulation
 pub fun clear(s: *Sim) {
-    own(s);
+    if (!own(s)) { ret; }
     if (wanted(s, 0, 0, 0, 0, true)) {
         val synced: err[gfx.Error] = sync(s);
         kept(s, 0, 0, 0, 0, true, sel synced.ok);
@@ -1720,7 +1751,7 @@ fun in_area(s: *Sim, sl: usize) bool {
 # are brought level with the GPU's, and with mark they are noted as written whole
 fun stage(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64, pull: bool, mark: bool) bool {
     if (x1 <= x0 || y1 <= y0) { ret true; }
-    own(s);
+    if (!own(s))              { ret false; }
     val sp: *space.Space = ?s.space;
     var sl: usize        = 0;
     for (sl < sp.hi) {
@@ -2212,8 +2243,8 @@ pub fun edit_end(s: *Sim) bool {
                 cy = cy + 1;
             }
         }
-        if (s.gpu != nil) { gpu.note_edit(s.gpu); }
-        if (e.lost)       { overflow(s); }
+        if (s.gpu != nil)          { gpu.note_edit(s.gpu); }
+        if (e.lost && !s.withheld) { overflow(s); }
         ret !e.lost;
     }
     var sl: usize = 0;
@@ -2222,8 +2253,8 @@ pub fun edit_end(s: *Sim) bool {
         sl = sl + 1;
     }
     ok = space.settle(sp, sp.census, sp.hi, false);
-    if (s.gpu != nil)  { gpu.note_edit(s.gpu); }
-    if (!ok || e.lost) { overflow(s); }
+    if (s.gpu != nil)                   { gpu.note_edit(s.gpu); }
+    if ((!ok || e.lost) && !s.withheld) { overflow(s); }
     ret ok && !e.lost;
 }
 
@@ -4630,6 +4661,8 @@ test frame__uncapped_steps_past_the_old_reach_exactly_as_the_cpu_does {
         val from: i64   = spread_of(?t.cpu);
         val most: usize = uncapped_frames(?t.r, ?t.gpu, want);
         if (most == 0) { ret 4 + phase::i32 * 10; }
+        # the soups outgrew the first pool, which the GPU grew on its own
+        if (phase == 0 && t.g.p.cap <= t.gpu.space.cap) { ret 8; }
         # a frame ran more generations than even the wide halo allowed a census
         if (most * rule.radius(?k) <= space.SPREAD_WIDE::usize) { ret 5 + phase::i32 * 10; }
         if (!caught_up(?t))                                     { ret 6 + phase::i32 * 10; }
@@ -4637,6 +4670,41 @@ test frame__uncapped_steps_past_the_old_reach_exactly_as_the_cpu_does {
         if (spread_of(?t.cpu) < from + 4 * space.SIDE) { ret 7 + phase::i32 * 10; }
         phase = phase + 1;
     }
+    rig_close(?t);
+    ret 0;
+}
+
+test frame__a_host_refused_the_memory_leaves_the_pool_to_the_gpu_and_pauses {
+    var t:    Rig;
+    val code: i32 = rig_open(?t, rule.preset_rule(2), seed_edges);
+    if (code != 0) { ret code; }
+    if (!t.on) {
+        rig_close(?t);
+        ret 0;
+    }
+    # the soups outgrow the first pool, which the GPU grows without the host,
+    # until its top is past what the host holds
+    var round: usize = 0;
+    for (round < 40 && t.g.top <= t.gpu.space.cap) {
+        if (uncapped_frames(?t.r, ?t.gpu, t.gpu.generation + 20) == 0) { ret 4; }
+        round = round + 1;
+    }
+    if (t.g.top <= t.gpu.space.cap) { ret 5; }
+    # the host cannot grow to hold the GPU's pool: a read of the cells and a
+    # clear are refused, the run pauses, and the world stays whole on the GPU
+    val gen: u64 = t.gpu.generation;
+    t.gpu.space.max_slots = t.gpu.space.cap;
+    t.gpu.running         = 1;
+    val synced: err[gfx.Error] = sync(?t.gpu);
+    if (sel synced.ok)                    { ret 6; }
+    if (t.gpu.running != 0 || t.gpu.full) { ret 7; }
+    if (!t.gpu.withheld)                  { ret 8; }
+    clear(?t.gpu);
+    if (t.gpu.generation != gen || t.gpu.full) { ret 9; }
+    # with the memory back, the host takes the pool as the GPU kept it
+    t.gpu.space.max_slots = space.HOST_SLOTS;
+    if (!caught_up(?t)) { ret 10; }
+    if (t.gpu.withheld) { ret 11; }
     rig_close(?t);
     ret 0;
 }
