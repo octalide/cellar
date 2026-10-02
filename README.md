@@ -122,11 +122,12 @@ dropped.
 | `B`                      | shrink the selection to its live cells                           |
 | right or middle mouse    | drag to pan                                                      |
 | scroll                   | zoom toward the cursor                                           |
+| `PgUp`, `PgDn`           | zoom in or out to the next power of two of pixels per cell       |
 | arrow keys               | pan                                                              |
 | `F`                      | frame the randomize area                                         |
 | `M`                      | next colour mode                                                 |
 | `G`                      | grid lines                                                       |
-| `Tab`                    | hide / show the panels                                           |
+| `Tab`                    | hide / show the toolbar and panels                               |
 | `H`, `F1`                | key reference                                                    |
 | `F11`                    | toggle borderless fullscreen                                     |
 | `F12`                    | screenshot                                                       |

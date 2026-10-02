@@ -34,6 +34,7 @@ use cellar.world;
 use allo: std.allocator;
 use std.allocator.page;
 use std.types.bool.bool;
+use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
 use std.types.option.opt;
@@ -178,7 +179,24 @@ pub fun readout(ui: *bctx.Context, l: look.Look, a: *app.App, s: *world.Shown, p
     bstyle.pop(ui);
 }
 
-# the cell under the cursor and the zoom, in the bottom-left corner
+# append a zoom's scale to the second place, its trailing zeros dropped
+fun scale(buf: *u8, off: usize, v: f32) usize {
+    if (v >= 1000.0) { ret text.buf_grouped(buf, off, (v + 0.5)::u64); }
+    ret text.buf_decimal(buf, off, ((v * 100.0 + 0.5)::u64) * (text.DECIMAL / 100));
+}
+
+# the zoom as text, in pixels per cell, or cells per pixel past one pixel to a cell
+fun zoom_text(buf: *u8, ppc: f32) usize {
+    if (ppc >= 1.0) {
+        val o: usize = scale(buf, 0, ppc);
+        ret text.buf_str(buf, o, " px per cell");
+    }
+    val o: usize = scale(buf, 0, 1.0 / ppc);
+    ret text.buf_str(buf, o, " cells per px");
+}
+
+# the cell under the cursor and the zoom, in the bottom-left corner, with a
+# button each side of the zoom that steps it by a power of two
 # ---
 # ui:   the interface
 # l:    cellar's look
@@ -187,7 +205,8 @@ pub fun readout(ui: *bctx.Context, l: look.Look, a: *app.App, s: *world.Shown, p
 # over: the cursor is over the world, at (mx, my)
 # mx:   cursor x in screen pixels
 # my:   cursor y in screen pixels
-pub fun position(ui: *bctx.Context, l: look.Look, cam: render.Camera, pt: render.Port, over: bool, mx: f32, my: f32) {
+# ret:  1 when the zoom button was pressed to zoom in, -1 to zoom out, else 0
+pub fun position(ui: *bctx.Context, l: look.Look, cam: render.Camera, pt: render.Port, over: bool, mx: f32, my: f32) i32 {
     var c:  [48]u8;
     var co: usize = 0;
     if (over) {
@@ -200,22 +219,7 @@ pub fun position(ui: *bctx.Context, l: look.Look, cam: render.Camera, pt: render
     }
     c[co] = 0;
     var zb: [48]u8;
-    var o:  usize = 0;
-    val z:  f32   = cam.ppc;
-    if (z >= 1.0) {
-        o = text.buf_u64(?zb[0], o, z::u64);
-        if (z < 10.0) {
-            o = text.buf_str(?zb[0], o, ".");
-            o = text.buf_u64(?zb[0], o, ((z - z::u64::f32) * 10.0)::u64);
-        }
-        o = text.buf_str(?zb[0], o, " px per cell");
-    }
-    or {
-        o = text.buf_str(?zb[0], o, "1 px per ");
-        o = text.buf_u64(?zb[0], o, (1.0 / z + 0.5)::u64);
-        o = text.buf_str(?zb[0], o, " cells");
-    }
-    zb[o] = 0;
+    zb[zoom_text(?zb[0], cam.ppc)] = 0;
 
     var ov: bov.Overlay = bov.on_rect(area(pt), bov.BOTTOM_LEFT, bov.BOTTOM_LEFT);
     ov.dx   = bctx.px(ui, 6.0);
@@ -227,9 +231,12 @@ pub fun position(ui: *bctx.Context, l: look.Look, cam: render.Camera, pt: render
     val pd:   f32 = bctx.px(ui, 6.0);
     val room: f32 = maxf(pt.w - pd * 4.0, 0.0);
     val cw:   f32 = bctx.text_width(ui, ?c[0]);
-    val zw:   f32 = bctx.text_width(ui, ?zb[0]);
-    val sep:  f32 = bctx.text_width(ui, "    ");
     val lh:   f32 = bctx.line_height(ui);
+    # the zoom reads between its two buttons, in a group as wide as it needs
+    val bh:  f32 = lh + bctx.px(ui, 4.0);
+    val gap: f32 = bctx.px(ui, 6.0);
+    val zw:  f32 = bh * 2.0 + gap * 2.0 + bctx.text_width(ui, ?zb[0]);
+    val sep: f32 = bctx.text_width(ui, "    ");
     # the cell and the zoom share a line while they fit, else the zoom drops under the cell
     var rows: usize = 1;
     var w:    f32   = zw;
@@ -240,22 +247,27 @@ pub fun position(ui: *bctx.Context, l: look.Look, cam: render.Camera, pt: render
             w    = maxf(cw, zw);
         }
     }
-    w = minf(w, room) + pd * 2.0;
-    val h:   f32             = lh * rows::f32 + pd * 2.0;
+    w = minf(w, maxf(room, zw)) + pd * 2.0;
+    val h:   f32             = bh * rows::f32 + pd * 2.0;
     val r:   bctx.Area       = bw.place(ui, blay.fixed(w), blay.fixed(h), w, h);
     val dim: blit.draw.Color = look.colour(theme.TEXT_DIM, 1.0);
-    val bw0: f32             = w - pd * 2.0;
     var y:   f32             = r.y0 + pd;
     if (co != 0) {
-        btext.fit_at(ui, ?c[0], r.x0 + pd, y, bw0, btext.CUT_END, dim);
-        if (rows == 2) { y = y + lh; }
+        btext.fit_at(ui, ?c[0], r.x0 + pd, y + (bh - lh) / 2.0, minf(cw, w - pd * 2.0), btext.CUT_END, dim);
+        if (rows == 2) { y = y + bh; }
     }
     var zx: f32 = r.x0 + pd;
     if (co != 0 && rows == 1) { zx = zx + cw + sep; }
-    btext.fit_at(ui, ?zb[0], zx, y, bw0, btext.CUT_END, dim);
+    var step: i32 = 0;
+    if (bw.button_at(ui, "-###zoom_out", zx, y, zx + bh, y + bh, false)) { step = -1; }
+    val tx: f32 = zx + bh + gap;
+    val tw: f32 = zw - bh * 2.0 - gap * 2.0;
+    btext.fit_at(ui, ?zb[0], tx, y + (bh - lh) / 2.0, tw, btext.CUT_END, dim);
+    if (bw.button_at(ui, "+###zoom_in", tx + tw + gap, y, tx + tw + gap + bh, y + bh, false)) { step = 1; }
     bctx.pop_style(ui);
     bov.end(ui, shown);
     bstyle.pop(ui);
+    ret step;
 }
 
 # append a signed integer
@@ -388,8 +400,8 @@ pub fun help(ui: *bctx.Context, a: *app.App, sw: f32, sh: f32) {
     bov.end(ui, scrim);
     if (hit.clicked) { a.help = 0; }
 
-    var keys: [30]str;
-    var what: [30]str;
+    var keys: [31]str;
+    var what: [31]str;
     keys[0]  = "Space";
     what[0]  = "play or pause";
     keys[1]  = "S";
@@ -417,7 +429,7 @@ pub fun help(ui: *bctx.Context, a: *app.App, sw: f32, sh: f32) {
     keys[12] = "G";
     what[12] = "grid lines";
     keys[13] = "Tab";
-    what[13] = "show or hide the panels";
+    what[13] = "show or hide the toolbar and panels";
     keys[14] = "F11";
     what[14] = "fullscreen";
     keys[15] = "F12";
@@ -450,7 +462,9 @@ pub fun help(ui: *bctx.Context, a: *app.App, sw: f32, sh: f32) {
     what[28] = "redo (Ctrl Y too)";
     keys[29] = "Q  Shift Q";
     what[29] = "next or previous state to draw";
-    val n: usize = 30;
+    keys[30] = "PgUp  PgDn";
+    what[30] = "zoom in or out by a power of two";
+    val n: usize = 31;
 
     # the reference claims nothing, so a press on it reaches the scrim
     var co: bov.Overlay = bov.on_surface(bov.CENTER);
