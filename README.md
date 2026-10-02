@@ -122,6 +122,7 @@ dropped.
 | `B`                      | shrink the selection to its live cells                           |
 | right or middle mouse    | drag to pan                                                      |
 | scroll                   | zoom toward the cursor                                           |
+| `PgUp`, `PgDn`           | zoom in or out to the next power of two of pixels per cell       |
 | arrow keys               | pan                                                              |
 | `F`                      | frame the randomize area                                         |
 | `M`                      | next colour mode                                                 |
