@@ -329,6 +329,83 @@ pub rec Mip {
     v: [MAX_SLOTS * MIP]u32;
 }
 
+# the status buffer: what the GPU reports to the host, and the allocator it
+# keeps while it owns the pool (cellar.gpu)
+#
+# the head holds the control words, then the indirect arguments the pass
+# stages and the frame's steps are dispatched from. the census rows follow,
+# so a readback of the head and the rows below a pool's capacity brings back
+# everything the host reads each frame. the rest is the allocator's alone: the
+# pass each slot was last asked for by, the slots claimed this pass, a bit per
+# free slot, and a hash from chunk coordinates to slots.
+#
+# while the GPU owns the pool it alone writes the page table, the allocator
+# words and the hash. the host writes only the words marked as its own, in
+# order with the GPU's work in the frame's command stream, and takes the pool
+# back only once the device is idle (see cellar.gpu take).
+
+# words of the status head, the control words and the indirect arguments
+pub val STATUS_HEAD: u32 = 768;
+# the census id the frame's census was recorded under
+pub val CTL_CENSUS: u32 = 0;
+# nonzero once a pass could not claim every chunk it needed: no pass claims
+# and no step runs after it until the host reopens it
+pub val CTL_GATE: u32 = 1;
+# the generations recorded before the pass that closed the gate, low bits
+pub val CTL_HALT: u32 = 2;
+# hash buckets a free left as tombstones
+pub val CTL_TOMBS: u32 = 3;
+# the last incarnation handed out
+pub val CTL_SERIAL: u32 = 4;
+# the host's: slots below which a pass claims, every slot the frame's stages cover
+pub val CTL_TOP: u32 = 5;
+# the host's: slots the pool's buffers hold
+pub val CTL_CAP: u32 = 6;
+# the pass header, which the host resets before every pass: slots claimed so
+# far, the pass id (never 0), the serial of the step that left the front, the
+# generations recorded before the pass, and the frame's first step after it
+pub val CTL_FRESH: u32 = 8;
+pub val CTL_PASS:  u32 = 9;
+pub val CTL_NOW:   u32 = 10;
+pub val CTL_GENS:  u32 = 11;
+pub val CTL_NEXT:  u32 = 12;
+# the indirect arguments of the settle stage, one workgroup per 64 slots
+# claimed, and of the clear stage, one per settled slot, three words each
+pub val ARGS_SETTLE: u32 = 16;
+pub val ARGS_CLEAR:  u32 = 19;
+# the step dispatches one frame records, and the first of their arguments
+pub val STEP_CALLS: u32 = 240;
+pub val ARGS_STEP:  u32 = 22;
+# census words per slot: the packed count, the extent, and the coordinates
+pub val ROW: u32 = 4;
+# buckets of the GPU's hash: a power of two, four a slot
+pub val HASH: u32 = MAX_SLOTS * 4;
+# a hash bucket nothing ever held, which ends a probe
+pub val EMPTY: u32 = 0xffffffff;
+# a hash bucket whose slot was freed, which a probe passes and a claim reuses
+pub val TOMB: u32 = 0xfffffffe;
+
+pub rec Status {
+    head:   [STATUS_HEAD]u32;
+    rows:   [MAX_SLOTS * ROW]u32;
+    asked:  [MAX_SLOTS]u32;
+    fresh:  [MAX_SLOTS]u32;
+    bitmap: [MAX_SLOTS / 32]u32;
+    hash:   [HASH]u32;
+}
+
+# words of the status buffer
+pub val STATUS_WORDS: u32 = STATUS_HEAD + MAX_SLOTS * ROW + MAX_SLOTS * 2 + MAX_SLOTS / 32 + HASH;
+
+# the first bucket a chunk's biased coordinates probe from
+pub fun bucket(bx: u32, by: u32) u32 {
+    var h: u32 = (bx * 0x9e3779b1) ^ (by * 0x85ebca77);
+    h = h ^ (h >> 15);
+    h = h * 0x2c1b3c6d;
+    h = h ^ (h >> 12);
+    ret h & (HASH - 1);
+}
+
 test link__takes_a_position_through_every_transform_and_back {
     # a plain link east moves a chunk left in the neighbour's frame
     if (hop_x(plain_link(5), 65, 3) != 1 || hop_y(plain_link(5), 65, 3) != 3) { ret 1; }
