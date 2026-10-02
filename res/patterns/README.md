@@ -1,15 +1,18 @@
 # The pattern library
 
 The patterns the draw section offers, embedded into cellar at build time and
-read through the RLE format (`src/formats/rle.mach`).
+read through the format registry (`src/formats.mach`), each in the format its
+bytes are.
 
 Each `.rle` file is one category and holds its patterns one after another, in
 the order the panel lists them. A pattern is an ordinary RLE file: `#N` names
 it, `#O` credits its discoverer and year, `#C` links the page it was taken
-from, and the header and body follow. A blank line between patterns is
-customary but not needed, since each one ends at its body's `!`.
+from, and the header and body follow. A pattern of a continuous rule may be an
+RLW file instead (`src/formats/rlw.mach`), which keeps its cells' exact
+values. A blank line between patterns is customary but not needed, since each
+one ends at its body's `!`.
 
-To add a pattern, append its RLE to the category it belongs in. To add a
+To add a pattern, append it to the category it belongs in. To add a
 category, add its file here and a row to the table in `src/library.mach`. The
 library's tests decode every pattern, so a malformed entry fails the build's
 tests rather than the app.

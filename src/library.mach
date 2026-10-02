@@ -1,14 +1,15 @@
 # the bundled pattern library: classic Life patterns embedded as RLE
 #
 # each category is one file under res/patterns holding its patterns one after
-# another as ordinary RLE, see res/patterns/README.md. a pattern ends at its
-# body's '!', so adding one is appending its RLE to a file. adding a category
-# is its file and a row in category(). nothing else here knows a pattern.
+# another, see res/patterns/README.md. a pattern is an ordinary RLE file, or
+# an RLW one where it keeps a continuous rule's exact values, and ends at its
+# body's '!', so adding one is appending it to a file. adding a category is
+# its file and a row in category(). nothing else here knows a pattern.
 #
-# init indexes every pattern once, validating it through the format registry,
-# refusing one a pattern.Pattern cannot hold, and keeping its name. load decodes
-# one into a pattern.Pattern on demand through formats.load, which plans the
-# pattern sink before opening it.
+# init indexes every pattern once in the format the registry detects for it,
+# validating it, refusing one a pattern.Pattern cannot hold, and keeping its
+# name. load decodes one into a pattern.Pattern on demand through
+# formats.load, which plans the pattern sink before opening it.
 
 use cellar.format;
 use cellar.formats;
@@ -71,13 +72,15 @@ pub fun category(c: usize) Category {
 # one indexed pattern
 # ---
 # cat:  its category
-# p:    its RLE, inside the category's bytes
+# p:    its file, inside the category's bytes
 # n:    how many bytes
+# f:    its format
 # name: its name, owned by the library
 pub rec Entry {
     cat:  usize;
     p:    *u8;
     n:    usize;
+    f:    format.Format;
     name: OwnedString;
 }
 
@@ -139,13 +142,6 @@ pub fun next_record(p: *u8, n: usize, at: *usize, start: *usize, len: *usize) bo
     ret true;
 }
 
-# the RLE format, from the registry
-fun rle() format.Format {
-    var f: format.Format;
-    formats.by_id("rle", ?f);
-    ret f;
-}
-
 # index every bundled pattern, validating each
 # ---
 # l:   library to initialize; it owns what it allocates until dnit
@@ -154,43 +150,54 @@ fun rle() format.Format {
 pub fun init(l: *Library, a: *allo.Allocator) err[format.Error] {
     l.a     = a;
     l.items = vector.init[Entry](a);
-    var f: format.Format = rle();
-    var c: usize         = 0;
+    var c: usize = 0;
     for (c < CATEGORY_COUNT) {
-        val k:  Category = category(c);
-        var at: usize    = 0;
-        var s:  usize    = 0;
-        var n:  usize    = 0;
-        for (next_record(k.p, k.n, ?at, ?s, ?n)) {
-            var info: format.Info;
-            format.info_init(?info, a);
-            val v: err[format.Error] = formats.validate(a, ?f, ?k.p[s], n, ?info);
-            if (sel v.err) {
-                format.info_dnit(?info);
-                dnit(l);
-                ret v;
-            }
-            # a pattern the library lists must fit a pattern.Pattern, as load plans it
-            if (info.bounded && !pattern.holds((info.x1 - info.x0)::u64, (info.y1 - info.y0)::u64)) {
-                format.info_dnit(?info);
-                dnit(l);
-                ret err[format.Error].err{format.Error.range{}};
-            }
-            val d: res[OwnedString, allo.Error] = string.owned_dup(a, format.text_of(?info.name));
-            format.info_dnit(?info);
-            if (sel d.err) {
-                dnit(l);
-                ret err[format.Error].err{format.Error.alloc{d.err}};
-            }
-            var e: Entry                  = Entry{cat: c, p: ?k.p[s], n: n, name: d.ok};
-            val r: res[usize, allo.Error] = vector.push[Entry](?l.items, e);
-            if (sel r.err) {
-                string.owned_release(?e.name);
-                dnit(l);
-                ret err[format.Error].err{format.Error.alloc{r.err}};
-            }
+        val k: Category          = category(c);
+        val r: err[format.Error] = index(l, c, k.p, k.n);
+        if (sel r.err) {
+            dnit(l);
+            ret r;
         }
         c = c + 1;
+    }
+    ret err[format.Error].ok{};
+}
+
+# index the patterns of a category's bytes, each in the format its bytes are
+# ---
+# l:   library, initialized
+# c:   the category
+# p:   the bytes, which must outlive the library
+# n:   how many
+# ret: ok, or why a pattern was refused
+fun index(l: *Library, c: usize, p: *u8, n: usize) err[format.Error] {
+    var at: usize = 0;
+    var s:  usize = 0;
+    var m:  usize = 0;
+    for (next_record(p, n, ?at, ?s, ?m)) {
+        var f: format.Format;
+        if (!formats.by_bytes(?p[s], m, ?f)) { ret err[format.Error].err{format.Error.malformed{}}; }
+        var info: format.Info;
+        format.info_init(?info, l.a);
+        val v: err[format.Error] = formats.validate(l.a, ?f, ?p[s], m, ?info);
+        if (sel v.err) {
+            format.info_dnit(?info);
+            ret v;
+        }
+        # a pattern the library lists must fit a pattern.Pattern, as load plans it
+        if (info.bounded && !pattern.holds((info.x1 - info.x0)::u64, (info.y1 - info.y0)::u64)) {
+            format.info_dnit(?info);
+            ret err[format.Error].err{format.Error.range{}};
+        }
+        val d: res[OwnedString, allo.Error] = string.owned_dup(l.a, format.text_of(?info.name));
+        format.info_dnit(?info);
+        if (sel d.err) { ret err[format.Error].err{format.Error.alloc{d.err}}; }
+        var e: Entry                  = Entry{cat: c, p: ?p[s], n: m, f: f, name: d.ok};
+        val r: res[usize, allo.Error] = vector.push[Entry](?l.items, e);
+        if (sel r.err) {
+            string.owned_release(?e.name);
+            ret err[format.Error].err{format.Error.alloc{r.err}};
+        }
     }
     ret err[format.Error].ok{};
 }
@@ -247,12 +254,11 @@ pub fun find(l: *Library, s: str) usize {
 # p:   initialized pattern, resized to the pattern and given its name and rule
 # ret: ok, or why it could not be decoded, leaving p holding what it held
 pub fun load(l: *Library, i: usize, p: *pattern.Pattern) err[format.Error] {
-    val e:    *Entry        = ?l.items.data[i];
-    var f:    format.Format = rle();
+    val e:    *Entry = ?l.items.data[i];
     var ps:   adapt.PatternSink;
     var info: format.Info;
     format.info_init(?info, l.a);
-    val r: err[format.Error] = formats.load(l.a, ?f, e.p, e.n, adapt.pattern_sink(?ps, p), ?info);
+    val r: err[format.Error] = formats.load(l.a, ?e.f, e.p, e.n, adapt.pattern_sink(?ps, p), ?info);
     format.info_dnit(?info);
     ret r;
 }
@@ -401,5 +407,29 @@ test next_record__splits_on_the_body_end {
     if (!next_record(text::*u8, n, ?at, ?s, ?k))      { ret 3; }
     if (text[s + 1] != 'N' || text[s + k - 1] != '!') { ret 4; }
     if (next_record(text::*u8, n, ?at, ?s, ?k))       { ret 5; }
+    ret 0;
+}
+
+test index__lists_an_rlw_pattern_beside_rle_ones {
+    var a: allo.Allocator;
+    page.make(?a);
+    val text: str = "#N block\nx = 2, y = 2, rule = B3/S23\n2o$2o!\n\n[RLW 1]\n#N speck\nx = 3, y = 1, rule = R=13,T=10,b=[1],m=0.15,s=0.015,kn=1,gn=1\nmgeuN.H!\n";
+    var l:    Library;
+    l.a     = ?a;
+    l.items = vector.init[Entry](?a);
+    val r: err[format.Error] = index(?l, 0, text::*u8, string.str_len(text));
+    if (sel r.err)                                                                                   { ret 1; }
+    if (count(?l) != 2 || find(?l, "speck") != 1 || !string.str_equals(l.items.data[1].f.id, "rlw")) { ret 2; }
+    # the RLW pattern comes out with its words exact, the one too small for a state included
+    var p:  pattern.Pattern;
+    val pm: err[allo.Error] = pattern.init(?p, ?a, 0, 0, "");
+    if (sel pm.err) { ret 3; }
+    val got: err[format.Error] = load(?l, 1, ?p);
+    if (sel got.err)                                                      { ret 4; }
+    if (!pattern.exact(?p) || p.w != 3 || p.h != 1)                       { ret 5; }
+    if (pattern.word(?p, 0, 0) != 5592405 || pattern.word(?p, 1, 0) != 0) { ret 6; }
+    if (pattern.word(?p, 2, 0) != 7 || pattern.get(?p, 0, 0) != 85)       { ret 7; }
+    pattern.dnit(?p);
+    dnit(?l);
     ret 0;
 }
