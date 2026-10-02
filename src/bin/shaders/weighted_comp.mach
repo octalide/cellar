@@ -2,11 +2,22 @@
 # outer-totalistic family (cellar.rules.weighted)
 #
 # an invocation is a run of 8 cells in a row, and 8 workgroups of 64 cover a
-# chunk; workgroup y names the chunk's slot, past the dispatch's base slot. the
-# neighbourhood is read straight from the source pool through the chunk's
-# page-table entry, which names the slot of each of its eight neighbours, so a
-# chunk that does not exist reads as dead. a cell is age << 8 | heat, alive
-# while its age is nonzero.
+# chunk, a band of 8 rows each; workgroup y names the chunk's slot, past the
+# dispatch's base slot. a cell is age << 8 | heat, alive while its age is
+# nonzero.
+#
+# a workgroup reads its band and an apron of the radius around it from the
+# source pool once, as one bit a cell, into a shared tile, and every
+# neighbourhood is read from the tile after a workgroup barrier. the apron is
+# read through the chunk's page-table entry, which names the slot of each of
+# its eight neighbours, so a chunk that does not exist reads as dead. the
+# tile's words are aligned to the chunk's columns from -32, so each word lies
+# in one chunk, and the tile holds the widest radius (word.RADIUS_MAX) in 640
+# bytes, well inside the 16 KiB of workgroup memory every device has.
+#
+# whether a chunk is stepped in full is decided once a workgroup, by its first
+# invocation, since a neighbour's stamp may change while the dispatch runs and
+# the tile's barrier must be reached by the whole workgroup or none of it.
 #
 # each step stamps, per slot, the step's serial into an alive and a warm word
 # when the chunk's result holds a live or a warm cell; every invocation that
@@ -31,6 +42,7 @@ use cellar.layout.Flags;
 use cellar.layout.Meta;
 use cellar.layout.Table;
 use cellar.rules.weighted.word;
+use sy: shader.sync;
 
 #[storage(1, 0, "readonly")]
 var src:   Cells;
@@ -45,6 +57,26 @@ var table: Table;
 
 #[builtin("global_invocation")]
 var gid: u32x3;
+#[builtin("local_invocation_index")]
+var lid: u32;
+
+# a band's rows and the widest apron above and below it, and the words a row
+# of the tile takes: columns -32 to 95 cover the widest apron either side
+val BAND:       u32 = 8;
+val TILE_ROWS:  u32 = BAND + 2 * word.RADIUS_MAX;
+val TILE_WORDS: u32 = 4;
+
+rec Tile {
+    v: [TILE_ROWS * TILE_WORDS]u32;
+}
+
+# the band's live cells and its apron's, bit c + 32 of a row's words the cell
+# at column c, and a cell past a plane's dead edge as the form holds the edge
+#[shared]
+var tile: Tile;
+# 1 when the workgroup's chunk steps in full, as its first invocation found
+#[shared]
+var full: u32;
 
 # the index in the source pool of the cell at (x, y) of a slot's frame, taken
 # through the links where it lies outside the window (cellar.layout), NONE
@@ -90,6 +122,7 @@ fun cool(v: u32) u32 {
 fun comp_main() {
     val slot: u32 = gid[1] + meta.base[0];
     val ly:   i32 = (gid[0] / 8)::i32;
+    val band: i32 = ((gid[0] / 64) * BAND)::i32;
     val x0:   u32 = (gid[0] % 8) * 8;
     val base: u32 = slot * layout.ENTRY;
     val row:  u32 = slot * layout.CELLS + (ly * layout.SIDE::i32)::u32;
@@ -104,18 +137,23 @@ fun comp_main() {
     # chunk that is live or warm at the source carries one of the two
     val last: u32 = meta.serial - 1;
     val now:  u32 = meta.serial;
-    var busy: u32 = 0;
-    var k:    u32 = 0;
-    for (k < 9) {
-        val n: u32 = meta.table[base + k];
-        if (n != layout.NONE) {
-            val f: u32 = flags.v[n * 2];
-            if (f == last || f == now) { busy = 1; }
+    if (lid == 0) {
+        var busy: u32 = 0;
+        var k:    u32 = 0;
+        for (k < 9) {
+            val n: u32 = meta.table[base + k];
+            if (n != layout.NONE) {
+                val f: u32 = flags.v[n * 2];
+                if (f == last || f == now) { busy = 1; }
+            }
+            k = k + 1;
         }
-        k = k + 1;
+        if (seamed != 0) { busy = 1; }
+        full = busy;
     }
-    if (seamed != 0) { busy = 1; }
-    var x: u32 = x0;
+    sy.workgroup_barrier();
+    val busy: u32 = full;
+    var x:    u32 = x0;
     if (busy == 0) {
         val warm: u32 = flags.v[slot * 2 + 1];
         if (warm != last && warm != now) {
@@ -151,49 +189,84 @@ fun comp_main() {
     val past:    u32 = word.past(form, gen & 1);
     var live:    u32 = 0;
     var warm:    u32 = 0;
+
+    # the tile's rows from the band's first less the radius; a word's columns
+    # outside the apron stay clear
+    val rows: u32 = BAND + 2 * r::u32;
+    var i:    u32 = lid;
+    for (i < rows * TILE_WORDS) {
+        val y:    i32 = band - r + (i / TILE_WORDS)::i32;
+        val k:    u32 = i % TILE_WORDS;
+        val c0:   i32 = k::i32 * 32 - 32;
+        var lo:   i32 = c0;
+        var hi:   i32 = c0 + 32;
+        var bits: u32 = 0;
+        if (lo < 0 - r)                { lo = 0 - r; }
+        if (hi > layout.SIDE::i32 + r) { hi = layout.SIDE::i32 + r; }
+        if (seamed != 0) {
+            var c: i32 = lo;
+            for (c < hi) {
+                val at: u32 = reach(slot, c, y);
+                var on: u32 = 0;
+                if (at == layout.PAST) { on = past; }
+                or (at != layout.NONE) {
+                    if (src.v[at] >= word.LIVE) { on = 1; }
+                }
+                bits = bits | (on << (c - c0)::u32);
+                c    = c + 1;
+            }
+        }
+        or (lo < hi) {
+            var yy: i32 = y;
+            var cy: u32 = 1;
+            if (yy < 0) {
+                yy = yy + layout.SIDE::i32;
+                cy = 0;
+            }
+            or (yy >= layout.SIDE::i32) {
+                yy = yy - layout.SIDE::i32;
+                cy = 2;
+            }
+            # words 0 and 3 lie in the west and east neighbours, 1 and 2 in the chunk
+            val cx: u32 = (k + 1) / 2;
+            val n:  u32 = meta.table[base + cy * 3 + cx];
+            if (n != layout.NONE) {
+                val from: i32 = (n * layout.CELLS)::i32 + yy * layout.SIDE::i32 - (cx::i32 - 1) * layout.SIDE::i32;
+                var c:    i32 = lo;
+                for (c < hi) {
+                    if (src.v[(from + c)::u32] >= word.LIVE) { bits = bits | (1 << (c - c0)::u32); }
+                    c = c + 1;
+                }
+            }
+        }
+        tile.v[i] = bits;
+        i         = i + 64;
+    }
+    sy.workgroup_barrier();
+
     for (x < x0 + 8) {
         val lx:  i32 = x::i32;
         var sum: i32 = 0;
-        var dy:  i32 = 0 - r;
+        # the footprint's row runs from bit sh of word ws of its tile row
+        val at: u32 = (lx - r + 32)::u32;
+        val ws: u32 = at / 32;
+        val sh: u32 = at % 32;
+        var dy: i32 = 0 - r;
         for (dy <= r) {
-            var y:  i32 = ly + dy;
-            var cy: u32 = 1;
-            if (y < 0) {
-                y  = y + layout.SIDE::i32;
-                cy = 0;
-            }
-            or (y >= layout.SIDE::i32) {
-                y  = y - layout.SIDE::i32;
-                cy = 2;
-            }
-            var dx: i32 = 0 - r;
-            for (dx <= r) {
-                val w: i32 = table.v[2 * words + ((dy + r) * width + dx + r)::u32]:~i32;
+            val t: u32 = (ly - band + dy + r)::u32 * TILE_WORDS + ws;
+            val a: u32 = tile.v[t];
+            val b: u32 = tile.v[t + 1];
+            var j: i32 = 0;
+            for (j < width) {
+                val w: i32 = table.v[2 * words + ((dy + r) * width + j)::u32]:~i32;
                 if (w != 0) {
-                    var xx: i32 = lx + dx;
-                    var cx: u32 = 1;
-                    if (xx < 0) {
-                        xx = xx + layout.SIDE::i32;
-                        cx = 0;
-                    }
-                    or (xx >= layout.SIDE::i32) {
-                        xx = xx - layout.SIDE::i32;
-                        cx = 2;
-                    }
-                    var at: u32 = layout.NONE;
-                    if (seamed != 0) { at = reach(slot, lx + dx, ly + dy); }
-                    or {
-                        val n: u32 = meta.table[base + cy * 3 + cx];
-                        if (n != layout.NONE) { at = n * layout.CELLS + (y * layout.SIDE::i32 + xx)::u32; }
-                    }
-                    if (at == layout.PAST) {
-                        if (past != 0) { sum = sum + w; }
-                    }
-                    or (at != layout.NONE) {
-                        if (src.v[at] >= word.LIVE) { sum = sum + w; }
-                    }
+                    val p:  u32 = sh + j::u32;
+                    var on: u32 = 0;
+                    if (p < 32)  { on = (a >> p) & 1; }
+                    or           { on = (b >> (p - 32)) & 1; }
+                    if (on != 0) { sum = sum + w; }
                 }
-                dx = dx + 1;
+                j = j + 1;
             }
             dy = dy + 1;
         }
