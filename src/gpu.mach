@@ -496,6 +496,7 @@ rec Pool {
 # ops:      the frame's planned dispatches
 # nops:     how many
 # ctl:      the status head's first words, as take read them
+# untaken:  why the last take that failed left the pool the GPU's
 pub rec Gpu {
     a:        *allo.Allocator;
     r:        *gfx.Renderer;
@@ -603,6 +604,7 @@ pub rec Gpu {
     ops:      [MAX_STEPS]Op;
     nops:     usize;
     ctl:      [16]u32;
+    untaken:  str;
 }
 
 # how long frames may take against the display's refresh interval
@@ -891,6 +893,7 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     g.used     = 0;
     g.tallied  = false;
     g.squeeze  = 0;
+    g.untaken  = "";
     g.listed   = false;
     g.gathered = 0;
     g.est      = UNKNOWN;
@@ -1410,10 +1413,13 @@ pub fun budget(g: *Gpu, radius: usize) usize {
 #         the GPU owns the pool, its count taken
 # fits:   the pool held every chunk the world grew into
 # behind: generations recorded since that census was taken
+# kept:   the gate closed, and the pool could not be taken back to reopen it
+#         (take), so it stays the GPU's and stepping stops
 pub rec Landed {
     fresh:  bool;
     fits:   bool;
     behind: u64;
+    kept:   bool;
 }
 
 # settle the host's pool from the newest census that has landed, or while the
@@ -1427,7 +1433,7 @@ pub rec Landed {
 # sp:  the host's pool
 # ret: whether a census was settled, how far behind it is, and whether it fit
 pub fun collect(g: *Gpu, sp: *space.Space) Landed {
-    val none: Landed = Landed{fresh: false, fits: true, behind: 0};
+    val none: Landed = Landed{fresh: false, fits: true, behind: 0, kept: false};
     if (!g.stepping || g.p.cap == 0) { ret none; }
     val len: usize = status_bytes(g.p.cap);
     if (!gfx.renderer_readback_take(g.r, ?g.p.rb, g.p.got::*u8, len)) { ret none; }
@@ -1489,11 +1495,11 @@ pub fun collect(g: *Gpu, sp: *space.Space) Landed {
         # a census taken while the gate was closed read cells no step since
         # has touched, so it is no count of the world
         if (gate) {
-            take(g, sp);
+            if (!take(g, sp)) { ret Landed{fresh: false, fits: true, behind: 0, kept: true}; }
             make_room(g, sp, g.top + slack(g.top));
             # a pool at its ceiling with no slot free below the top, and no
             # growth coming, cannot hold the world
-            ret Landed{fresh: false, fits: sp.live < g.top || g.reserved, behind: 0};
+            ret Landed{fresh: false, fits: sp.live < g.top || g.reserved, behind: 0, kept: false};
         }
         # a census taken before an edit is no count of the world after it
         if (snap.edits == g.edits) {
@@ -1505,7 +1511,7 @@ pub fun collect(g: *Gpu, sp: *space.Space) Landed {
         }
         g.settled = snap.seq;
         if (high + slack(high) / 2 > g.top) { make_room(g, sp, high + slack(high)); }
-        ret Landed{fresh: true, fits: true, behind: g.gens - snap.gens};
+        ret Landed{fresh: true, fits: true, behind: g.gens - snap.gens, kept: false};
     }
     val ok: bool = space.settle(sp, g.p.landed, n, snap.edits == g.edits);
     g.settled = snap.seq;
@@ -1517,7 +1523,7 @@ pub fun collect(g: *Gpu, sp: *space.Space) Landed {
     var to: u64 = snap.spread + snap.span::u64;
     if (to > g.hold)        { to = g.hold; }
     if (ok && to > g.limit) { g.limit = to; }
-    ret Landed{fresh: true, fits: ok, behind: g.gens - snap.gens};
+    ret Landed{fresh: true, fits: ok, behind: g.gens - snap.gens, kept: false};
 }
 
 # raise the top toward want slots while the GPU owns the pool, and make
@@ -1528,7 +1534,7 @@ pub fun collect(g: *Gpu, sp: *space.Space) Landed {
 # capacity has its free bit, so it takes no seeding. the next flush moves the
 # pool into the larger buffers on the GPU (carry_comp), so a growth neither
 # takes the pool back nor grows the host's, and the top passes the old
-# capacity once a census finds the pool there.
+# capacity once the next flush has moved the pool, as aim keeps it.
 fun make_room(g: *Gpu, sp: *space.Space, want: usize) {
     val ahead: usize = want + slack(want);
     if (ahead > g.p.cap) {
@@ -1549,24 +1555,36 @@ fun make_room(g: *Gpu, sp: *space.Space, want: usize) {
 # is the GPU's: a stall, which reads the page table and the allocator's words,
 # first growing the host's pool to the GPU's capacity, which grew without it
 #
+# a host refused the memory for that, or a read that fails, leaves the pool
+# the GPU's as it was, the host's mirror stale, and why in untaken: nothing
+# that needs the host's pool may go on.
 # a closed gate voided every step recorded after the pass that closed it, so
 # the count of generations, the serial and the front go back to that pass,
 # and the generations taken back wait in rewound for the world's count. the
 # GPU keeps owning the pool until the host changes it.
 # call outside a frame, or in one before frame has recorded anything.
 # ---
-# g:  the GPU side
-# sp: the host's pool
-pub fun take(g: *Gpu, sp: *space.Space) {
-    if (!g.owns || !g.moved) { ret; }
-    val eh: err[gfx.Error] = gfx.storage_buffer_read(g.d, ?g.p.status, 0, (?g.ctl[0])::*u8, 64);
-    if (sel eh.err) { ret; }
+# g:   the GPU side
+# sp:  the host's pool
+# ret: the host's pool is the world's, false when the GPU keeps it
+pub fun take(g: *Gpu, sp: *space.Space) bool {
+    if (!g.owns || !g.moved) { ret true; }
     var n: usize = g.top;
-    # a host refused the memory takes back only the slots it holds
-    if (n > sp.cap && !space.grow(sp, g.p.cap)) { n = sp.cap; }
+    if (n > sp.cap && !space.grow(sp, g.p.cap)) {
+        g.untaken = "there is not enough memory to bring the world back from the GPU";
+        ret false;
+    }
+    val eh: err[gfx.Error] = gfx.storage_buffer_read(g.d, ?g.p.status, 0, (?g.ctl[0])::*u8, 64);
+    if (sel eh.err) {
+        g.untaken = "the GPU's pool could not be read back";
+        ret false;
+    }
     if (n != 0) {
         val et: err[gfx.Error] = gfx.storage_buffer_read(g.d, ?g.p.meta, HEAD * 4, sp.table::*u8, n * space.ENTRY * 4);
-        if (sel et.err) { ret; }
+        if (sel et.err) {
+            g.untaken = "the GPU's pool could not be read back";
+            ret false;
+        }
     }
     if (g.ctl[layout.CTL_GATE::usize] != 0) {
         val v: u64 = ((g.gens & 0xffffffff) + 0x100000000 - g.ctl[layout.CTL_HALT::usize]::u64) & 0xffffffff;
@@ -1584,7 +1602,14 @@ pub fun take(g: *Gpu, sp: *space.Space) {
     g.moved   = false;
     g.squeeze = 0;
     g.top     = sp.hi + slack(sp.hi);
+    g.aim     = 0;
     if (g.top > g.p.cap) { g.top = g.p.cap; }
+    ret true;
+}
+
+# why the last take the GPU kept the pool through could not take it back
+pub fun untaken(g: *Gpu) str {
+    ret g.untaken;
 }
 
 # generations a closed gate voided since this was last asked, which the
@@ -1619,8 +1644,8 @@ pub fun tallied(g: *Gpu) bool {
 # sp:  the host's pool
 # ret: ok, or why the read failed
 pub fun pull(g: *Gpu, sp: *space.Space) err[gfx.Error] {
-    if (!g.stepping) { ret err[gfx.Error].ok{}; }
-    take(g, sp);
+    if (!g.stepping)  { ret err[gfx.Error].ok{}; }
+    if (!take(g, sp)) { ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.empty{}}}; }
     # one read per run of slots whose staging is not newer; a free slot's
     # staging is unused, so it may ride along in a run
     var top: usize = g.hi;
@@ -1664,8 +1689,8 @@ pub fun pull(g: *Gpu, sp: *space.Space) err[gfx.Error] {
 # n:   slots in the run
 # ret: ok, or why the read failed
 pub fun pull_chunks(g: *Gpu, sp: *space.Space, lo: usize, n: usize) err[gfx.Error] {
-    if (!g.stepping) { ret err[gfx.Error].ok{}; }
-    take(g, sp);
+    if (!g.stepping)  { ret err[gfx.Error].ok{}; }
+    if (!take(g, sp)) { ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.empty{}}}; }
     var top: usize = lo + n;
     if (g.hi < top)  { top = g.hi; }
     if (sp.hi < top) { top = sp.hi; }
@@ -1737,8 +1762,8 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
     # the GPU owned the pool before this frame, so its page table is the one
     # a growth carries
     var held: bool = g.owns;
-    if (g.owns && !owns) {
-        take(g, sp);
+    # a pool that cannot be taken back stays the GPU's
+    if (g.owns && !owns && take(g, sp)) {
         g.owns = false;
         held   = false;
     }
