@@ -498,12 +498,13 @@ pub fun on_gpu(s: *Sim) bool {
 # a GPU that cannot step the rule the world runs leaves the stepping to the
 # CPU, which steps every family.
 # ---
-# s: simulation
+# s: simulation, which must not move while attached
 # g: the GPU side, initialized with at least the pool's capacity
 pub fun attach(s: *Sim, g: *gpu.Gpu) {
     if (!gpu.steps(g, rule.family_of(?s.rule))) { gpu.forgo_compute(g); }
     s.gpu = g;
-    space.set_mirror(?s.space, gpu.mirror(g, ?s.space), g.slots);
+    gpu.mirror(g, ?s.space);
+    space.set_mirror(?s.space, space.Mirror{ctx: s::*u8, reserve: reserve_pool, own: own_pool}, g.slots);
     var t: usize = 0;
     for (t < s.space.hi) {
         s.space.dirty[t] = space.DIRTY_ENTRY | space.DIRTY_CELLS;
@@ -516,6 +517,22 @@ pub fun attach(s: *Sim, g: *gpu.Gpu) {
     or               { space.set_pyramids(?s.space, true); }
     if (!on_tree(s)) { s.engine = pool_engine(s); }
     s.seen.valid = false;
+}
+
+# make room on the GPU before the pool grows. the render thread holds the world
+# for every change while the GPU steps it, so the buffers are made at once.
+# otherwise the simulation thread may be growing the pool, which must not call
+# the device, and the growth is owed to the next frame (cellar.gpu.Pool)
+fun reserve_pool(ctx: *u8, cap: usize) bool {
+    val s: *Sim = ctx::*Sim;
+    if (on_gpu(s)) { ret gpu.reserve(s.gpu, cap); }
+    ret gpu.owe(s.gpu, cap);
+}
+
+# take the pool back from the GPU before the host reads or changes it
+fun own_pool(ctx: *u8) {
+    val s: *Sim = ctx::*Sim;
+    gpu.take(s.gpu, ?s.space);
 }
 
 # write every live chunk of the pool into the tree, emptied first

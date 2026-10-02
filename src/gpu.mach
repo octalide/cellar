@@ -328,6 +328,17 @@ rec Write {
 }
 
 # the buffers sized to the pool's capacity
+#
+# the device is the render thread's. it alone creates and deletes these
+# buffers, reads them back and records and submits work on them, since boom
+# records every dispatch into the frame's one command buffer on the one queue
+# that thread submits, with no locking across threads. the host's pool may
+# change on the simulation thread whenever the GPU does not step the world
+# (cellar.runner), so a growth asked there touches nothing here: it is owed
+# (owe) and the next frame makes the buffers (flush). a growth is made at once
+# (reserve) only while the GPU steps the world, when the render thread holds
+# the world for every change. the pool is handed back (take) only while the GPU
+# owns it, which it does only while it steps the world.
 # ---
 # cells:  the two cell pools stepped between
 # meta:   the rule and the page table
@@ -391,8 +402,8 @@ rec Pool {
 # hi:       slots the GPU's page table covers
 # front:    which of cells holds the world
 # stepping: the compute stages built, so the GPU steps
-# owed:     slots a growth asked for while the CPU steps, which the next frame
-#           makes the buffers for
+# owed:     slots a growth asked for while the GPU does not step the world,
+#           which the next frame makes the buffers for
 # drawn:    the sense the held pyramids were built with
 # serial:   the serial of the last step recorded; stamps equal to it are current
 # ring:     recent censuses
@@ -1134,26 +1145,32 @@ fun fill_shades(pal: *f32) {
     }
 }
 
-# make room for a pool of cap slots, ahead of the host's pool growing to it
-#
-# while the GPU steps, the buffers are made now, where a refusal can still
-# turn the growth down, and the next frame moves the world into them. while the
-# CPU steps, which it may do off the device's thread, the growth is owed and
-# the next frame makes them, failing the frame if the device refuses.
+# make room for a pool of cap slots now, ahead of the host's pool growing to
+# it, where a refusal can still turn the growth down, and the next frame moves
+# the world into the buffers. only the render thread may call it, while the GPU
+# steps the world (see Pool)
 # ---
 # g:   the GPU side
 # cap: slots the host's pool grows to
-# ret: false when the device refused the buffers, or cap is past its ceiling
+# ret: false when the device refused the buffers
 pub fun reserve(g: *Gpu, cap: usize) bool {
     if (cap <= g.p.cap || (g.reserved && cap <= g.next.cap)) { ret true; }
-    if (!g.stepping) {
-        # the CPU may be stepping on the simulation thread, which must not
-        # call the device, so the next frame makes the buffers
-        if (cap > g.slots) { ret false; }
-        if (cap > g.owed)  { g.owed = cap; }
-        ret true;
-    }
     ret make_next(g, cap);
+}
+
+# owe room for a pool of cap slots to the next frame, ahead of the host's pool
+# growing to it, without calling the device, so whichever thread holds the
+# world may grow the pool through it (see Pool). the next frame makes the
+# buffers, failing if the device refuses them
+# ---
+# g:   the GPU side
+# cap: slots the host's pool grows to
+# ret: false when cap is past the device's ceiling
+pub fun owe(g: *Gpu, cap: usize) bool {
+    if (cap <= g.p.cap || (g.reserved && cap <= g.next.cap)) { ret true; }
+    if (cap > g.slots)                                       { ret false; }
+    if (cap > g.owed)                                        { g.owed = cap; }
+    ret true;
 }
 
 # make the buffers a growth to cap slots moves the world into
@@ -1169,23 +1186,14 @@ fun make_next(g: *Gpu, cap: usize) bool {
     ret true;
 }
 
-fun reserve_for(ctx: *u8, cap: usize) bool {
-    ret reserve(ctx::*Gpu, cap);
-}
-
-fun own_for(ctx: *u8) {
-    val g: *Gpu = ctx::*Gpu;
-    if (g.sp != nil) { take(g, g.sp); }
-}
-
-# the GPU side as the host pool's mirror, which makes room before the pool
-# grows and hands the pool back before the host reads or changes it
+# have the GPU side mirror the host's pool, which then makes room through
+# reserve or owe before it grows, as the world's holder decides, and hands the
+# pool back through take before the host reads or changes it
 # ---
 # g:  the GPU side
 # sp: the host's pool, which must not move while it is mirrored
-pub fun mirror(g: *Gpu, sp: *space.Space) space.Mirror {
+pub fun mirror(g: *Gpu, sp: *space.Space) {
     g.sp = sp;
-    ret space.Mirror{ctx: g::*u8, reserve: reserve_for, own: own_for};
 }
 
 # leave stepping to the CPU even though the compute stages were built, to
