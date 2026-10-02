@@ -18,7 +18,12 @@
 #                                    DISPLAY_MAX bytes
 #   same_rule(a: *R, b: *R) bool     whether two rules step alike
 #   states(r: *R) u32                how many states a cell can be in
-#   word_of(r: *R, state: u32) u32   the word a fresh cell of a state holds
+#   layers(r: *R) plane.Set          the layers its cells are stored in, its
+#                                    state layer and any rule layers its step
+#                                    needs (cellar.layer)
+#   word_of(r: *R, state: u32) u32   the word a fresh cell of a state holds:
+#                                    its exact value, its state and rule
+#                                    layers' values where they lie in it
 #   state_of(c: u32) u32             the state a word holds
 #   ink(r: *R) u32                   the state painted or seeded when none is
 #                                    chosen, the fully live one
@@ -26,7 +31,8 @@
 #                                    from the CPU's a generation on from the
 #                                    same cells, 0 for a family the engines
 #                                    step bit for bit
-#   sense() layout.Sense             how shared code reads the word
+#   sense() layout.Sense             how shared code reads a value of its
+#                                    state layer
 #   radius(r: *R) usize              how far one generation reaches, at most
 #                                    layout.REACH_MAX
 #   caps(r: *R) Caps                 what the rule can do (see Caps)
@@ -94,6 +100,8 @@
 # (bindings(i) against boom's max_dispatch_bindings) cannot step that family's
 # rules on the GPU, and the simulation refuses them there (see cellar.sim).
 
+use cellar.layer;
+use cellar.layer.plane;
 use cellar.layout;
 use cellar.rules.generations;
 use cellar.rules.lenia;
@@ -546,7 +554,21 @@ pub fun slack(r: *Rule) u32 {
     ret 0;
 }
 
-# how shared code reads the rule's cell word: the census, the pool and the draw
+# the layers a rule's cells are stored in (cellar.layer): its family's state
+# layer and the rule layers its step needs
+pub fun layers(r: *Rule) plane.Set {
+    if (sel r.kind.weighted)      { ret weighted.layers(?r.kind.weighted); }
+    if (sel r.kind.generations)   { ret generations.layers(?r.kind.generations); }
+    if (sel r.kind.nontotalistic) { ret nontotalistic.layers(?r.kind.nontotalistic); }
+    if (sel r.kind.table)         { ret ruletable.layers(?r.kind.table); }
+    if (sel r.kind.lenia)         { ret lenia.layers(?r.kind.lenia); }
+    if (sel r.kind.reaction)      { ret reaction.layers(?r.kind.reaction); }
+    unmatched();
+    ret plane.state("", 32);
+}
+
+# how shared code reads a value of the rule's state layer: the census, the
+# pool and the draw
 pub fun sense(r: *Rule) layout.Sense {
     var none: layout.Sense;
     if (sel r.kind.weighted)      { ret weighted.sense(); }
@@ -920,6 +942,21 @@ test dispatch__every_function_handles_every_family {
             for (st < states(?r)) {
                 if (state(?r, word(?r, st)) != st) { ret 8; }
                 st = st + 1;
+            }
+            # its layers hold to the contract, with no view layer, and every
+            # state's word lies inside them
+            var ls: plane.Set = layers(?r);
+            if (!plane.holds(?ls) || plane.views(?ls) != 0) { ret 16; }
+            var bits: u32   = 0;
+            var lk:   usize = 0;
+            for (lk < ls.n) {
+                bits = bits | (layer.mask(ls.at[lk].width) << ls.at[lk].at);
+                lk   = lk + 1;
+            }
+            var sw: u32 = 0;
+            for (sw < states(?r)) {
+                if ((word(?r, sw) & ~bits) != 0) { ret 16; }
+                sw = sw + 1;
             }
             val sn: layout.Sense = sense(?r);
             if (layout.live(0, sn.live_mask, sn.live_lo, sn.live_hi) != 0) { ret 9; }
