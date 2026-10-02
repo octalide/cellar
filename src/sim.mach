@@ -3390,10 +3390,12 @@ fun settle_frames(r: *gfx.Renderer, s: *Sim, want: u64) bool {
     ret s.generation == want && sampled(s) == want;
 }
 
-# whether every cell either world holds is the same in the other
+# whether every cell either world holds is the same in the other, or as near
+# as the rule's slack lets two engines' words lie a generation apart
 #[testing]
 fun same_world(a: *Sim, b: *Sim) bool {
-    var pass: usize = 0;
+    val slack: u32   = rule.slack(?a.rule);
+    var pass:  usize = 0;
     for (pass < 2) {
         var x: *Sim = a;
         var y: *Sim = b;
@@ -3410,7 +3412,11 @@ fun same_world(a: *Sim, b: *Sim) bool {
                 for (i < space.CELLS) {
                     val cx: i64 = ox + (i % 64)::i64;
                     val cy: i64 = oy + (i / 64)::i64;
-                    if (cell(x, cx, cy) != cell(y, cx, cy)) {
+                    val p:  u32 = cell(x, cx, cy);
+                    val q:  u32 = cell(y, cx, cy);
+                    var d:  u32 = p - q;
+                    if (q > p) { d = q - p; }
+                    if (d > slack) {
                         print.eprintlnf("cells differ at ({}, {}): {} and {}", cx, cy, cell(x, cx, cy), cell(y, cx, cy));
                         ret false;
                     }
@@ -3424,25 +3430,44 @@ fun same_world(a: *Sim, b: *Sim) bool {
     ret true;
 }
 
+# the live cells a world's pool holds, counted cell by cell
+#[testing]
+fun live_cells(s: *Sim) usize {
+    var n:  usize = 0;
+    var sl: usize = 0;
+    for (sl < s.space.hi) {
+        if (space.used(?s.space, sl)) {
+            var i: usize = 0;
+            for (i < space.CELLS) {
+                if (space.live(?s.space, s.space.cells[sl * space.CELLS + i])) { n = n + 1; }
+                i = i + 1;
+            }
+        }
+        sl = sl + 1;
+    }
+    ret n;
+}
+
 # seed the same soups and far-flung glider into a world
 #[testing]
 pub fun seed_world(s: *Sim) {
+    val ink: u32 = rule.ink(?s.rule);
     s.rng = rand.seed(1, 2, 3, 4);
     fill_begin(s);
     var y: i64 = -70;
     for (y < 70) {
         var x: i64 = -70;
         for (x < 70) {
-            if (rand.range(?s.rng, 0, 1000) < 350) { fill_cell(s, x, y, 1); }
+            if (rand.range(?s.rng, 0, 1000) < 350) { fill_cell(s, x, y, ink); }
             x = x + 1;
         }
         y = y + 1;
     }
-    fill_cell(s, 5001, -3000, 1);
-    fill_cell(s, 5002, -2999, 1);
-    fill_cell(s, 5000, -2998, 1);
-    fill_cell(s, 5001, -2998, 1);
-    fill_cell(s, 5002, -2998, 1);
+    fill_cell(s, 5001, -3000, ink);
+    fill_cell(s, 5002, -2999, ink);
+    fill_cell(s, 5000, -2998, ink);
+    fill_cell(s, 5001, -2998, ink);
+    fill_cell(s, 5002, -2998, ink);
     fill_end(s);
 }
 
@@ -3495,25 +3520,33 @@ pub val RIG_SPAN: usize = 3;
 # a world the CPU steps and, where a GPU can step one, the same world on the GPU
 # beside it, for tests that hold the two engines to the same result, the GPU's
 # generations split across frames (RIG_SPAN)
+#
+# a rule whose engines' words may part by its slack (rule.slack) is held to it
+# a generation at a time: the GPU's world is checked against the CPU's after
+# each generation the rig steps, and then takes the CPU's cells, so a
+# generation's rounding is never carried on and amplified by the next
 # ---
-# a:    allocator behind both worlds
-# cpu:  the world the CPU steps
-# gpu:  the world the GPU steps, attached only when on
-# on:   a GPU steps gpu
-# w:    the window the renderer draws to
-# r:    the renderer
-# g:    the GPU side of gpu
-# made: how far the GPU's setup got, 1 window, 2 renderer, 3 GPU side
+# a:      allocator behind both worlds
+# cpu:    the world the CPU steps
+# gpu:    the world the GPU steps, attached only when on
+# on:     a GPU steps gpu
+# w:      the window the renderer draws to
+# r:      the renderer
+# g:      the GPU side of gpu
+# made:   how far the GPU's setup got, 1 window, 2 renderer, 3 GPU side
+# parted: a generation stepped one at a time left the worlds further apart
+#         than the rule's slack
 #[testing]
 pub rec Rig {
-    a:    allo.Allocator;
-    cpu:  Sim;
-    gpu:  Sim;
-    on:   bool;
-    w:    window.Window;
-    r:    gfx.Renderer;
-    g:    gpu.Gpu;
-    made: u8;
+    a:      allo.Allocator;
+    cpu:    Sim;
+    gpu:    Sim;
+    on:     bool;
+    w:      window.Window;
+    r:      gfx.Renderer;
+    g:      gpu.Gpu;
+    made:   u8;
+    parted: bool;
 }
 
 # seed both worlds and attach the GPU world where a GPU can step it
@@ -3527,8 +3560,9 @@ pub rec Rig {
 # ret:  0 when open, or the failure's code
 #[testing]
 pub fun rig_open(t: *Rig, r: rule.Rule, seed: fun(*Sim)) i32 {
-    t.on   = false;
-    t.made = 0;
+    t.on     = false;
+    t.made   = 0;
+    t.parted = false;
     page.make(?t.a);
     val m1: err[allo.Error] = init(?t.cpu, ?t.a);
     if (sel m1.err) { ret 1; }
@@ -3567,15 +3601,24 @@ pub fun rig_open(t: *Rig, r: rule.Rule, seed: fun(*Sim)) i32 {
     ret 0;
 }
 
-# advance both worlds n generations
+# advance both worlds n generations, a rule with slack one generation at a
+# time, held to its slack after each and the GPU then given the CPU's cells
 #[testing]
 pub fun rig_step(t: *Rig, n: u64) {
+    val apart: bool = t.on && rule.slack(?t.cpu.rule) != 0;
+    var snap:  snapshot.Snapshot;
+    if (apart) { snapshot.init(?snap, ?t.a); }
     var i: u64 = 0;
     for (i < n) {
         step(?t.cpu);
         step(?t.gpu);
+        if (apart) {
+            if (!rig_same(t))                                    { t.parted = true; }
+            if (!take(?t.cpu, ?snap) || !restore(?t.gpu, ?snap)) { t.parted = true; }
+        }
         i = i + 1;
     }
+    if (apart) { snapshot.dnit(?snap); }
 }
 
 # let the GPU record every generation owed and go idle, its cells left on the
@@ -3617,6 +3660,7 @@ pub fun rig_frame(t: *Rig) bool {
 #[testing]
 pub fun rig_same(t: *Rig) bool {
     if (!t.on)          { ret true; }
+    if (t.parted)       { ret false; }
     if (!rig_settle(t)) { ret false; }
     val synced: err[gfx.Error] = sync(?t.gpu);
     if (sel synced.err) { ret false; }
@@ -3670,6 +3714,9 @@ fun engines_agree(f: usize) i32 {
     for (phase < rule.sample_count(f)) {
         var n: u64 = 60;
         if (phase > 0) {
+            # a generation spans a few frames however few chunks the rule
+            # left, so the edit below lands part way through one
+            gpu.fix_span(?t.g, t.gpu.space.hi / 3 + 1);
             # the GPU runs on past the host's staging cells, and a bulk edit then
             # pulls the chunks it covers before writing them whole
             rig_step(?t, 5);
@@ -3690,15 +3737,24 @@ fun engines_agree(f: usize) i32 {
         if (!rig_same(?t)) { ret 20 + phase::i32; }
         # the pyramids the draw reads below a pixel per cell hold what the cells do
         if (!gpu.pyramids_hold(?t.g, ?t.gpu.space)) { ret 14; }
-        # the census the GPU's readout and graph read agrees with the CPU's
-        if (population(?t.cpu) != population(?t.gpu))                                         { ret 9; }
-        if (history.pop_at(?t.gpu.history, t.gpu.history.len - 1) != population(?t.cpu)::u64) { ret 10; }
-        val cb: opt[space.Box] = bounds(?t.cpu);
-        val gb: opt[space.Box] = bounds(?t.gpu);
-        if (sel cb.none) { ret 11; }
-        if (sel gb.none) { ret 12; }
-        if (cb.some.x0 != gb.some.x0 || cb.some.y0 != gb.some.y0 || cb.some.x1 != gb.some.x1 || cb.some.y1 != gb.some.y1) {
-            ret 13;
+        # the census the GPU's readout and graph read agrees with the CPU's,
+        # where the engines step alike, and with the GPU's own cells where
+        # their words may part by the rule's slack, which can leave a cell
+        # live on one engine and empty on the other
+        if (rule.slack(?t.cpu.rule) != 0) {
+            if (population(?t.gpu) != live_cells(?t.gpu))                                         { ret 9; }
+            if (history.pop_at(?t.gpu.history, t.gpu.history.len - 1) != population(?t.gpu)::u64) { ret 10; }
+        }
+        or {
+            if (population(?t.cpu) != population(?t.gpu))                                         { ret 9; }
+            if (history.pop_at(?t.gpu.history, t.gpu.history.len - 1) != population(?t.cpu)::u64) { ret 10; }
+            val cb: opt[space.Box] = bounds(?t.cpu);
+            val gb: opt[space.Box] = bounds(?t.gpu);
+            if (sel cb.none) { ret 11; }
+            if (sel gb.none) { ret 12; }
+            if (cb.some.x0 != gb.some.x0 || cb.some.y0 != gb.some.y0 || cb.some.x1 != gb.some.x1 || cb.some.y1 != gb.some.y1) {
+                ret 13;
+            }
         }
         phase = phase + 1;
     }
@@ -5110,14 +5166,15 @@ fun seed_nothing(s: *Sim) {}
 # a soup over the whole of the rule's bounded grid
 #[testing]
 fun seed_grid_soup(s: *Sim) {
-    var g: topology.Grid = s.rule.grid;
+    var g:   topology.Grid = s.rule.grid;
+    val ink: u32           = rule.ink(?s.rule);
     s.rng = rand.seed(4, 3, 2, 1);
     fill_begin(s);
     var y: i64 = 0;
     for (y < g.h) {
         var x: i64 = 0;
         for (x < g.w) {
-            if (rand.range(?s.rng, 0, 1000) < 350) { fill_cell(s, topology.left(?g) + x, topology.top(?g) + y, 1); }
+            if (rand.range(?s.rng, 0, 1000) < 350) { fill_cell(s, topology.left(?g) + x, topology.top(?g) + y, ink); }
             x = x + 1;
         }
         y = y + 1;
@@ -5134,13 +5191,15 @@ test frame__bounded_grids_step_on_the_gpu_as_on_the_cpu {
     mem.raw_copy(?wide[n], ":T100,90", 9);
     # then a rule whose background flips on a plane, seeded and empty, whose
     # edge the stage reads live on odd generations, non-totalistic rules
-    # across a twisted seam and on a plane whose edge flips, and the widest
-    # radius on a plane whose edge flips, read across every chunk of its apron
-    val strings: [13]str = [13]str{"B3/S23:T100,100", "B2/S/C3:K37,41*", "345/2/4:T100,90", "R2,C0,M0,S5..9,B7..8,NM:C66,65", "B3/S23:P70,50", "B0123/S123:T100,90",
+    # across a twisted seam and on a plane whose edge flips, the widest
+    # radius on a plane whose edge flips, read across every chunk of its apron,
+    # and a lenia rule across a twisted seam and on a plane's dead edge
+    val strings: [15]str = [15]str{"B3/S23:T100,100", "B2/S/C3:K37,41*", "345/2/4:T100,90", "R2,C0,M0,S5..9,B7..8,NM:C66,65", "B3/S23:P70,50", "B0123/S123:T100,90",
         "R5,C0,M1,S34..58,B34..45,NM:K70*,60", ?wide[0], "B0123/S123:P130,120", "B0123/S123:P130,120", "B2-a/S12:K70*,60", "B0124-k/S1c25:P130,120",
-        "R16,C0,M1,S200..600,B0..180,NM:P130,120"};
+        "R16,C0,M1,S200..600,B0..180,NM:P130,120", "R=13,T=10,b=[1],m=0.15,s=0.015,kn=1,gn=1:K70*,60",
+        "R=13,T=10,b=[1],m=0.15,s=0.015,kn=1,gn=1:P70,60"};
     var k: usize = 0;
-    for (k < 13) {
+    for (k < 15) {
         var t:    Rig;
         var seed: fun(*Sim) = seed_grid_soup;
         if (k == 9) { seed = seed_nothing; }
