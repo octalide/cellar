@@ -36,6 +36,7 @@
 # of the meta head, and the sets and the weights in the rule buffer at
 # layout.TABLE_BINDING, as cellar.rules.weighted pack_table lays them out.
 
+use cellar.layer;
 use cellar.layout;
 use cellar.layout.Flags;
 use cellar.layout.Layer;
@@ -83,7 +84,13 @@ var tile: Tile;
 #[shared]
 var full: u32;
 
-# the index in the source pool of the cell at (x, y) of a slot's frame, taken
+# the source's value of the cell at address a in the family's state layer
+# (cellar.layer)
+fun cell_of(a: u32) u32 {
+    ret layer.read(src.v[layer.addr_word(word.WIDTH, a)], word.WIDTH, a);
+}
+
+# the address (cellar.layer) of the cell at (x, y) of a slot's frame, taken
 # through the links where it lies outside the window (cellar.layout), NONE
 # where no chunk holds it, or PAST past a plane's dead edge
 fun reach(slot: u32, x: i32, y: i32) u32 {
@@ -98,7 +105,7 @@ fun reach(slot: u32, x: i32, y: i32) u32 {
         val n: u32 = meta.table[b + k];
         val t: u32 = meta.table[b + layout.LINK_AT + k];
         if (k == 4) {
-            at = sl * layout.CELLS + (py * layout.SIDE::i32 + px)::u32;
+            at = layer.addr(sl, (py * layout.SIDE::i32 + px)::u32);
             h  = layout.HOPS;
         }
         or (n == layout.NONE) {
@@ -134,7 +141,8 @@ fun comp_main() {
     val band: i32 = ((gid[0] / 64) * BAND)::i32;
     val x0:   u32 = (gid[0] % 8) * 8;
     val base: u32 = slot * layout.ENTRY;
-    val row:  u32 = slot * layout.CELLS + (ly * layout.SIDE::i32)::u32;
+    val row:  u32 = layer.addr(slot, (ly * layout.SIDE::i32)::u32);
+    var acc:  u32 = 0;
     if (meta.table[base + layout.INCARNATION_AT] == 0) { ret; }
     # a seamed chunk reads its block through its links, and holds its cells
     # off the grid at zero
@@ -170,17 +178,21 @@ fun comp_main() {
             # destination already holds zeros
             if (warm != last - 1) { ret; }
             for (x < x0 + 8) {
-                dst.v[row + x] = 0;
-                x              = x + 1;
+                dst.v[layer.addr_word(word.WIDTH, row + x)] = 0;
+                x                                           = x + 1;
             }
             ret;
         }
         var any: u32 = 0;
         for (x < x0 + 8) {
-            val c: u32 = cool(src.v[row + x]);
-            dst.v[row + x] = c;
-            any            = any | c;
-            x              = x + 1;
+            val c: u32 = cool(cell_of(row + x));
+            acc = acc | layer.place(word.WIDTH, row + x, c);
+            if (layer.ends(word.WIDTH, row + x) != 0) {
+                dst.v[layer.addr_word(word.WIDTH, row + x)] = acc;
+                acc                                         = 0;
+            }
+            any = any | c;
+            x   = x + 1;
         }
         if (any != 0) { flags.v[slot * 2 + 1] = now; }
         ret;
@@ -219,7 +231,7 @@ fun comp_main() {
                 var on: u32 = 0;
                 if (at == layout.PAST) { on = past; }
                 or (at != layout.NONE) {
-                    if (src.v[at] >= word.LIVE) { on = 1; }
+                    if (cell_of(at) >= word.LIVE) { on = 1; }
                 }
                 bits = bits | (on << (c - c0)::u32);
                 c    = c + 1;
@@ -240,10 +252,10 @@ fun comp_main() {
             val cx: u32 = (k + 1) / 2;
             val n:  u32 = meta.table[base + cy * 3 + cx];
             if (n != layout.NONE) {
-                val from: i32 = (n * layout.CELLS)::i32 + yy * layout.SIDE::i32 - (cx::i32 - 1) * layout.SIDE::i32;
+                val from: i32 = layer.addr(n, 0)::i32 + yy * layout.SIDE::i32 - (cx::i32 - 1) * layout.SIDE::i32;
                 var c:    i32 = lo;
                 for (c < hi) {
-                    if (src.v[(from + c)::u32] >= word.LIVE) { bits = bits | (1 << (c - c0)::u32); }
+                    if (cell_of((from + c)::u32) >= word.LIVE) { bits = bits | (1 << (c - c0)::u32); }
                     c = c + 1;
                 }
             }
@@ -300,7 +312,7 @@ fun comp_main() {
         var sum: i32 = sums.v[x - x0];
 
         # a cell held inverted reads as its complement, its sum as total less the held one
-        val cur:   u32 = src.v[row + x];
+        val cur:   u32 = cell_of(row + x);
         var alive: u32 = 0;
         if (cur >= word.LIVE) { alive = 1; }
         if (inv_in != 0) {
@@ -324,9 +336,13 @@ fun comp_main() {
         or                                                      { next = cool(cur); }
         if (seamed != 0 && layout.edge_side(edge, lx, ly) != 4) { next = 0; }
         if (next >= word.LIVE)                                  { live = 1; }
-        warm           = warm | (next & word.HEAT_MASK);
-        dst.v[row + x] = next;
-        x              = x + 1;
+        warm = warm | (next & word.HEAT_MASK);
+        acc  = acc | layer.place(word.WIDTH, row + x, next);
+        if (layer.ends(word.WIDTH, row + x) != 0) {
+            dst.v[layer.addr_word(word.WIDTH, row + x)] = acc;
+            acc                                         = 0;
+        }
+        x = x + 1;
     }
     if (live != 0) { flags.v[slot * 2] = now; }
     if (warm != 0) { flags.v[slot * 2 + 1] = now; }
