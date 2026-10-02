@@ -20,10 +20,13 @@
 #
 # a frame steps no more than its span of slots, counting every generation's
 # slots, so one generation over a large pool is dispatched in ranges of its
-# active list across several frames. the span follows the frame time against the display's
-# refresh interval: the time a frame's dispatches take shows as the next
-# frames arriving late, which cuts the span, and frames on time that the span
-# cut short let it grow. while a generation is part way through, its finished
+# active list across several frames. the span is what fits a share of the
+# display's refresh interval at what a slot costs on the GPU, timed by the
+# device's timestamps and smoothed, so it follows the cost both ways with no
+# band where an overrun is let stand. a device without timestamps falls back
+# to the frame time: a frame over the interval cuts the span in proportion to
+# its overrun, and frames on time that the span cut short let it grow. while a
+# generation is part way through, its finished
 # ranges lie in the back cells, so the draw, the census and the pyramids read
 # the front, the last completed generation, and only a frame that completes
 # one counts and reduces it again. an edit, a growth or another rule since the
@@ -48,7 +51,11 @@
 # the host hands it back by changing it: the next flush uploads what it wrote
 # and seeds the GPU's hash and free bits from the table again. between the two
 # the host writes only its own words of the status head, in order with the
-# GPU's work, so the two never write the same word at once.
+# GPU's work, so the two never write the same word at once. the pool grows
+# while the GPU owns it without the host: the capacity grows ahead of the top,
+# the GPU carries its own page table and allocator's words into the larger
+# buffers (carry_comp) and keeps owning the pool, and the host's mirror, its
+# cells with it, grows only once take next brings it level.
 #
 # a pass runs between generations, before the spread recorded since the last
 # would pass what the halo it left holds: each live chunk asks for the rule's
@@ -112,11 +119,14 @@ use cellar.space;
 use cellar.theme;
 use cellar.topology;
 use allo: std.allocator;
+use std.chrono.duration.Duration;
 use std.chrono.time;
 use std.chrono.time.Instant;
+use std.collections.sort;
 use std.collections.vector;
 use std.collections.vector.Vector;
 use mem: std.memory;
+use std.sync.atomic;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -130,6 +140,8 @@ use std.types.string.str;
 val CLEAR_SPV:  [_]u8;
 #[embed("{artifact.stage-grow_comp.out}")]
 val GROW_SPV:   [_]u8;
+#[embed("{artifact.stage-carry_comp.out}")]
+val CARRY_SPV:  [_]u8;
 #[embed("{artifact.stage-census_comp.out}")]
 val CENSUS_SPV: [_]u8;
 #[embed("{artifact.stage-reduce_comp.out}")]
@@ -160,9 +172,6 @@ pub val HEAD: usize = layout.HEAD::usize;
 pub val LOOK: usize = 24;
 # the words of the view buffer where the rule palette starts
 val INK_AT: usize = LOOK + SHADES * 8;
-# the largest rule buffer uploaded in the frame's command stream: a larger one
-# goes up staged (see sync_table)
-val INLINE_MAX: usize = 65536;
 # words of a slot's coverage pyramid
 pub val MIP: usize = layout.MIP::usize;
 # entries in each palette
@@ -177,18 +186,31 @@ val FRAME_SETS: usize = 8;
 pub val MAX_STEPS: usize = 248;
 # dispatches a pass records, and one more for the first of a frame, which frees
 pub val PASS_CALLS: usize = 3;
-# the span a frame starts with, before the frame time has adapted it
+# the span a frame starts with, before a frame has been measured
 val FIRST_SPAN: usize = 4096;
 # the least a span shrinks to
 val MIN_SPAN: usize = 64;
 # the most a span grows to: every generation a frame may record of the largest
 # pool
 pub val MAX_SPAN: usize = layout.MAX_SLOTS::usize * MAX_STEPS;
+# the share of the refresh interval a frame's stepping may take on the GPU,
+# STEP_SHARE over SHARE_OF, the rest left to the draw, the census and the
+# compositor
+val STEP_SHARE: u64 = 7;
+val SHARE_OF:   u64 = 8;
+# timers a frame's stepping is measured by in turn, one more than the frames in
+# flight, so a timer's last range has always finished by its next turn
+val TIMERS: usize = 3;
+# a slot's measured cost moves toward a dearer measure by this share of the
+# difference and toward a cheaper one by the other, so an overrun is followed
+# within a frame or two and a single cheap frame does not undo it
+val RISE: u64 = 2;
+val FALL: u64 = 16;
 # frames recorded before a late one is seen, whose lateness the span was
-# already cut for
+# already cut for, when the frame time paces it
 val CALM: u32 = 2;
 # the share a span grows by each frame on time it cut short, until a frame
-# first comes late and after
+# first comes late and after, when the frame time paces it
 val GROW_FAST: usize = 8;
 val GROW_SLOW: usize = 64;
 # consecutive uncapped frames the budget cut short before the halo widens
@@ -204,10 +226,12 @@ val NO_HOLD: u64 = 0xffffffffffffffff;
 val FALLBACK_HZ: f32 = 60.0;
 # censuses in flight a frame can look back over
 val RING: usize = 8;
-# dirty entries or chunks past which one stalled upload beats many recorded ones
-val BULK: usize = 32;
-# the share of the refresh interval a frame spends sending the CPU's chunks
-val VIEW_SHARE: u64 = 4;
+# the refresh interval divides by this for the time a frame spends sending the
+# CPU's chunks: more than that stretches the frame that follows a step
+val VIEW_SHARE: u64 = 32;
+# picoseconds a byte of the CPU's chunks is taken to cost to send before an
+# upload has measured it, a copy at 10 GB/s
+val SEND_PS: u64 = 100;
 # a held slot's pyramid was sent
 val SENT_MIP: u8 = 1;
 # a held slot's cells were sent
@@ -328,6 +352,20 @@ rec Write {
 }
 
 # the buffers sized to the pool's capacity
+#
+# the device is the render thread's. it alone creates and deletes these
+# buffers, reads them back and records and submits work on them, since boom
+# records every dispatch into the frame's one command buffer on the one queue
+# that thread submits, with no locking across threads. the host's pool may
+# change on the simulation thread whenever the GPU does not step the world
+# (cellar.runner), so a growth asked there touches nothing here but one atomic
+# word: it is owed (owe), and the next frame takes what is owed with an
+# exchange and makes the buffers (flush). a growth is made at once
+# (reserve) only while the GPU steps the world, when the render thread holds
+# the world for every change. while the GPU owns the pool, which it does only
+# while it steps the world, the render thread grows it on its own (make_room)
+# and the host's pool does not grow with it, and the pool is handed back
+# (take) only then.
 # ---
 # cells:  the two cell pools stepped between
 # meta:   the rule and the page table
@@ -383,6 +421,8 @@ rec Pool {
 # srgb:     the renderer's target encodes sRGB, so colours go up linear
 # clear:    the clear stage
 # grow:     the stage that carries the world into larger buffers
+# carry:    the stage that carries the page table and the allocator's words
+#           into larger buffers while the GPU owns the pool
 # census:   the census stage
 # reduce:   the stage that builds the coverage pyramids
 # draw:     the cell shader
@@ -391,8 +431,9 @@ rec Pool {
 # hi:       slots the GPU's page table covers
 # front:    which of cells holds the world
 # stepping: the compute stages built, so the GPU steps
-# owed:     slots a growth asked for while the CPU steps, which the next frame
-#           makes the buffers for
+# owed:     slots a growth asked for while the GPU does not step the world,
+#           which the next frame makes the buffers for, atomic: the one word
+#           another thread writes (owe)
 # drawn:    the sense the held pyramids were built with
 # serial:   the serial of the last step recorded; stamps equal to it are current
 # ring:     recent censuses
@@ -418,16 +459,27 @@ rec Pool {
 # writes:   painted cells to upload
 # zeros:    slots to clear this frame
 # stamped:  slots whose stamps to set current this frame
+# batch:    the writes of one buffer a frame records as one copy (send)
+# keys:     painted cells ordered by cell, then by when they were painted
+# stamp:    the current serial, twice for every slot a run of stamps covers
+# pyrs:     pyramids built in the frame, staged for upload
 # span:     slots the next frame may step, over every generation it records
-# fixed:    span is held where it was set rather than following the frame time
-# found:    a frame came late since the span began following it
+# fixed:    span is held where it was set rather than following what frames cost
+# cost:     picoseconds of GPU time a slot is measured to cost, smoothed, 0
+#           before the first measure
+# clocks:   the timers measuring each frame's stepping in turn
+# clocked:  the device writes timestamps and clocks are held, so cost paces
+#           the span rather than the frame time
+# paid:     slots the frame each clock last measured stepped, 0 for none
+# turn:     the clock the next frame measures with
+# found:    a frame came late since the frame time began pacing the span
 # calm:     frames left before lateness cuts the span again
 # worked:   slots the last frame stepped
 # limited:  the span cut the last frame's steps short
 # quick:    the last frame kept up with the display
 # last:     when the last frame was recorded
 # timed:    last holds a frame
-# pace_us:  the frame-time thresholds for the display
+# pace_us:  the refresh interval and the frame-time threshold for the display
 # going:    a generation is part way through: front holds the one before it and
 #           the back the ranges finished so far
 # at:       the slot the generation going resumes from
@@ -435,6 +487,8 @@ rec Pool {
 # rule:     the rule the generation going began under
 # counted:  the last census and reduction read the front as it stands
 # cursor:   the slot the next frame's upload of the CPU's chunks starts from
+# send_ps:  picoseconds a byte of the CPU's chunks has cost to send, as the
+#           last uploads measured it
 # head:     the meta header staged for upload
 # built:    a pyramid built on the host, staged for upload
 # mark:     a pass's stage that asks for halos and claims slots
@@ -451,6 +505,8 @@ rec Pool {
 #           the gate, so the allocator's words are written and the hash seeded
 # rehash:   tombstones piled up in the hash, which the next flush seeds again
 # top:      while owned, the slots every stage covers and below which a pass claims
+# aim:      the top the newest census asked for, which a growth under way
+#           lets the next flush reach
 # pass:     the last pass id
 # grouped:  cells of spread recorded since the last pass
 # passed:   cells of spread the halo the last pass left holds
@@ -471,6 +527,7 @@ rec Pool {
 # ops:      the frame's planned dispatches
 # nops:     how many
 # ctl:      the status head's first words, as take read them
+# untaken:  why the last take that failed left the pool the GPU's
 pub rec Gpu {
     a:        *allo.Allocator;
     r:        *gfx.Renderer;
@@ -495,6 +552,7 @@ pub rec Gpu {
     srgb:     bool;
     clear:    gfx.Compute;
     grow:     gfx.Compute;
+    carry:    gfx.Compute;
     census:   gfx.Compute;
     reduce:   gfx.Compute;
     draw:     gfx.Shader;
@@ -503,7 +561,7 @@ pub rec Gpu {
     hi:       usize;
     front:    usize;
     stepping: bool;
-    owed:     usize;
+    owed:     i64;
     drawn:    layout.Sense;
     serial:   u32;
     ring:     [8]Snap;
@@ -528,8 +586,17 @@ pub rec Gpu {
     writes:   Vector[Write];
     zeros:    Vector[u32];
     stamped:  Vector[u32];
+    batch:    Vector[gfx.BufferWrite];
+    keys:     Vector[u64];
+    stamp:    Vector[u32];
+    pyrs:     Vector[u32];
     span:     usize;
     fixed:    bool;
+    cost:     u64;
+    clocks:   [3]gfx.GpuTimer;
+    clocked:  bool;
+    paid:     [3]usize;
+    turn:     usize;
     found:    bool;
     calm:     u32;
     worked:   usize;
@@ -544,6 +611,7 @@ pub rec Gpu {
     rule:     rule.Rule;
     counted:  bool;
     cursor:   usize;
+    send_ps:  u64;
     head:     [128]u32;
     built:    [layout.MIP]u32;
     mark:     gfx.Compute;
@@ -558,6 +626,7 @@ pub rec Gpu {
     reseed:   bool;
     rehash:   bool;
     top:      usize;
+    aim:      usize;
     pass:     u32;
     grouped:  usize;
     passed:   usize;
@@ -576,29 +645,29 @@ pub rec Gpu {
     ops:      [MAX_STEPS]Op;
     nops:     usize;
     ctl:      [16]u32;
+    untaken:  str;
 }
 
 # how long frames may take against the display's refresh interval
 #
-# slow_us:  a frame this many microseconds apart from the last has missed its
-#           budget
-# quick_us: a frame no more than this many microseconds apart from the last
-#           kept up with the display, so frame time is not what bounds it
+# interval_us: the display's refresh interval in microseconds
+# quick_us:    a frame no more than this many microseconds apart from the last
+#              kept up with the display, and one further apart missed it
 pub rec Pace {
-    slow_us:  u64;
-    quick_us: u64;
+    interval_us: u64;
+    quick_us:    u64;
 }
 
 # the frame-time thresholds for a display refreshing at hz, which fall back to
 # 60 Hz when hz is not a rate. a frame that keeps up is within 1.08 refresh
-# intervals and one that misses is past 1.44
+# intervals, the slack a frame's timing jitters by
 # ---
 # hz: the display's refresh rate in hertz, zero or less when unknown
 pub fun pace_for(hz: f32) Pace {
     var rate: f32 = FALLBACK_HZ;
     if (hz > 0.0) { rate = hz; }
     val interval: u64 = (1000000.0 / rate + 0.5)::u64;
-    ret Pace{slow_us: interval * 36 / 25, quick_us: interval * 27 / 25};
+    ret Pace{interval_us: interval, quick_us: interval * 27 / 25};
 }
 
 # follow the display's refresh rate, which a window can change by moving to
@@ -670,26 +739,36 @@ fun forget_censuses(g: *Gpu) {
     }
 }
 
-# the buffers sized for cap slots, into pp
-fun make_pool(g: *Gpu, pp: *Pool, cap: usize) err[gfx.Error] {
+# a pool's buffer, made inside the frame when framed so nothing waits for the
+# device, else outside one, which drains the queue
+fun make_framed(g: *Gpu, framed: bool, size: usize, out: *gfx.StorageBuffer) err[gfx.Error] {
+    if (!framed) { ret make(g.d, size, out); }
+    val made: res[gfx.StorageBuffer, gfx.Error] = gfx.renderer_storage_buffer(g.r, size);
+    if (sel made.err) { ret err[gfx.Error].err{made.err}; }
+    @out = made.ok;
+    ret err[gfx.Error].ok{};
+}
+
+# the buffers sized for cap slots, into pp, made inside the frame when framed
+fun make_pool(g: *Gpu, pp: *Pool, cap: usize, framed: bool) err[gfx.Error] {
     pp.got    = nil;
     pp.landed = nil;
     pp.held   = nil;
     pp.cap    = 0;
-    val e1: err[gfx.Error] = make(g.d, cap * space.CELLS * 4, ?pp.cells[0]);
+    val e1: err[gfx.Error] = make_framed(g, framed, cap * space.CELLS * 4, ?pp.cells[0]);
     if (sel e1.err) { ret e1; }
-    val e2: err[gfx.Error] = make(g.d, cap * space.CELLS * 4, ?pp.cells[1]);
+    val e2: err[gfx.Error] = make_framed(g, framed, cap * space.CELLS * 4, ?pp.cells[1]);
     if (sel e2.err) {
         gfx.storage_buffer_delete(g.d, ?pp.cells[0]);
         ret e2;
     }
-    val e3: err[gfx.Error] = make(g.d, (HEAD + cap * space.ENTRY) * 4, ?pp.meta);
+    val e3: err[gfx.Error] = make_framed(g, framed, (HEAD + cap * space.ENTRY) * 4, ?pp.meta);
     if (sel e3.err) {
         gfx.storage_buffer_delete(g.d, ?pp.cells[0]);
         gfx.storage_buffer_delete(g.d, ?pp.cells[1]);
         ret e3;
     }
-    val e4: err[gfx.Error] = make(g.d, layout.STATUS_WORDS::usize * 4, ?pp.status);
+    val e4: err[gfx.Error] = make_framed(g, framed, layout.STATUS_WORDS::usize * 4, ?pp.status);
     if (sel e4.err) {
         gfx.storage_buffer_delete(g.d, ?pp.cells[0]);
         gfx.storage_buffer_delete(g.d, ?pp.cells[1]);
@@ -704,7 +783,7 @@ fun make_pool(g: *Gpu, pp: *Pool, cap: usize) err[gfx.Error] {
         gfx.storage_buffer_delete(g.d, ?pp.status);
         ret e5;
     }
-    val e5f: err[gfx.Error] = make(g.d, layout.FLAGS_WORDS::usize * 4, ?pp.flags);
+    val e5f: err[gfx.Error] = make_framed(g, framed, layout.FLAGS_WORDS::usize * 4, ?pp.flags);
     if (sel e5f.err) {
         gfx.readback_delete(?pp.rb, g.d);
         gfx.storage_buffer_delete(g.d, ?pp.cells[0]);
@@ -713,7 +792,7 @@ fun make_pool(g: *Gpu, pp: *Pool, cap: usize) err[gfx.Error] {
         gfx.storage_buffer_delete(g.d, ?pp.status);
         ret e5f;
     }
-    val e5l: err[gfx.Error] = make(g.d, cap * 4, ?pp.list);
+    val e5l: err[gfx.Error] = make_framed(g, framed, cap * 4, ?pp.list);
     if (sel e5l.err) {
         gfx.storage_buffer_delete(g.d, ?pp.flags);
         gfx.readback_delete(?pp.rb, g.d);
@@ -723,7 +802,7 @@ fun make_pool(g: *Gpu, pp: *Pool, cap: usize) err[gfx.Error] {
         gfx.storage_buffer_delete(g.d, ?pp.status);
         ret e5l;
     }
-    val e5m: err[gfx.Error] = make(g.d, cap * MIP * 4, ?pp.mip);
+    val e5m: err[gfx.Error] = make_framed(g, framed, cap * MIP * 4, ?pp.mip);
     if (sel e5m.err) {
         gfx.storage_buffer_delete(g.d, ?pp.list);
         gfx.storage_buffer_delete(g.d, ?pp.flags);
@@ -824,9 +903,16 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     g.writes   = vector.init[Write](a);
     g.zeros    = vector.init[u32](a);
     g.stamped  = vector.init[u32](a);
+    g.batch    = vector.init[gfx.BufferWrite](a);
+    g.keys     = vector.init[u64](a);
+    g.stamp    = vector.init[u32](a);
+    g.pyrs     = vector.init[u32](a);
     g.cut      = false;
     g.span     = FIRST_SPAN;
     g.fixed    = false;
+    g.cost     = 0;
+    g.clocked  = false;
+    g.turn     = 0;
     g.found    = false;
     g.calm     = 0;
     g.worked   = 0;
@@ -838,12 +924,14 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     g.counted  = false;
     g.pace_us  = pace_for(0.0);
     g.cursor   = 0;
+    g.send_ps  = SEND_PS;
     g.sp       = nil;
     g.owns     = false;
     g.moved    = false;
     g.reseed   = false;
     g.rehash   = false;
     g.top      = 0;
+    g.aim      = 0;
     g.pass     = 0;
     g.grouped  = 0;
     g.passed   = 0;
@@ -853,6 +941,7 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     g.used     = 0;
     g.tallied  = false;
     g.squeeze  = 0;
+    g.untaken  = "";
     g.listed   = false;
     g.gathered = 0;
     g.est      = UNKNOWN;
@@ -876,6 +965,7 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
         if (build_stages(g)) { g.stepping = true; }
         or                   { drop_steps(g, rule.FAMILIES); }
     }
+    if (g.stepping) { hold_clocks(g); }
 
     val e7: err[gfx.Error] = make(g.d, (INK_AT + SHADES * 4) * 4, ?g.view);
     if (sel e7.err) { ret e7; }
@@ -885,7 +975,7 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     if (sel e9.err)    { ret e9; }
     if (cap > g.slots) { ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.overrun{(cap * space.CELLS * 4)::u64}}}; }
     forget_censuses(g);
-    ret make_pool(g, ?g.p, cap);
+    ret make_pool(g, ?g.p, cap, false);
 }
 
 # the shared compute stages, in the order build_stages makes them
@@ -940,13 +1030,46 @@ fun stage_of(g: *Gpu, i: usize, spv: **u8, len: *usize) *gfx.Compute {
         @len = $length_of(SEED_SPV);
         ret ?g.seed;
     }
-    @spv = ?GATHER_SPV[0];
-    @len = $length_of(GATHER_SPV);
-    ret ?g.gather;
+    if (i == 10) {
+        @spv = ?GATHER_SPV[0];
+        @len = $length_of(GATHER_SPV);
+        ret ?g.gather;
+    }
+    @spv = ?CARRY_SPV[0];
+    @len = $length_of(CARRY_SPV);
+    ret ?g.carry;
 }
 
 # the shared compute stages
-val STAGES: usize = 11;
+val STAGES: usize = 12;
+
+# hold the clocks a frame's stepping is timed by, all of them or none, none on
+# a device whose queue writes no timestamps, which leaves the frame time to
+# pace the span
+fun hold_clocks(g: *Gpu) {
+    g.clocked = false;
+    var i: usize = 0;
+    for (i < TIMERS) {
+        val e: err[gfx.Error] = gfx.renderer_timer(g.r, ?g.clocks[i]);
+        if (sel e.err) {
+            drop_clocks(g, i);
+            ret;
+        }
+        g.paid[i] = 0;
+        i         = i + 1;
+    }
+    g.clocked = true;
+}
+
+# give the first n clocks back
+fun drop_clocks(g: *Gpu, n: usize) {
+    var i: usize = 0;
+    for (i < n) {
+        gfx.renderer_timer_delete(g.r, ?g.clocks[i]);
+        i = i + 1;
+    }
+    g.clocked = false;
+}
 
 # build every shared compute stage, all of them or none
 fun build_stages(g: *Gpu) bool {
@@ -1023,18 +1146,32 @@ pub fun refusal(g: *Gpu, f: usize) str {
     ret "this GPU's compute stages bind too few storage buffers for the rule buffer this family's rules need, so they cannot run while it steps the world";
 }
 
+# add a write to the batch the next send records
+fun queue(g: *Gpu, offset: usize, src: *u8, len: usize) err[gfx.Error] {
+    val pushed: res[usize, allo.Error] = vector.push[gfx.BufferWrite](?g.batch, gfx.BufferWrite{offset: offset, src: src, len: len});
+    if (sel pushed.err) { ret err[gfx.Error].err{gfx.Error.alloc{pushed.err}}; }
+    ret err[gfx.Error].ok{};
+}
+
+# record the batched writes into b as one copy, with one barrier pair around
+# them all, and empty the batch. the bytes are staged as this returns, so their
+# sources may change at once. the writes must not overlap
+fun send(g: *Gpu, b: *gfx.StorageBuffer) err[gfx.Error] {
+    if (g.batch.len == 0) { ret err[gfx.Error].ok{}; }
+    val e: err[gfx.Error] = gfx.renderer_buffer_update_batch(g.r, b, g.batch.data, g.batch.len);
+    vector.clear[gfx.BufferWrite](?g.batch);
+    ret e;
+}
+
 # bring the rule buffer level with the rule running, ahead of the frame's steps
 #
-# a rule needing more words than the buffer holds replaces it, which waits for
-# the frames in flight that read it. the rule buffer changes only when the rule
-# does, and a rule table's tree can run to megabytes: recorded in the frame's
-# command stream, as a frame's own small writes are, it would be copied into
-# the command buffer 64 KiB at a time and carried there whole. so a buffer
-# past INLINE_MAX bytes goes up staged, a copy the queue is drained for, which
-# waits once for the frames in flight as a replaced buffer already does, and
-# only when the rule changes. a smaller one, a wide kernel's weights that the
-# rule panel changes with every click, stays in the command stream and never
-# stalls.
+# the rule buffer changes only when the rule does, and a rule table's tree can
+# run to megabytes, so it goes up through the frame's staging memory as one
+# recorded copy, in order with the frame's dispatches: the steps recorded after
+# it read it, and the frames in flight still reading the old one finish first.
+# a rule needing more words than the buffer holds makes a larger one inside
+# the frame, as a growing pool makes its buffers, and frees the old one once
+# the frames reading it have run. nothing waits for the queue.
 fun sync_table(g: *Gpu, r: *rule.Rule) err[gfx.Error] {
     if (g.tabled && rule.same(r, ?g.shown)) { ret err[gfx.Error].ok{}; }
     val n: usize = rule.table_words(r);
@@ -1045,7 +1182,7 @@ fun sync_table(g: *Gpu, r: *rule.Rule) err[gfx.Error] {
         g.tabled = false;
         var want: usize = 1024;
         for (want < n) { want = want * 2; }
-        val e: err[gfx.Error] = make(g.d, want * 4, ?g.table);
+        val e: err[gfx.Error] = make_framed(g, true, want * 4, ?g.table);
         if (sel e.err) { ret e; }
         g.words = want;
     }
@@ -1053,14 +1190,10 @@ fun sync_table(g: *Gpu, r: *rule.Rule) err[gfx.Error] {
     val room: res[usize, allo.Error] = vector.ensure[u32](?g.packed, n);
     if (sel room.err) { ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.overrun{(n * 4)::u64}}}; }
     rule.pack_table(r, g.packed.data);
-    if (n * 4 > INLINE_MAX) {
-        val staged: err[gfx.Error] = gfx.storage_buffer_upload(g.d, ?g.table, 0, g.packed.data::*u8, n * 4);
-        if (sel staged.err) { ret staged; }
-    }
-    or {
-        val up: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.table, 0, g.packed.data::*u8, n * 4);
-        if (sel up.err) { ret up; }
-    }
+    val queued: err[gfx.Error] = queue(g, 0, g.packed.data::*u8, n * 4);
+    if (sel queued.err) { ret queued; }
+    val up: err[gfx.Error] = send(g, ?g.table);
+    if (sel up.err) { ret up; }
     g.shown  = @r;
     g.tabled = true;
     ret err[gfx.Error].ok{};
@@ -1134,58 +1267,56 @@ fun fill_shades(pal: *f32) {
     }
 }
 
-# make room for a pool of cap slots, ahead of the host's pool growing to it
-#
-# while the GPU steps, the buffers are made now, where a refusal can still
-# turn the growth down, and the next frame moves the world into them. while the
-# CPU steps, which it may do off the device's thread, the growth is owed and
-# the next frame makes them, failing the frame if the device refuses.
+# make room for a pool of cap slots now, ahead of the host's pool growing to
+# it, where a refusal can still turn the growth down, and the next frame moves
+# the world into the buffers. only the render thread may call it, while the GPU
+# steps the world (see Pool)
 # ---
 # g:   the GPU side
 # cap: slots the host's pool grows to
-# ret: false when the device refused the buffers, or cap is past its ceiling
+# ret: false when the device refused the buffers
 pub fun reserve(g: *Gpu, cap: usize) bool {
     if (cap <= g.p.cap || (g.reserved && cap <= g.next.cap)) { ret true; }
-    if (!g.stepping) {
-        # the CPU may be stepping on the simulation thread, which must not
-        # call the device, so the next frame makes the buffers
-        if (cap > g.slots) { ret false; }
-        if (cap > g.owed)  { g.owed = cap; }
-        ret true;
-    }
-    ret make_next(g, cap);
+    ret make_next(g, cap, false);
 }
 
-# make the buffers a growth to cap slots moves the world into
-fun make_next(g: *Gpu, cap: usize) bool {
+# owe room for a pool of cap slots to the next frame, ahead of the host's pool
+# growing to it, without calling the device, so whichever thread holds the
+# world may grow the pool through it (see Pool). the next frame makes the
+# buffers, failing if the device refuses them
+# ---
+# g:   the GPU side
+# cap: slots the host's pool grows to
+# ret: false when cap is past the device's ceiling
+pub fun owe(g: *Gpu, cap: usize) bool {
+    if (cap > g.slots) { ret false; }
+    var was: i64 = atomic.load(?g.owed);
+    for (cap::i64 > was && !atomic.cas(?g.owed, ?was, cap::i64)) {}
+    ret true;
+}
+
+# make the buffers a growth to cap slots moves the world into, inside the frame
+# when framed
+fun make_next(g: *Gpu, cap: usize, framed: bool) bool {
     # nothing has been recorded into a pool made since the last frame
     if (g.reserved) {
         drop_pool(g, ?g.next);
         g.reserved = false;
     }
-    val made: err[gfx.Error] = make_pool(g, ?g.next, cap);
+    val made: err[gfx.Error] = make_pool(g, ?g.next, cap, framed);
     if (sel made.err) { ret false; }
     g.reserved = true;
     ret true;
 }
 
-fun reserve_for(ctx: *u8, cap: usize) bool {
-    ret reserve(ctx::*Gpu, cap);
-}
-
-fun own_for(ctx: *u8) {
-    val g: *Gpu = ctx::*Gpu;
-    if (g.sp != nil) { take(g, g.sp); }
-}
-
-# the GPU side as the host pool's mirror, which makes room before the pool
-# grows and hands the pool back before the host reads or changes it
+# have the GPU side mirror the host's pool, which then makes room through
+# reserve or owe before it grows, as the world's holder decides, and hands the
+# pool back through take before the host reads or changes it
 # ---
 # g:  the GPU side
 # sp: the host's pool, which must not move while it is mirrored
-pub fun mirror(g: *Gpu, sp: *space.Space) space.Mirror {
+pub fun mirror(g: *Gpu, sp: *space.Space) {
     g.sp = sp;
-    ret space.Mirror{ctx: g::*u8, reserve: reserve_for, own: own_for};
 }
 
 # leave stepping to the CPU even though the compute stages were built, to
@@ -1211,9 +1342,14 @@ pub fun dnit(g: *Gpu) {
         drop_steps(g, rule.FAMILIES);
         drop_stages(g, STAGES);
     }
+    if (g.clocked) { drop_clocks(g, TIMERS); }
     vector.dnit[Write](?g.writes);
     vector.dnit[u32](?g.zeros);
     vector.dnit[u32](?g.stamped);
+    vector.dnit[gfx.BufferWrite](?g.batch);
+    vector.dnit[u64](?g.keys);
+    vector.dnit[u32](?g.stamp);
+    vector.dnit[u32](?g.pyrs);
 }
 
 # note an edit, which a census recorded before it cannot free chunks around
@@ -1271,45 +1407,99 @@ pub fun squeeze(g: *Gpu, slots: usize) {
     g.squeeze = slots;
 }
 
-# time the frame against the last, and follow the span to it
+# time the frame against the last, and pace the span by what frames cost
 #
-# a late frame cuts the span to three quarters of what the last frame stepped,
-# then waits out the frames already recorded before another cut. a frame on
-# time that the span cut short grows it by an eighth until the first late
-# frame and by a sixty-fourth after, so the frames settle just inside the
-# refresh interval and seldom miss it.
+# with clocks, the span is what fits the stepping's share of the refresh
+# interval at a slot's measured cost, refitted every frame. without, the frame
+# time paces it (pace_by_frame).
 fun follow(g: *Gpu) {
     val now: time.InstantClock = time.instant();
     if (sel now.err) { ret; }
-    var quick: bool = false;
-    var slow:  bool = false;
-    if (g.timed) {
-        val us: u64 = (time.instant_sub(now.ok, g.last) / 1000)::u64;
-        quick = us <= g.pace_us.quick_us;
-        slow  = us > g.pace_us.slow_us;
-    }
+    var us: u64 = 0;
+    if (g.timed) { us = (time.instant_sub(now.ok, g.last) / 1000)::u64; }
+    val late: bool = g.timed && us > g.pace_us.quick_us;
+    g.quick = g.timed && !late;
     g.last  = now.ok;
     g.timed = true;
-    g.quick = quick;
     if (g.fixed) { ret; }
+    if (g.clocked) {
+        measure(g);
+        if (g.cost != 0) { g.span = fit_span(g.pace_us.interval_us * 1000 * STEP_SHARE / SHARE_OF, g.cost); }
+        ret;
+    }
+    pace_by_frame(g, late, us);
+}
+
+# take what the clocks measured since the last frame into a slot's cost
+fun measure(g: *Gpu) {
+    var i: usize = 0;
+    for (i < TIMERS) {
+        val took: opt[Duration] = gfx.renderer_timer_take(g.r, ?g.clocks[i]);
+        if (sel took.some) {
+            if (g.paid[i] != 0) {
+                var ps: u64 = took.some::u64 * 1000 / g.paid[i]::u64;
+                if (ps == 0) { ps = 1; }
+                g.cost = smooth(g.cost, ps);
+            }
+        }
+        i = i + 1;
+    }
+}
+
+# pace the span by the frame time, where the device writes no timestamps
+#
+# a frame later than the display cuts the span to the share of what the last
+# frame stepped that would have fit the refresh interval, in proportion to how
+# late it came, then waits out the frames already recorded before another cut.
+# a frame on time that the span cut short grows it by an eighth until the
+# first late frame and by a sixty-fourth after, since a frame on time shows no
+# room to spare when the display paces it.
+# ---
+# late: the frame came later than the display
+# us:   microseconds since the frame before
+fun pace_by_frame(g: *Gpu, late: bool, us: u64) {
     if (g.calm > 0) {
         g.calm = g.calm - 1;
         ret;
     }
-    if (slow && g.worked != 0) {
+    if (late && g.worked != 0) {
         var was: usize = g.span;
         if (g.worked < was) { was = g.worked; }
-        g.span = was - was / 4;
-        if (g.span < MIN_SPAN) { g.span = MIN_SPAN; }
+        g.span  = cut_span(was, us, g.pace_us.interval_us);
         g.calm  = CALM;
         g.found = true;
     }
-    or (quick && g.limited) {
+    or (g.quick && g.limited) {
         var share: usize = GROW_FAST;
         if (g.found) { share = GROW_SLOW; }
         g.span = g.span + g.span / share + 1;
         if (g.span > MAX_SPAN) { g.span = MAX_SPAN; }
     }
+}
+
+# the span that steps what fits budget_ns of GPU time at cost_ps a slot
+fun fit_span(budget_ns: u64, cost_ps: u64) usize {
+    if (cost_ps == 0) { ret MAX_SPAN; }
+    val n: u64 = budget_ns * 1000 / cost_ps;
+    if (n < MIN_SPAN::u64) { ret MIN_SPAN; }
+    if (n > MAX_SPAN::u64) { ret MAX_SPAN; }
+    ret n::usize;
+}
+
+# a slot's cost moved toward a measure of it: most of the way toward a dearer
+# one, a little toward a cheaper one, and all the way from no cost yet
+fun smooth(cost_ps: u64, measure_ps: u64) u64 {
+    if (cost_ps == 0)         { ret measure_ps; }
+    if (measure_ps > cost_ps) { ret cost_ps + (measure_ps - cost_ps + RISE - 1) / RISE; }
+    ret cost_ps - (cost_ps - measure_ps) / FALL;
+}
+
+# the slots of worked that would have fit interval_us in a frame us long
+fun cut_span(worked: usize, us: u64, interval_us: u64) usize {
+    var n: u64 = worked::u64;
+    if (us > interval_us)  { n = worked::u64 * interval_us / us; }
+    if (n < MIN_SPAN::u64) { ret MIN_SPAN; }
+    ret n::usize;
 }
 
 # follow how the uncapped frames are running with the halo, once per uncapped
@@ -1369,10 +1559,13 @@ pub fun budget(g: *Gpu, radius: usize) usize {
 #         the GPU owns the pool, its count taken
 # fits:   the pool held every chunk the world grew into
 # behind: generations recorded since that census was taken
+# kept:   the gate closed, and the pool could not be taken back to reopen it
+#         (take), so it stays the GPU's and stepping stops
 pub rec Landed {
     fresh:  bool;
     fits:   bool;
     behind: u64;
+    kept:   bool;
 }
 
 # settle the host's pool from the newest census that has landed, or while the
@@ -1386,7 +1579,7 @@ pub rec Landed {
 # sp:  the host's pool
 # ret: whether a census was settled, how far behind it is, and whether it fit
 pub fun collect(g: *Gpu, sp: *space.Space) Landed {
-    val none: Landed = Landed{fresh: false, fits: true, behind: 0};
+    val none: Landed = Landed{fresh: false, fits: true, behind: 0, kept: false};
     if (!g.stepping || g.p.cap == 0) { ret none; }
     val len: usize = status_bytes(g.p.cap);
     if (!gfx.renderer_readback_take(g.r, ?g.p.rb, g.p.got::*u8, len)) { ret none; }
@@ -1448,10 +1641,11 @@ pub fun collect(g: *Gpu, sp: *space.Space) Landed {
         # a census taken while the gate was closed read cells no step since
         # has touched, so it is no count of the world
         if (gate) {
-            take(g, sp);
+            if (!take(g, sp)) { ret Landed{fresh: false, fits: true, behind: 0, kept: true}; }
             make_room(g, sp, g.top + slack(g.top));
-            # a pool at its ceiling with no slot free below the top cannot hold the world
-            ret Landed{fresh: false, fits: sp.live < g.top, behind: 0};
+            # a pool at its ceiling with no slot free below the top, and no
+            # growth coming, cannot hold the world
+            ret Landed{fresh: false, fits: sp.live < g.top || g.reserved, behind: 0, kept: false};
         }
         # a census taken before an edit is no count of the world after it
         if (snap.edits == g.edits) {
@@ -1463,7 +1657,7 @@ pub fun collect(g: *Gpu, sp: *space.Space) Landed {
         }
         g.settled = snap.seq;
         if (high + slack(high) / 2 > g.top) { make_room(g, sp, high + slack(high)); }
-        ret Landed{fresh: true, fits: true, behind: g.gens - snap.gens};
+        ret Landed{fresh: true, fits: true, behind: g.gens - snap.gens, kept: false};
     }
     val ok: bool = space.settle(sp, g.p.landed, n, snap.edits == g.edits);
     g.settled = snap.seq;
@@ -1475,49 +1669,68 @@ pub fun collect(g: *Gpu, sp: *space.Space) Landed {
     var to: u64 = snap.spread + snap.span::u64;
     if (to > g.hold)        { to = g.hold; }
     if (ok && to > g.limit) { g.limit = to; }
-    ret Landed{fresh: true, fits: ok, behind: g.gens - snap.gens};
+    ret Landed{fresh: true, fits: ok, behind: g.gens - snap.gens, kept: false};
 }
 
-# raise the top to want slots while the GPU owns the pool, taking the pool
-# back and growing it when its buffers hold fewer
+# raise the top toward want slots while the GPU owns the pool, and make
+# larger buffers ahead of it, when the buffers would leave less than its slack
+# above it
 #
 # a raised top only lets the passes claim higher, since every free slot of the
-# capacity has its free bit, so it takes no seeding. a pool growing moves into
-# larger buffers, which takes the device idle.
+# capacity has its free bit, so it takes no seeding. the next flush moves the
+# pool into the larger buffers on the GPU (carry_comp), so a growth neither
+# takes the pool back nor grows the host's, and the top passes the old
+# capacity once the next flush has moved the pool, as aim keeps it.
 fun make_room(g: *Gpu, sp: *space.Space, want: usize) {
-    var top: usize = want;
-    if (top > g.p.cap) {
-        take(g, sp);
+    val ahead: usize = want + slack(want);
+    if (ahead > g.p.cap) {
         var cap: usize = g.p.cap;
-        for (cap < top && cap < sp.max_slots) { cap = cap * 2; }
-        if (cap > sp.max_slots)   { cap = sp.max_slots; }
-        if (!space.grow(sp, cap)) { cap = g.p.cap; }
-        if (top > cap)            { top = cap; }
-        g.reseed = true;
+        for (cap < ahead && cap < sp.max_slots) { cap = cap * 2; }
+        if (cap > sp.max_slots) { cap = sp.max_slots; }
+        # made in the frame, so nothing waits for the device. a refusal leaves
+        # the pool its buffers, the top held below them
+        if (cap > g.p.cap && !(g.reserved && cap <= g.next.cap)) { make_next(g, cap, true); }
     }
-    if (top > g.top) { g.top = top; }
+    if (want > g.aim) { g.aim = want; }
+    var top: usize = want;
+    if (top > g.p.cap) { top = g.p.cap; }
+    if (top > g.top)   { g.top = top; }
 }
 
 # take the pool back from the GPU while it owns it, so the host's page table
-# is the GPU's: a stall, which reads the page table and the allocator's words
+# is the GPU's: a stall, which reads the page table and the allocator's words,
+# first growing the host's pool to the GPU's capacity, which grew without it
 #
+# a host refused the memory for that, or a read that fails, leaves the pool
+# the GPU's as it was, the host's mirror stale, and why in untaken: nothing
+# that needs the host's pool may go on.
 # a closed gate voided every step recorded after the pass that closed it, so
 # the count of generations, the serial and the front go back to that pass,
 # and the generations taken back wait in rewound for the world's count. the
 # GPU keeps owning the pool until the host changes it.
 # call outside a frame, or in one before frame has recorded anything.
 # ---
-# g:  the GPU side
-# sp: the host's pool
-pub fun take(g: *Gpu, sp: *space.Space) {
-    if (!g.owns || !g.moved) { ret; }
-    val eh: err[gfx.Error] = gfx.storage_buffer_read(g.d, ?g.p.status, 0, (?g.ctl[0])::*u8, 64);
-    if (sel eh.err) { ret; }
+# g:   the GPU side
+# sp:  the host's pool
+# ret: the host's pool is the world's, false when the GPU keeps it
+pub fun take(g: *Gpu, sp: *space.Space) bool {
+    if (!g.owns || !g.moved) { ret true; }
     var n: usize = g.top;
-    if (n > sp.cap) { n = sp.cap; }
+    if (n > sp.cap && !space.grow(sp, g.p.cap)) {
+        g.untaken = "there is not enough memory to bring the world back from the GPU";
+        ret false;
+    }
+    val eh: err[gfx.Error] = gfx.storage_buffer_read(g.d, ?g.p.status, 0, (?g.ctl[0])::*u8, 64);
+    if (sel eh.err) {
+        g.untaken = "the GPU's pool could not be read back";
+        ret false;
+    }
     if (n != 0) {
         val et: err[gfx.Error] = gfx.storage_buffer_read(g.d, ?g.p.meta, HEAD * 4, sp.table::*u8, n * space.ENTRY * 4);
-        if (sel et.err) { ret; }
+        if (sel et.err) {
+            g.untaken = "the GPU's pool could not be read back";
+            ret false;
+        }
     }
     if (g.ctl[layout.CTL_GATE::usize] != 0) {
         val v: u64 = ((g.gens & 0xffffffff) + 0x100000000 - g.ctl[layout.CTL_HALT::usize]::u64) & 0xffffffff;
@@ -1535,7 +1748,14 @@ pub fun take(g: *Gpu, sp: *space.Space) {
     g.moved   = false;
     g.squeeze = 0;
     g.top     = sp.hi + slack(sp.hi);
+    g.aim     = 0;
     if (g.top > g.p.cap) { g.top = g.p.cap; }
+    ret true;
+}
+
+# why the last take the GPU kept the pool through could not take it back
+pub fun untaken(g: *Gpu) str {
+    ret g.untaken;
 }
 
 # generations a closed gate voided since this was last asked, which the
@@ -1570,8 +1790,8 @@ pub fun tallied(g: *Gpu) bool {
 # sp:  the host's pool
 # ret: ok, or why the read failed
 pub fun pull(g: *Gpu, sp: *space.Space) err[gfx.Error] {
-    if (!g.stepping) { ret err[gfx.Error].ok{}; }
-    take(g, sp);
+    if (!g.stepping)  { ret err[gfx.Error].ok{}; }
+    if (!take(g, sp)) { ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.empty{}}}; }
     # one read per run of slots whose staging is not newer; a free slot's
     # staging is unused, so it may ride along in a run
     var top: usize = g.hi;
@@ -1615,8 +1835,8 @@ pub fun pull(g: *Gpu, sp: *space.Space) err[gfx.Error] {
 # n:   slots in the run
 # ret: ok, or why the read failed
 pub fun pull_chunks(g: *Gpu, sp: *space.Space, lo: usize, n: usize) err[gfx.Error] {
-    if (!g.stepping) { ret err[gfx.Error].ok{}; }
-    take(g, sp);
+    if (!g.stepping)  { ret err[gfx.Error].ok{}; }
+    if (!take(g, sp)) { ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.empty{}}}; }
     var top: usize = lo + n;
     if (g.hi < top)  { top = g.hi; }
     if (sp.hi < top) { top = sp.hi; }
@@ -1665,13 +1885,64 @@ pub fun forget_writes(g: *Gpu, lo: usize, n: usize) {
     g.writes.len = keep;
 }
 
-# upload a run of whole chunks, stalled or recorded
-fun upload_cells(g: *Gpu, sp: *space.Space, s: usize, n: usize, stall: bool) err[gfx.Error] {
-    val at:  usize = s * space.CELLS * 4;
-    val len: usize = n * space.CELLS * 4;
-    val src: *u8   = (?sp.cells[s * space.CELLS])::*u8;
-    if (stall) { ret gfx.storage_buffer_upload(g.d, ?g.p.cells[g.front], at, src, len); }
-    ret gfx.renderer_buffer_update(g.r, ?g.p.cells[g.front], at, src, len);
+# whether the host filled slot s since the last flush, so it goes up whole
+fun refilled(sp: *space.Space, s: usize) bool {
+    ret (sp.dirty[s] & space.DIRTY_CELLS) != 0 && space.used(sp, s);
+}
+
+# batch the painted cells: the last painted of each cell, and none in a chunk
+# going up whole (filled), whose cells the host has written since
+fun queue_painted(g: *Gpu, sp: *space.Space, filled: bool) err[gfx.Error] {
+    vector.clear[u64](?g.keys);
+    var i: usize = 0;
+    for (i < g.writes.len) {
+        val at: usize = g.writes.data[i].at::usize;
+        if (!filled || !refilled(sp, at / space.CELLS)) {
+            val pushed: res[usize, allo.Error] = vector.push[u64](?g.keys, (at::u64 << 32) | i::u64);
+            if (sel pushed.err) { ret err[gfx.Error].err{gfx.Error.alloc{pushed.err}}; }
+        }
+        i = i + 1;
+    }
+    sort.sort[u64](g.keys.data, g.keys.len);
+    i = 0;
+    for (i < g.keys.len) {
+        val k: u64 = g.keys.data[i];
+        if (i + 1 < g.keys.len && (g.keys.data[i + 1] >> 32) == (k >> 32)) {
+            i = i + 1;
+            cnt;
+        }
+        val w: *Write         = ?g.writes.data[(k & 0xffffffff)::usize];
+        val e: err[gfx.Error] = queue(g, w.at::usize * 4, (?w.v)::*u8, 4);
+        if (sel e.err) { ret e; }
+        i = i + 1;
+    }
+    ret err[gfx.Error].ok{};
+}
+
+# batch the stamps that mark the slots in stamped alive and warm as of the
+# current serial, a write for each run of them
+fun queue_stamps(g: *Gpu) err[gfx.Error] {
+    val n: usize = g.stamped.len;
+    if (n == 0) { ret err[gfx.Error].ok{}; }
+    sort.sort[u32](g.stamped.data, n);
+    vector.clear[u32](?g.stamp);
+    val room: res[usize, allo.Error] = vector.ensure[u32](?g.stamp, n * 2);
+    if (sel room.err) { ret err[gfx.Error].err{gfx.Error.alloc{room.err}}; }
+    mem.fill[u32](g.stamp.data, g.serial, n * 2);
+    g.stamp.len = n * 2;
+    var i: usize = 0;
+    for (i < n) {
+        val lo:  u32   = g.stamped.data[i];
+        var run: usize = 1;
+        i = i + 1;
+        for (i < n && g.stamped.data[i] <= lo + run::u32) {
+            if (g.stamped.data[i] == lo + run::u32) { run = run + 1; }
+            i = i + 1;
+        }
+        val e: err[gfx.Error] = queue(g, lo::usize * 8, g.stamp.data::*u8, run * 8);
+        if (sel e.err) { ret e; }
+    }
+    ret err[gfx.Error].ok{};
 }
 
 # bring the GPU's pool level with the host's: grow it, then upload changed
@@ -1686,9 +1957,13 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
         drop_pool(g, ?g.old);
         g.retired = false;
     }
-    if (g.owns && !owns) {
-        take(g, sp);
+    # the GPU owned the pool before this frame, so its page table is the one
+    # a growth carries
+    var held: bool = g.owns;
+    # a pool that cannot be taken back stays the GPU's
+    if (g.owns && !owns && take(g, sp)) {
         g.owns = false;
+        held   = false;
     }
     if (!g.owns && owns) {
         # the host's halo is the rule's ring from here on, as the passes keep it
@@ -1696,44 +1971,70 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
         g.moved  = false;
         g.reseed = true;
         g.top    = 0;
+        g.aim    = 0;
         g.want   = false;
         g.wide   = false;
         sp.wide  = false;
         g.listed = false;
     }
-    if (g.owed > g.p.cap && !(g.reserved && g.owed <= g.next.cap) && !make_next(g, g.owed)) {
-        ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.overrun{(g.owed * space.CELLS * 4)::u64}}};
+    val owed: usize = atomic.exchange(?g.owed, 0)::usize;
+    if (owed > g.p.cap && !(g.reserved && owed <= g.next.cap) && !make_next(g, owed, true)) {
+        ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.overrun{(owed * space.CELLS * 4)::u64}}};
     }
-    g.owed = 0;
     val grew: bool = g.reserved;
     if (grew) {
-        # the world moves into the larger buffers reserve made, and only the
-        # page table goes up again
+        # the world moves into the larger buffers reserve made
         g.old      = g.p;
         g.retired  = true;
         g.p        = g.next;
         g.reserved = false;
         g.est      = UNKNOWN;
         forget_censuses(g);
-        if (g.hi != 0 && g.stepping) {
+        # a gate closed in a frame no census has shown yet voided steps the
+        # front was turned for, so while the GPU owned the pool either cells may
+        # hold the world, and both go
+        var pools: usize = 1;
+        if (held) { pools = 2; }
+        var k: usize = 0;
+        for (g.hi != 0 && g.stepping && k < pools) {
+            val c:  usize = (g.front + k) % 2;
             var gb: [4]*gfx.StorageBuffer;
-            gb[0] = ?g.old.cells[g.front];
-            gb[1] = ?g.p.cells[g.front];
+            gb[0] = ?g.old.cells[c];
+            gb[1] = ?g.p.cells[c];
             gb[2] = ?g.old.flags;
             gb[3] = ?g.p.flags;
             val eg: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.grow, ?gb[0], 4, 64, g.hi::u32, 1);
             if (sel eg.err) { ret eg; }
+            k = k + 1;
         }
-        var t: usize = 0;
-        for (t < sp.hi) {
-            sp.dirty[t] = sp.dirty[t] | space.DIRTY_ENTRY;
-            t           = t + 1;
+        if (held) {
+            # the GPU carries its own page table, which the host's may lag, and
+            # keeps owning the pool, its hash and free bits seeded again for
+            # the larger capacity
+            var cb: [4]*gfx.StorageBuffer;
+            cb[0] = ?g.old.meta;
+            cb[1] = ?g.p.meta;
+            cb[2] = ?g.old.status;
+            cb[3] = ?g.p.status;
+            val ec: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.carry, ?cb[0], 4, 1, g.old.cap::u32, 1);
+            if (sel ec.err) { ret ec; }
+            g.rehash = true;
         }
-        if (g.owns) { g.reseed = true; }
+        or {
+            # the host's page table is the world's, and goes up again
+            var t: usize = 0;
+            for (t < sp.hi) {
+                sp.dirty[t] = sp.dirty[t] | space.DIRTY_ENTRY;
+                t           = t + 1;
+            }
+            if (g.owns) { g.reseed = true; }
+        }
     }
 
+    # the GPU's top may lie past the host's capacity, which did not grow with it
     var top: usize = sp.hi;
-    if (g.hi > top) { top = g.hi; }
+    if (g.hi > top)   { top = g.hi; }
+    if (top > sp.cap) { top = sp.cap; }
     var entries: usize = 0;
     var chunks:  usize = 0;
     var s:       usize = 0;
@@ -1752,34 +2053,24 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
     # a list gathered before read the page table and the stamps as they were
     if (grew || chunks != 0 || entries != 0 || g.writes.len != 0 || g.stamped.len != 0) { g.listed = false; }
 
-    if (entries > BULK) {
-        # one recorded write of the span the dirty entries lie in, which never
-        # waits on the GPU the way a stalled upload would every frame
-        var lo: usize = top;
-        var hi: usize = 0;
-        s = 0;
-        for (s < top) {
-            if ((sp.dirty[s] & space.DIRTY_ENTRY) != 0) {
-                if (s < lo) { lo = s; }
-                hi = s + 1;
-            }
+    # every write below is recorded into the frame, in order with the growth
+    # copy and the steps, so nothing waits on the GPU, and each buffer's go up
+    # as one batch with one barrier pair, a write for each run of changed
+    # entries or chunks
+    s = 0;
+    for (entries != 0 && s < top) {
+        if ((sp.dirty[s] & space.DIRTY_ENTRY) == 0) {
             s = s + 1;
+            cnt;
         }
-        val e10: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.meta, (HEAD + lo * space.ENTRY) * 4,
-            (?sp.table[lo * space.ENTRY])::*u8, (hi - lo) * space.ENTRY * 4);
+        var run: usize = 1;
+        for (s + run < top && (sp.dirty[s + run] & space.DIRTY_ENTRY) != 0) { run = run + 1; }
+        val e10: err[gfx.Error] = queue(g, (HEAD + s * space.ENTRY) * 4, (?sp.table[s * space.ENTRY])::*u8, run * space.ENTRY * 4);
         if (sel e10.err) { ret e10; }
+        s = s + run;
     }
-    or (entries != 0) {
-        s = 0;
-        for (s < top) {
-            if ((sp.dirty[s] & space.DIRTY_ENTRY) != 0) {
-                val e11: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.meta, (HEAD + s * space.ENTRY) * 4,
-                    (?sp.table[s * space.ENTRY])::*u8, space.ENTRY * 4);
-                if (sel e11.err) { ret e11; }
-            }
-            s = s + 1;
-        }
-    }
+    val e11: err[gfx.Error] = send(g, ?g.p.meta);
+    if (sel e11.err) { ret e11; }
 
     if (g.stepping) {
         # chunks allocated empty are cleared on the GPU, in both pools
@@ -1804,56 +2095,37 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
         }
     }
 
-    if (g.stepping || whole) {
-        # chunks the host filled are uploaded, and stamped so they step in full.
-        # a stalled upload would land before this frame's growth copy, which
-        # would then overwrite it, so a growing frame records its uploads
-        val stall: bool = chunks > BULK && !grew;
-        s = 0;
-        for (chunks != 0 && s < top) {
-            if ((sp.dirty[s] & space.DIRTY_CELLS) != 0 && space.used(sp, s)) {
-                # a stalled upload runs on over free slots, whose cells nothing reads,
-                # so a fragmented pool still goes up in a few copies
-                var run: usize = 1;
-                for (stall && s + run < top
-                    && ((sp.dirty[s + run] & space.DIRTY_CELLS) != 0 || !space.used(sp, s + run))) {
-                    run = run + 1;
-                }
-                val e12: err[gfx.Error] = upload_cells(g, sp, s, run, stall);
-                if (sel e12.err)          { ret e12; }
-                if (!stall && g.stepping) { vector.push[u32](?g.stamped, s::u32); }
-                s = s + run;
-                cnt;
-            }
+    # chunks the host filled are uploaded, where the GPU steps or with whole,
+    # and stamped so they step in full. painted cells go up after the clear,
+    # which may have emptied the chunk they lie in
+    val filled: bool = g.stepping || whole;
+    s = 0;
+    for (filled && chunks != 0 && s < top) {
+        if (!refilled(sp, s)) {
             s = s + 1;
+            cnt;
         }
-        if (stall && g.stepping) {
-            # many at once: every slot is stamped, which only costs one full step
-            val rs: res[*u32, allo.Error] = allo.allocate[u32](g.a, top * 2);
-            if (sel rs.err) { ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.empty{}}}; }
-            mem.fill[u32](rs.ok, g.serial, top * 2);
-            val ef: err[gfx.Error] = gfx.storage_buffer_upload(g.d, ?g.p.flags, 0, rs.ok::*u8, top * 8);
-            allo.deallocate[u32](g.a, rs.ok, top * 2);
-            if (sel ef.err) { ret ef; }
+        var run: usize = 1;
+        for (s + run < top && refilled(sp, s + run)) { run = run + 1; }
+        val e12: err[gfx.Error] = queue(g, s * space.CELLS * 4, (?sp.cells[s * space.CELLS])::*u8, run * space.CELLS * 4);
+        if (sel e12.err) { ret e12; }
+        var k: usize = 0;
+        for (g.stepping && k < run) {
+            vector.push[u32](?g.stamped, (s + k)::u32);
+            k = k + 1;
         }
+        s = s + run;
     }
-
-    var i: usize = 0;
-    for (i < g.writes.len) {
-        val w:   *Write         = ?g.writes.data[i];
-        val e13: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.cells[g.front], w.at::usize * 4, (?w.v)::*u8, 4);
-        if (sel e13.err) { ret e13; }
-        i = i + 1;
-    }
+    val e13: err[gfx.Error] = queue_painted(g, sp, filled);
+    if (sel e13.err) { ret e13; }
     vector.clear[Write](?g.writes);
-    var now: [2]u32;
-    now[0] = g.serial;
-    now[1] = g.serial;
-    i      = 0;
-    for (i < g.stamped.len && g.stepping) {
-        val es: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.flags, g.stamped.data[i]::usize * 8, (?now[0])::*u8, 8);
+    val e14: err[gfx.Error] = send(g, ?g.p.cells[g.front]);
+    if (sel e14.err) { ret e14; }
+    if (g.stepping) {
+        val es: err[gfx.Error] = queue_stamps(g);
         if (sel es.err) { ret es; }
-        i = i + 1;
+        val ef: err[gfx.Error] = send(g, ?g.p.flags);
+        if (sel ef.err) { ret ef; }
     }
     vector.clear[u32](?g.stamped);
 
@@ -1871,7 +2143,8 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
     }
     g.hi = sp.hi;
     if (g.owns) {
-        val want: usize = sp.hi + slack(sp.hi);
+        var want: usize = sp.hi + slack(sp.hi);
+        if (want < g.aim)                                              { want = g.aim; }
         if (g.top < want)                                              { g.top = want; }
         if (g.top > g.p.cap)                                           { g.top = g.p.cap; }
         if (g.squeeze != 0 && g.top > g.squeeze && g.squeeze >= sp.hi) { g.top = g.squeeze; }
@@ -1893,23 +2166,27 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
 # the hash and the free bits seeded from the page table just uploaded. the next
 # generation waits for a pass, which gives the host's chunks their halo
 fun hand_back(g: *Gpu, sp: *space.Space) err[gfx.Error] {
-    var w: [6]u32;
+    var w: [4]u32;
     w[0] = 0;
     w[1] = 0;
     w[2] = 0;
     w[3] = sp.serial;
-    w[4] = g.top::u32;
-    w[5] = g.p.cap::u32;
-    val ew: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.status, layout.CTL_GATE::usize * 4, (?w[0])::*u8, 24);
+    val ew: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.status, layout.CTL_GATE::usize * 4, (?w[0])::*u8, 16);
     if (sel ew.err) { ret ew; }
     g.reseed  = false;
     g.grouped = MAX_SPAN;
     ret rehash(g);
 }
 
-# seed the GPU's hash and free bits from its page table again, which also
-# clears the tombstones out of the hash
+# seed the GPU's hash and free bits from its page table again, for the top
+# and the capacity written ahead of it, which also clears the tombstones out of
+# the hash
 fun rehash(g: *Gpu) err[gfx.Error] {
+    var w: [2]u32;
+    w[0] = g.top::u32;
+    w[1] = g.p.cap::u32;
+    val et: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.status, layout.CTL_TOP::usize * 4, (?w[0])::*u8, 8);
+    if (sel et.err) { ret et; }
     var wb: [1]*gfx.StorageBuffer;
     wb[0] = ?g.p.status;
     val ew: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.wipe, ?wb[0], 1, layout.HASH / 64, 1, 1);
@@ -1946,9 +2223,10 @@ pub fun reads_pyramids(look: *Look) bool {
 }
 
 # while the CPU steps, upload the chunks the view can see that changed since
-# they were last sent, for as long as VIEW_SHARE of the refresh interval
-# allows, going on from where the last frame stopped so every chunk takes its
-# turn. what does not fit is sent by the frames after, so the view may lag the
+# they were last sent, as one batch, for as long as the refresh interval over
+# VIEW_SHARE allows: the time spent choosing them and what the last batches
+# measured their bytes to cost to send (send_ps). it goes on from where the
+# last frame stopped so every chunk takes its turn. what does not fit is sent by the frames after, so the view may lag the
 # world a generation but the frame never waits on it. the pyramids come built
 # from the step (space.pyramid), and only a chunk changed some other way has its
 # own built here. the draw reads either the cells or, at half a pixel per cell
@@ -1964,32 +2242,49 @@ fun upload_view(g: *Gpu, sp: *space.Space, look: *Look) err[gfx.Error] {
     view_chunks(look, ?box[0]);
     var want: u8 = SENT_CELLS;
     if (reads_pyramids(look)) { want = SENT_MIP; }
+    vector.clear[u32](?g.pyrs);
     val t0: time.InstantClock = time.instant();
     if (sel t0.err) { ret err[gfx.Error].ok{}; }
     val budget: u64   = g.pace_us.quick_us * 1000 / VIEW_SHARE;
     var s:      usize = g.cursor;
     if (s >= sp.hi) { s = 0; }
-    var n: usize = 0;
+    var bytes: usize = 0;
+    var n:     usize = 0;
     for (n < sp.hi) {
         val h: u8 = g.p.held[s];
         if (space.used(sp, s) && (h & want) != want) {
             val x: i64 = space.slot_x(sp, s);
             val y: i64 = space.slot_y(sp, s);
             if (x >= box[0] && x <= box[2] && y >= box[1] && y <= box[3]) {
+                var len: usize = MIP * 4;
+                if (want == SENT_CELLS) { len = space.CELLS * 4; }
                 val now: time.InstantClock = time.instant();
                 if (sel now.ok) {
-                    if (time.instant_sub(now.ok, t0.ok)::u64 > budget) { brk; }
+                    val spent: u64 = time.instant_sub(now.ok, t0.ok)::u64 + ((bytes + len)::u64 * g.send_ps) / 1000;
+                    if (spent > budget) { brk; }
                 }
+                bytes = bytes + len;
+                var e: err[gfx.Error] = err[gfx.Error].ok{};
                 if (want == SENT_CELLS) {
-                    val e: err[gfx.Error] = upload_cells(g, sp, s, 1, false);
-                    if (sel e.err) { ret e; }
+                    e = queue(g, s * space.CELLS * 4, (?sp.cells[s * space.CELLS])::*u8, space.CELLS * 4);
+                }
+                or ((h & BUILT) != 0) {
+                    e = queue(g, s * MIP * 4, (?sp.mips[s * MIP])::*u8, MIP * 4);
                 }
                 or {
-                    var m: *u32 = ?g.built[0];
-                    if ((h & BUILT) != 0) { m = ?sp.mips[s * MIP]; }
-                    or                    { space.pyramid(?sp.cells[s * space.CELLS], sp.sense, m); }
-                    val em: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.mip, s * MIP * 4, m::*u8, MIP * 4);
-                    if (sel em.err) { ret em; }
+                    # staged in pyrs, which may move as it grows, so the write
+                    # finds its bytes once every pyramid is built
+                    val room: res[usize, allo.Error] = vector.reserve[u32](?g.pyrs, MIP);
+                    if (sel room.err) { e = err[gfx.Error].err{gfx.Error.alloc{room.err}}; }
+                    or {
+                        space.pyramid(?sp.cells[s * space.CELLS], sp.sense, ?g.pyrs.data[g.pyrs.len]);
+                        g.pyrs.len = g.pyrs.len + MIP;
+                        e          = queue(g, s * MIP * 4, nil, MIP * 4);
+                    }
+                }
+                if (sel e.err) {
+                    vector.clear[gfx.BufferWrite](?g.batch);
+                    ret e;
                 }
                 g.p.held[s] = h | want;
             }
@@ -1999,7 +2294,31 @@ fun upload_view(g: *Gpu, sp: *space.Space, look: *Look) err[gfx.Error] {
         n = n + 1;
     }
     g.cursor = s;
-    ret err[gfx.Error].ok{};
+    var to: *gfx.StorageBuffer = ?g.p.cells[g.front];
+    if (want == SENT_MIP) {
+        to = ?g.p.mip;
+        var k: usize = 0;
+        var i: usize = 0;
+        for (i < g.batch.len) {
+            if (g.batch.data[i].src == nil) {
+                g.batch.data[i].src = (?g.pyrs.data[k * MIP])::*u8;
+                k                   = k + 1;
+            }
+            i = i + 1;
+        }
+    }
+    if (bytes == 0) { ret send(g, to); }
+    val t1: time.InstantClock = time.instant();
+    val e:  err[gfx.Error]    = send(g, to);
+    val t2: time.InstantClock = time.instant();
+    if (sel t1.ok) {
+        if (sel t2.ok) {
+            # what the batch's bytes cost to send, for the next frame's budget
+            val ps: u64 = time.instant_sub(t2.ok, t1.ok)::u64 * 1000 / bytes::u64;
+            g.send_ps = (g.send_ps * 3 + ps) / 4;
+        }
+    }
+    ret e;
 }
 
 # whether the GPU's pyramid of every chunk the host's staging holds as the GPU
@@ -2216,6 +2535,24 @@ fun record_ops(g: *Gpu, step: *gfx.Compute, bound: usize) err[gfx.Error] {
     ret err[gfx.Error].ok{};
 }
 
+# record the frame's planned dispatches, timed by the frame's turn of the
+# clocks when it steps any slots, for what a slot costs (measure)
+fun timed_ops(g: *Gpu, step: *gfx.Compute, bound: usize) err[gfx.Error] {
+    if (!g.clocked) { ret record_ops(g, step, bound); }
+    val c: usize = g.turn;
+    g.turn    = (c + 1) % TIMERS;
+    g.paid[c] = 0;
+    if (g.worked == 0) { ret record_ops(g, step, bound); }
+    val eb: err[gfx.Error] = gfx.renderer_timer_begin(g.r, ?g.clocks[c]);
+    if (sel eb.err) { ret eb; }
+    val eo: err[gfx.Error] = record_ops(g, step, bound);
+    if (sel eo.err) { ret eo; }
+    val ee: err[gfx.Error] = gfx.renderer_timer_end(g.r, ?g.clocks[c]);
+    if (sel ee.err) { ret ee; }
+    g.paid[c] = g.worked;
+    ret err[gfx.Error].ok{};
+}
+
 # record a frame's work: bring the pool level, step, count, and set the view
 #
 # call once a frame between renderer_begin_frame and the first pass, after
@@ -2365,7 +2702,7 @@ pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, 
         n          = n + 1;
     }
     g.stepped = n::u64 * radius::u64;
-    val eo: err[gfx.Error] = record_ops(g, step, bound);
+    val eo: err[gfx.Error] = timed_ops(g, step, bound);
     if (sel eo.err) { ret res[usize, gfx.Error].err{eo.err}; }
     if (g.going) {
         # the census, the reduction and the draw read the completed generation
@@ -2474,13 +2811,48 @@ pub fun draw(g: *Gpu, p: *gfx.Pass) {
 
 test pace_for__follows_the_refresh_interval_and_falls_back_to_sixty {
     val slow: Pace = pace_for(30.0);
-    if (slow.quick_us != 35999 || slow.slow_us != 47999) { ret 1; }
+    if (slow.interval_us != 33333 || slow.quick_us != 35999) { ret 1; }
     val base: Pace = pace_for(60.0);
-    if (base.quick_us != 18000 || base.slow_us != 24000) { ret 2; }
+    if (base.interval_us != 16667 || base.quick_us != 18000) { ret 2; }
     val fast: Pace = pace_for(144.0);
-    if (fast.quick_us != 7499 || fast.slow_us != 9999) { ret 3; }
+    if (fast.interval_us != 6944 || fast.quick_us != 7499) { ret 3; }
     val none: Pace = pace_for(0.0);
-    if (none.quick_us != base.quick_us || none.slow_us != base.slow_us) { ret 4; }
+    if (none.interval_us != base.interval_us || none.quick_us != base.quick_us) { ret 4; }
+    ret 0;
+}
+
+test fit_span__steps_what_the_budget_holds_at_the_cost {
+    # 8 ms at 50 ns a slot
+    if (fit_span(8000000, 50000) != 160000)  { ret 1; }
+    if (fit_span(8000000, 0) != MAX_SPAN)    { ret 2; }
+    if (fit_span(1000, 50000) != MIN_SPAN)   { ret 3; }
+    if (fit_span(0xffffffff, 1) != MAX_SPAN) { ret 4; }
+    ret 0;
+}
+
+test smooth__follows_a_dearer_cost_fast_and_a_cheaper_one_slowly {
+    if (smooth(0, 700) != 700) { ret 1; }
+    # half of a rise at once, a sixteenth of a fall
+    if (smooth(1000, 3000) != 2000) { ret 2; }
+    if (smooth(1600, 0) != 1500)    { ret 3; }
+    # a single frame over the cost moves it, however little over
+    if (smooth(1000, 1001) != 1001) { ret 4; }
+    if (smooth(1000, 1000) != 1000) { ret 5; }
+    ret 0;
+}
+
+test cut_span__is_in_proportion_to_any_overrun {
+    # a frame of twice the interval halves what it stepped
+    if (cut_span(10000, 33334, 16667) != 5000) { ret 1; }
+    # a frame barely over is cut barely
+    if (cut_span(10000, 18334, 16667) != 9090)   { ret 2; }
+    if (cut_span(10000, 16000, 16667) != 10000)  { ret 3; }
+    if (cut_span(100, 33334, 16667) != MIN_SPAN) { ret 4; }
+    ret 0;
+}
+
+test timers__outnumber_the_frames_in_flight {
+    if (TIMERS != gfx.MAX_FRAMES_IN_FLIGHT + 1) { ret 1; }
     ret 0;
 }
 

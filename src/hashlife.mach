@@ -28,10 +28,15 @@
 # its centre quarter and the root is deep enough for 2^k generations, and takes
 # the root's result as the new root.
 #
-# the table holds at most max nodes. collect frees every node the root and the
-# empty squares do not reach, and forgets the results that named one. tidy
-# collects as the nodes in use near what the table can reach under a budget,
-# the max unless a ceiling on the tree's memory sets a lower one (set_budget). a node
+# the table holds at most max nodes, and grows while a budget allows: the max
+# unless a ceiling on the tree's memory sets a lower one (set_budget). collect
+# keeps every node the root and the empty squares reach, with the results those
+# nodes worked out, so stepping carries on from what it knew. results that would
+# hold over half the table are dropped instead, but for those naming a node
+# kept. a collection costs what it keeps, not what the table holds: it clears a
+# byte a node and the buckets, chains the nodes it reaches afresh, and a node
+# made later takes the first slot it did not reach (held, sweep). tidy collects
+# when the room left under the budget is less than the last step took. a node
 # the table cannot make is NONE, which every function passes up, so a step or
 # an edit that fills the table stops whole and says so rather than going wrong.
 #
@@ -96,10 +101,10 @@ val CELLS: usize = 4096;
 # kids:  nw, ne, sw, se
 # full:  the result 2^(level-2) generations on, NONE until worked out
 # slow:  the result 2^sk generations on, NONE until worked out
-# next:  the next node in its hash chain, or in the free list
+# next:  the next node in its hash chain
 # level: its level
 # sk:    the exponent slow was worked out for
-# flags: USED while it holds a node, MARK while a walk has reached it
+# flags: MARK while a walk has reached it
 # heat:  the most heat the rule's word for any of its cells carries
 # pop:   cells in a state other than 0, held at the u64 ceiling
 # live:  cells in a state the rule counts live, held at the u64 ceiling
@@ -116,9 +121,9 @@ rec Node {
     live:  u64;
 }
 
-# the memory a node takes: itself and its share of the buckets, of which there
-# are at most two a node
-pub val NODE_BYTES: usize = $size_of(Node) + 2 * $size_of(u32);
+# the memory a node takes: itself, its held byte and its share of the buckets,
+# of which there are at most two a node
+pub val NODE_BYTES: usize = $size_of(Node) + $size_of(u8) + 2 * $size_of(u32);
 
 # why a step was cancelled (cancelled): it was not
 pub val CANCEL_NONE: u8 = 0;
@@ -132,8 +137,7 @@ pub val CANCEL_ASKED: u8 = 3;
 val POLL: u32 = 1024;
 
 # Node.flags
-val USED: u8 = 1;
-val MARK: u8 = 2;
+val MARK: u8 = 1;
 
 # the chunks an edit or a read has taken out of the tree
 # ---
@@ -164,9 +168,14 @@ rec Cache {
 # cap:      nodes allocated
 # hi:       ids in use lie below this
 # used:     nodes in use, the cells included
-# free:     the first free id below hi, NONE when none
+# held:     1 per id that holds a node, the cells' always
+# helds:    bytes held has room for, at least cap
+# sweep:    no id below this and at or past the cells is free
+# spent:    nodes the last step made
 # heads:    first node per hash bucket
 # hcap:     buckets, a power of two
+# low:      buckets before the doubling under way, hcap when none is
+# split:    low buckets already split into the high half
 # empty:    the empty node of each level, NONE until made
 # r:        the rule
 # states:   states a cell of the rule can be in
@@ -196,9 +205,14 @@ pub rec Tree {
     cap:      usize;
     hi:       usize;
     used:     usize;
-    free:     u32;
+    held:     *u8;
+    helds:    usize;
+    sweep:    usize;
+    spent:    usize;
     heads:    *u32;
     hcap:     usize;
+    low:      usize;
+    split:    usize;
     empty:    [61]u32;
     r:        rule.Rule;
     states:   u32;
@@ -231,6 +245,7 @@ pub fun init(t: *Tree, a: *allo.Allocator, max: usize) {
     t.budget   = max;
     t.in_place = $mach.build.os == $mach.os.linux;
     t.cap      = 0;
+    t.spent    = 0;
     t.k        = 0;
     t.full     = false;
     t.armed    = false;
@@ -255,6 +270,7 @@ pub fun init(t: *Tree, a: *allo.Allocator, max: usize) {
 pub fun dnit(t: *Tree) {
     if (!t.made) { ret; }
     allo.deallocate[Node](t.a, t.nodes, t.cap);
+    allo.deallocate[u8](t.a, t.held, t.helds);
     allo.deallocate[u32](t.a, t.heads, t.hcap);
     allo.deallocate[i64](t.a, t.cache.at, CACHE_MAX * 2);
     allo.deallocate[u8](t.a, t.cache.cells, CACHE_MAX * CELLS);
@@ -279,23 +295,54 @@ fun hash4(a: u32, b: u32, c: u32, d: u32) u64 {
     ret h ^ (h >> 33);
 }
 
-fun bucket(t: *Tree, n: u32) usize {
-    val d: *Node = ?t.nodes[n::usize];
-    ret (hash4(d.kids[0], d.kids[1], d.kids[2], d.kids[3])::usize) & (t.hcap - 1);
+# the bucket of a hash: of the low buckets, unless that one has been split
+# into the high half the buckets last doubled to
+fun slot(t: *Tree, h: u64) usize {
+    val b: usize = h::usize & (t.low - 1);
+    if (b < t.split) { ret h::usize & (t.hcap - 1); }
+    ret b;
 }
 
-# chain every node in use into the buckets afresh
-fun rehash(t: *Tree) {
-    mem.fill[u32](t.heads, NONE, t.hcap);
-    var i: usize = MAX_STATES::usize;
-    for (i < t.hi) {
-        if ((t.nodes[i].flags & USED) != 0) {
-            val b: usize = bucket(t, i::u32);
-            t.nodes[i].next = t.heads[b];
-            t.heads[b]      = i::u32;
+fun bucket(t: *Tree, n: u32) usize {
+    val d: *Node = ?t.nodes[n::usize];
+    ret slot(t, hash4(d.kids[0], d.kids[1], d.kids[2], d.kids[3]));
+}
+
+# split the next low bucket of a doubling under way between itself and its
+# twin in the high half, finishing the doubling with the last
+fun spread(t: *Tree) {
+    if (t.low == t.hcap) { ret; }
+    val lo: usize = t.split;
+    var i:  u32   = t.heads[lo];
+    var a:  u32   = NONE;
+    var z:  u32   = NONE;
+    for (i != NONE) {
+        val d:    *Node = ?t.nodes[i::usize];
+        val next: u32   = d.next;
+        if ((hash4(d.kids[0], d.kids[1], d.kids[2], d.kids[3])::usize & (t.hcap - 1)) == lo) {
+            d.next = a;
+            a      = i;
         }
-        i = i + 1;
+        or {
+            d.next = z;
+            z      = i;
+        }
+        i = next;
     }
+    t.heads[lo]         = a;
+    t.heads[lo + t.low] = z;
+    t.split             = t.split + 1;
+    if (t.split == t.low) {
+        t.low   = t.hcap;
+        t.split = 0;
+    }
+}
+
+# empty every bucket, done doubling
+fun unchain(t: *Tree) {
+    mem.fill[u32](t.heads, NONE, t.hcap);
+    t.low   = t.hcap;
+    t.split = 0;
 }
 
 # the nodes a full table grows to: double, at most max, and while a step is
@@ -334,29 +381,52 @@ fun grow(t: *Tree, cap: usize) bool {
     if (t.cap == 0) {
         val rn: res[*Node, allo.Error] = allo.zallocate[Node](t.a, cap);
         if (sel rn.err) { ret false; }
-        val rh: res[*u32, allo.Error] = allo.allocate[u32](t.a, hcap);
-        if (sel rh.err) {
+        val rk: res[*u8, allo.Error] = allo.zallocate[u8](t.a, cap);
+        if (sel rk.err) {
             allo.deallocate[Node](t.a, rn.ok, cap);
             ret false;
         }
+        val rh: res[*u32, allo.Error] = allo.allocate[u32](t.a, hcap);
+        if (sel rh.err) {
+            allo.deallocate[Node](t.a, rn.ok, cap);
+            allo.deallocate[u8](t.a, rk.ok, cap);
+            ret false;
+        }
         t.nodes = rn.ok;
+        t.held  = rk.ok;
+        t.helds = cap;
         t.heads = rh.ok;
+        t.cap   = cap;
+        t.hcap  = hcap;
+        unchain(t);
+        ret true;
     }
     or {
+        # held grows ahead of the nodes, so it has room for them whichever fails
+        if (t.helds < cap) {
+            val rk: res[*u8, allo.Error] = allo.reallocate[u8](t.a, t.held, t.helds, cap);
+            if (sel rk.err) { ret false; }
+            t.held  = rk.ok;
+            t.helds = cap;
+        }
         val rn: res[*Node, allo.Error] = allo.reallocate[Node](t.a, t.nodes, t.cap, cap);
         if (sel rn.err) { ret false; }
         t.nodes = rn.ok;
         t.cap   = cap;
         if (hcap != t.hcap) {
+            # a doubling under way ends before the next starts
+            for (t.low != t.hcap) { spread(t); }
             val rh: res[*u32, allo.Error] = allo.reallocate[u32](t.a, t.heads, t.hcap, hcap);
             if (sel rh.err) { ret false; }
+            # the nodes move to the new buckets a few at a time as nodes are
+            # made (spread), so a growth costs no pass over the table. the high
+            # half is written as each low bucket is split, so it is not cleared
             t.heads = rh.ok;
+            t.low   = t.hcap;
+            t.split = 0;
+            t.hcap  = hcap;
         }
     }
-    t.cap  = cap;
-    t.hcap = hcap;
-    # the free list runs through next, which rehash rewrites for nodes in use only
-    rehash(t);
     ret true;
 }
 
@@ -390,6 +460,7 @@ pub fun make(t: *Tree) bool {
         if (dirty != nil) { allo.deallocate[u8](t.a, dirty, CACHE_MAX); }
         if (hash != nil)  { allo.deallocate[u32](t.a, hash, hc); }
         allo.deallocate[Node](t.a, t.nodes, t.cap);
+        allo.deallocate[u8](t.a, t.held, t.helds);
         allo.deallocate[u32](t.a, t.heads, t.hcap);
         t.cap = 0;
         ret false;
@@ -413,18 +484,18 @@ pub fun clear(t: *Tree) {
     var i: u32 = 0;
     for (i < MAX_STATES) {
         val n: *Node = ?t.nodes[i::usize];
-        n.flags = USED;
-        n.full  = NONE;
-        n.slow  = NONE;
-        n.live  = t.lit[i::usize]::u64;
-        n.heat  = t.hue[i::usize];
+        n.full = NONE;
+        n.slow = NONE;
+        n.live = t.lit[i::usize]::u64;
+        n.heat = t.hue[i::usize];
         if (i != 0) { n.pop = 1; }
-        i = i + 1;
+        t.held[i::usize] = 1;
+        i                = i + 1;
     }
-    t.hi   = MAX_STATES::usize;
-    t.used = t.hi;
-    t.free = NONE;
-    mem.fill[u32](t.heads, NONE, t.hcap);
+    t.hi    = MAX_STATES::usize;
+    t.used  = t.hi;
+    t.sweep = t.hi;
+    unchain(t);
     var l: usize = 0;
     for (l < 61) {
         t.empty[l] = NONE;
@@ -478,15 +549,20 @@ fun add_pop(a: u64, b: u64) u64 {
 # ret: the node, or NONE when a child is NONE or the table is full
 pub fun node(t: *Tree, nw: u32, ne: u32, sw: u32, se: u32) u32 {
     if (nw == NONE || ne == NONE || sw == NONE || se == NONE) { ret NONE; }
-    val b: usize = (hash4(nw, ne, sw, se)::usize) & (t.hcap - 1);
-    var i: u32   = t.heads[b];
+    val h: u64 = hash4(nw, ne, sw, se);
+    var i: u32 = t.heads[slot(t, h)];
     for (i != NONE) {
         val d: *Node = ?t.nodes[i::usize];
         if (d.kids[0] == nw && d.kids[1] == ne && d.kids[2] == sw && d.kids[3] == se) { ret i; }
         i = t.nodes[i::usize].next;
     }
-    var id: u32 = t.free;
-    if (id != NONE) { t.free = t.nodes[id::usize].next; }
+    # the first slot the last collection did not reach, or a new one
+    for (t.sweep < t.hi && t.held[t.sweep] != 0) { t.sweep = t.sweep + 1; }
+    var id: u32 = NONE;
+    if (t.sweep < t.hi) {
+        id      = t.sweep::u32;
+        t.sweep = t.sweep + 1;
+    }
     or {
         if (t.hi >= t.max) {
             t.full = true;
@@ -504,24 +580,28 @@ pub fun node(t: *Tree, nw: u32, ne: u32, sw: u32, se: u32) u32 {
                 ret NONE;
             }
         }
-        id   = t.hi::u32;
-        t.hi = t.hi + 1;
+        id      = t.hi::u32;
+        t.hi    = t.hi + 1;
+        t.sweep = t.hi;
     }
-    val bb: usize = (hash4(nw, ne, sw, se)::usize) & (t.hcap - 1);
+    # a bucket split a node made moves the chains along with the table
+    spread(t);
+    val bb: usize = slot(t, h);
     val n:  *Node = ?t.nodes[id::usize];
-    n.kids[0]   = nw;
-    n.kids[1]   = ne;
-    n.kids[2]   = sw;
-    n.kids[3]   = se;
-    n.full      = NONE;
-    n.slow      = NONE;
-    n.sk        = 0;
-    n.flags     = USED;
-    n.level     = (t.nodes[nw::usize].level + 1)::u8;
-    n.pop       = add_pop(add_pop(t.nodes[nw::usize].pop, t.nodes[ne::usize].pop), add_pop(t.nodes[sw::usize].pop, t.nodes[se::usize].pop));
-    n.next      = t.heads[bb];
-    t.heads[bb] = id;
-    t.used      = t.used + 1;
+    n.kids[0]         = nw;
+    n.kids[1]         = ne;
+    n.kids[2]         = sw;
+    n.kids[3]         = se;
+    n.full            = NONE;
+    n.slow            = NONE;
+    n.sk              = 0;
+    n.flags           = 0;
+    n.level           = (t.nodes[nw::usize].level + 1)::u8;
+    n.pop             = add_pop(add_pop(t.nodes[nw::usize].pop, t.nodes[ne::usize].pop), add_pop(t.nodes[sw::usize].pop, t.nodes[se::usize].pop));
+    n.next            = t.heads[bb];
+    t.heads[bb]       = id;
+    t.held[id::usize] = 1;
+    t.used            = t.used + 1;
     light(t, id);
     ret id;
 }
@@ -566,13 +646,12 @@ fun relight(t: *Tree) {
     }
     i = MAX_STATES::usize;
     for (i < t.hi) {
-        val f: u8 = t.nodes[i].flags;
-        if ((f & USED) != 0 && (f & MARK) == 0) { relight_from(t, i::u32); }
+        if (t.held[i] != 0 && (t.nodes[i].flags & MARK) == 0) { relight_from(t, i::u32); }
         i = i + 1;
     }
     i = MAX_STATES::usize;
     for (i < t.hi) {
-        t.nodes[i].flags = t.nodes[i].flags & USED;
+        t.nodes[i].flags = 0;
         i                = i + 1;
     }
 }
@@ -776,64 +855,78 @@ pub fun set_exponent(t: *Tree, k: u32) {
     if (t.k > MAX_EXPONENT) { t.k = MAX_EXPONENT; }
 }
 
-fun mark(t: *Tree, n: u32) {
-    if (n == NONE || n < MAX_STATES) { ret; }
-    val nd: *Node = ?t.nodes[n::usize];
-    if ((nd.flags & MARK) != 0) { ret; }
-    nd.flags = nd.flags | MARK;
+# hold a node and every node it reaches, chained afresh, with the results it
+# worked out when keep, and those of the step exponent only, since a slow result
+# of another names a node nothing holds
+fun mark(t: *Tree, n: u32, keep: bool) {
+    if (n == NONE || n < MAX_STATES || t.held[n::usize] != 0) { ret; }
+    t.held[n::usize] = 1;
+    t.used           = t.used + 1;
+    val d: *Node = ?t.nodes[n::usize];
+    val b: usize = bucket(t, n);
+    d.next     = t.heads[b];
+    t.heads[b] = n;
     var q: usize = 0;
     for (q < 4) {
-        mark(t, t.nodes[n::usize].kids[q]);
+        mark(t, d.kids[q], keep);
         q = q + 1;
+    }
+    if (!keep)                              { ret; }
+    if (d.slow != NONE && d.sk::u32 != t.k) { d.slow = NONE; }
+    mark(t, d.full, keep);
+    mark(t, d.slow, keep);
+}
+
+# hold what the root, extra and the empty squares reach, and free the rest
+fun hold(t: *Tree, extra: u32, keep: bool) {
+    mem.zero[u8](?t.held[MAX_STATES::usize], t.hi - MAX_STATES::usize);
+    unchain(t);
+    t.used  = MAX_STATES::usize;
+    t.sweep = MAX_STATES::usize;
+    mark(t, t.root, keep);
+    mark(t, extra, keep);
+    var l: usize = 0;
+    for (l < 61) {
+        mark(t, t.empty[l], keep);
+        l = l + 1;
     }
 }
 
-# free every node the root and the empty squares do not reach, and forget the
-# results that named one
+# forget every result that names a node not held, walking the chains, which
+# hold the nodes held and no others
+fun scrub(t: *Tree) {
+    var b: usize = 0;
+    for (b < t.hcap) {
+        var i: u32 = t.heads[b];
+        for (i != NONE) {
+            val n: *Node = ?t.nodes[i::usize];
+            if (n.full != NONE && t.held[n.full::usize] == 0) { n.full = NONE; }
+            if (n.slow != NONE && t.held[n.slow::usize] == 0) { n.slow = NONE; }
+            i = n.next;
+        }
+        b = b + 1;
+    }
+}
+
+# free every node the root and the empty squares do not reach, keeping the
+# results the nodes kept worked out, unless those hold over half of what the
+# table can reach, when only the results naming a node kept stay
 # ---
 # t:     the tree
 # extra: another node to keep, or NONE
 pub fun collect(t: *Tree, extra: u32) {
     if (!t.made) { ret; }
-    mark(t, t.root);
-    mark(t, extra);
-    var l: usize = 0;
-    for (l < 61) {
-        mark(t, t.empty[l]);
-        l = l + 1;
+    hold(t, extra, true);
+    if (t.used > attainable(t) / 2) {
+        hold(t, extra, false);
+        scrub(t);
     }
-    t.free = NONE;
-    var i: usize = t.hi;
-    for (i > MAX_STATES::usize) {
-        i = i - 1;
-        val n: *Node = ?t.nodes[i];
-        if (n.flags == USED) {
-            n.flags = 0;
-            t.used  = t.used - 1;
-        }
-        if (n.flags == 0) {
-            n.next = t.free;
-            t.free = i::u32;
-        }
-    }
-    i = MAX_STATES::usize;
-    for (i < t.hi) {
-        val n: *Node = ?t.nodes[i];
-        if (n.flags != 0) {
-            n.flags = USED;
-            if (n.full != NONE && n.full >= MAX_STATES && t.nodes[n.full::usize].flags == 0) { n.full = NONE; }
-            if (n.slow != NONE && n.slow >= MAX_STATES && t.nodes[n.slow::usize].flags == 0) { n.slow = NONE; }
-        }
-        i = i + 1;
-    }
-    rehash(t);
     t.full = false;
 }
 
-# collect when the nodes in use reach three quarters of what the table can reach
+# collect when the room left under the budget is less than the last step took
 pub fun tidy(t: *Tree, extra: u32) {
-    val b: usize = attainable(t);
-    if (t.used >= b - b / 4) { collect(t, extra); }
+    if (t.used + t.spent >= attainable(t)) { collect(t, extra); }
 }
 
 # say whether the allocator resizes the table where it lies, so a growth never
@@ -927,8 +1020,10 @@ fun pad_to(t: *Tree, level: u32) bool {
 
 # advance the world 2^k generations
 #
-# a failure leaves the world as it was, and collect then retry may succeed
-# unless the step was cancelled for its time or by an ask.
+# a step the budget cancels collects, and is tried once more when that leaves
+# it at least twice the room it had, so garbage alone never cancels one. a
+# failure leaves the world as it was, and when the table filled to its max,
+# collect then retry may succeed.
 # ---
 # t:   the tree, made
 # ret: false when the table filled, the root would pass MAX_LEVEL, or the step
@@ -936,6 +1031,24 @@ fun pad_to(t: *Tree, level: u32) bool {
 pub fun step(t: *Tree) bool {
     t.cancel = CANCEL_NONE;
     tidy(t, NONE);
+    val room: usize = room_left(t);
+    if (advance(t))                { ret true; }
+    if (t.cancel != CANCEL_BUDGET) { ret false; }
+    collect(t, NONE);
+    if (room_left(t) < room * 2) { ret false; }
+    t.cancel = CANCEL_NONE;
+    ret advance(t);
+}
+
+# the nodes the table may yet make under the budget
+fun room_left(t: *Tree) usize {
+    val b: usize = attainable(t);
+    if (t.used >= b) { ret 0; }
+    ret b - t.used;
+}
+
+# the step itself, past tidy
+fun advance(t: *Tree) bool {
     if (!pad_to(t, t.k + 3)) { ret false; }
     for (!centred(t)) {
         if (t.level >= MAX_LEVEL) {
@@ -946,8 +1059,10 @@ pub fun step(t: *Tree) bool {
     }
     t.armed = true;
     t.polls = 0;
-    val r: u32 = result(t, t.root);
+    val before: usize = t.used;
+    val r:      u32   = result(t, t.root);
     t.armed = false;
+    t.spent = t.used - before;
     if (r == NONE) { ret false; }
     t.root  = r;
     t.level = t.level - 1;
