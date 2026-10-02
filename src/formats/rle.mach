@@ -252,44 +252,70 @@ fun read_body(c: *Cur, e: *format.Emit, ox: i64, oy: i64, w: i64, h: i64) err[fo
     ret err[format.Error].ok{};
 }
 
-fun read_all(a: *allo.Allocator, p: *u8, n: usize, e: *format.Emit, com: *Vector[u8]) err[format.Error] {
+# read the '#' lines and the header from a position, as an RLE file has them
+# before its body, for RLE and the formats that share its head
+#
+# the comments are kept in the Info, and the declared box covers it.
+# ---
+# a:  allocator for the Info's text and the comments
+# p:  the bytes
+# n:  how many
+# at: the first byte of the head, left at the body
+# e:  the decode's emit, whose Info takes the name, rule and comments
+# ox, oy: receive the world position of the pattern's top-left corner
+# w, h:   receive the declared size
+pub fun read_head(a: *allo.Allocator, p: *u8, n: usize, at: *usize, e: *format.Emit, ox: *i64, oy: *i64, w: *i64, h: *i64) err[format.Error] {
+    var com: Vector[u8]        = vector.init[u8](a);
+    val r:   err[format.Error] = read_lines(a, p, n, at, e, ?com, ox, oy, w, h);
+    vector.dnit[u8](?com);
+    ret r;
+}
+
+fun read_lines(a: *allo.Allocator, p: *u8, n: usize, at: *usize, e: *format.Emit, com: *Vector[u8], ox: *i64, oy: *i64, w: *i64, h: *i64) err[format.Error] {
     var c: Cur;
     c.p = p;
     c.n = n;
-    c.i = 0;
-    var ox: i64 = 0;
-    var oy: i64 = 0;
+    c.i = @at;
+    @ox = 0;
+    @oy = 0;
     for (true) {
         skip_blank(?c);
         if (at_end(?c))      { ret err[format.Error].err{format.Error.truncated{}}; }
         if (c.p[c.i] != '#') { brk; }
-        val r: err[format.Error] = read_hash(a, ?c, com, e.info, ?ox, ?oy);
+        val r: err[format.Error] = read_hash(a, ?c, com, e.info, ox, oy);
         if (sel r.err) {
             e.info.at = c.i;
             ret r;
         }
     }
-    var w:  i64               = 0;
-    var h:  i64               = 0;
-    val hd: err[format.Error] = read_header(a, ?c, e.info, ?w, ?h);
+    @w = 0;
+    @h = 0;
+    val hd: err[format.Error] = read_header(a, ?c, e.info, w, h);
     if (sel hd.err) {
         e.info.at = c.i;
         ret hd;
     }
-    if (w > 0 && h > 0) { format.cover(e.info, ox, oy, ox + w, oy + h); }
-    val body: err[format.Error] = read_body(?c, e, ox, oy, w, h);
-    if (sel body.err) { ret body; }
+    if (@w > 0 && @h > 0) { format.cover(e.info, @ox, @oy, @ox + @w, @oy + @h); }
     val m: err[allo.Error] = format.set_text(a, ?e.info.comments, com.data, com.len);
     if (sel m.err) { ret err[format.Error].err{format.Error.alloc{m.err}}; }
+    @at = c.i;
     ret err[format.Error].ok{};
 }
 
 # decode an RLE file
 fun decode(a: *allo.Allocator, p: *u8, n: usize, e: *format.Emit) err[format.Error] {
-    var com: Vector[u8]        = vector.init[u8](a);
-    val r:   err[format.Error] = read_all(a, p, n, e, ?com);
-    vector.dnit[u8](?com);
-    ret r;
+    var at: usize             = 0;
+    var ox: i64               = 0;
+    var oy: i64               = 0;
+    var w:  i64               = 0;
+    var h:  i64               = 0;
+    val hd: err[format.Error] = read_head(a, p, n, ?at, e, ?ox, ?oy, ?w, ?h);
+    if (sel hd.err) { ret hd; }
+    var c: Cur;
+    c.p = p;
+    c.n = n;
+    c.i = at;
+    ret read_body(?c, e, ox, oy, w, h);
 }
 
 # how likely the bytes are RLE: the first line that is not a '#' line must be an
@@ -316,12 +342,12 @@ fun sniff(p: *u8, n: usize) u32 {
 # ---
 # out: the file so far
 # col: bytes in the current line
-rec Out {
+pub rec Out {
     out: *Vector[u8];
     col: usize;
 }
 
-fun put(w: *Out, b: u8) err[format.Error] {
+pub fun put(w: *Out, b: u8) err[format.Error] {
     val r: res[usize, allo.Error] = vector.push[u8](w.out, b);
     if (sel r.err) { ret err[format.Error].err{format.Error.alloc{r.err}}; }
     ret err[format.Error].ok{};
@@ -337,7 +363,7 @@ fun put_n(w: *Out, p: *u8, n: usize) err[format.Error] {
     ret err[format.Error].ok{};
 }
 
-fun put_str(w: *Out, s: str) err[format.Error] {
+pub fun put_str(w: *Out, s: str) err[format.Error] {
     ret put_n(w, s, string.str_len(s));
 }
 
@@ -352,7 +378,7 @@ fun put_num(w: *Out, v: i64) err[format.Error] {
 # count: repeat count, 1 writes none
 # tag:   the tag's bytes
 # n:     how many
-fun token(w: *Out, count: i64, tag: *u8, n: usize) err[format.Error] {
+pub fun token(w: *Out, count: i64, tag: *u8, n: usize) err[format.Error] {
     var b:   [40]u8;
     var len: usize = 0;
     if (count > 1) { len = text.buf_i64(?b[0], 0, count); }
@@ -387,8 +413,9 @@ fun tag_of(v: u8, multi: bool, b: *u8) usize {
     ret n + 1;
 }
 
-# the header and '#' lines
-fun write_head(w: *Out, src: *format.Source, info: *format.Info) err[format.Error] {
+# write the '#' lines and the header for a source, as an RLE file has them
+# before its body, for RLE and the formats that share its head
+pub fun write_head(w: *Out, src: *format.Source, info: *format.Info) err[format.Error] {
     val name: str = format.text_of(?info.name);
     if (name[0] != 0) {
         var n: usize = 0;

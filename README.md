@@ -72,9 +72,9 @@ radius, up to 32. T is the generations to a unit of time. b holds the peaks of
 the kernel's rings. m and s are the growth's centre and width. kn and gn name
 the kernel core and growth function, numbered as his are. Cells are drawn by
 value on his colour map. Chakazul's patterns are Golly multi-state RLE of
-their values in 255ths, so they open as RLE files. Pattern formats keep the
-255ths, and a format with fewer states refuses the rule. A world file keeps
-every value exactly. Lenia runs on the CPU and the GPU, not on HashLife.
+their values in 255ths, so they open as RLE files. RLE and the other pattern
+formats keep the 255ths, and a format with fewer states refuses the rule.
+RLW, cellar's own pattern format, and a world file keep every value exactly. Lenia runs on the CPU and the GPU, not on HashLife.
 
 Reaction-diffusion rules are Gray-Scott's model: a cell holds two
 concentrations, u and v, that diffuse and react, v feeding on u at u v^2,
@@ -84,8 +84,8 @@ left out. The step is Pearson's, on the 5-point Laplacian, in integers, so both
 engines give the same cells. Each concentration is kept to 16 bits in the
 cell, and a pattern format keeps each to a 15th: state 16 j + i is
 u = 1 - i/15 and v = j/15, so a pattern needs 256 states, as multi-state RLE
-holds, and a format with fewer refuses the rule. A world file keeps every
-value exactly. The pen paints u = 1, v = 1, which starts a pattern from a
+holds, and a format with fewer refuses the rule. RLW and a world file keep
+every value exactly. The pen paints u = 1, v = 1, which starts a pattern from a
 stroke. Cells are drawn by v. Built-in: Gray-Scott spots (`F=0.03,k=0.062`),
 stripes (`F=0.029,k=0.057`) and mitosis (`F=0.0367,k=0.0649`). Reaction-diffusion
 runs on the CPU and the GPU, not on HashLife.
@@ -155,7 +155,8 @@ at the sides, grouped by purpose:
   [res/patterns](res/patterns/README.md)
 - **files**: named saves of the world and the custom pattern, a list of every
   world, pattern and `.rule` file in the data directory to load or run, and
-  screenshots
+  screenshots. A pattern is saved as RLE unless its name gives another
+  format's extension, or as RLW when it holds a continuous rule's exact values
 - **rule**: presets, the rule in B/S notation, radius, a clickable weight grid
   whose cells cycle from 0 up to 4 and on through -4 to -1, and birth and
   survive toggles over the reachable sums
@@ -194,7 +195,7 @@ falls back under it.
 
 `cellar <file>` opens a file at startup: a `.cellar` world loads as the world,
 a `.rule` file's rule runs on the world, and a pattern in any format cellar reads (RLE, plaintext `.cells`, Life 1.05
-and 1.06, Golly's Macrocell `.mc`) is stamped onto an empty world centred on the
+and 1.06, Golly's Macrocell `.mc`, cellar's RLW `.rlw`) is stamped onto an empty world centred on the
 origin and framed, taking its rule when cellar can run it. A file that cannot be
 read, or a pattern too large for the world to hold, leaves the world as it was
 and says why. With `--engine hashlife` a Macrocell file is built straight into
@@ -208,6 +209,13 @@ left alone. `Ctrl+V` reads any of those pattern formats from the clipboard as
 the stamp, and `Ctrl+C` puts a copied selection on the clipboard as RLE with
 its rule, ready to paste into LifeWiki or Golly.
 
+RLW (`.rlw`) is cellar's pattern format for continuous rules. It is RLE's
+head with the rule required, and a body of run-counted cell words, each cell's
+exact value under that rule in base 26 (`mgeuN` is a third in Lenia), so a
+Lenia or reaction-diffusion pattern saved to it opens with every value as it
+was. Placed under a rule that reads its words differently, it takes their
+states, as any pattern does.
+
 `cellar --capture shot.png` draws a second of frames, saves the last one and
 exits, leaving the saved settings alone.
 
@@ -215,7 +223,7 @@ exits, leaving the saved settings alone.
 a world or pattern headless, with no window and no GPU. The file opens as it
 would at startup, runs under `--rule` or else its own rule for `n`
 generations on the CPU, and is written in the format `--out`'s extension names
-(`.rle`, `.cells`, `.mc`), or as RLE on stdout without one. The
+(`.rle`, `.cells`, `.mc`, `.rlw`), or as RLE on stdout without one. The
 generation and population go to stderr unless `--quiet`. It honours the saved
 ceilings, which `--max-population`, `--max-chunks`, `--max-memory` (MiB) and
 `--max-step-ms` set to a limit or `off` for that run. A run that crosses one
