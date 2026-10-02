@@ -1,0 +1,463 @@
+# the reaction family: reaction-diffusion, Gray-Scott's model, whose cells
+# hold two concentrations that diffuse and react
+#
+# a cell holds u, the substrate, and v, the catalyst, each in [0, 1]. both
+# diffuse, at rates Du and Dv. v turns u into more of itself at u v^2, u is fed
+# in at F (1 - u) and v is killed at (F + k) v. the rates are Pearson's, per
+# cell and per generation, his forward Euler step of unit time over the
+# 5-point Laplacian, so his grid's Du = 2e-5 and Dv = 1e-5 are 0.2097152 and
+# 0.1048576 here.
+#
+# its rule string is "F=0.0367,k=0.0649,Du=0.2097152,Dv=0.1048576", keys in
+# any order, Du and Dv Pearson's when left out, as format leaves them. F and k
+# run from 0 to 1/4, and Du and Dv from 0 to 1/4, the explicit step's
+# stability bound. each is kept as a decimal to the ninth place, so a rule
+# string round-trips exactly. its cell word is cellar.rules.reaction.word's,
+# both fields in one word, and its step stage is reaction_comp.
+#
+# the fields are continuous, but a cell still has states, for everything in
+# cellar that trades in them: state 16 j + i holds u = 1 - i/15 and v = j/15,
+# so a pattern format keeps both fields to 4 bits, a 256-state format such as
+# Golly's multi-state RLE carries the rule, and one that holds fewer states
+# refuses it (format.Error.levels). a world file keeps the words themselves
+# (caps continuous).
+#
+# the quadtree engine cannot run a continuous rule. the empty world, u = 1 and
+# v = 0 everywhere, steps to itself under every rule.
+
+use cellar.layout;
+use cellar.rules.reaction.word;
+use cellar.space;
+use cellar.text;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+#[embed("{artifact.stage-reaction_comp.out}")]
+val STAGE: [_]u8;
+
+# the largest rate of each kind, 1/4, in units of 10^-9
+val RATE_MAX: u64 = 250000000;
+# Pearson's diffusion rates, in units of 10^-9
+val DU_PEARSON: u64 = 209715200;
+val DV_PEARSON: u64 = 104857600;
+
+# what the family's capabilities come to for one rule
+# ---
+# b0:         a dead cell with no live neighbour is born, which no rule does
+# isotropic:  the Laplacian treats every rotation and reflection alike
+# no_tree:    why a quadtree engine cannot run it: no rule, a cell's fields
+#             being continuous
+# bounded:    it can run on a bounded grid
+# life_like:  no rule is Life-like
+# continuous: a cell's fields are continuous, which its state only approximates
+pub rec Caps {
+    b0:         bool;
+    isotropic:  bool;
+    no_tree:    str;
+    bounded:    bool;
+    life_like:  bool;
+    continuous: bool;
+}
+
+# a reaction-diffusion rule, each rate in units of 10^-9
+# ---
+# f:  the feed rate F
+# k:  the kill rate k
+# du: u's diffusion rate Du
+# dv: v's diffusion rate Dv
+pub rec Rule {
+    f:  u64;
+    k:  u64;
+    du: u64;
+    dv: u64;
+}
+
+# a rate in units of 10^-9 in units of 1/one, to the nearest
+fun units(v: u64, one: u64) u32 {
+    ret ((v * one + text.DECIMAL / 2) / text.DECIMAL)::u32;
+}
+
+# skip blanks
+fun blanks(s: str, i: *usize) {
+    for (s[@i] == ' ' || s[@i] == '\t') { @i = @i + 1; }
+}
+
+val KEY_COUNT: usize = 4;
+# the rates, in the order format writes them
+val KEYS: [4]str = [4]str{"F", "k", "Du", "Dv"};
+
+# the rate a key at s[@i] names, its index in KEYS, past its '='
+fun key(s: str, i: *usize) opt[usize] {
+    var k: usize = 0;
+    for (k < KEY_COUNT) {
+        val name: str   = KEYS[k];
+        var n:    usize = 0;
+        for (name[n] != 0 && s[@i + n] == name[n]) { n = n + 1; }
+        if (name[n] == 0 && s[@i + n] == '=') {
+            @i = @i + n + 1;
+            ret opt[usize].some{k};
+        }
+        k = k + 1;
+    }
+    ret opt[usize].none{};
+}
+
+# whether a rule string is plausibly this family's: one that starts with one
+# of its keys and an '='
+# ---
+# s: NUL-terminated rule text
+pub fun claims(s: str) bool {
+    var i: usize = 0;
+    blanks(s, ?i);
+    val k: opt[usize] = key(s, ?i);
+    ret sel k.some;
+}
+
+# read the family's rule string, "F=0.0367,k=0.0649,Du=0.2097152,Dv=0.1048576"
+# ---
+# s:   NUL-terminated rule text
+# ret: the rule, or what is wrong with s
+pub fun parse(s: str) res[Rule, str] {
+    var r:    Rule  = Rule{f: 0, k: 0, du: DU_PEARSON, dv: DV_PEARSON};
+    var seen: [4]bool;
+    var i:    usize = 0;
+    blanks(s, ?i);
+    for {
+        val k: opt[usize] = key(s, ?i);
+        if (sel k.none)   { ret res[Rule, str].err{"not a reaction-diffusion rule: a rate is not F, k, Du or Dv followed by ="}; }
+        if (seen[k.some]) { ret res[Rule, str].err{"a rate is given twice"}; }
+        seen[k.some] = true;
+        var v: u64 = 0;
+        if (!text.read_decimal(s, ?i, RATE_MAX, ?v)) {
+            if (k.some < 2) { ret res[Rule, str].err{"F and k are decimals of 0 to 0.25, to at most nine places"}; }
+            ret res[Rule, str].err{"Du and Dv are decimals of 0 to 0.25, to at most nine places, past which a step is unstable"};
+        }
+        if (k.some == 0) { r.f = v; }
+        or (k.some == 1) { r.k = v; }
+        or (k.some == 2) { r.du = v; }
+        or               { r.dv = v; }
+        blanks(s, ?i);
+        if (s[i] == 0)   { brk; }
+        if (s[i] != ',') { ret res[Rule, str].err{"rates are not separated by commas"}; }
+        i = i + 1;
+        blanks(s, ?i);
+    }
+    if (!seen[0] || !seen[1]) { ret res[Rule, str].err{"a reaction-diffusion rule needs F and k"}; }
+    ret res[Rule, str].ok{r};
+}
+
+# the longest rule string format writes, less its NUL: four rates of nine
+# places, their keys and commas
+pub val FORMAT_MAX: usize = 60;
+
+# write the family's rule string: F and k, then Du and Dv where they are not
+# Pearson's
+# ---
+# r:   the rule
+# buf: at least FORMAT_MAX + 1 bytes
+# ret: buf, which parse reads back as r
+pub fun format(r: *Rule, buf: *u8) str {
+    val rates: [4]u64 = [4]u64{r.f, r.k, r.du, r.dv};
+    val usual: [4]u64 = [4]u64{RATE_MAX + 1, RATE_MAX + 1, DU_PEARSON, DV_PEARSON};
+    var o:     usize  = 0;
+    var i:     usize  = 0;
+    for (i < KEY_COUNT) {
+        if (rates[i] != usual[i]) {
+            if (o != 0) { o = text.buf_str(buf, o, ","); }
+            o = text.buf_str(buf, o, KEYS[i]);
+            o = text.buf_str(buf, o, "=");
+            o = text.buf_decimal(buf, o, rates[i]);
+        }
+        i = i + 1;
+    }
+    buf[o] = 0;
+    ret buf;
+}
+
+# write a rule's short form for the readout, its whole rule string
+pub fun display(r: *Rule, buf: *u8) str {
+    ret format(r, buf);
+}
+
+# whether two rules step alike: the same rates
+pub fun same_rule(a: *Rule, b: *Rule) bool {
+    ret a.f == b.f && a.k == b.k && a.du == b.du && a.dv == b.dv;
+}
+
+# a field's levels, and the field value between two of them
+val LEVELS: u32 = 16;
+val LEVEL:  u32 = 4369;
+# the states, a level of each field
+pub val STATES: u32 = 256;
+
+# how many states a cell of the rule can be in: every pair of the fields' levels
+pub fun states(r: *Rule) u32 {
+    ret STATES;
+}
+
+# the word of a cell of a state: u = 1 - (state % 16)/15 and v = (state / 16)/15
+pub fun word_of(r: *Rule, state: u32) u32 {
+    ret word.cell((state % LEVELS) * LEVEL, (state / LEVELS) * LEVEL);
+}
+
+# the state a word holds, each field to the nearest 15th
+pub fun state_of(c: u32) u32 {
+    val i: u32 = (word.a_of(c) + LEVEL / 2) / LEVEL;
+    val j: u32 = (word.b_of(c) + LEVEL / 2) / LEVEL;
+    ret j * LEVELS + i;
+}
+
+# the state painted or seeded when none is chosen: u = 1 and v = 1, which
+# grows every preset's pattern from a stroke of the pen
+pub fun ink(r: *Rule) u32 {
+    ret (LEVELS - 1) * LEVELS;
+}
+
+# how far the engines' words for a cell may lie apart a generation on from
+# the same cells: none, the step being integer arithmetic (cellar.rules.reaction.word)
+pub fun slack(r: *Rule) u32 {
+    ret 0;
+}
+
+# how shared code reads the family's cell word
+pub fun sense() layout.Sense {
+    ret word.sense();
+}
+
+# how far one generation reaches: the Laplacian's orthogonal neighbours
+pub fun radius(r: *Rule) usize {
+    ret 1;
+}
+
+# the capabilities the family has for a rule
+pub fun caps(r: *Rule) Caps {
+    ret Caps{b0: false, isotropic: true, no_tree: "a continuous rule", bounded: true, life_like: false, continuous: true};
+}
+
+# the state a cell becomes from its 3 by 3 block, which no rule's quadtree
+# asks for (caps no_tree), so the cell is left as it is
+pub fun next_of(r: *Rule, nb: *u32) u32 {
+    ret nb[4];
+}
+
+# the window's words of a rule: Du, Dv, F and k in the units the step reads
+fun rates(r: *Rule, w: *u32) {
+    w[word.DU_AT] = units(r.du, word.RATE_ONE);
+    w[word.DV_AT] = units(r.dv, word.RATE_ONE);
+    w[word.F_AT]  = units(r.f, word.FEED_ONE);
+    w[word.K_AT]  = units(r.k, word.FEED_ONE);
+}
+
+# the word at (x, y) of a block, in its chunk's coordinates
+#[inline]
+fun at(b: *space.Block, x: i64, y: i64) u32 {
+    val own: *u32 = b.nb[4];
+    if (x >= 0 && x < 64 && y >= 0 && y < 64) { ret own[(y * 64 + x)::usize]; }
+    ret space.block_cell(b, x, y);
+}
+
+# step one chunk on the CPU, the function the family's stage applies
+# ---
+# r: the rule
+# b: the chunk's block and back cells
+# t: the tally of the cells written
+pub fun step_chunk(r: *Rule, b: *space.Block, t: *space.Tally) {
+    val own: *u32 = b.nb[4];
+    val out: *u32 = b.out;
+    var w:   [4]u32;
+    rates(r, ?w[0]);
+    var y: i64 = 0;
+    for (y < 64) {
+        var x: i64 = 0;
+        for (x < 64) {
+            val i:  usize = (y * 64 + x)::usize;
+            var sa: u32   = 0;
+            var sb: u32   = 0;
+            # a block with no live cell is all zeros, and its sums with it
+            if (b.busy) {
+                val n: [4]u32 = [4]u32{at(b, x, y - 1), at(b, x - 1, y), at(b, x + 1, y), at(b, x, y + 1)};
+                var q: usize  = 0;
+                for (q < 4) {
+                    sa = sa + word.a_of(n[q]);
+                    sb = sb + word.b_of(n[q]);
+                    q  = q + 1;
+                }
+            }
+            val v: u32 = word.next(own[i], sa, sb, w[word.DU_AT], w[word.DV_AT], w[word.F_AT], w[word.K_AT]);
+            out[i] = v;
+            space.note(t, v, x::u32, y::u32);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+# pack a rule into the family's window of the meta head, as its stage reads it
+# ---
+# r: the rule
+# w: layout.RULE words
+pub fun pack(r: *Rule, w: *u32) {
+    var i: usize = 0;
+    for (i < layout.RULE::usize) {
+        w[i] = 0;
+        i    = i + 1;
+    }
+    rates(r, w);
+}
+
+# the family's stage binds no rule buffer, its rule fitting the window
+pub val TABLE: bool = false;
+
+# the words of the rule buffer a rule needs: none
+pub fun table_words(r: *Rule) usize {
+    ret 0;
+}
+
+# pack a rule into its rule buffer, which it has none of
+pub fun pack_table(r: *Rule, w: *u32) {}
+
+# the colour of a cell holding no v, only the hollow it leaves in u
+val HOLLOW: u32 = 0x18264a;
+# the colour map v runs along, from deep blue through cyan and green to white
+val RAMP_COUNT: u32    = 6;
+val RAMP:       [6]u32 = [6]u32{0x1d3b8f, 0x1f78c8, 0x2cc1d6, 0x8ee8b4, 0xf3f1a2, 0xffffff};
+
+# the colour a cell of a state is drawn in: v along the colour map. the draw
+# finds a cell's colour by its heat, v alone (cellar.gpu sync_ink), so the
+# colour follows v alone too
+pub fun colour(r: *Rule, state: u32) opt[u32] {
+    if (state == 0) { ret opt[u32].none{}; }
+    val j: u32 = state / LEVELS;
+    if (j == 0) { ret opt[u32].some{HOLLOW}; }
+    # the map's stops lie evenly across v's levels 1 to 15
+    val pos: u32 = (j - 1) * (RAMP_COUNT - 1) * 256 / (LEVELS - 2);
+    var i:   u32 = pos / 256;
+    var f:   u32 = pos % 256;
+    if (i >= RAMP_COUNT - 1) {
+        i = RAMP_COUNT - 2;
+        f = 256;
+    }
+    val a:  u32 = RAMP[i];
+    val b:  u32 = RAMP[i + 1];
+    var c:  u32 = 0;
+    var sh: u32 = 0;
+    for (sh < 24) {
+        val x: u32 = (a >> sh) & 0xff;
+        val y: u32 = (b >> sh) & 0xff;
+        c  = c | (((x * (256 - f) + y * f) / 256) << sh);
+        sh = sh + 8;
+    }
+    ret opt[u32].some{c};
+}
+
+# the family's step stage, as SPIR-V
+# ---
+# len: receives its length in bytes
+# ret: its first byte
+pub fun stage(len: *usize) *u8 {
+    @len = $length_of(STAGE);
+    ret ?STAGE[0];
+}
+
+# rule strings that exercise the family, for the tests that run every family:
+# the mitosis preset's, then a labyrinth at slower diffusion
+pub val SAMPLE_COUNT: usize = 2;
+
+# the sample rule string i
+pub fun sample(i: usize) str {
+    if (i == 1) { ret "F=0.029,k=0.057,Du=0.16,Dv=0.08"; }
+    ret "F=0.0367,k=0.0649";
+}
+
+test parse__reads_the_rates_and_refuses_the_rest {
+    val o: res[Rule, str] = parse("F=0.0367,k=0.0649");
+    if (!sel o.ok)                                                                                  { ret 1; }
+    if (o.ok.f != 36700000 || o.ok.k != 64900000 || o.ok.du != DU_PEARSON || o.ok.dv != DV_PEARSON) { ret 2; }
+    # keys in any order, with blanks
+    val any: res[Rule, str] = parse(" Dv=0.1048576, k=0.0649 ,Du=0.2097152,F=0.0367");
+    if (!sel any.ok)                { ret 3; }
+    if (!same_rule(?any.ok, ?o.ok)) { ret 3; }
+    val bad: [7]str = [7]str{"F=0.0367", "F=0.3,k=0.06", "F=0.03,k=0.06,Du=0.26", "F=0.03,k=0.06,F=0.04", "F=0.03;k=0.06", "F=0.03,k=0.06,D=0.1", "F=0.0000000001,k=0.06"};
+    var i:   usize  = 0;
+    for (i < 7) {
+        val r: res[Rule, str] = parse(bad[i]);
+        if (sel r.ok) { ret 10 + i::i32; }
+        i = i + 1;
+    }
+    if (!claims("F=0.03") || !claims("Du=0.2") || claims("R=13") || claims("B3/S23")) { ret 4; }
+    ret 0;
+}
+
+test format__round_trips_through_parse {
+    var buf:  [FORMAT_MAX + 1]u8;
+    val wide: res[Rule, str] = parse("F=0.123456789,k=0.234567891,Du=0.249999999,Dv=0.111111111");
+    if (!sel wide.ok) { ret 1; }
+    val n: usize = text.buf_str(?buf[0], 0, format(?wide.ok, ?buf[0]));
+    if (n > FORMAT_MAX) { ret 2; }
+    var i: usize = 0;
+    for (i < SAMPLE_COUNT) {
+        val r: res[Rule, str] = parse(sample(i));
+        if (!sel r.ok) { ret 3; }
+        val again: res[Rule, str] = parse(format(?r.ok, ?buf[0]));
+        if (!sel again.ok)                { ret 4; }
+        if (!same_rule(?again.ok, ?r.ok)) { ret 5; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test word__every_state_round_trips_and_shades_by_v {
+    var r:  Rule;
+    var st: u32 = 0;
+    for (st < STATES) {
+        val c: u32 = word_of(?r, st);
+        if (state_of(c) != st)                                                       { ret 1; }
+        if (layout.texel_heat(c, word.HEAT_SHIFT, word.HEAT_MASK) != (st / 16) * 17) { ret 2; }
+        if (layout.live(c, 0xffffffff, 1, 0xffffffff) != (st != 0)::u32)             { ret 3; }
+        st = st + 1;
+    }
+    # the ink is u = 1 and v at its greatest
+    val ink_word: u32 = word_of(?r, ink(?r));
+    if (word.a_of(ink_word) != 0 || word.b_of(ink_word) != word.MAX) { ret 4; }
+    ret 0;
+}
+
+test next__keeps_the_background_and_takes_a_residue_to_zero {
+    # pearson's rates and the mitosis preset's F and k, as the window keeps them
+    if (word.next(0, 0, 0, 3436, 1718, 615724, 1088841) != 0) { ret 1; }
+    # a faint cell alone fades to nothing within a few generations
+    var c: u32   = word.cell(40, 40);
+    var i: usize = 0;
+    for (i < 8) {
+        c = word.next(c, 0, 0, 3436, 1718, 615724, 1088841);
+        i = i + 1;
+    }
+    if (c != 0) { ret 2; }
+    ret 0;
+}
+
+test next__matches_the_gray_scott_terms {
+    # u = 1/2 and v = 1/4 among neighbours that hold the same, so the
+    # laplacian is zero: a' = a + u v^2 - F a and b' = b + u v^2 - (F + k) b
+    val a:   u32 = 32768;
+    val b:   u32 = 16384;
+    val f:   u32 = 629146;
+    val k:   u32 = 1048576;
+    val got: u32 = word.next(word.cell(a, b), a * 4, b * 4, 3436, 1718, f, k);
+    # u v^2 = 1/32, F = 0.0375, k = 0.0625
+    val wa: f64 = 0.5 + 0.03125 - 0.0375 * 0.5;
+    val wb: f64 = 0.25 + 0.03125 - 0.1 * 0.25;
+    val ga: f64 = word.a_of(got)::f64 / 65536.0;
+    val gb: f64 = word.b_of(got)::f64 / 65536.0;
+    if (ga > wa || wa - ga > 0.00005) { ret 1; }
+    if (gb > wb || wb - gb > 0.00005) { ret 2; }
+    # a lone spike of v spreads to its neighbours at Dv
+    val spike: u32 = word.next(0, 0, 65535, 3436, 1718, 0, 0);
+    if (word.b_of(spike) != (1718 * 65535) >> 14) { ret 3; }
+    ret 0;
+}

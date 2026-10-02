@@ -1,0 +1,117 @@
+# the reaction family's cell word, its window of the meta head and the step,
+# one source for the host and the family's step stage
+#
+# a cell holds Gray-Scott's two concentrations, u and v, each in [0, 1] as a
+# 16-bit field of 65536ths: the low half is a = 1 - u and the high half b = v.
+# the background, u = 1 and v = 0, is then word zero, and both fields decay
+# toward it. b's top byte is the heat the draw reads, so the palette shades a
+# cell by v.
+#
+# a generation is Pearson's forward Euler step of unit time over the 5-point
+# Laplacian:
+#
+#   a' = a + Du lap(a) + u v^2 - F a
+#   b' = b + Dv lap(b) + u v^2 - (F + k) b
+#
+# in integers alone. the rates Du and Dv are kept in 2^-14ths and F and k in
+# 2^-24ths, every term is summed in 2^-30ths in an i32, and the sum is floored
+# to the field once. no product passes 32 bits and the sum stays inside an i32
+# while Du and Dv are at most 1/4, the explicit step's stability bound, and F
+# and k are at most 1/4, so the host and the stage compute the same word bit
+# for bit. the floor takes a lone residue down to zero, so empty space stays
+# empty and a chunk the pattern left is freed.
+
+use cellar.layout;
+
+# the bits of a field, and where b's lies
+pub val FIELD:   u32 = 0xffff;
+pub val B_SHIFT: u32 = 16;
+# a field's greatest value, just under 1
+pub val MAX: u32 = 65535;
+# the field value of u = 1, which a = 0 leaves
+val U_ONE: u32 = 65536;
+
+# a diffusion rate's units, 2^-14ths, and the feed and kill rates', 2^-24ths
+pub val RATE_ONE: u64 = 16384;
+pub val FEED_ONE: u64 = 16777216;
+
+# where the heat display channel starts: v in 256ths
+pub val HEAT_SHIFT: u32 = 24;
+pub val HEAT_MASK:  u32 = 0xff;
+
+# the window's words: Du and Dv in 2^-14ths, F and k in 2^-24ths
+pub val DU_AT: u32 = 0;
+pub val DV_AT: u32 = 1;
+pub val F_AT:  u32 = 2;
+pub val K_AT:  u32 = 3;
+
+# a cell's a field, 1 - u
+#[inline]
+pub fun a_of(c: u32) u32 {
+    ret c & FIELD;
+}
+
+# a cell's b field, v
+#[inline]
+pub fun b_of(c: u32) u32 {
+    ret c >> B_SHIFT;
+}
+
+# the word of a cell holding fields a and b, each at most MAX
+#[inline]
+pub fun cell(a: u32, b: u32) u32 {
+    ret a | (b << B_SHIFT);
+}
+
+# a field times a rate in 2^-24ths of at most 1/4, in 2^-30ths: the product
+# floored, split at x's low byte so no part passes 32 bits
+fun scaled(r: u32, x: u32) u32 {
+    val hi: u32 = r * (x >> 8);
+    val lo: u32 = r * (x & 0xff);
+    ret (hi >> 2) + ((((hi & 3) << 8) + lo) >> 10);
+}
+
+# a sum in 2^-30ths, floored to a field and clamped to [0, MAX]
+fun field(x: i32) u32 {
+    if (x <= 0) { ret 0; }
+    val v: u32 = x::u32 >> 14;
+    if (v > MAX) { ret MAX; }
+    ret v;
+}
+
+# the word a cell becomes one generation on
+# ---
+# c:  the cell's word
+# sa: the sum of its four orthogonal neighbours' a fields
+# sb: the sum of their b fields
+# du: Du in 2^-14ths, at most 4096
+# dv: Dv in 2^-14ths, at most 4096
+# f:  F in 2^-24ths, at most 2^22
+# k:  k in 2^-24ths, at most 2^22
+pub fun next(c: u32, sa: u32, sb: u32, du: u32, dv: u32, f: u32, k: u32) u32 {
+    val a: u32 = a_of(c);
+    val b: u32 = b_of(c);
+    # u v^2, floored to 2^-16ths after u v and to 2^-30ths after the second v
+    val uv: u32 = ((U_ONE - a) * b) >> 16;
+    val r:  i32 = ((uv * b) >> 2)::i32;
+    val la: i32 = sa::i32 - (a * 4)::i32;
+    val lb: i32 = sb::i32 - (b * 4)::i32;
+    val na: i32 = (a << 14)::i32 + du::i32 * la + r - scaled(f, a)::i32;
+    val nb: i32 = (b << 14)::i32 + dv::i32 * lb + r - scaled(f, b)::i32 - scaled(k, b)::i32;
+    ret cell(field(na), field(nb));
+}
+
+# how the shared stages read the word: any field above zero is live and keeps
+# its chunk, and v is the heat
+pub fun sense() layout.Sense {
+    ret layout.Sense{
+        live_mask:  0xffffffff,
+        live_lo:    1,
+        live_hi:    0xffffffff,
+        warm_mask:  0xffffffff,
+        heat_shift: HEAT_SHIFT,
+        heat_mask:  HEAT_MASK,
+        age_shift:  0,
+        age_mask:   0,
+    };
+}
