@@ -34,7 +34,8 @@
 # steps, asking for the adjacent chunks, since it settles every generation;
 # the GPU's is read back once a frame and asks for the ring or the wide halo,
 # whichever its budget runs within, and a chunk counted on the host asks for
-# the same.
+# the same. on the unbounded plane the GPU settles its pool itself instead,
+# and the pool here mirrors it (see Mirror and adopt).
 
 use cellar.layout;
 use cellar.topology;
@@ -142,13 +143,19 @@ pub val DIRTY_ZERO: u8 = 4;
 pub val DIRTY_MIP: u8 = 8;
 
 # a copy of the pool kept elsewhere, a device's, which must make room before
-# the pool grows
+# the pool grows, and which may own the page table for a while
+#
+# a device that allocates and frees chunks itself owns the pool between the
+# times the host takes it back, and own brings the host's page table level
+# with the device's before anything here reads or changes it.
 # ---
-# ctx:     the mirror's own state, passed back to reserve
+# ctx:     the mirror's own state, passed back to reserve and own
 # reserve: make room for a pool of the given slots; false refuses the growth
+# own:     hand the pool to the host, bringing its page table level first
 pub rec Mirror {
     ctx:     *u8;
     reserve: fun(*u8, usize) bool;
+    own:     fun(*u8);
 }
 
 # the pool
@@ -729,6 +736,7 @@ pub fun touch(sp: *Space, s: usize) {
 
 # free every slot, keeping the capacity
 pub fun reset(sp: *Space) {
+    own(sp);
     mem.zero[u32](sp.table, sp.hi * ENTRY);
     mem.zero[u32](sp.census, sp.hi * CENSUS);
     mem.fill[u32](sp.hash, NONE, sp.hcap);
@@ -829,6 +837,7 @@ pub fun mask(sp: *Space, s: usize) {
 # sp: the pool
 # g:  the grid
 pub fun set_grid(sp: *Space, g: topology.Grid) {
+    own(sp);
     sp.grid = g;
     var s: usize = 0;
     for (s < sp.hi) {
@@ -871,6 +880,65 @@ pub fun resolve(sp: *Space, s: usize, x: i32, y: i32, past: u32) u32 {
     ret 0;
 }
 
+# take the pool back from a mirror that owns it, so the host's page table is
+# the one to read and change
+pub fun own(sp: *Space) {
+    if (sp.mirrored) { sp.mirror.own(sp.mirror.ctx); }
+}
+
+# the incarnation bits a mirror's census carries
+pub val TAG: u32 = 0x3ffff;
+
+# take up a page table a mirror wrote into the first n slots' entries, as the
+# pool from now on
+#
+# every slot at or past n is free. hi, the count, the hash and the free slots
+# follow the table, and a slot's census is kept where its incarnation is the
+# one counted, else taken from the mirror's census when its incarnation bits
+# (TAG) name it, else zeroed. nothing is dirty, since the mirror holds the
+# table as it stands.
+# ---
+# sp:     the pool, whose table holds the mirror's entries below n
+# n:      slots the mirror's table covers, at most the capacity
+# landed: CENSUS words per slot below n from the mirror's last census, or nil
+pub fun adopt(sp: *Space, n: usize, landed: *u32) {
+    if (sp.hi > n) { mem.zero[u32](?sp.table[n * ENTRY], (sp.hi - n) * ENTRY); }
+    sp.hi   = n;
+    sp.live = 0;
+    mem.fill[u32](sp.hash, NONE, sp.hcap);
+    var s: usize = 0;
+    for (s < n) {
+        val c: *u32 = ?sp.census[s * CENSUS];
+        if (!used(sp, s)) { mem.zero[u32](c, CENSUS); }
+        or {
+            sp.live = sp.live + 1;
+            hash_put(sp, s);
+            val inc: u32 = incarnation(sp, s);
+            if (c[2] != inc) {
+                mem.zero[u32](c, CENSUS);
+                if (landed != nil && landed[s * CENSUS + 2] == (inc & TAG)) {
+                    mem.copy[u32](c, ?landed[s * CENSUS], CENSUS);
+                    c[2] = inc;
+                }
+            }
+        }
+        sp.dirty[s] = 0;
+        s           = s + 1;
+    }
+    compact(sp);
+}
+
+# grow the pool to hold cap slots, the mirror making room first
+# ---
+# ret: false when cap is past the pool's ceiling or either side refused
+pub fun grow(sp: *Space, cap: usize) bool {
+    if (cap <= sp.cap)                                         { ret true; }
+    if (cap > sp.max_slots)                                    { ret false; }
+    if (sp.mirrored && !sp.mirror.reserve(sp.mirror.ctx, cap)) { ret false; }
+    val grown: err[allo.Error] = alloc_arrays(sp, cap);
+    ret sel grown.ok;
+}
+
 # the slot of the chunk at (cx, cy), allocating it empty when it does not exist
 #
 # a new chunk is linked into its neighbours' entries, and its own entry and
@@ -882,6 +950,7 @@ pub fun resolve(sp: *Space, s: usize, x: i32, y: i32, past: u32) u32 {
 # ret: the slot, or NONE when the chunk lies off the grid or the pool is at its
 #      ceiling, or the allocator or the mirror refused to grow it
 pub fun alloc(sp: *Space, cx: i64, cy: i64) u32 {
+    own(sp);
     val have: u32 = find(sp, cx, cy);
     if (have != NONE) { ret have; }
     val bounded: bool = topology.bounded(?sp.grid);
@@ -953,6 +1022,7 @@ pub fun alloc(sp: *Space, cx: i64, cy: i64) u32 {
 
 # free a slot, unlinking it from its neighbours
 pub fun release(sp: *Space, s: usize) {
+    own(sp);
     if (!used(sp, s)) { ret; }
     hash_remove(sp, s);
     val e:    *u32  = ?sp.table[s * ENTRY];
@@ -1122,21 +1192,22 @@ fun current(sp: *Space, census: *u32, n: usize, s: usize) bool {
 # frees:  whether empty chunks may be freed
 # ret:    false when the pool could not hold a needed chunk
 pub fun settle(sp: *Space, census: *u32, n: usize, frees: bool) bool {
+    own(sp);
     # the pool's own census moves when surrounding a chunk grows the pool
-    val own: bool = census == sp.census;
-    var c:   *u32 = census;
-    var ok:  bool = true;
+    val mine: bool = census == sp.census;
+    var c:    *u32 = census;
+    var ok:   bool = true;
     mem.zero[u8](sp.asked, sp.hi);
     var s: usize = 0;
     for (s < n && s < sp.hi) {
-        if (own) { c = sp.census; }
+        if (mine) { c = sp.census; }
         if (current(sp, c, n, s) && c[s * CENSUS] != 0) {
             if (!surround_by(sp, s, c[s * CENSUS + 3])) { ok = false; }
         }
         s = s + 1;
     }
     if (!keep_rim(sp)) { ok = false; }
-    if (own)           { c = sp.census; }
+    if (mine)          { c = sp.census; }
     if (frees) {
         val had: usize = sp.nfree;
         s = 0;
@@ -1148,7 +1219,7 @@ pub fun settle(sp: *Space, census: *u32, n: usize, frees: bool) bool {
         }
         if (sp.nfree != had) { compact(sp); }
     }
-    if (own) { ret ok; }
+    if (mine) { ret ok; }
     s = 0;
     for (s < n && s < sp.hi) {
         if (current(sp, c, n, s)) { mem.copy[u32](?sp.census[s * CENSUS], ?c[s * CENSUS], CENSUS); }
