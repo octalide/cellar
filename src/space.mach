@@ -177,9 +177,6 @@ pub rec Mirror {
 # fronts:    each layer's front cells, cap spans of it (cellar.layer)
 # backs:     each layer's back cells, cap spans of it, or nil when the GPU
 #            steps
-# cells:     the state layer's front cells, fronts[0], for code not yet
-#            reading them through the planes
-# back:      the state layer's back cells, backs[0]
 # mips:      each slot's coverage pyramid (layout.MIP texels), cap * MIP, for a
 #            draw of the cells the CPU steps, or nil
 # mips_back: the pyramids of the back cells, which a step builds as it goes
@@ -227,8 +224,6 @@ pub rec Space {
     set:       plane.Set;
     fronts:    [layer.LAYERS_MAX]*u32;
     backs:     [layer.LAYERS_MAX]*u32;
-    cells:     *u32;
-    back:      *u32;
     mips:      *u32;
     mips_back: *u32;
     mip_box:   [4]i64;
@@ -543,6 +538,17 @@ pub fun any(sp: *Space, s: usize) bool {
     ret false;
 }
 
+# whether a state or rule layer is narrower than a word, so a word of it holds
+# several cells and a cell is written into its word rather than as one
+pub fun packed(sp: *Space) bool {
+    var k: usize = 0;
+    for (k < plane.exact(?sp.set)) {
+        if (sp.set.at[k].width < layer.WIDTH_MAX) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
 # whether any cell of slot s holds a word but 0
 pub fun holds_word(sp: *Space, s: usize) bool {
     var k: usize = 0;
@@ -643,8 +649,6 @@ pub fun swap(sp: *Space) {
         sp.backs[k]  = f;
         k            = k + 1;
     }
-    sp.cells = sp.fronts[0];
-    sp.back  = sp.backs[0];
 }
 
 # the chunk coordinate holding a cell coordinate
@@ -839,8 +843,6 @@ fun alloc_arrays(sp: *Space, cap: usize) err[allo.Error] {
         sp.backs[k]  = backs[k];
         k            = k + 1;
     }
-    sp.cells     = sp.fronts[0];
-    sp.back      = sp.backs[0];
     sp.mips      = mips;
     sp.mips_back = mback;
     sp.census    = census;
@@ -867,8 +869,6 @@ fun free_arrays(sp: *Space) {
     val a: *allo.Allocator = sp.a;
     allo.deallocate[u32](a, sp.table, sp.cap * ENTRY);
     drop_layers(a, ?sp.set, sp.cap, ?sp.fronts[0], ?sp.backs[0]);
-    sp.cells = nil;
-    sp.back  = nil;
     if (sp.mips != nil) {
         allo.deallocate[u32](a, sp.mips, sp.cap * MIP);
         allo.deallocate[u32](a, sp.mips_back, sp.cap * MIP);
@@ -1021,8 +1021,6 @@ pub fun relayer(sp: *Space, set: *plane.Set, map: Remap, ctx: *u8) err[allo.Erro
         }
         k = k + 1;
     }
-    sp.cells = sp.fronts[0];
-    sp.back  = sp.backs[0];
     ret err[allo.Error].ok{};
 }
 
@@ -1093,7 +1091,6 @@ pub fun set_stepped(sp: *Space, stepped: bool) err[allo.Error] {
             sp.backs[k] = nil;
             k           = k + 1;
         }
-        sp.back    = nil;
         sp.stepped = false;
         ret err[allo.Error].ok{};
     }
@@ -1115,7 +1112,6 @@ pub fun set_stepped(sp: *Space, stepped: bool) err[allo.Error] {
         sp.backs[k] = backs[k];
         k           = k + 1;
     }
-    sp.back    = sp.backs[0];
     sp.stepped = true;
     ret err[allo.Error].ok{};
 }
@@ -2273,4 +2269,50 @@ test cover__holds_every_chunk_of_a_grid_that_fits_until_its_ceiling_drops {
     if (sp.whole || grid_chunks(?sp.grid) != 0) { ret 9; }
     dnit(?sp);
     ret 0;
+}
+
+test relayer__carries_words_into_layers_of_any_width {
+    var a: allo.Allocator;
+    page.make(?a);
+    var sp:   Space;
+    val made: err[allo.Error] = init(?sp, ?a, true);
+    if (sel made.err) { ret 1; }
+    val s: usize = alloc(?sp, 3, -2)::usize;
+    put_word(?sp, s, 70, 0xa5);
+    put_word(?sp, s, 71, 0x3c00);
+    # a word split across a 4-bit state layer and an 8-bit rule layer above
+    # it, with a view layer kept beside them
+    var set: plane.Set = plane.state("low", 4);
+    plane.add_rule(?set, "high", 8, 8);
+    plane.add_view(?set, "heat", 2);
+    val laid: err[allo.Error] = relayer(?sp, ?set, nil, nil);
+    if (sel laid.err)                                                                      { ret 2; }
+    if (word(?sp, s, 70) != 0x05 || word(?sp, s, 71) != 0x3c00 || sensed(?sp, s, 70) != 5) { ret 3; }
+    # a view layer is not part of the word, and an edit leaves it alone
+    plane.put(plane_of(?sp, 2, s), 70, 3);
+    fill_words(?sp, s, 64, 8, 0x1f02);
+    if (word(?sp, s, 70) != 0x1f02 || plane.get(plane_of(?sp, 2, s), 70) != 3) { ret 4; }
+    if (!holds_word(?sp, s) || !any(?sp, s) || !packed(?sp))                   { ret 5; }
+    # a chunk's image holds its word, and a view of the pool takes its layers
+    var img: [4096]u32;
+    get_image(?sp, s, ?img[0]);
+    if (image_words(?sp) != plane.span_words(4) + plane.span_words(8) || image_word(?sp.set, ?img[0], 71) != 0x1f02) { ret 6; }
+    var view: Space;
+    val mv:   err[allo.Error] = init(?view, ?a, false);
+    if (sel mv.err)                                                                { ret 7; }
+    if (!stage(?view, ?sp, true, nil))                                             { ret 8; }
+    if (word(?view, s, 70) != 0x1f02 || plane.get(plane_of(?view, 2, s), 70) != 3) { ret 9; }
+    # back to one 32-bit layer, the view layer dropped, each word remapped
+    var one:  plane.Set       = plane.state("cells", 32);
+    val back: err[allo.Error] = relayer(?sp, ?one, flip, nil);
+    if (sel back.err)                                                      { ret 10; }
+    if (word(?sp, s, 70) != ~0x1f02::u32 || word(?sp, s, 0) != 0xffffffff) { ret 11; }
+    dnit(?view);
+    dnit(?sp);
+    ret 0;
+}
+
+#[testing]
+fun flip(ctx: *u8, w: u32) u32 {
+    ret ~w;
 }
