@@ -822,6 +822,79 @@ pub fun wake(sp: *Space, s: usize) {
     sp.nawake           = sp.nawake + 1;
 }
 
+# bring a view of the pool level with it: the pool's slots, page table, cells
+# and pyramids as they stand, for a mirror to send from while the pool steps on
+# (cellar.runner)
+#
+# the page table is copied whole, and the cells and pyramids of the chunks in
+# box that changed since the last stage, whose dirty marks move from the pool
+# to the view, for the mirror to clear. a chunk out of box keeps its marks
+# until a stage finds it in box, so a mirror that sends only what a draw can
+# see sends no more than before. full copies every slot and marks every one
+# dirty, for a view that held anything else. a view is read through its page
+# table alone: nothing finds, allocates or frees in it.
+# ---
+# dst:  the view, a pool without back cells
+# src:  the pool
+# full: copy every slot
+# box:  chunk columns and rows x0, y0, x1, y1, inclusive, or nil for every
+#       chunk
+# ret:  false when the view could not be grown to hold the pool, leaving it
+#       and the pool's dirty marks as they were
+pub fun stage(dst: *Space, src: *Space, full: bool, box: *i64) bool {
+    var all: bool = full;
+    if ((src.mips != nil) != (dst.mips != nil)) {
+        val made: err[allo.Error] = set_pyramids(dst, src.mips != nil);
+        if (sel made.err) { ret false; }
+        all = true;
+    }
+    if (dst.cap < src.cap) {
+        val grown: err[allo.Error] = alloc_arrays(dst, src.cap);
+        if (sel grown.err) { ret false; }
+    }
+    # every slot either side used since the last stage, or every slot at all
+    var top: usize = src.hi;
+    if (dst.hi > top) { top = dst.hi; }
+    if (all)          { top = dst.cap; }
+    var n: usize = top;
+    if (n > src.cap) { n = src.cap; }
+    mem.copy[u32](dst.table, src.table, n * ENTRY);
+    if (top > n) { mem.zero[u32](?dst.table[n * ENTRY], (top - n) * ENTRY); }
+    val kept: u8    = DIRTY_CELLS | DIRTY_ZERO | DIRTY_MIP;
+    var s:    usize = 0;
+    for (s < top) {
+        var d: u8 = 0;
+        if (s < n) {
+            d            = src.dirty[s];
+            src.dirty[s] = 0;
+            if (!all && box != nil && s < src.hi && used(src, s)) {
+                val x: i64 = slot_x(src, s);
+                val y: i64 = slot_y(src, s);
+                if (x < box[0] || x > box[2] || y < box[1] || y > box[3]) {
+                    src.dirty[s] = d & kept;
+                    d            = d & ~kept;
+                }
+            }
+        }
+        if (all) { d = d | DIRTY_ENTRY; }
+        if (s < src.hi) {
+            if (all) { d = d | DIRTY_CELLS; }
+            if ((d & (DIRTY_CELLS | DIRTY_ZERO)) != 0) {
+                mem.copy[u32](?dst.cells[s * CELLS], ?src.cells[s * CELLS], CELLS);
+                dst.dirty[s] = dst.dirty[s] & ~DIRTY_MIP;
+            }
+            if ((d & DIRTY_MIP) != 0 && src.mips != nil) { mem.copy[u32](?dst.mips[s * MIP], ?src.mips[s * MIP], MIP); }
+        }
+        dst.dirty[s] = dst.dirty[s] | d;
+        s            = s + 1;
+    }
+    dst.hi    = src.hi;
+    dst.live  = src.live;
+    dst.sense = src.sense;
+    dst.grid  = src.grid;
+    ret true;
+}
+
 # free every slot, keeping the capacity, and on a grid held whole hold every
 # chunk again, empty
 pub fun reset(sp: *Space) {
@@ -1617,6 +1690,45 @@ test halo__asks_toward_the_quadrants_holding_live_cells {
     if (ring(32) != SPREAD_RING || ring(33) != 64 || ring(layout.REACH_MAX::usize) != 64)      { ret 6; }
     if (halo(1, ring(33)) != MASK_RING)                                                        { ret 7; }
     if (halo_span(64, true) != layout.SPREAD_MAX || halo(1, halo_span(64, true)) != MASK_HALO) { ret 8; }
+    ret 0;
+}
+
+test stage__a_view_takes_the_chunks_in_box_and_leaves_the_rest_marked {
+    var a: allo.Allocator;
+    page.make(?a);
+    var sp:   Space;
+    var view: Space;
+    val made: err[allo.Error] = init(?sp, ?a, true);
+    if (sel made.err) { ret 1; }
+    val mv: err[allo.Error] = init(?view, ?a, false);
+    if (sel mv.err) { ret 1; }
+    val s:   usize = alloc(?sp, 0, 0)::usize;
+    val t:   usize = alloc(?sp, 9, 9)::usize;
+    var box: [4]i64;
+    mem.zero[i64](?box[0], 4);
+    # a full stage copies every chunk, whatever the box
+    sp.cells[t * CELLS] = 7;
+    if (!stage(?view, ?sp, true, ?box[0]))                      { ret 2; }
+    if (view.hi != sp.hi || view.cells[t * CELLS] != 7)         { ret 3; }
+    if ((view.dirty[s] & DIRTY_CELLS) == 0 || sp.dirty[s] != 0) { ret 4; }
+    if (view.table[t * ENTRY + 9] != sp.table[t * ENTRY + 9])   { ret 5; }
+    mem.zero[u8](view.dirty, view.hi);
+    # after it, only the chunks in box that changed, the rest keeping their marks
+    sp.cells[s * CELLS] = 5;
+    sp.cells[t * CELLS] = 6;
+    touch(?sp, s);
+    touch(?sp, t);
+    if (!stage(?view, ?sp, false, ?box[0]))                               { ret 6; }
+    if (view.cells[s * CELLS] != 5 || (view.dirty[s] & DIRTY_CELLS) == 0) { ret 7; }
+    if (view.cells[t * CELLS] != 7 || (view.dirty[t] & DIRTY_CELLS) != 0) { ret 8; }
+    if (sp.dirty[s] != 0 || (sp.dirty[t] & DIRTY_CELLS) == 0)             { ret 9; }
+    # until a box takes them in
+    box[2] = 9;
+    box[3] = 9;
+    if (!stage(?view, ?sp, false, ?box[0]))             { ret 10; }
+    if (view.cells[t * CELLS] != 6 || sp.dirty[t] != 0) { ret 11; }
+    dnit(?view);
+    dnit(?sp);
     ret 0;
 }
 

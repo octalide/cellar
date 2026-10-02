@@ -22,25 +22,24 @@
 # thread is not stepping the world, paused, full or on the GPU, the interface
 # takes it every frame and the world runs as if there were no thread.
 #
-# a step is two halves (sim.advance, sim.commit). advance changes nothing a draw
-# reads, so while it runs the interface draws the last completed generation:
-# the CPU's front cells, or the squares of the tree the pool last showed.
+# a step is two halves (sim.advance, sim.commit), and neither writes what a
+# draw reads, so the interface draws the last generation a step posted while
+# the next one runs.
 #
-# what a draw reads of the world is the view: the pool the GPU's copy is sent
-# from, and what the interface shows of it (world.Shown). the view is double
-# buffered. the pool is the back buffer a step writes, and the GPU's copy the
-# front one, which only the interface writes (gpu.flush) and draws from every
-# frame. one atomic word (slot) says who has the back buffer, and the
-# interface never waits for it: a step publishes the generation it completed
-# into the view and posts it, and the frame takes what was posted, sending it
-# to the front. what the interface shows is observed once a frame, by the
-# first step to post after the frame took the last. the tree's commit leaves the pool alone, so a step on the tree builds
-# a view (sim.show_view) only once the frame has taken the last, for the
-# camera that frame aimed, and never waits: the frame finds a new generation
-# posted every frame. the CPU's commit swaps the pool's own cells, so it takes
-# the pool from a post the frame has not taken yet, waiting only while the
-# frame sends from it, and posts again. a frame that lands in that swap draws
-# what its GPU copy holds, and sends the generation with the next frame.
+# what a draw reads of the world is the view: the host pool the GPU's copy is
+# sent from, and what the interface shows of it (world.Shown). on the tree the
+# view is the pool, which the tree's commit leaves alone, filled with the tree
+# for the camera the frame last aimed. on the CPU it is a copy of the pool the
+# step stages (sim.stage_view), since the CPU's commit swaps the pool's cells.
+# the view is double buffered: it is the back buffer a step writes, and the
+# GPU's copy the front one, which only the interface writes (gpu.flush) and
+# draws from every frame. one atomic word (slot) says who has the back buffer,
+# and neither side waits for it: a step builds a view (sim.show_view) of the
+# generation it completed only once the frame has taken the last, and posts
+# it, and the frame takes what was posted, sending it to the front. so the
+# frame finds a new generation posted every frame, and what the interface
+# shows is observed once a frame, by the first step to post after the frame
+# took the last.
 
 use cellar.gpu;
 use cellar.sim;
@@ -167,35 +166,20 @@ fun tick(r: *Runner) {
     if (behind > iv * MAX_BEHIND::Duration) { r.next = time.instant_add(now(), iv); }
 }
 
-# take the view for a commit that changes it, from a post the frame has not
-# taken yet too, waiting while the frame reads it
-fun own(r: *Runner) {
-    for (true) {
-        var was: i64 = VIEW_FREE;
-        if (atomic.cas(?r.slot, ?was, VIEW_SIM)) { ret; }
-        was = VIEW_POSTED;
-        if (atomic.cas(?r.slot, ?was, VIEW_SIM)) { ret; }
-        mutex.lock(?r.lock);
-        for (atomic.load(?r.slot) == VIEW_UI) { condition.wait(?r.wake, ?r.lock); }
-        mutex.unlock(?r.lock);
-    }
-}
-
 # one step, and its publication: the step entry
 fun step(r: *Runner) {
     val s: *sim.Sim = r.sim;
-    if (r.aiming) { sim.aim_pyramids(s, ?r.aimed); }
-    val owed:   bool = sim.advance(s);
-    val writes: bool = owed && sim.commit_shows(s);
-    if (writes) { own(r); }
-    if (owed)   { sim.commit(s); }
+    if (r.aiming)       { sim.aim_pyramids(s, ?r.aimed); }
+    if (sim.advance(s)) { sim.commit(s); }
     var was: i64 = VIEW_FREE;
-    if (!writes && !atomic.cas(?r.slot, ?was, VIEW_SIM)) { ret; }
+    if (!atomic.cas(?r.slot, ?was, VIEW_SIM)) { ret; }
     r.aimed  = r.look;
     r.aiming = r.looked;
     # what the interface shows is observed once a frame, as the view is built
     if (!r.posted) {
-        if (r.looked) { sim.show_view(s, r.look); }
+        var look: *gpu.Look = nil;
+        if (r.looked) { look = ?r.look; }
+        sim.show_view(s, look);
         world.observe(s, ?r.shown);
         r.posted = true;
     }
@@ -374,9 +358,6 @@ pub fun seen(r: *Runner, out: *world.Shown) {
 # give the view back after view, for the next step to post into
 pub fun unview(r: *Runner) {
     atomic.store(?r.slot, VIEW_FREE);
-    mutex.lock(?r.lock);
-    condition.signal(?r.wake);
-    mutex.unlock(?r.lock);
 }
 
 # stop the thread, cancelling the step under way, and wait for it to exit
