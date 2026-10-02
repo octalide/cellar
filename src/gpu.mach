@@ -205,6 +205,9 @@ val RING: usize = 8;
 # the refresh interval divides by this for the time a frame spends sending the
 # CPU's chunks: more than that stretches the frame that follows a step
 val VIEW_SHARE: u64 = 32;
+# picoseconds a byte of the CPU's chunks is taken to cost to send before an
+# upload has measured it, a copy at 10 GB/s
+val SEND_PS: u64 = 100;
 # a held slot's pyramid was sent
 val SENT_MIP: u8 = 1;
 # a held slot's cells were sent
@@ -447,6 +450,8 @@ rec Pool {
 # rule:     the rule the generation going began under
 # counted:  the last census and reduction read the front as it stands
 # cursor:   the slot the next frame's upload of the CPU's chunks starts from
+# send_ps:  picoseconds a byte of the CPU's chunks has cost to send, as the
+#           last uploads measured it
 # head:     the meta header staged for upload
 # built:    a pyramid built on the host, staged for upload
 # mark:     a pass's stage that asks for halos and claims slots
@@ -560,6 +565,7 @@ pub rec Gpu {
     rule:     rule.Rule;
     counted:  bool;
     cursor:   usize;
+    send_ps:  u64;
     head:     [128]u32;
     built:    [layout.MIP]u32;
     mark:     gfx.Compute;
@@ -858,6 +864,7 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     g.counted  = false;
     g.pace_us  = pace_for(0.0);
     g.cursor   = 0;
+    g.send_ps  = SEND_PS;
     g.sp       = nil;
     g.owns     = false;
     g.moved    = false;
@@ -1999,9 +2006,10 @@ pub fun reads_pyramids(look: *Look) bool {
 }
 
 # while the CPU steps, upload the chunks the view can see that changed since
-# they were last sent, for as long as the refresh interval over VIEW_SHARE
-# allows, going on from where the last frame stopped so every chunk takes its
-# turn. what does not fit is sent by the frames after, so the view may lag the
+# they were last sent, as one batch, for as long as the refresh interval over
+# VIEW_SHARE allows: the time spent choosing them and what the last batches
+# measured their bytes to cost to send (send_ps). it goes on from where the
+# last frame stopped so every chunk takes its turn. what does not fit is sent by the frames after, so the view may lag the
 # world a generation but the frame never waits on it. the pyramids come built
 # from the step (space.pyramid), and only a chunk changed some other way has its
 # own built here. the draw reads either the cells or, at half a pixel per cell
@@ -2023,17 +2031,22 @@ fun upload_view(g: *Gpu, sp: *space.Space, look: *Look) err[gfx.Error] {
     val budget: u64   = g.pace_us.quick_us * 1000 / VIEW_SHARE;
     var s:      usize = g.cursor;
     if (s >= sp.hi) { s = 0; }
-    var n: usize = 0;
+    var bytes: usize = 0;
+    var n:     usize = 0;
     for (n < sp.hi) {
         val h: u8 = g.p.held[s];
         if (space.used(sp, s) && (h & want) != want) {
             val x: i64 = space.slot_x(sp, s);
             val y: i64 = space.slot_y(sp, s);
             if (x >= box[0] && x <= box[2] && y >= box[1] && y <= box[3]) {
+                var len: usize = MIP * 4;
+                if (want == SENT_CELLS) { len = space.CELLS * 4; }
                 val now: time.InstantClock = time.instant();
                 if (sel now.ok) {
-                    if (time.instant_sub(now.ok, t0.ok)::u64 > budget) { brk; }
+                    val spent: u64 = time.instant_sub(now.ok, t0.ok)::u64 + ((bytes + len)::u64 * g.send_ps) / 1000;
+                    if (spent > budget) { brk; }
                 }
+                bytes = bytes + len;
                 var e: err[gfx.Error] = err[gfx.Error].ok{};
                 if (want == SENT_CELLS) {
                     e = queue(g, s * space.CELLS * 4, (?sp.cells[s * space.CELLS])::*u8, space.CELLS * 4);
@@ -2064,17 +2077,31 @@ fun upload_view(g: *Gpu, sp: *space.Space, look: *Look) err[gfx.Error] {
         n = n + 1;
     }
     g.cursor = s;
-    if (want == SENT_CELLS) { ret send(g, ?g.p.cells[g.front]); }
-    var k: usize = 0;
-    var i: usize = 0;
-    for (i < g.batch.len) {
-        if (g.batch.data[i].src == nil) {
-            g.batch.data[i].src = (?g.pyrs.data[k * MIP])::*u8;
-            k                   = k + 1;
+    var to: *gfx.StorageBuffer = ?g.p.cells[g.front];
+    if (want == SENT_MIP) {
+        to = ?g.p.mip;
+        var k: usize = 0;
+        var i: usize = 0;
+        for (i < g.batch.len) {
+            if (g.batch.data[i].src == nil) {
+                g.batch.data[i].src = (?g.pyrs.data[k * MIP])::*u8;
+                k                   = k + 1;
+            }
+            i = i + 1;
         }
-        i = i + 1;
     }
-    ret send(g, ?g.p.mip);
+    if (bytes == 0) { ret send(g, to); }
+    val t1: time.InstantClock = time.instant();
+    val e:  err[gfx.Error]    = send(g, to);
+    val t2: time.InstantClock = time.instant();
+    if (sel t1.ok) {
+        if (sel t2.ok) {
+            # what the batch's bytes cost to send, for the next frame's budget
+            val ps: u64 = time.instant_sub(t2.ok, t1.ok)::u64 * 1000 / bytes::u64;
+            g.send_ps = (g.send_ps * 3 + ps) / 4;
+        }
+    }
+    ret e;
 }
 
 # whether the GPU's pyramid of every chunk the host's staging holds as the GPU
