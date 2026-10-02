@@ -217,13 +217,15 @@ or at `speed` generations a second. The worlds:
 - `dense`: a 512 by 512 random soup.
 - `sparse`: 400 small soups a thousand cells apart.
 - `gun`: Gosper's glider gun, growing a glider at a time.
-- `footprint`: a live 1024 by 1024 square under the majority vote over the
-  whole (2r+1) by (2r+1) square at the radius, centre included. Every weight is
-  nonzero, so each cell reads its whole footprint, and the square keeps still
-  but for its rounding corners, so each generation steps the same chunks in
-  full. On the unbounded plane the GPU allocates its own chunks, so no census
-  budget bounds the generations, and at wider radii the rate is the step
-  stage's. This is the world for measuring a change to a step shader.
+- `footprint`: a live 1024 by 1024 square under a vote over the whole (2r+1)
+  by (2r+1) square at the radius, centre included: a dead cell is born where
+  most of its square is live, and a live one survives where more than a third
+  is. Every weight is nonzero, so each cell reads its whole footprint, and the
+  square holds still once the tips of its corners fall, so each generation
+  steps the same chunks in full. On the unbounded plane the GPU allocates its
+  own chunks, so no census budget bounds the generations, and at wider radii
+  the rate is the step stage's. This is the world for measuring a change to a
+  step shader.
 
 The other worlds run Life with its eight weights widened to the radius, one by
 default, so a wider radius costs its spread but reads the same eight cells.
