@@ -24,13 +24,23 @@
 #
 # a step is two halves (sim.advance, sim.commit). advance changes nothing a draw
 # reads, so while it runs the interface draws the last completed generation:
-# the CPU's front cells, or the squares of the tree the pool last showed. commit
-# makes the next generation the world's under the publication's lock (view),
-# which the thread holds for nothing else, and posts what the interface shows
-# of the world (world.Shown), with the tree's view rebuilt for the camera the
-# interface last aimed. the interface only ever tries that lock, so a frame
-# that meets a commit moves the camera over the cells it has and takes the new
-# generation with the next.
+# the CPU's front cells, or the squares of the tree the pool last showed.
+#
+# what a draw reads of the world is the view: the pool the GPU's copy is sent
+# from, and what the interface shows of it (world.Shown). the view is double
+# buffered. the pool is the back buffer a step writes, and the GPU's copy the
+# front one, which only the interface writes (gpu.flush) and draws from every
+# frame. one atomic word (slot) says who has the back buffer, and the
+# interface never waits for it: a step publishes the generation it completed
+# into the view and posts it, and the frame takes what was posted, sending it
+# to the front. what the interface shows is observed once a frame, by the
+# first step to post after the frame took the last. the tree's commit leaves the pool alone, so a step on the tree builds
+# a view (sim.show_view) only once the frame has taken the last, for the
+# camera that frame aimed, and never waits: the frame finds a new generation
+# posted every frame. the CPU's commit swaps the pool's own cells, so it takes
+# the pool from a post the frame has not taken yet, waiting only while the
+# frame sends from it, and posts again. a frame that lands in that swap draws
+# what its GPU copy holds, and sends the generation with the next frame.
 
 use cellar.gpu;
 use cellar.sim;
@@ -58,13 +68,22 @@ val HOLD_SIM: u8 = 1;
 # the interface
 val HOLD_UI: u8 = 2;
 
+# the view is nobody's, and holds nothing the frame has not taken
+val VIEW_FREE: i64 = 0;
+# the view is nobody's, and holds a generation the frame has not taken
+val VIEW_POSTED: i64 = 1;
+# the thread writes the view
+val VIEW_SIM: i64 = 2;
+# the interface reads the view
+val VIEW_UI: i64 = 3;
+
 # generations capped pacing may fall behind before the backlog is dropped, so
 # a world slower than its rate cannot spiral
 val MAX_BEHIND: u64 = 16;
 
 # the thread, the world's holder and what the thread is asked to do
 # ---
-# lock:     guards the fields below up to view; never held across a step
+# lock:     guards the fields below up to slot; never held across a step
 # wake:     signalled when the thread may have something to do or should quit
 # worker:   the thread
 # sim:      the world it steps
@@ -80,13 +99,14 @@ val MAX_BEHIND: u64 = 16;
 # due:      capped generations owed to the frame, on the GPU
 # quit:     the thread should exit
 # started:  the thread was spawned and has not been joined
-# view:     guards the publication below and what a draw reads of the world
+# slot:     who has the view, VIEW_FREE, VIEW_POSTED, VIEW_SIM or VIEW_UI,
+#           atomic. the fields below belong to whoever has it
 # look:     the camera the interface last aimed, in cells
 # looked:   look holds one
 # aimed:    the camera the thread's steps build pyramids for, its own copy of
 #           look
 # aiming:   aimed holds one
-# shown:    what the interface shows of the last completed generation
+# shown:    what the interface shows of the generation the view holds
 # posted:   shown holds a generation the interface has not taken
 pub rec Runner {
     lock:     mutex.Mutex;
@@ -105,7 +125,7 @@ pub rec Runner {
     due:      u64;
     quit:     bool;
     started:  bool;
-    view:     mutex.Mutex;
+    slot:     i64;
     look:     gpu.Look;
     looked:   bool;
     aimed:    gpu.Look;
@@ -147,21 +167,39 @@ fun tick(r: *Runner) {
     if (behind > iv * MAX_BEHIND::Duration) { r.next = time.instant_add(now(), iv); }
 }
 
+# take the view for a commit that changes it, from a post the frame has not
+# taken yet too, waiting while the frame reads it
+fun own(r: *Runner) {
+    for (true) {
+        var was: i64 = VIEW_FREE;
+        if (atomic.cas(?r.slot, ?was, VIEW_SIM)) { ret; }
+        was = VIEW_POSTED;
+        if (atomic.cas(?r.slot, ?was, VIEW_SIM)) { ret; }
+        mutex.lock(?r.lock);
+        for (atomic.load(?r.slot) == VIEW_UI) { condition.wait(?r.wake, ?r.lock); }
+        mutex.unlock(?r.lock);
+    }
+}
+
 # one step, and its publication: the step entry
 fun step(r: *Runner) {
     val s: *sim.Sim = r.sim;
     if (r.aiming) { sim.aim_pyramids(s, ?r.aimed); }
-    val owed: bool = sim.advance(s);
-    mutex.lock(?r.view);
-    if (owed) { sim.commit(s); }
+    val owed:   bool = sim.advance(s);
+    val writes: bool = owed && sim.commit_shows(s);
+    if (writes) { own(r); }
+    if (owed)   { sim.commit(s); }
+    var was: i64 = VIEW_FREE;
+    if (!writes && !atomic.cas(?r.slot, ?was, VIEW_SIM)) { ret; }
     r.aimed  = r.look;
     r.aiming = r.looked;
+    # what the interface shows is observed once a frame, as the view is built
     if (!r.posted) {
         if (r.looked) { sim.show_view(s, r.look); }
         world.observe(s, ?r.shown);
         r.posted = true;
     }
-    mutex.unlock(?r.view);
+    atomic.store(?r.slot, VIEW_POSTED);
 }
 
 fun work(arg: *u8) {
@@ -208,7 +246,6 @@ fun work(arg: *u8) {
 pub fun start(r: *Runner, s: *sim.Sim) err[thread.ThreadError] {
     r.lock     = mutex.make();
     r.wake     = condition.make();
-    r.view     = mutex.make();
     r.sim      = s;
     r.holder   = HOLD_FREE;
     r.asked    = 0;
@@ -223,6 +260,7 @@ pub fun start(r: *Runner, s: *sim.Sim) err[thread.ThreadError] {
     r.started  = false;
     r.looked   = false;
     r.aiming   = false;
+    r.slot     = VIEW_FREE;
     r.posted   = false;
     val spawned: thread.Operation = thread.spawn_with(work, r::*u8, ?r.worker);
     if (sel spawned.err) { ret err[thread.ThreadError].err{spawned.err}; }
@@ -265,7 +303,8 @@ pub fun give(r: *Runner) {
     r.running = s.running != 0;
     r.full    = s.full;
     r.on_gpu  = sim.on_gpu(s);
-    # the interface saw the world itself, so the next step posts again
+    # the interface saw the world itself, so what was posted before is stale
+    atomic.store(?r.slot, VIEW_FREE);
     r.posted = false;
     r.holder = HOLD_FREE;
     condition.signal(?r.wake);
@@ -304,14 +343,18 @@ pub fun owed(r: *Runner) u64 {
     ret n;
 }
 
-# try to reach the last completed generation while the thread may be stepping,
-# without waiting: false while a step is committing. on true the draw may read
-# what sim.show reads, until unview
+# take the view of the last completed generation while the thread may be
+# stepping, without waiting: false only while a step writes it. on true the
+# draw may read what sim.show reads, until unview
 # ---
 # r:    the runner
 # look: the camera, in cells, the next tree view is built for
 pub fun view(r: *Runner, look: gpu.Look) bool {
-    if (!mutex.try_lock(?r.view)) { ret false; }
+    var was: i64 = VIEW_POSTED;
+    if (!atomic.cas(?r.slot, ?was, VIEW_UI)) {
+        was = VIEW_FREE;
+        if (!atomic.cas(?r.slot, ?was, VIEW_UI)) { ret false; }
+    }
     r.look   = look;
     r.looked = true;
     ret true;
@@ -328,9 +371,12 @@ pub fun seen(r: *Runner, out: *world.Shown) {
     r.posted = false;
 }
 
-# let the next step commit, after view
+# give the view back after view, for the next step to post into
 pub fun unview(r: *Runner) {
-    mutex.unlock(?r.view);
+    atomic.store(?r.slot, VIEW_FREE);
+    mutex.lock(?r.lock);
+    condition.signal(?r.wake);
+    mutex.unlock(?r.lock);
 }
 
 # stop the thread, cancelling the step under way, and wait for it to exit
@@ -365,7 +411,7 @@ test runner__steps_while_running_and_gives_the_world_between_steps {
     pace(?r, true, 1.0);
     give(?r);
 
-    # uncapped, the generations posted climb while only the publication is read
+    # uncapped, the generations posted climb while only the view is read
     var look:  gpu.Look;
     var shown: world.Shown;
     shown.generation = 0;
