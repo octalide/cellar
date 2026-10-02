@@ -54,9 +54,15 @@ val TILE_H: i32 = 16;
 # gives a workgroup: 40 rows of the widest apron, 96 columns at radius 32
 val SHARED: u32 = 3840;
 
+# a record, since mach 6.9 lowers a bare shared array indexed in a loop to
+# computed addressing at O2 (briar-systems/mach#4388)
+rec Band {
+    v: [SHARED]f32;
+}
+
 # the band of the tile and its apron loaded, row by row from the apron's top
 #[shared]
-var band: [3840]f32;
+var band: Band;
 # what the tile does, as its first invocation found: SKIP, ZERO or FULL
 #[shared]
 var plan: u32;
@@ -132,28 +138,31 @@ fun level_at(slot: u32, seamed: u32, x: i32, y: i32) f32 {
 }
 
 # what a tile of a slot does: SKIP when its cells already hold the zeros it
-# steps to, ZERO when it steps to zeros its cells do not hold yet, FULL to step
+# steps to, ZERO when it steps to zeros its cells do not hold yet, FULL to step.
+# it leaves only at its end, which the SPIR-V target asks of a loop once it is
+# inlined
 fun plan_of(slot: u32, base: u32, seamed: u32) u32 {
     # the serial that produced the source. a stamp this step already wrote
     # may have replaced it, so a stamp of either serial counts as set then
     val last: u32 = meta.serial - 1;
     val now:  u32 = meta.serial;
-    if (seamed != 0) { ret FULL; }
-    var k: u32 = 0;
+    var live: u32 = seamed;
+    var k:    u32 = 0;
     for (k < 9) {
         val n: u32 = meta.table[base + k];
         if (n != layout.NONE) {
             val f: u32 = flags.v[n * 2];
-            if (f == last || f == now) { ret FULL; }
+            if (f == last || f == now) { live = 1; }
         }
         k = k + 1;
     }
     # a warm cell is a live one, so the block is empty at the source; the
     # destination holds zeros unless the chunk was warm a step earlier
     val warm: u32 = flags.v[slot * 2 + 1];
-    if (warm == last || warm == now) { ret FULL; }
-    if (warm == last - 1)            { ret ZERO; }
-    ret SKIP;
+    var plan: u32 = SKIP;
+    if (live != 0 || warm == last || warm == now) { plan = FULL; }
+    or (warm == last - 1)                         { plan = ZERO; }
+    ret plan;
 }
 
 #[stage("compute")]
@@ -205,8 +214,8 @@ fun comp_main() {
         sy.workgroup_barrier();
         var i: i32 = lid::i32;
         for (i < n * wide) {
-            band[i::u32] = level_at(slot, seamed, tx0 - r + i % wide, ty0 - r + top + i / wide);
-            i            = i + 64;
+            band.v[i::u32] = level_at(slot, seamed, tx0 - r + i % wide, ty0 - r + top + i / wide);
+            i              = i + 64;
         }
         sy.workgroup_barrier();
         var dy: i32 = 0 - r;
@@ -222,7 +231,7 @@ fun comp_main() {
                     val w: f32 = table.v[(wr::i32 + dx)::u32]:~f32;
                     c = 0;
                     for (c < 8) {
-                        sum[c::u32] = sum[c::u32] + w * band[(at + dx + c)::u32];
+                        sum[c::u32] = sum[c::u32] + w * band.v[(at + dx + c)::u32];
                         c           = c + 1;
                     }
                     dx = dx + 1;
