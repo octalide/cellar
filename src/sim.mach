@@ -499,7 +499,7 @@ pub fun on_gpu(s: *Sim) bool {
 pub fun attach(s: *Sim, g: *gpu.Gpu) {
     if (!gpu.steps(g, rule.family_of(?s.rule))) { gpu.forgo_compute(g); }
     s.gpu = g;
-    space.set_mirror(?s.space, gpu.mirror(g), g.slots);
+    space.set_mirror(?s.space, gpu.mirror(g, ?s.space), g.slots);
     var t: usize = 0;
     for (t < s.space.hi) {
         s.space.dirty[t] = space.DIRTY_ENTRY | space.DIRTY_CELLS;
@@ -959,6 +959,7 @@ pub fun collect(s: *Sim) {
         ret;
     }
     val got: gpu.Landed = gpu.collect(s.gpu, ?s.space);
+    rewind(s);
     if (!got.fits)  { overflow(s); }
     if (!got.fresh) { ret; }
     # every census older than the last clear is refused, so it is never more
@@ -1174,13 +1175,33 @@ pub fun record(s: *Sim, uncapped: bool, look: *gpu.Look) err[gfx.Error] {
 # ret: ok, or why the read failed
 pub fun sync(s: *Sim) err[gfx.Error] {
     if (!on_gpu(s)) { ret err[gfx.Error].ok{}; }
+    own(s);
     ret gpu.pull(s.gpu, ?s.space);
+}
+
+# take the pool back from a GPU that owns it, before the host reads or changes
+# its page table, and take any generations a closed gate voided off the count
+# (gpu.take). call outside a frame, or in one before gpu frame has recorded
+# anything
+fun own(s: *Sim) {
+    if (!on_gpu(s)) { ret; }
+    gpu.take(s.gpu, ?s.space);
+    rewind(s);
+}
+
+# take the generations a closed gate voided off the count, and owe them again
+fun rewind(s: *Sim) {
+    val v: u64 = gpu.rewound(s.gpu);
+    if (v == 0) { ret; }
+    s.generation = s.generation - v;
+    s.pending    = s.pending + v::usize;
 }
 
 # empty the world and reset the generation counter
 # ---
 # s: simulation
 pub fun clear(s: *Sim) {
+    own(s);
     if (wanted(s, 0, 0, 0, 0, true)) {
         val synced: err[gfx.Error] = sync(s);
         kept(s, 0, 0, 0, 0, true, sel synced.ok);
@@ -1571,6 +1592,7 @@ fun in_area(s: *Sim, sl: usize) bool {
 # are brought level with the GPU's, and with mark they are noted as written whole
 fun stage(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64, pull: bool, mark: bool) bool {
     if (x1 <= x0 || y1 <= y0) { ret true; }
+    own(s);
     val sp: *space.Space = ?s.space;
     var sl: usize        = 0;
     for (sl < sp.hi) {
@@ -2308,7 +2330,19 @@ pub fun complemented(s: *Sim) bool {
 pub fun population(s: *Sim) usize {
     if (complemented(s)) { ret (s.rule.grid.w * s.rule.grid.h)::usize - space.population(?s.space); }
     if (on_tree(s))      { ret hashlife.population(?s.tree)::usize; }
+    if (owned(s))        { ret s.gpu.pop; }
     ret space.population(?s.space);
+}
+
+# whether the GPU owns the pool and its census, not the host's, counts the world
+fun owned(s: *Sim) bool {
+    ret on_gpu(s) && gpu.tallied(s.gpu);
+}
+
+# chunks the pool holds, as of the last step or census
+pub fun chunks_held(s: *Sim) usize {
+    if (owned(s)) { ret s.gpu.used; }
+    ret s.space.live;
 }
 
 # the smallest box holding every live cell, as of the last step or census
@@ -2317,7 +2351,11 @@ pub fun population(s: *Sim) usize {
 # ret: the box, or none when nothing is alive
 pub fun bounds(s: *Sim) opt[space.Box] {
     if (complemented(s)) { ret complement_bounds(s); }
-    if (!on_tree(s))     { ret space.bounds(?s.space); }
+    if (owned(s)) {
+        if (!s.gpu.boxed) { ret opt[space.Box].none{}; }
+        ret opt[space.Box].some{s.gpu.box};
+    }
+    if (!on_tree(s)) { ret space.bounds(?s.space); }
     if (s.boxed != s.epoch) {
         var e: [4]i64;
         s.box = opt[space.Box].none{};
@@ -4138,7 +4176,6 @@ test hashlife__edits_snapshots_and_the_way_back_match_the_pool {
 }
 
 # Gosper's glider gun, row by row
-#[testing]
 val GUN: [9]str = [9]str{
     "........................o...........",
     "......................o.o...........",
@@ -4151,8 +4188,8 @@ val GUN: [9]str = [9]str{
     "............oo......................",
 };
 
-#[testing]
-fun seed_gun(s: *Sim) {
+# seed Gosper's glider gun, its corner at the origin, into an emptied world
+pub fun seed_gun(s: *Sim) {
     fill_begin(s);
     var y: usize = 0;
     for (y < 9) {
@@ -4286,14 +4323,13 @@ fun seed_edges(s: *Sim) {
     fill_end(s);
 }
 
-# run uncapped frames, each asking for as many generations as the budget
+# run uncapped frames, each asking for as many generations as the frame
 # allows, until the GPU has recorded at least want, then pause and let the
 # census of the last land
 # ---
-# wide: set when the halo was wide on the way
-# ret:  the most generations one frame recorded, 0 when a frame failed
+# ret: the most generations one frame recorded, 0 when a frame failed
 #[testing]
-fun uncapped_frames(r: *gfx.Renderer, s: *Sim, want: u64, wide: *bool) usize {
+fun uncapped_frames(r: *gfx.Renderer, s: *Sim, want: u64) usize {
     var most:   usize = 0;
     var frames: usize = 0;
     var look:   gpu.Look;
@@ -4311,15 +4347,12 @@ fun uncapped_frames(r: *gfx.Renderer, s: *Sim, want: u64, wide: *bool) usize {
         if (sel br.err) { ret 0; }
         if (br.ok) {
             collect(s);
-            # pacing would shrink the span, and a slow machine keep the halo
-            # from widening; here the budget alone limits the frames
+            # pacing would shrink the span; here the dispatches alone limit the frames
             gpu.fix_span(s.gpu, gpu.MAX_SPAN);
-            s.gpu.want = true;
             val before: u64            = s.generation;
             val rec:    err[gfx.Error] = record(s, true, ?look);
             if (sel rec.err)                           { ret 0; }
             if ((s.generation - before)::usize > most) { most = (s.generation - before)::usize; }
-            if (s.gpu.wide)                            { @wide = true; }
             val ended: err[gfx.Error] = gfx.renderer_end_frame(r);
             if (sel ended.err) { ret 0; }
         }
@@ -4354,8 +4387,9 @@ test frame__uncapped_steps_past_the_old_reach_exactly_as_the_cpu_does {
         rig_close(?t);
         ret 0;
     }
-    # seeds at radius 1 for a few censuses, then a radius-4 rule, each from the
-    # same soups; either spreads well past the 32 cells a census once allowed
+    # seeds at radius 1, then a radius-4 rule, each from the same soups; either
+    # spreads well past the 32 cells a census once allowed, and a frame steps
+    # more generations than a census round trip ever let one
     var phase: usize = 0;
     for (phase < 2) {
         var k:    rule.Rule = rule.preset_rule(2);
@@ -4369,11 +4403,10 @@ test frame__uncapped_steps_past_the_old_reach_exactly_as_the_cpu_does {
             seed_edges(?t.gpu);
         }
         val from: i64   = spread_of(?t.cpu);
-        var wide: bool  = false;
-        val most: usize = uncapped_frames(?t.r, ?t.gpu, want, ?wide);
-        if (!wide) { ret 4 + phase::i32 * 10; }
-        # a frame ran more generations than the ring allowed a census
-        if (most * rule.radius(?k) <= space.SPREAD_RING::usize) { ret 5 + phase::i32 * 10; }
+        val most: usize = uncapped_frames(?t.r, ?t.gpu, want);
+        if (most == 0) { ret 4 + phase::i32 * 10; }
+        # a frame ran more generations than even the wide halo allowed a census
+        if (most * rule.radius(?k) <= space.SPREAD_WIDE::usize) { ret 5 + phase::i32 * 10; }
         if (!caught_up(?t))                                     { ret 6 + phase::i32 * 10; }
         # the soups spread past the halo the pool held when they were seeded
         if (spread_of(?t.cpu) < from + 4 * space.SIDE) { ret 7 + phase::i32 * 10; }
@@ -4391,19 +4424,39 @@ test frame__switching_between_uncapped_and_capped_steps_exactly_as_the_cpu_does 
         rig_close(?t);
         ret 0;
     }
-    # uncapped widens the halo, capped narrows it while the fronts still spread
-    # a cell a generation, and uncapped widens it again
+    # uncapped, then capped while the fronts still spread a cell a generation,
+    # then uncapped again, each picking up where the last left the pool
     var round: usize = 0;
     for (round < 2) {
-        var wide: bool = false;
-        if (uncapped_frames(?t.r, ?t.gpu, t.gpu.generation + 100, ?wide) == 0) { ret 4 + round::i32 * 10; }
-        if (!wide)                                                             { ret 5 + round::i32 * 10; }
-        if (!caught_up(?t))                                                    { ret 6 + round::i32 * 10; }
+        if (uncapped_frames(?t.r, ?t.gpu, t.gpu.generation + 100) == 0) { ret 4 + round::i32 * 10; }
+        if (!caught_up(?t))                                             { ret 6 + round::i32 * 10; }
         rig_step(?t, 80);
-        if (!rig_settle(?t) || t.g.wide) { ret 7 + round::i32 * 10; }
-        if (!caught_up(?t))              { ret 8 + round::i32 * 10; }
+        if (!rig_settle(?t)) { ret 7 + round::i32 * 10; }
+        if (!caught_up(?t))  { ret 8 + round::i32 * 10; }
         round = round + 1;
     }
+    rig_close(?t);
+    ret 0;
+}
+
+test frame__a_pass_out_of_room_stops_the_steps_and_the_count_goes_back_exactly {
+    var t:    Rig;
+    val code: i32 = rig_open(?t, rule.preset_rule(2), seed_edges);
+    if (code != 0) { ret code; }
+    if (!t.on) {
+        rig_close(?t);
+        ret 0;
+    }
+    # the soups need new chunks within a few passes, and the top leaves none
+    # free: the gate closes, the steps after it are voided, and the host takes
+    # the pool, counts back to the pass, makes room and runs on
+    if (uncapped_frames(?t.r, ?t.gpu, 10) == 0) { ret 4; }
+    val synced: err[gfx.Error] = sync(?t.gpu);
+    if (sel synced.err) { ret 8; }
+    gpu.squeeze(?t.g, t.gpu.space.hi);
+    if (uncapped_frames(?t.r, ?t.gpu, t.gpu.generation + 300) == 0) { ret 5; }
+    if (t.gpu.full || t.g.squeeze != 0)                             { ret 6; }
+    if (!caught_up(?t))                                             { ret 7; }
     rig_close(?t);
     ret 0;
 }
