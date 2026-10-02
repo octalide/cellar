@@ -161,9 +161,6 @@ pub val HEAD: usize = layout.HEAD::usize;
 pub val LOOK: usize = 24;
 # the words of the view buffer where the rule palette starts
 val INK_AT: usize = LOOK + SHADES * 8;
-# the largest rule buffer uploaded in the frame's command stream: a larger one
-# goes up staged (see sync_table)
-val INLINE_MAX: usize = 65536;
 # words of a slot's coverage pyramid
 pub val MIP: usize = layout.MIP::usize;
 # entries in each palette
@@ -1065,16 +1062,13 @@ fun send(g: *Gpu, b: *gfx.StorageBuffer) err[gfx.Error] {
 
 # bring the rule buffer level with the rule running, ahead of the frame's steps
 #
-# a rule needing more words than the buffer holds replaces it, which waits for
-# the frames in flight that read it. the rule buffer changes only when the rule
-# does, and a rule table's tree can run to megabytes: recorded in the frame's
-# command stream, as a frame's own small writes are, it would be copied into
-# the command buffer 64 KiB at a time and carried there whole. so a buffer
-# past INLINE_MAX bytes goes up staged, a copy the queue is drained for, which
-# waits once for the frames in flight as a replaced buffer already does, and
-# only when the rule changes. a smaller one, a wide kernel's weights that the
-# rule panel changes with every click, stays in the command stream and never
-# stalls.
+# the rule buffer changes only when the rule does, and a rule table's tree can
+# run to megabytes, so it goes up through the frame's staging memory as one
+# recorded copy, in order with the frame's dispatches: the steps recorded after
+# it read it, and the frames in flight still reading the old one finish first.
+# nothing waits for the queue but a rule needing more words than the buffer
+# holds, which makes a larger one as a growing pool makes its buffers, waiting
+# for its zero fill, and frees the old one once the frames reading it have run.
 fun sync_table(g: *Gpu, r: *rule.Rule) err[gfx.Error] {
     if (g.tabled && rule.same(r, ?g.shown)) { ret err[gfx.Error].ok{}; }
     val n: usize = rule.table_words(r);
@@ -1093,14 +1087,10 @@ fun sync_table(g: *Gpu, r: *rule.Rule) err[gfx.Error] {
     val room: res[usize, allo.Error] = vector.ensure[u32](?g.packed, n);
     if (sel room.err) { ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.overrun{(n * 4)::u64}}}; }
     rule.pack_table(r, g.packed.data);
-    if (n * 4 > INLINE_MAX) {
-        val staged: err[gfx.Error] = gfx.storage_buffer_upload(g.d, ?g.table, 0, g.packed.data::*u8, n * 4);
-        if (sel staged.err) { ret staged; }
-    }
-    or {
-        val up: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.table, 0, g.packed.data::*u8, n * 4);
-        if (sel up.err) { ret up; }
-    }
+    val queued: err[gfx.Error] = queue(g, 0, g.packed.data::*u8, n * 4);
+    if (sel queued.err) { ret queued; }
+    val up: err[gfx.Error] = send(g, ?g.table);
+    if (sel up.err) { ret up; }
     g.shown  = @r;
     g.tabled = true;
     ret err[gfx.Error].ok{};
