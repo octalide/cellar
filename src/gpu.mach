@@ -29,12 +29,15 @@
 # one counts and reduces it again. an edit, a growth or another rule since the
 # generation began starts it over from the front, under the same serial.
 #
-# the halo is the ring of adjacent chunks, 32 cells of reach, unless uncapped
-# stepping keeps running into the budget, when it widens to chunks two away and
-# 96 cells, at nearly three times the slots. the budget rises only once a
-# census taken with the wide halo has settled, so every live chunk holds it,
-# and before the ring's first census can free the far chunks the budget drops
-# to what the ring holds.
+# the halo is the rule's ring of adjacent chunks (cellar.space.ring), the
+# chunks its live cells lean toward and 32 cells of reach for a rule reaching
+# no further, every adjacent chunk and 64 cells for one reaching further,
+# unless uncapped stepping keeps running into the budget, when it widens by a
+# chunk, toward chunks two away, at nearly three times the slots. the budget
+# rises only once a census taken with the wider halo has settled, so every live
+# chunk holds it, and before the first census of a narrower halo, the ring's
+# or a rule's reaching less, can free the far chunks the budget drops to what
+# that halo holds.
 #
 # on the unbounded plane the GPU allocates and frees chunks itself, and the
 # census round trip no longer bounds the generations a frame may record. while
@@ -48,8 +51,8 @@
 # GPU's work, so the two never write the same word at once.
 #
 # a pass runs between generations, before the spread recorded since the last
-# would pass SPREAD_RING cells: each live chunk asks for the ring of chunks its
-# live cells lean toward and claims a slot for any missing (mark_comp), the
+# would pass what the halo it left holds: each live chunk asks for the rule's
+# ring of chunks and claims a slot for any missing (mark_comp), the
 # first pass of a frame frees the chunks nothing asked for (free_comp), twins
 # claimed for one chunk give way to the lowest and the rest are linked in
 # (settle_comp), and the new chunks are cleared. so no generation outruns the halo the last pass
@@ -246,7 +249,7 @@ pub rec Look {
 # edits:  the edit count then
 # cap:    slots the readback covers
 # hi:     slots the census counted
-# wide:   the halo settling it asks for is the wide one
+# span:   cells of spread the halo settling it asks for holds
 # owned:  the GPU owned the pool, so the host's settles nothing from it
 rec Snap {
     id:     u32;
@@ -257,7 +260,7 @@ rec Snap {
     edits:  u64;
     cap:    usize;
     hi:     usize;
-    wide:   bool;
+    span:   u32;
     owned:  bool;
 }
 
@@ -273,6 +276,7 @@ rec Snap {
 # now:  a step's serial, or for a pass the serial of the step that left the front
 # id:   a pass's id
 # gens: generations recorded before a pass, low bits
+# span: cells of spread the halo a pass leaves holds
 rec Op {
     pass: bool;
     free: bool;
@@ -283,6 +287,7 @@ rec Op {
     now:  u32;
     id:   u32;
     gens: u32;
+    span: u32;
 }
 
 # a painted cell waiting to be uploaded
@@ -368,6 +373,7 @@ rec Pool {
 # limit:    the spread the last settled census allows
 # wide:     censuses are recorded asking for the wide halo
 # want:     the halo the next census should ask for is the wide one
+# halo:     cells of spread the halo censuses are recorded asking for holds
 # streak:   consecutive uncapped frames that argue for changing the halo
 # patience: budget-bound frames in a row the halo next widens after
 # hold:     the most limit may be until a census recorded since the halo
@@ -419,6 +425,7 @@ rec Pool {
 # known:    while owned, past the highest slot in use as the host last knew it
 # pass:     the last pass id
 # grouped:  cells of spread recorded since the last pass
+# passed:   cells of spread the halo the last pass left holds
 # rewound:  generations a closed gate voided, not yet taken from the world's count
 # pop:      live cells the newest census found while owned
 # box:      the box around them
@@ -471,6 +478,7 @@ pub rec Gpu {
     limit:    u64;
     wide:     bool;
     want:     bool;
+    halo:     u32;
     streak:   u32;
     patience: u32;
     hold:     u64;
@@ -518,6 +526,7 @@ pub rec Gpu {
     known:    usize;
     pass:     u32;
     grouped:  usize;
+    passed:   usize;
     rewound:  u64;
     pop:      usize;
     box:      space.Box;
@@ -572,12 +581,6 @@ fun slack(n: usize) usize {
     val q: usize = n / 4;
     if (q < 64) { ret 64; }
     ret q;
-}
-
-# cells of spread a pool settled to a halo holds room for
-fun reach(wide: bool) u64 {
-    if (wide) { ret space.SPREAD_WIDE::u64; }
-    ret space.SPREAD_RING::u64;
 }
 
 fun make(d: *gfx.Device, size: usize, out: *gfx.StorageBuffer) err[gfx.Error] {
@@ -764,9 +767,10 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     g.id       = 0;
     g.spread   = 0;
     g.gens     = 0;
-    g.limit    = reach(false);
+    g.limit    = space.SPREAD_RING::u64;
     g.wide     = false;
     g.want     = false;
+    g.halo     = space.SPREAD_RING;
     g.streak   = 0;
     g.patience = WIDEN_AFTER;
     g.hold     = NO_HOLD;
@@ -805,6 +809,7 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     g.known    = 0;
     g.pass     = 0;
     g.grouped  = 0;
+    g.passed   = 0;
     g.rewound  = 0;
     g.pop      = 0;
     g.boxed    = false;
@@ -1178,7 +1183,8 @@ pub fun note_bulk(g: *Gpu) {
     g.bulk    = g.bulk + 1;
     g.edits   = g.edits + 1;
     g.tallied = false;
-    g.limit   = g.spread + reach(g.wide);
+    g.halo    = space.span(g.sp);
+    g.limit   = g.spread + g.halo::u64;
     g.hold    = NO_HOLD;
     g.settled = g.seq;
     vector.clear[Write](?g.writes);
@@ -1255,14 +1261,15 @@ fun follow(g: *Gpu) {
 #
 # the halo widens once the budget cut several frames in a row short that kept
 # up with the display, reach rather than frame time bounding them, and narrows
-# once several in a row fell behind the display or would have fit the ring.
+# once several in a row fell behind the display or would have fit the rule's
+# ring.
 # each such narrowing doubles how many frames the next widening waits for,
 # until stepping stops being uncapped.
 # ---
 # g: the GPU side, after the frame
 pub fun tune(g: *Gpu) {
     var argues: bool = g.cut && g.quick;
-    if (g.wide) { argues = !g.quick || (!g.cut && g.lag + g.stepped <= reach(false)); }
+    if (g.wide) { argues = !g.quick || (!g.cut && g.lag + g.stepped <= space.ring(g.sp.reach)::u64); }
     if (argues) { g.streak = g.streak + 1; }
     or          { g.streak = 0; }
     if (!g.wide && g.streak >= g.patience) {
@@ -1350,7 +1357,7 @@ pub fun collect(g: *Gpu, sp: *space.Space) Landed {
         c[2] = w >> 14;
         c[4] = rows[s * row + 1];
         c[3] = 0;
-        if (c[0] != 0) { c[3] = space.halo_of(c[4], snap.wide); }
+        if (c[0] != 0) { c[3] = space.halo_of(c[4], snap.span); }
         if (!snap.owned) {
             val inc: u32 = space.incarnation(sp, s);
             c[2] = 0;
@@ -1403,10 +1410,11 @@ pub fun collect(g: *Gpu, sp: *space.Space) Landed {
     val ok: bool = space.settle(sp, g.p.landed, n, snap.edits == g.edits);
     g.settled = snap.seq;
     g.lag     = g.spread - snap.spread;
-    # a census recorded since the halo narrowed has freed what the ring leaves out
+    # a census recorded since the halo narrowed has freed what the narrower
+    # halo leaves out
     if (snap.seq >= g.held) { g.hold = NO_HOLD; }
     # a census the pool could not be settled from leaves the limit where it was
-    var to: u64 = snap.spread + reach(snap.wide);
+    var to: u64 = snap.spread + snap.span::u64;
     if (to > g.hold)        { to = g.hold; }
     if (ok && to > g.limit) { g.limit = to; }
     ret Landed{fresh: true, fits: ok, behind: g.gens - snap.gens};
@@ -1625,7 +1633,7 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
         g.owns = false;
     }
     if (!g.owns && owns) {
-        # the host's halo is the ring from here on, as the passes keep it
+        # the host's halo is the rule's ring from here on, as the passes keep it
         g.owns   = true;
         g.moved  = false;
         g.reseed = true;
@@ -1994,8 +2002,9 @@ fun plan_step(g: *Gpu, lo: usize, n: usize, step: u32) {
     g.nops  = g.nops + 1;
 }
 
-# plan a pass ahead of the next generation, over the front
-fun plan_pass(g: *Gpu, free: bool, next: u32) {
+# plan a pass ahead of the next generation, over the front, leaving every live
+# chunk a halo holding span cells of spread
+fun plan_pass(g: *Gpu, free: bool, next: u32, span: u32) {
     g.pass = g.pass + 1;
     if (g.pass == 0) { g.pass = 1; }
     val op: *Op = ?g.ops[g.nops];
@@ -2006,6 +2015,7 @@ fun plan_pass(g: *Gpu, free: bool, next: u32) {
     op.now  = g.serial;
     op.id   = g.pass;
     op.gens = (g.gens & 0xffffffff)::u32;
+    op.span = span;
     g.nops  = g.nops + 1;
     g.moved = true;
 }
@@ -2039,6 +2049,7 @@ fun record_pass(g: *Gpu, op: *Op) err[gfx.Error] {
     h[5]  = op.now;
     h[6]  = op.gens;
     h[7]  = op.step;
+    h[8]  = op.span;
     h[11] = 0;
     h[12] = 1;
     h[13] = 1;
@@ -2183,19 +2194,22 @@ pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, 
                 g.cut = true;
                 brk;
             }
-            # no live cell reaches a chunk the ring left out within its
-            # SPREAD_RING cells, whatever the radius of the rules on the way
-            if (g.owns && g.grouped + radius > space.SPREAD_RING::usize) {
+            # no live cell reaches a chunk the last pass left out within the
+            # spread its halo holds, whatever the radius of the rules on the
+            # way, and a pass leaves the ring of the rule about to step, which
+            # holds a generation of it
+            if (g.owns && g.grouped + radius > g.passed) {
                 var cost: usize = PASS_CALLS;
                 if (first) { cost = cost + 1; }
                 if (calls + cost >= MAX_STEPS) {
                     g.limited = true;
                     brk;
                 }
-                plan_pass(g, first, made::u32);
+                plan_pass(g, first, made::u32, space.ring(radius));
                 calls     = calls + cost;
                 first     = false;
                 g.grouped = 0;
+                g.passed  = space.ring(radius)::usize;
             }
             if (g.hi != 0 && rule.table(fam)) {
                 val et: err[gfx.Error] = sync_table(g, r);
@@ -2254,20 +2268,21 @@ pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, 
         if (sel ec.err) { ret res[usize, gfx.Error].err{ec.err}; }
     }
 
-    # a narrower halo frees chunks the budget may already have spread into, so
-    # the budget drops to what the ring holds from this census on, and stays
-    # there until a census recorded from now on has settled. while the GPU
-    # owns the pool the halo is always the ring its passes keep
+    # a narrower halo, the ring after the wide one or the ring of a rule
+    # reaching less, frees chunks the budget may already have spread into, so
+    # the budget drops to what it holds from this census on, and stays there
+    # until a census recorded from now on has settled. while the GPU owns the
+    # pool the halo is always the ring its passes keep
     if (g.owns) { g.want = false; }
-    if (g.want != g.wide) {
-        g.wide  = g.want;
-        sp.wide = g.wide;
-        if (!g.wide) {
-            g.hold = g.spread + reach(false);
-            g.held = g.seq;
-            if (g.limit > g.hold) { g.limit = g.hold; }
-        }
+    g.wide  = g.want;
+    sp.wide = g.wide;
+    val halo: u32 = space.span(sp);
+    if (halo < g.halo) {
+        g.hold = g.spread + halo::u64;
+        g.held = g.seq;
+        if (g.limit > g.hold) { g.limit = g.hold; }
     }
+    g.halo = halo;
 
     # while a generation is part way through, the front is counted and reduced
     # again only once it changed
@@ -2304,7 +2319,7 @@ pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, 
     snap.edits  = g.edits;
     snap.cap    = g.p.cap;
     snap.hi     = g.hi;
-    snap.wide   = g.wide;
+    snap.span   = g.halo;
     snap.owned  = g.owns;
     ret res[usize, gfx.Error].ok{n};
 }
