@@ -9,7 +9,9 @@
 # cellar.render and cellar.gpu, and the world has no edge, so nothing here
 # names one.
 
+use cellar.boundary;
 use cellar.ceiling;
+use cellar.command;
 use cellar.fill;
 use cellar.history;
 use cellar.pattern;
@@ -18,7 +20,9 @@ use rules: cellar.rule;
 use cellar.rules.weighted;
 use cellar.sim;
 use cellar.space;
+use allo: std.allocator;
 use std.types.bool.bool;
+use std.types.error.err;
 use std.types.option.opt;
 use std.types.size.usize;
 use std.types.string;
@@ -242,13 +246,61 @@ pub fun choose_region(s: *sim.Sim, x: i64, y: i64) {
     sim.choose_region(s, x, y);
 }
 
-# set the cell at world (x, y) live (v = 1) or dead (v = 0)
-pub fun paint(s: *sim.Sim, x: i64, y: i64, v: u8) {
-    sim.paint(s, x, y, v);
+# the mode the pen paints a state in: a dead cell is the eraser's, which takes
+# a wall away with the cell, and any other is drawn past the walls
+fun pen_mode(v: u8) u8 {
+    if (v == 0) { ret sim.EDIT_ERASE; }
+    ret sim.EDIT_CELLS;
 }
 
-# set every cell on the line from (x0, y0) to (x1, y1), ends included
+# set the cell at world (x, y) to a state, live (v = 1) or dead (v = 0), a
+# dead one erasing a wall there too
+pub fun paint(s: *sim.Sim, x: i64, y: i64, v: u8) {
+    sim.paint_as(s, x, y, v, pen_mode(v));
+}
+
+# set every cell on the line from (x0, y0) to (x1, y1), ends included, as
+# paint sets one
 pub fun line(s: *sim.Sim, x0: i64, y0: i64, x1: i64, y1: i64, v: u8) {
+    line_as(s, x0, y0, x1, y1, v, pen_mode(v));
+}
+
+# draw walls with the wall tool: a brush stroke along a line, or a rectangle
+# or the ellipse inscribed in one, each wall holding the command's state
+# ---
+# s:   simulation
+# c:   the walls
+# ret: why they were not drawn, the world then as it was
+pub fun walls(s: *sim.Sim, c: *command.Walls) opt[str] {
+    if (c.shape == command.WALLS_LINE) {
+        val held: opt[str] = sim.hold_walls(s);
+        if (sel held.some) { ret held; }
+        line_as(s, c.x0, c.y0, c.x1, c.y1, c.v, sim.EDIT_WALLS);
+        ret opt[str].none{};
+    }
+    var x0: i64 = c.x0;
+    var x1: i64 = c.x1;
+    var y0: i64 = c.y0;
+    var y1: i64 = c.y1;
+    if (x1 < x0) {
+        x0 = c.x1;
+        x1 = c.x0;
+    }
+    if (y1 < y0) {
+        y0 = c.y1;
+        y1 = c.y0;
+    }
+    var r: boundary.Region = boundary.init(s.space.a);
+    fin { boundary.dnit(?r); }
+    var made: err[allo.Error] = err[allo.Error].ok{};
+    if (c.shape == command.WALLS_RECT) { made = boundary.rect(?r, x0, y0, x1 + 1, y1 + 1); }
+    or                                 { made = boundary.ellipse(?r, x0, y0, x1 + 1, y1 + 1); }
+    if (sel made.err)                  { ret opt[str].some{"the shape could not be held"}; }
+    ret sim.paint_region(s, ?r, c.v, sim.EDIT_WALLS);
+}
+
+# set every cell on a line as paint does, each write doing mode to walls
+fun line_as(s: *sim.Sim, x0: i64, y0: i64, x1: i64, y1: i64, v: u8, mode: u8) {
     var dx: i64 = x1 - x0;
     var dy: i64 = y1 - y0;
     var sx: i64 = 1;
@@ -265,7 +317,7 @@ pub fun line(s: *sim.Sim, x0: i64, y0: i64, x1: i64, y1: i64, v: u8) {
     var x: i64 = x0;
     var y: i64 = y0;
     for {
-        sim.paint(s, x, y, v);
+        sim.paint_as(s, x, y, v, mode);
         if (x == x1 && y == y1) { brk; }
         val e2: i64 = e * 2;
         if (e2 > 0 - dy) {

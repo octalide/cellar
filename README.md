@@ -115,6 +115,7 @@ dropped.
 | `Ctrl+Z`                 | undo                                                             |
 | `Ctrl+Shift+Z`, `Ctrl+Y` | redo                                                             |
 | `D`, `E`, `T`, `V`       | draw, erase, stamp or select tool                                |
+| `L`                      | wall tool                                                        |
 | `Z`, `X`                 | rotate the stamp, flip the stamp                                 |
 | `Q`, `Shift+Q`           | next or previous state to draw, with a rule of more than two     |
 | left mouse               | use the tool; drag to select                                     |
@@ -138,6 +139,15 @@ dropped.
 | `F11`                    | toggle borderless fullscreen                                     |
 | `F12`                    | screenshot                                                       |
 | `Esc`                    | close the reference, deselect, or quit                           |
+
+Walls are cells with a fixed state that the live cells around them read but
+never change. The wall tool draws them with a brush, a rectangle or an
+ellipse, each wall dead or holding the pen's state: alive, or under Lenia and
+reaction-diffusion a fixed value, a source or a sink. The eraser takes them
+away. Drawing, stamping, randomizing and the selection's operations leave
+them where they stand, and a clear removes them. They show in a stone colour
+of their own in every colour mode, and HashLife does not run a world that has
+them.
 
 Undo steps back through strokes, stamps, selection operations, pastes, rule
 changes, clears, randomizes, resets, loads and dropped files, with as many steps as 256 MiB of

@@ -445,6 +445,7 @@ fun keys(ctx: *Context, g: *Game) {
     if (inp.key_pressed(in, inp.KEY_Q))                                    { app.step_ink(a, rule.states(?g.shown.rule), shift); }
     if (inp.key_pressed(in, inp.KEY_V) && !ctrl)                           { a.tool = app.TOOL_SELECT; }
     if (inp.key_pressed(in, inp.KEY_W))                                    { a.tool = app.TOOL_BOUNDS; }
+    if (inp.key_pressed(in, inp.KEY_L))                                    { a.tool = app.TOOL_WALL; }
     if (inp.key_pressed(in, inp.KEY_V) && ctrl)                            { paste(ctx, a, shift); }
     if (z && !ctrl)                                                        { a.orient = pattern.orient_turn(a.orient); }
     if (z && ctrl && !shift)                                               { app.submit(a, command.Command.undo{}); }
@@ -589,7 +590,8 @@ fun edit_world(g: *Game, cam: render.Camera) {
         ret;
     }
     if (!over_world(g)) {
-        a.stroke = false;
+        a.stroke  = false;
+        a.walling = false;
         ret;
     }
     var cx: i64 = 0;
@@ -605,6 +607,10 @@ fun edit_world(g: *Game, cam: render.Camera) {
     }
     if (a.tool == app.TOOL_STAMP) {
         if (h.pressed) { arrange.stamp_active(a, cx, cy); }
+        ret;
+    }
+    if (a.tool == app.TOOL_WALL) {
+        walls(a, h, cx, cy);
         ret;
     }
     if (a.tool == app.TOOL_SELECT) {
@@ -627,6 +633,62 @@ fun edit_world(g: *Game, cam: render.Camera) {
     a.stroke = true;
     a.last_x = cx;
     a.last_y = cy;
+}
+
+# the wall tool under the pointer at cell (cx, cy): the brush draws a stroke
+# of walls as the pen draws cells, and a shape is dragged out from the press
+# and drawn as it is let go
+fun walls(a: *app.App, h: *bint.Hit, cx: i64, cy: i64) {
+    val v: u8 = app.wall_state(a);
+    if (a.wall_shape == app.WALL_BRUSH) {
+        if (!h.held) {
+            a.stroke = false;
+            ret;
+        }
+        var w: command.Walls = command.Walls{shape: command.WALLS_LINE, x0: cx, y0: cy, x1: cx, y1: cy, v: v, joins: a.stroke};
+        if (a.stroke) {
+            w.x0 = a.last_x;
+            w.y0 = a.last_y;
+        }
+        app.submit(a, command.Command.walls{w});
+        a.stroke = true;
+        a.last_x = cx;
+        a.last_y = cy;
+        ret;
+    }
+    if (h.pressed) {
+        a.walling  = true;
+        a.anchor_x = cx;
+        a.anchor_y = cy;
+    }
+    if (!a.walling) { ret; }
+    a.wall_x = cx;
+    a.wall_y = cy;
+    if (h.held) { ret; }
+    a.walling = false;
+    var shape: u8 = command.WALLS_RECT;
+    if (a.wall_shape == app.WALL_ELLIPSE) { shape = command.WALLS_ELLIPSE; }
+    app.submit(a, command.Command.walls{command.Walls{shape: shape, x0: a.anchor_x, y0: a.anchor_y, x1: cx, y1: cy, v: v, joins: false}});
+}
+
+# the box a wall shape being dragged out covers, as it would be drawn
+fun wall_drag(g: *Game, d: *paint.Paint, cam: render.Camera) {
+    val a: *app.App = ?g.app;
+    if (a.tool != app.TOOL_WALL || !a.walling) { ret; }
+    var b: space.Box = space.Box{x0: a.anchor_x, y0: a.anchor_y, x1: a.wall_x, y1: a.wall_y};
+    if (b.x1 < b.x0) {
+        b.x0 = a.wall_x;
+        b.x1 = a.anchor_x;
+    }
+    if (b.y1 < b.y0) {
+        b.y0 = a.wall_y;
+        b.y1 = a.anchor_y;
+    }
+    b.x1 = b.x1 + 1;
+    b.y1 = b.y1 + 1;
+    val r: render.Span = render.span(cam, b);
+    paint.rect(d, r.x0, r.y0, r.x1, r.y1, theme.WALL, 0.25);
+    paint.frame(d, r.x0 - 1.0, r.y0 - 1.0, r.x1 + 1.0, r.y1 + 1.0, 1.0, theme.WALL, 0.9);
 }
 
 # a bounded grid's edge as a thin line, and the space off it as the plain
@@ -894,6 +956,7 @@ pub fun on_draw(ctx: *Context) {
     bounds.overlay(?d, a, cam);
     hover(g, ?d, cam);
     ghost(g, ?d, pt, cam);
+    wall_drag(g, ?d, cam);
     val drew: err[gfx.Error] = gui.draw(?g.gui, ?pass);
     if (sel drew.err) { print.eprintlnf("could not draw the interface: {}", gfx.error_message(drew.err)); }
 

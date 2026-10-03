@@ -425,10 +425,21 @@ fun area(c: *command.Area, a: *app.App, s: *sim.Sim, d: *Deps) {
 # no journal step
 val UNRECORDED: u8 = 255;
 
+# whether a command goes on with the stroke before it, as one change
+fun joins(c: *command.Command) bool {
+    if (sel c.walls) { ret c.walls.joins; }
+    ret false;
+}
+
 # the kind of journal step a command runs in, or UNRECORDED
 fun recorded(c: *command.Command) u8 {
     if (sel c.toggle || sel c.step || sel c.jump) { ret journal.KIND_RUN; }
     if (sel c.paint || sel c.line)                { ret journal.KIND_STROKE; }
+    if (sel c.walls) {
+        # a brush stroke of walls is one change, as a paint stroke is
+        if (c.walls.shape == command.WALLS_LINE) { ret journal.KIND_STROKE; }
+        ret journal.KIND_EDIT;
+    }
     if (sel c.area) {
         # shrink and identify only read the world
         if (c.area.op == command.AREA_SHRINK || c.area.op == command.AREA_IDENTIFY) { ret UNRECORDED; }
@@ -561,11 +572,11 @@ fun apply(c: *command.Command, a: *app.App, s: *sim.Sim, d: *Deps) {
     # while running, everything recorded joins the run
     val kind: u8 = recorded(c);
     if (kind != UNRECORDED && !paused)                                                    { journal.begin(?a.log, journal.KIND_RUN, true); }
-    or (kind != UNRECORDED)                                                               { journal.begin(?a.log, kind, kind == journal.KIND_RUN || sel c.line); }
+    or (kind != UNRECORDED)                                                               { journal.begin(?a.log, kind, kind == journal.KIND_RUN || sel c.line || joins(c)); }
     if ((sel c.toggle || sel c.step || sel c.jump) && paused && !s.full && !a.start.held) { take_start(a, s); }
     var change: Change = Change.none{};
-    if (sel c.paint || sel c.line || sel c.stamp || sel c.rule) { change = Change.edit{}; }
-    if (sel c.clear || sel c.randomize)                         { change = Change.fresh{}; }
+    if (sel c.paint || sel c.line || sel c.walls || sel c.stamp || sel c.rule) { change = Change.edit{}; }
+    if (sel c.clear || sel c.randomize)                                        { change = Change.fresh{}; }
     # copy, shrink and identify only read the world
     if (sel c.area) {
         val op: u8 = c.area.op;
@@ -583,9 +594,13 @@ fun apply(c: *command.Command, a: *app.App, s: *sim.Sim, d: *Deps) {
             or                                { app.say(a, "the world has no bounded grid to fill"); }
         }
     }
-    if (sel c.region)     { world.choose_region(s, c.region.x, c.region.y); }
-    if (sel c.paint)      { world.paint(s, c.paint.x, c.paint.y, c.paint.v); }
-    if (sel c.line)       { world.line(s, c.line.x0, c.line.y0, c.line.x1, c.line.y1, c.line.v); }
+    if (sel c.region) { world.choose_region(s, c.region.x, c.region.y); }
+    if (sel c.paint)  { world.paint(s, c.paint.x, c.paint.y, c.paint.v); }
+    if (sel c.line)   { world.line(s, c.line.x0, c.line.y0, c.line.x1, c.line.y1, c.line.v); }
+    if (sel c.walls) {
+        val why: opt[str] = world.walls(s, ?c.walls);
+        if (sel why.some) { app.say_why(a, "the walls were not drawn", why.some); }
+    }
     if (sel c.stamp)      { world.stamp(s, ?c.stamp.p, c.stamp.x, c.stamp.y); }
     if (sel c.rule)       { rule_to(a, s, c.rule); }
     if (sel c.engine)     { engine(a, s, c.engine); }
@@ -1604,6 +1619,62 @@ test run__bounds_move_the_world_and_the_view_drop_what_falls_off_and_undo_puts_b
     run(?ap, ?s, ?d);
     if (sim.on_tree(?s) || !sim.alive(?s, -3, -4))                    { ret 18; }
     if (!string.str_ends_with(ap.toast, "moved to the chunk engine")) { ret 19; }
+    app.dnit(?ap);
+    sim.dnit(?s);
+    ret 0;
+}
+
+# whether every cell of row y from x0 to x1, ends included, is a wall
+#[testing]
+fun walls_along(s: *sim.Sim, x0: i64, x1: i64, y: i64) bool {
+    var x: i64 = x0;
+    for (x <= x1) {
+        if (!sim.wall_at(s, x, y)) { ret false; }
+        x = x + 1;
+    }
+    ret true;
+}
+
+test run__a_wall_stroke_a_wall_shape_and_an_erase_are_each_one_change {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    var ap: app.App;
+    app.init(?ap);
+    val shown: err[format.Error] = app.attach(?ap, ?a);
+    if (sel shown.err) { ret 1; }
+    var d: Deps;
+
+    # a stroke of dead walls with the brush, then a rectangle of live ones
+    app.submit(?ap, command.Command.walls{command.Walls{shape: command.WALLS_LINE, x0: 0, y0: 0, x1: 0, y1: 0, v: 0, joins: false}});
+    app.submit(?ap, command.Command.walls{command.Walls{shape: command.WALLS_LINE, x0: 0, y0: 0, x1: 5, y1: 0, v: 0, joins: true}});
+    run(?ap, ?s, ?d);
+    app.submit(?ap, command.Command.walls{command.Walls{shape: command.WALLS_RECT, x0: 14, y0: 12, x1: 10, y1: 10, v: 1, joins: false}});
+    run(?ap, ?s, ?d);
+    if (!walls_along(?s, 0, 5, 0) || sim.alive(?s, 3, 0))                           { ret 2; }
+    if (!walls_along(?s, 10, 14, 10) || !walls_along(?s, 10, 14, 12))               { ret 3; }
+    if (!sim.alive(?s, 12, 11) || sim.wall_at(?s, 15, 11) || sim.wall_at(?s, 6, 0)) { ret 3; }
+    # the eraser takes a wall away with its cell
+    app.submit(?ap, command.Command.paint{command.Paint{x: 12, y: 11, v: 0}});
+    run(?ap, ?s, ?d);
+    if (sim.wall_at(?s, 12, 11) || sim.alive(?s, 12, 11)) { ret 4; }
+    # each undoes as one change, the last wall taking the layer with it
+    app.submit(?ap, command.Command.undo{});
+    run(?ap, ?s, ?d);
+    if (!sim.wall_at(?s, 12, 11) || !sim.alive(?s, 12, 11)) { ret 5; }
+    app.submit(?ap, command.Command.undo{});
+    run(?ap, ?s, ?d);
+    if (sim.wall_at(?s, 12, 11) || sim.alive(?s, 12, 11) || !walls_along(?s, 0, 5, 0)) { ret 6; }
+    app.submit(?ap, command.Command.undo{});
+    run(?ap, ?s, ?d);
+    if (sim.walls(?s) || sim.wall_at(?s, 3, 0)) { ret 7; }
+    app.submit(?ap, command.Command.redo{});
+    app.submit(?ap, command.Command.redo{});
+    run(?ap, ?s, ?d);
+    if (!walls_along(?s, 0, 5, 0) || !walls_along(?s, 10, 14, 11) || !sim.alive(?s, 12, 11)) { ret 8; }
+
     app.dnit(?ap);
     sim.dnit(?s);
     ret 0;
