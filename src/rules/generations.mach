@@ -9,8 +9,9 @@
 # births without causing any.
 #
 # its rule string is B/S/C notation, "B2/S/C3" for Brian's Brain, or the older
-# survive/birth/states form Golly also reads, "/2/3". its cell word is
-# cellar.rules.generations.word's, and its step stage is generations_comp.
+# survive/birth/states form Golly also reads, "/2/3". its cells are an 8-bit
+# state layer of cellar.rules.generations.word's values, and its step stage is
+# generations_comp.
 
 use cellar.layer.plane;
 use cellar.layout;
@@ -188,14 +189,14 @@ pub fun states(r: *Rule) u32 {
     ret r.states;
 }
 
-# the word a fresh cell of a state is written as
+# the value a fresh cell of a state is written as
 pub fun word_of(r: *Rule, state: u32) u32 {
     ret word.word(state, r.states);
 }
 
-# the state a word holds, its heat aside
-pub fun state_of(c: u32) u32 {
-    ret c & word.STATE_MASK;
+# the state a value holds
+pub fun state_of(r: *Rule, c: u32) u32 {
+    ret word.state(c, r.states);
 }
 
 # the state painted or seeded when none is chosen: the live one
@@ -215,10 +216,10 @@ pub fun rest_of(r: *Rule, state: u32, k: usize) u32 {
     ret 0;
 }
 
-# the layers the family's cells are stored in (cellar.layer): its word as
-# the state layer, word.WIDTH bits wide
+# the layers the family's cells are stored in (cellar.layer): the state
+# layer alone, word.WIDTH bits wide
 pub fun layers(r: *Rule) plane.Set {
-    ret plane.state("state and heat", word.WIDTH);
+    ret plane.state("state", word.WIDTH);
 }
 
 # how shared code reads a value of the family's state layer
@@ -242,14 +243,6 @@ pub fun radius(r: *Rule) usize {
 # continuous: a cell's state is all it holds, in every rule
 pub fun caps(r: *Rule) family.Caps {
     ret family.Caps{b0: false, isotropic: true, no_tree: nil, bounded: true, life_like: r.states == 2, continuous: false};
-}
-
-# the next word of a cell given its word and its live neighbour count
-pub fun next(r: *Rule, c: u32, count: u32) u32 {
-    val st:   u32 = c & word.STATE_MASK;
-    var mask: u32 = r.birth;
-    if (st == word.LIVE) { mask = r.survive; }
-    ret word.word(word.next(st, r.states, (mask >> count) & 1), r.states);
 }
 
 # the state a cell becomes from the states of the 3 by 3 block around it
@@ -281,31 +274,45 @@ pub fun next_of(r: *Rule, nb: *u32) u32 {
 pub fun step_chunk(r: *Rule, b: *space.Block, t: *space.Tally) {
     val own: *u32 = space.block_own(b, 0).w;
     val out: *u32 = space.block_out(b, 0).w;
-    var ly:  i64  = 0;
+    # the state of every value and the value of every state, worked out once
+    var state_of_value: [256]u8;
+    var value_of_state: [256]u32;
+    var k:              u32 = 0;
+    for (k <= word.HEAT_MASK) {
+        state_of_value[k::usize] = word.state(k, r.states)::u8;
+        value_of_state[k::usize] = word.word(k, r.states);
+        k                        = k + 1;
+    }
+    # which of the chunk's cells and the ring around it are live, each read
+    # once rather than once per neighbour that counts it
+    var lit: [FRAME * FRAME]u8;
+    if (b.busy) {
+        var fy: i64 = 0;
+        for (fy < FRAME) {
+            var fx: i64 = 0;
+            for (fx < FRAME) {
+                lit[(fy * FRAME + fx)::usize] = (space.block_cell(b, word.WIDTH, fx - 1, fy - 1) == word.LIVE_VALUE)::u8;
+                fx                            = fx + 1;
+            }
+            fy = fy + 1;
+        }
+    }
+    var ly: i64 = 0;
     for (ly < 64) {
         var lx: i64 = 0;
         for (lx < 64) {
             val i:     usize = (ly * 64 + lx)::usize;
             var count: u32   = 0;
             if (b.busy) {
-                var dy: i64 = -1;
-                for (dy <= 1) {
-                    var dx: i64 = -1;
-                    for (dx <= 1) {
-                        if (dx != 0 || dy != 0) {
-                            val x: i64 = lx + dx;
-                            val y: i64 = ly + dy;
-                            var c: u32 = 0;
-                            if (x >= 0 && x < 64 && y >= 0 && y < 64) { c = plane.load(own, word.WIDTH, (y * 64 + x)::usize); }
-                            or                                        { c = space.block_cell(b, word.WIDTH, x, y); }
-                            if ((c & word.STATE_MASK) == word.LIVE)   { count = count + 1; }
-                        }
-                        dx = dx + 1;
-                    }
-                    dy = dy + 1;
-                }
+                val up: usize = (ly * FRAME + lx)::usize;
+                val at: usize = up + FRAME::usize;
+                val dn: usize = at + FRAME::usize;
+                count = (lit[up] + lit[up + 1] + lit[up + 2] + lit[at] + lit[at + 2] + lit[dn] + lit[dn + 1] + lit[dn + 2])::u32;
             }
-            val v: u32 = next(r, plane.load(own, word.WIDTH, i), count);
+            val st:   u32 = state_of_value[plane.load(own, word.WIDTH, i)::usize]::u32;
+            var mask: u32 = r.birth;
+            if (st == word.LIVE) { mask = r.survive; }
+            val v: u32 = value_of_state[word.next(st, r.states, (mask >> count) & 1)::usize];
             plane.store(out, word.WIDTH, i, v);
             space.note(t, v, lx::u32, ly::u32);
             lx = lx + 1;
@@ -313,6 +320,10 @@ pub fun step_chunk(r: *Rule, b: *space.Block, t: *space.Tally) {
         ly = ly + 1;
     }
 }
+
+# side of the frame the CPU step reads a chunk's cells into, the chunk and a
+# cell around it
+val FRAME: i64 = 66;
 
 # pack a rule into the family's window of the meta head, as its stage reads it
 # ---
@@ -447,12 +458,12 @@ fun fam_rest_of(p: *family.Payload, state: u32, k: usize) u32 {
 }
 
 fun fam_state_of(p: *family.Payload, c: u32) u32 {
-    ret state_of(c);
+    ret state_of(held(p), c);
 }
 
 # a cell's state, read from its state layer alone
 fun fam_word_state(p: *family.Payload, w: *u32) u32 {
-    ret state_of(w[0]);
+    ret state_of(held(p), w[0]);
 }
 
 fun fam_ink(p: *family.Payload) u32 {
@@ -538,17 +549,18 @@ test format__round_trips_through_parse {
 }
 
 test word__gives_every_state_its_own_heat {
-    var n: u32 = 2;
+    val sn: layout.Sense = word.sense();
+    var n:  u32          = 2;
     for (n <= word.STATES_MAX) {
         var st:   u32 = 0;
         var last: u32 = 256;
         for (st < n) {
             val c: u32 = word.word(st, n);
-            if ((c & word.STATE_MASK) != st) { ret 1; }
-            val h: u32 = c >> word.HEAT_SHIFT;
-            if (st != 0 && (h == 0 || h >= last))            { ret 2; }
-            if (layout.live(c, 255, 1, 1) != (st == 1)::u32) { ret 3; }
-            if (st != 0)                                     { last = h; }
+            if (word.state(c, n) != st || c > word.HEAT_MASK) { ret 1; }
+            val h: u32 = layout.texel_heat(c, sn.heat_shift, sn.heat_mask);
+            if (st != 0 && (h == 0 || h >= last))                                       { ret 2; }
+            if (layout.live(c, sn.live_mask, sn.live_lo, sn.live_hi) != (st == 1)::u32) { ret 3; }
+            if (st != 0)                                                                { last = h; }
             st = st + 1;
         }
         n = n + 1;
