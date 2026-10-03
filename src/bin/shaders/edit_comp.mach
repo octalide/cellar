@@ -1,20 +1,23 @@
-# write painted cells into a layer narrower than a word, on the GPU
+# write painted cells into layers narrower than a word, on the GPU
 #
 # a cell painted while the GPU steps goes up as an edit (cellar.layout.Edits):
-# the word of the layer it lies in, the bits it takes there and its value in
-# them. an invocation applies one, clearing the cell's bits and setting its
-# value with atomics on the word, so edits of cells that share a word, applied
-# at once by other invocations, leave each other alone, and the host need not
-# hold the word's other cells as the GPU holds them. the host sends a cell's
-# last edit alone, and a dispatch for each layer edits it.
+# its slot, its layer and the word of the slot's span it lies in, the bits it
+# takes there and its value in them. an invocation applies one to the front
+# cells the edits name, reached by address, clearing the cell's bits and
+# setting its value with atomics on the word, so edits of cells that share a
+# word, applied at once by other invocations, leave each other alone, and the
+# host need not hold the word's other cells as the GPU holds them. the host
+# sends a cell's last edit alone.
 
+use cellar.layer;
+use cellar.layout;
 use cellar.layout.Edits;
-use cellar.layout.Layer;
+use cellar.layout.Meta;
 use at: shader.atomic;
 use sy: shader.sync;
 
-#[storage(1, 0)]
-var cells: Layer;
+#[storage(1, 0, "readonly")]
+var meta:  Meta;
 #[storage(1, 1, "readonly")]
 var edits: Edits;
 
@@ -29,8 +32,14 @@ val RX:  u32 = sy.SEMANTICS_RELAXED;
 fun comp_main() {
     val i: u32 = gid[0];
     if (i >= edits.n) { ret; }
-    val w: u32 = edits.v[i * 3];
-    val m: u32 = edits.v[i * 3 + 1];
-    at.atomic_and_u32(?cells.v[w], DEV, RX, ~m);
-    at.atomic_or_u32(?cells.v[w], DEV, RX, edits.v[i * 3 + 2] & m);
+    val slot:  u32          = edits.v[i * 4];
+    val kw:    u32          = edits.v[i * 4 + 1];
+    val m:     u32          = edits.v[i * 4 + 2];
+    val k:     u32          = kw >> layout.EDIT_LAYER;
+    val width: u32          = layer.width_in(meta.base[layout.WIDTHS_AT - layout.BASE_AT], k);
+    val place: layout.Where = layout.where(slot, meta.base[layout.SHARD_AT - layout.BASE_AT]);
+    val s:     layout.Span  = layer.span(meta.shards, k, edits.front, place, width);
+    val w:     u32          = s.at + (kw & ((1 << layout.EDIT_LAYER) - 1));
+    at.atomic_and_u32(?s.p.v[w], DEV, RX, ~m);
+    at.atomic_or_u32(?s.p.v[w], DEV, RX, edits.v[i * 4 + 3] & m);
 }
