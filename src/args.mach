@@ -6,7 +6,7 @@
 # twice or a second file is refused, and the binary says why and exits rather
 # than starting.
 #
-#   cellar [--version] [--capture <file.png>] [--bench <gpu|cpu> <dense|sparse|gun|footprint|pause|torus|plane|box> [seconds [radius [speed]]]]
+#   cellar [--version] [--capture <file.png>] [--bench <gpu|cpu> <dense|sparse|gun|footprint|pause|torus|plane|box> [seconds [radius [speed]]] [--rule <rule>]]
 #          [--engine <cpu|gpu|hashlife>] [--] [file]
 #   cellar run <pattern> --gens <n> [--rule <rule>] [--engine <cpu|hashlife>] [--out <file>] [--quiet]
 #              [--max-population <n|off>] [--max-pool-memory <MiB|off>] [--max-memory <MiB|off>] [--max-step-ms <ms|off>] [--]
@@ -35,7 +35,7 @@ use std.types.string.str;
 use std.types.string.str_equals;
 
 # the usage printed with a refusal of the session's command line, both forms
-pub val USAGE: str = "usage: cellar [--version] [--capture <file.png>] [--bench <gpu|cpu> <dense|sparse|gun|footprint|pause|torus|plane|box> [seconds [radius [speed]]]]\n              [--engine <cpu|gpu|hashlife>] [--] [file]\n       cellar run <pattern> --gens <n> [--rule <rule>] [--engine <cpu|hashlife>] [--out <file>] [--quiet]\n                  [--max-population <n|off>] [--max-pool-memory <MiB|off>] [--max-memory <MiB|off>] [--max-step-ms <ms|off>] [--]";
+pub val USAGE: str = "usage: cellar [--version] [--capture <file.png>] [--bench <gpu|cpu> <dense|sparse|gun|footprint|pause|torus|plane|box> [seconds [radius [speed]]] [--rule <rule>]]\n              [--engine <cpu|gpu|hashlife>] [--] [file]\n       cellar run <pattern> --gens <n> [--rule <rule>] [--engine <cpu|hashlife>] [--out <file>] [--quiet]\n                  [--max-population <n|off>] [--max-pool-memory <MiB|off>] [--max-memory <MiB|off>] [--max-step-ms <ms|off>] [--]";
 
 # the usage printed with a refusal of a batch run, its form alone
 pub val RUN_USAGE: str = "usage: cellar run <pattern> --gens <n> [--rule <rule>] [--engine <cpu|hashlife>] [--out <file>] [--quiet]\n                  [--max-population <n|off>] [--max-pool-memory <MiB|off>] [--max-memory <MiB|off>] [--max-step-ms <ms|off>] [--]";
@@ -116,6 +116,7 @@ pub rec Run {
 # bench_r:    the radius the measured rule reads, Life's weights widened to it, or
 #             the radius of the footprint world's kernel
 # bench_gps:  generations a second the measurement is capped at, 0 uncapped
+# bench_rule: the rule every world of the measurement runs under, or nil for Life
 # engine:     the ENGINE_* the world runs on
 # open:       a world or pattern file to open, or nil
 pub rec Args {
@@ -128,6 +129,7 @@ pub rec Args {
     bench_secs: f64;
     bench_r:    usize;
     bench_gps:  usize;
+    bench_rule: str;
     engine:     u8;
     open:       str;
 }
@@ -381,6 +383,7 @@ pub fun parse(argc: i64, argv: *str) res[Args, Error] {
     r.bench_secs = BENCH_SECS;
     r.bench_r    = 1;
     r.bench_gps  = 0;
+    r.bench_rule = nil;
     r.engine     = ENGINE_ANY;
     r.open       = nil;
     if (is_run(argc, argv)) {
@@ -415,6 +418,11 @@ pub fun parse(argc: i64, argv: *str) res[Args, Error] {
         }
         if (str_equals(s, "--engine")) {
             val bad: opt[Error] = engine_value(argc, argv, ?i, ?r.engine, true);
+            if (sel bad.some) { ret res[Args, Error].err{bad.some}; }
+            cnt;
+        }
+        if (str_equals(s, "--rule")) {
+            val bad: opt[Error] = value(argc, argv, ?i, r.bench_rule != nil, s, ?r.bench_rule);
             if (sel bad.some) { ret res[Args, Error].err{bad.some}; }
             cnt;
         }
@@ -454,6 +462,8 @@ pub fun parse(argc: i64, argv: *str) res[Args, Error] {
         }
         ret res[Args, Error].err{Error.unknown{s}};
     }
+    # the rule is the measurement's, so a session has none to give it to
+    if (r.bench_rule != nil && r.bench == BENCH_NONE) { ret res[Args, Error].err{Error.absent{"--bench"}}; }
     ret res[Args, Error].ok{r};
 }
 
@@ -496,6 +506,9 @@ test parse__takes_options_in_any_order_around_the_file {
     val t: res[Args, Error] = line("--bench", "gpu", "torus");
     if (!sel t.ok)                 { ret 17; }
     if (t.ok.bench != BENCH_TORUS) { ret 18; }
+    val m: res[Args, Error] = line("--bench", "gpu", "dense", "2", "--rule", "R=13,T=10,b=[1],m=0.15,s=0.015,kn=1,gn=1");
+    if (!sel m.ok)                                                                                          { ret 19; }
+    if (!str_equals(m.ok.bench_rule, "R=13,T=10,b=[1],m=0.15,s=0.015,kn=1,gn=1") || m.ok.bench_secs != 2.0) { ret 20; }
     val e: res[Args, Error] = line();
     if (!sel e.ok)                                                           { ret 9; }
     if (e.ok.open != nil || e.ok.capture != nil || e.ok.bench != BENCH_NONE) { ret 10; }
@@ -511,6 +524,8 @@ test parse__refuses_unknown_options_missing_values_and_a_second_file {
     if (!(sel c.err && sel c.err.missing)) { ret 3; }
     val d: res[Args, Error] = line("--bench", "tpu", "dense");
     if (!(sel d.err && sel d.err.value)) { ret 4; }
+    val rb: res[Args, Error] = line("--rule", "B3/S23");
+    if (!(sel rb.err && sel rb.err.absent)) { ret 20; }
     val e: res[Args, Error] = line("a.rle", "b.rle");
     if (!(sel e.err && sel e.err.extra)) { ret 5; }
     val f: res[Args, Error] = line("--capture", "a.png", "--capture", "b.png");
