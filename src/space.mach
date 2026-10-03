@@ -154,16 +154,37 @@ pub val DIRTY_MIP: u8 = 8;
 #
 # a device that allocates and frees chunks itself owns the pool between the
 # times the host takes it back, and own brings the host's page table level
-# with the device's before anything here reads or changes it.
+# with the device's before anything here reads or changes it. a chunk the
+# pool moves to another slot (relocate) is moved in the copy too, by the
+# mirror where it holds the chunk's cells as the world's, else by sending it
+# again as the pool holds it. a pool emptied whole (reset) needs nothing the
+# device holds, so it is handed back emptied rather than brought level.
 # ---
-# ctx:     the mirror's own state, passed back to reserve and own
+# ctx:     the mirror's own state, passed back to reserve, own, empty and move
 # reserve: make room for a pool of the given slots; false refuses the growth
 # own:     hand the pool to the host, bringing its page table level first;
 #          false keeps it the mirror's, as when the host could not hold it
+# empty:   hand the pool to the host, which is about to free every slot,
+#          reading nothing back: the mirror empties its own copy in turn
+# move:    the chunks the pool is about to move, n slots they move from,
+#          ascending, and the slot each moves to; what the mirror does (Follow)
 pub rec Mirror {
     ctx:     *u8;
     reserve: fun(*u8, usize) bool;
     own:     fun(*u8) bool;
+    empty:   fun(*u8);
+    move:    fun(*u8, *u32, *u32, usize) Follow;
+}
+
+# what a mirror does with the chunks the pool is about to move (Mirror move)
+# ---
+# refuse: nothing may move, as when the mirror could not keep the moves
+# send:   the pool marks the chunks moved to be sent whole, as it holds them
+# carry:  the mirror moves its own copy of their cells, the world's
+pub tag Follow: u8 {
+    refuse;
+    send;
+    carry;
 }
 
 # the pool
@@ -1599,7 +1620,8 @@ pub fun wake(sp: *Space, s: usize) {
 # and pyramids as they stand, for a mirror to send from while the pool steps on
 # (cellar.runner)
 #
-# the page table is copied whole, and the cells and pyramids of the chunks in
+# the view takes the pool's capacity, larger or smaller. the page table is
+# copied whole, and the cells and pyramids of the chunks in
 # box that changed since the last stage, whose dirty marks move from the pool
 # to the view, for the mirror to clear. a chunk out of box keeps its marks
 # until a stage finds it in box, so a mirror that sends only what a draw can
@@ -1629,6 +1651,16 @@ pub fun stage(dst: *Space, src: *Space, full: bool, box: *i64) bool {
     if (dst.cap < src.cap) {
         val grown: err[allo.Error] = alloc_arrays(dst, src.cap);
         if (sel grown.err) { ret false; }
+    }
+    # a pool that shrank (relocate, shrink) has the view follow it, whole
+    if (dst.cap > src.cap) {
+        if (dst.hi > src.cap) {
+            mem.zero[u32](?dst.table[src.cap * ENTRY], (dst.hi - src.cap) * ENTRY);
+            dst.hi = src.cap;
+        }
+        val shrunk: err[allo.Error] = alloc_arrays(dst, src.cap);
+        if (sel shrunk.err) { ret false; }
+        all = true;
     }
     # every slot either side used since the last stage, or every slot at all
     var top: usize = src.hi;
@@ -1679,9 +1711,11 @@ pub fun stage(dst: *Space, src: *Space, full: bool, box: *i64) bool {
 }
 
 # free every slot, keeping the capacity, and on a grid held whole hold every
-# chunk again, empty
+# chunk again, empty. a mirror that owns the pool hands it back emptied, its
+# page table never read (Mirror empty), so what the host held of it is stale
+# and goes too
 pub fun reset(sp: *Space) {
-    if (!own(sp)) { ret; }
+    if (sp.mirrored) { sp.mirror.empty(sp.mirror.ctx); }
     mem.zero[u32](sp.table, sp.hi * ENTRY);
     mem.zero[u32](sp.census, sp.hi * CENSUS);
     mem.fill[u32](sp.hash, NONE, sp.hcap);
@@ -1954,14 +1988,153 @@ pub fun adopt(sp: *Space, n: usize, landed: *u32) {
 }
 
 # shrink the pool to hold cap slots, the slots in use all lying below it
-# (compact), so a pool grown for a world since cleared or gone takes no more
+# (relocate), so a pool grown for a world since cleared or gone takes no more
 # than the world it holds. a mirror follows it (cellar.gpu shrink)
 # ---
-# sp:  the pool, compacted, with hi at most cap
+# sp:  the pool, with hi at most cap
 # cap: the slots it holds, no more than it holds now
 # ret: ok, or the allocator's refusal, which leaves the pool as it was
 pub fun shrink(sp: *Space, cap: usize) err[allo.Error] {
     if (cap >= sp.cap) { ret err[allo.Error].ok{}; }
+    ret alloc_arrays(sp, cap);
+}
+
+# move every chunk in a slot at or past cap into a free slot below it, the
+# lowest first, so the pool may shrink to cap slots (shrink)
+#
+# a chunk moves whole: its entry, its cells in every layer and both halves,
+# its pyramids, its census and its marks, and every entry naming its slot
+# names the new one. the slots it leaves are free. every entry that changed is
+# marked dirty, and the mirror is shown the moves first (Mirror move), which
+# it moves its copy of or has sent. a pool held whole never moves a chunk.
+# ---
+# sp:  the pool, which the host must own (own)
+# cap: the slots its chunks are to lie below
+# ret: false when the mirror keeps the pool or refuses the moves, the pool is
+#      held whole, more chunks are in use than cap holds or the allocator
+#      refused, the pool then as it was
+pub fun relocate(sp: *Space, cap: usize) bool {
+    if (!own(sp) || sp.whole || sp.live > cap) { ret false; }
+    compact(sp);
+    if (sp.hi <= cap) { ret true; }
+    # the movers, and the free slots they move into, lowest first: compact
+    # left the free slots highest first, and as many lie below cap as move
+    var n: usize = 0;
+    var s: usize = cap;
+    for (s < sp.hi) {
+        if (used(sp, s)) { n = n + 1; }
+        s = s + 1;
+    }
+    val rf: res[*u32, allo.Error] = allo.allocate[u32](sp.a, n * 2);
+    if (sel rf.err) { ret false; }
+    val from: *u32  = rf.ok;
+    val to:   *u32  = ?from[n];
+    var i:    usize = 0;
+    s = cap;
+    for (s < sp.hi) {
+        if (used(sp, s)) {
+            from[i] = s::u32;
+            to[i]   = sp.frees[sp.nfree - 1 - i];
+            i       = i + 1;
+        }
+        s = s + 1;
+    }
+    var follow: Follow = Follow.send{};
+    if (sp.mirrored) { follow = sp.mirror.move(sp.mirror.ctx, from, to, n); }
+    if (sel follow.refuse) {
+        allo.deallocate[u32](sp.a, from, n * 2);
+        ret false;
+    }
+    sp.nfree = sp.nfree - n;
+    i        = 0;
+    for (i < n) {
+        move_slot(sp, from[i]::usize, to[i]::usize);
+        i = i + 1;
+    }
+    # every neighbour named past cap moved, and its old entry names where to
+    var x: usize = 0;
+    for (x < cap) {
+        if (used(sp, x)) {
+            val e: *u32  = ?sp.table[x * ENTRY];
+            var k: usize = 0;
+            for (k < 9) {
+                val nb: u32 = e[k];
+                if (k != 4 && nb != NONE && nb::usize >= cap) {
+                    e[k]        = sp.table[nb::usize * ENTRY + 4];
+                    sp.dirty[x] = sp.dirty[x] | DIRTY_ENTRY;
+                }
+                k = k + 1;
+            }
+        }
+        x = x + 1;
+    }
+    i = 0;
+    for (i < n) {
+        mem.zero[u32](?sp.table[from[i]::usize * ENTRY], ENTRY);
+        i = i + 1;
+    }
+    compact(sp);
+    val send: bool = sel follow.send;
+    i = 0;
+    for (send && i < n) {
+        val d: usize = to[i]::usize;
+        sp.dirty[d] = sp.dirty[d] | DIRTY_CELLS;
+        if (sp.mips != nil) { sp.dirty[d] = sp.dirty[d] | DIRTY_MIP; }
+        i = i + 1;
+    }
+    allo.deallocate[u32](sp.a, from, n * 2);
+    ret true;
+}
+
+# move the chunk in slot s into free slot d, leaving s free but for the word
+# of its entry naming the chunk itself, which names d (relocate)
+fun move_slot(sp: *Space, s: usize, d: usize) {
+    hash_remove(sp, s);
+    mem.copy[u32](?sp.table[d * ENTRY], ?sp.table[s * ENTRY], ENTRY);
+    sp.table[d * ENTRY + 4] = d::u32;
+    mem.zero[u32](?sp.table[s * ENTRY], ENTRY);
+    sp.table[s * ENTRY + 4] = d::u32;
+    var k: usize = 0;
+    for (k < sp.set.n) {
+        val w: usize = span_of(sp, k);
+        mem.copy[u32](?sp.fronts[k][d * w], ?sp.fronts[k][s * w], w);
+        if (sp.backs[k] != nil) { mem.copy[u32](?sp.backs[k][d * w], ?sp.backs[k][s * w], w); }
+        k = k + 1;
+    }
+    if (sp.mips != nil) {
+        mem.copy[u32](?sp.mips[d * MIP], ?sp.mips[s * MIP], MIP);
+        mem.copy[u32](?sp.mips_back[d * MIP], ?sp.mips_back[s * MIP], MIP);
+    }
+    mem.copy[u32](?sp.census[d * CENSUS], ?sp.census[s * CENSUS], CENSUS);
+    mem.copy[u32](?sp.before[d * CENSUS], ?sp.before[s * CENSUS], CENSUS);
+    mem.zero[u32](?sp.census[s * CENSUS], CENSUS);
+    sp.asked[d] = sp.asked[s];
+    sp.asked[s] = 0;
+    sp.dirty[d] = sp.dirty[s] | DIRTY_ENTRY;
+    sp.dirty[s] = DIRTY_ENTRY;
+    hash_put(sp, d);
+}
+
+# let a mirror that owns the pool keep fewer slots of the host's copy, cap of
+# them: the host's page table is the mirror's to bring level when the host
+# next takes the pool (own, adopt), so what it holds past cap goes
+# ---
+# sp:  the pool, whose mirror owns it and holds every chunk below cap
+# cap: the slots it holds, no more than it holds now
+# ret: ok, or the allocator's refusal, which leaves the pool as it was
+pub fun cede(sp: *Space, cap: usize) err[allo.Error] {
+    if (cap >= sp.cap) { ret err[allo.Error].ok{}; }
+    if (sp.hi > cap) {
+        mem.zero[u32](?sp.table[cap * ENTRY], (sp.hi - cap) * ENTRY);
+        sp.hi = cap;
+    }
+    sp.live = 0;
+    var s: usize = 0;
+    for (s < sp.hi) {
+        if (used(sp, s)) { sp.live = sp.live + 1; }
+        s = s + 1;
+    }
+    compact(sp);
     ret alloc_arrays(sp, cap);
 }
 
