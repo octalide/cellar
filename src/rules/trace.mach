@@ -1,16 +1,19 @@
 # a family that exists only for tests, registered at run time
-# (cellar.rule.family), that holds the contract to the members furthest from
-# the families every build runs: the CPU alone steps it, having no stage, and
-# its word is a 16-bit state layer with rule layers of 32 and 16 bits beside
-# it, 64 bits in all.
+# (cellar.rule.family), whose cells are live by a rule layer alone: an 8-bit
+# state layer, 0 or 1, and a 16-bit trace layer declared live (cellar.layer),
+# stepped on both engines, the GPU's through a stage that binds the trace
+# layer beside the state layer.
 #
-# its rule is "probe": a cell keeps its state, 0 or 1, forever. a live cell's
-# first rule layer counts the generations it has lived, from a fresh cell's
-# AGED, and its second holds MARK, both untouched while it is dead
+# its rule is "trace": a cell keeps its state forever, and its trace counts
+# down to zero, a generation at a time. a cell holding a trace and state 0 is
+# live while the trace lasts, so the census counts it, its chunk is kept and
+# asks for its halo, and its pyramid shows it, on both engines, until the
+# trace runs out and the chunk, holding nothing else, is freed.
 
 use cellar.layer.plane;
 use cellar.layout;
 use cellar.rule.family;
+use cellar.rules.trace.word;
 use cellar.space;
 use cellar.text;
 use std.types.bool.bool;
@@ -22,6 +25,9 @@ use std.types.size.usize;
 use std.types.string;
 use std.types.string.str;
 
+#[embed("{artifact.stage-trace_comp.out}")]
+val STAGE: [_]u8;
+
 # the family's rule, which has nothing to choose
 # ---
 # states: how many states a cell can be in, 2
@@ -29,23 +35,13 @@ rec Rule {
     states: u32;
 }
 
-# what a fresh live cell holds in its rule layers, a value of each layer's
-# full width
-val AGED: u32 = 0x80000001;
-val MARK: u32 = 0xabcd;
-
-# the state, count and mark layers' widths
-val STATE_WIDTH: u32 = 16;
-val COUNT_WIDTH: u32 = 32;
-val MARK_WIDTH:  u32 = 16;
-
 fun parse(s: *u8) err[str] {
-    if (!string.str_equals(s, "probe")) { ret err[str].err{"not the probe family's rule"}; }
+    if (!string.str_equals(s, "trace")) { ret err[str].err{"not the trace family's rule"}; }
     ret err[str].ok{};
 }
 
 fun claims(s: str) bool {
-    ret string.str_equals(s, "probe");
+    ret string.str_equals(s, "trace");
 }
 
 fun fam_parse(s: str, p: *family.Payload) err[str] {
@@ -56,7 +52,7 @@ fun fam_parse(s: str, p: *family.Payload) err[str] {
 }
 
 fun fam_format(p: *family.Payload, buf: *u8) str {
-    buf[text.buf_str(buf, 0, "probe")] = 0;
+    buf[text.buf_str(buf, 0, "trace")] = 0;
     ret buf;
 }
 
@@ -69,9 +65,8 @@ fun fam_states(p: *family.Payload) u32 {
 }
 
 fun fam_layers(p: *family.Payload) plane.Set {
-    var s: plane.Set = plane.state("probe", STATE_WIDTH);
-    plane.add_rule(?s, "age", COUNT_WIDTH);
-    plane.add_rule(?s, "mark", MARK_WIDTH);
+    var s: plane.Set = plane.state("state", word.STATE_WIDTH);
+    plane.add_live(?s, "trace", word.TRACE_WIDTH);
     ret s;
 }
 
@@ -79,17 +74,16 @@ fun fam_word_of(p: *family.Payload, state: u32) u32 {
     ret state;
 }
 
+# a fresh cell holds no trace
 fun fam_rest_of(p: *family.Payload, state: u32, k: usize) u32 {
-    if (state == 0) { ret 0; }
-    if (k == 1)     { ret AGED; }
-    ret MARK;
+    ret 0;
 }
 
 fun state_of(c: u32) u32 {
     ret c;
 }
 
-# a cell's state, read from its state layer alone
+# a cell's state, read from its state layer alone, its trace aside
 fun fam_word_state(p: *family.Payload, w: *u32) u32 {
     ret state_of(w[0]);
 }
@@ -103,7 +97,7 @@ fun fam_slack(p: *family.Payload) u32 {
 }
 
 fun sense() layout.Sense {
-    ret layout.Sense{live_mask: 0xffff, live_lo: 1, live_hi: 1, warm_mask: 0, heat_shift: 0, heat_mask: 0, age_shift: 0, age_mask: 0};
+    ret layout.Sense{live_mask: 0xff, live_lo: 1, live_hi: 1, warm_mask: 0xff, heat_shift: 0, heat_mask: 0, age_shift: 0, age_mask: 0};
 }
 
 fun fam_radius(p: *family.Payload) usize {
@@ -111,26 +105,22 @@ fun fam_radius(p: *family.Payload) usize {
 }
 
 fun fam_caps(p: *family.Payload) family.Caps {
-    ret family.Caps{b0: false, isotropic: true, no_tree: nil, bounded: true, life_like: false, continuous: false};
+    ret family.Caps{b0: false, isotropic: true, no_tree: "a rule layer of its own", bounded: false, life_like: false, continuous: false};
 }
 
-# a cell keeps its state, and a live one's age counts on
+# a cell keeps its state, and its trace counts down
 fun fam_step_chunk(p: *family.Payload, b: *space.Block, t: *space.Tally) {
     val own:    *u32  = space.block_own(b, 0).w;
     val out:    *u32  = space.block_out(b, 0).w;
-    val age:    *u32  = space.block_own(b, 1).w;
-    val aged:   *u32  = space.block_out(b, 1).w;
-    val mark:   *u32  = space.block_own(b, 2).w;
-    val marked: *u32  = space.block_out(b, 2).w;
+    val traced: *u32  = space.block_own(b, 1).w;
+    val traces: *u32  = space.block_out(b, 1).w;
     var i:      usize = 0;
     for (i < layout.CELLS::usize) {
-        val c: u32 = plane.load(own, STATE_WIDTH, i);
-        var n: u32 = plane.load(age, COUNT_WIDTH, i);
-        if (c != 0) { n = n + 1; }
-        plane.store(out, STATE_WIDTH, i, c);
-        plane.store(aged, COUNT_WIDTH, i, n);
-        plane.store(marked, MARK_WIDTH, i, plane.load(mark, MARK_WIDTH, i));
-        space.note(t, c, (i % 64)::u32, (i / 64)::u32);
+        val c: u32 = plane.load(own, word.STATE_WIDTH, i);
+        val n: u32 = word.next(plane.load(traced, word.TRACE_WIDTH, i));
+        plane.store(out, word.STATE_WIDTH, i, c);
+        plane.store(traces, word.TRACE_WIDTH, i, n);
+        space.note_with(t, c, n, (i % 64)::u32, (i / 64)::u32);
         i = i + 1;
     }
 }
@@ -157,14 +147,19 @@ fun fam_colour(p: *family.Payload, state: u32) opt[u32] {
     ret opt[u32].none{};
 }
 
+fun stage(len: *usize) *u8 {
+    @len = $length_of(STAGE);
+    ret ?STAGE[0];
+}
+
 fun sample(i: usize) str {
-    ret "probe";
+    ret "trace";
 }
 
 # the family's record
 #[testing]
 pub val FAMILY: family.Family = family.Family{
-    id:          "probe",
+    id:          "trace",
     size:        $size_of(Rule),
     parse:       fam_parse,
     claims:      claims,
@@ -189,7 +184,7 @@ pub val FAMILY: family.Family = family.Family{
     table_words: fam_table_words,
     pack_table:  fam_pack_table,
     colour:      fam_colour,
-    stage:       nil,
+    stage:       stage,
     samples:     1,
     sample:      sample,
 };

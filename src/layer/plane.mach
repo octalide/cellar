@@ -23,10 +23,13 @@ pub val LAYERS_MAX: usize = layer.LAYERS_MAX::usize;
 # name:  what the layer holds, for a reader of the set
 # width: bits a cell takes, 1, 2, 4, 8, 16 or 32
 # role:  layer.STATE, layer.RULE or layer.VIEW
+# live:  a value but zero makes the cell live (cellar.layer): the state
+#        layer's, read through the sense, and a rule layer declared so
 pub rec Decl {
     name:  str;
     width: u32;
     role:  u32;
+    live:  bool;
 }
 
 # a set of layers: the state layer, the rule layers, then the view layers
@@ -45,7 +48,7 @@ pub rec Set {
 pub fun state(name: str, width: u32) Set {
     var s: Set;
     s.n     = 1;
-    s.at[0] = Decl{name: name, width: width, role: layer.STATE};
+    s.at[0] = Decl{name: name, width: width, role: layer.STATE, live: true};
     ret s;
 }
 
@@ -57,9 +60,46 @@ pub fun state(name: str, width: u32) Set {
 # ret:   false when the set is full or holds a view layer, leaving it alone
 pub fun add_rule(s: *Set, name: str, width: u32) bool {
     if (s.n == LAYERS_MAX || views(s) != 0) { ret false; }
-    s.at[s.n] = Decl{name: name, width: width, role: layer.RULE};
+    s.at[s.n] = Decl{name: name, width: width, role: layer.RULE, live: false};
     s.n       = s.n + 1;
     ret true;
+}
+
+# add a rule layer whose values but zero make a cell live, and so warm, to a
+# set that holds no view layer yet
+# ---
+# s:     the set
+# name:  what it holds
+# width: bits a cell takes
+# ret:   false when the set is full or holds a view layer, leaving it alone
+pub fun add_live(s: *Set, name: str, width: u32) bool {
+    if (!add_rule(s, name, width)) { ret false; }
+    s.at[s.n - 1].live = true;
+    ret true;
+}
+
+# the rule layers of a set declared live, beside its state layer
+pub fun lives(s: *Set) usize {
+    var n: usize = 0;
+    var k: usize = 1;
+    for (k < exact(s)) {
+        if (s.at[k].live) { n = n + 1; }
+        k = k + 1;
+    }
+    ret n;
+}
+
+# whether a cell's word, its values in a set's state and rule layers, is live:
+# its state layer's value through a sense, or a value but zero in a live rule
+# layer
+pub fun live_word(s: *Set, sn: layout.Sense, w: *u32) bool {
+    if (layout.live(w[0], sn.live_mask, sn.live_lo, sn.live_hi) != 0) { ret true; }
+    var k: usize = 1;
+    for (k < exact(s)) {
+        if (s.at[k].live && w[k] != 0) { ret true; }
+        k = k + 1;
+    }
+    ret false;
 }
 
 # add a view layer to the end of a set
@@ -67,7 +107,7 @@ pub fun add_rule(s: *Set, name: str, width: u32) bool {
 # ret: false when the set is full, leaving it alone
 pub fun add_view(s: *Set, name: str, width: u32) bool {
     if (s.n == LAYERS_MAX) { ret false; }
-    s.at[s.n] = Decl{name: name, width: width, role: layer.VIEW};
+    s.at[s.n] = Decl{name: name, width: width, role: layer.VIEW, live: false};
     s.n       = s.n + 1;
     ret true;
 }
@@ -125,6 +165,7 @@ pub fun refusal(s: *Set) opt[str] {
         val d: *Decl = ?s.at[k];
         if (layer.valid(d.width) == 0)       { ret opt[str].some{"a layer is 1, 2, 4, 8, 16 or 32 bits wide"}; }
         if (k != 0 && d.role == layer.STATE) { ret opt[str].some{"a set of layers opens with one state layer"}; }
+        if (d.role == layer.VIEW && d.live)  { ret opt[str].some{"a view layer is never live"}; }
         if (d.role == layer.VIEW)            { view = true; }
         or (view)                            { ret opt[str].some{"a set's view layers come after its rule layers"}; }
         k = k + 1;
@@ -162,14 +203,15 @@ pub fun same_words(a: *Set, b: *Set) bool {
     ret true;
 }
 
-# whether two sets are the same layers: their shape, roles and names
+# whether two sets are the same layers: their shape, roles, names and which
+# are live
 pub fun same(a: *Set, b: *Set) bool {
     if (!same_shape(a, b)) { ret false; }
     var k: usize = 0;
     for (k < a.n) {
         val x: *Decl = ?a.at[k];
         val y: *Decl = ?b.at[k];
-        if (x.role != y.role || !string.str_equals(x.name, y.name)) { ret false; }
+        if (x.role != y.role || x.live != y.live || !string.str_equals(x.name, y.name)) { ret false; }
         k = k + 1;
     }
     ret true;
@@ -344,6 +386,19 @@ test set__holds_its_layers_to_the_contract {
     add_rule(?o, "v", 32);
     add_rule(?o, "w", 16);
     if (!holds(?o) || exact(?o) != 3) { ret 9; }
+    # a live rule layer makes a cell live where the state layer does not
+    var l: Set = state("value", 16);
+    if (!add_live(?l, "v", 16) || !add_rule(?l, "w", 8)) { ret 14; }
+    if (!holds(?l) || lives(?l) != 1 || lives(?o) != 0)  { ret 15; }
+    if (same(?l, ?o))                                    { ret 15; }
+    val sn: layout.Sense = layout.Sense{live_mask: 0xffff, live_lo: 1, live_hi: 0xffff, warm_mask: 0xffff, heat_shift: 0, heat_mask: 0, age_shift: 0, age_mask: 0};
+    var lw: [3]u32       = [3]u32{0, 0, 7};
+    if (live_word(?l, sn, ?lw[0])) { ret 16; }
+    lw[1] = 3;
+    if (!live_word(?l, sn, ?lw[0])) { ret 17; }
+    lw[1] = 0;
+    lw[0] = 1;
+    if (!live_word(?l, sn, ?lw[0])) { ret 18; }
     var w: Set = state("value", 24);
     if (holds(?w)) { ret 10; }
     # a view layer comes and goes without moving a rule layer
