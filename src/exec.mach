@@ -32,6 +32,8 @@ use cellar.region;
 use cellar.rule;
 #[testing]
 use cellar.rules.lenia;
+#[testing]
+use cellar.rules.reaction;
 use cellar.rules.table.load;
 use cellar.rules.weighted;
 use cellar.saves;
@@ -950,6 +952,103 @@ test run__a_lenia_selection_copies_pastes_and_stamps_back_its_exact_values {
     app.paste(?ap, clipboard(?ap, ?other[0]), false);
     run(?ap, ?s, ?d);
     if (pattern.exact(?ap.custom) || ap.custom.w != 4) { ret 7; }
+
+    app.dnit(?ap);
+    sim.dnit(?s);
+    ret 0;
+}
+
+# whether the world's cells from (x0, y0), w by h, hold the words vals lays
+# out row by row, each of the world's values
+#[testing]
+fun words_are(s: *sim.Sim, x0: i64, y0: i64, w: usize, h: usize, vals: *u32) bool {
+    val m: usize = sim.word_len(s);
+    var y: usize = 0;
+    for (y < h) {
+        var x: usize = 0;
+        for (x < w) {
+            var got: [8]u32;
+            sim.word_at(s, x0 + x::i64, y0 + y::i64, ?got[0]);
+            var k: usize = 0;
+            for (k < m) {
+                if (got[k] != vals[(y * w + x) * m + k]) { ret false; }
+                k = k + 1;
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    ret true;
+}
+
+test run__a_cell_of_two_layers_keeps_both_through_edits_undo_a_world_file_and_copy_paste {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    var ap: app.App;
+    app.init(?ap);
+    val shown: err[format.Error] = app.attach(?ap, ?a);
+    if (sel shown.err) { ret 1; }
+    var d: Deps                = Deps{a: ?a};
+    val r: res[rule.Rule, str] = rule.parse(reaction.sample(0));
+    if (sel r.err)                                        { ret 1; }
+    if (!sim.set_rule(?s, r.ok) || sim.word_len(?s) != 2) { ret 1; }
+
+    # each cell's v then 1 - u: both fields, either alone, values between the
+    # 15ths a state holds, and a cell of neither
+    var vals: [24]u32 = [24]u32{65535, 0, 1, 65535, 0, 7, 300, 301, 0, 0, 4369, 8738, 12345, 54321, 0, 1, 2, 0, 65535, 65535, 40000, 3, 9, 10};
+    if (!sim.edit_begin(?s, 0, 0, 4, 3)) { ret 2; }
+    var y: usize = 0;
+    for (y < 3) {
+        sim.edit_words(?s, 0, y::i64, 4, ?vals[y * 8]);
+        y = y + 1;
+    }
+    if (!sim.edit_end(?s) || !words_are(?s, 0, 0, 4, 3, ?vals[0])) { ret 2; }
+    # a cell holding u below 1 alone is live
+    if (!sim.alive(?s, 2, 0) || sim.alive(?s, 0, 1)) { ret 2; }
+
+    # painted over, the edit is undone to both fields of every cell
+    app.submit(?ap, command.Command.line{command.Line{x0: 0, y0: 1, x1: 3, y1: 1, v: 37}});
+    app.submit(?ap, command.Command.paint{command.Paint{x: 1, y: 0, v: 0}});
+    run(?ap, ?s, ?d);
+    if (words_are(?s, 0, 0, 4, 3, ?vals[0])) { ret 3; }
+    app.submit(?ap, command.Command.undo{});
+    app.submit(?ap, command.Command.undo{});
+    run(?ap, ?s, ?d);
+    if (!words_are(?s, 0, 0, 4, 3, ?vals[0])) { ret 3; }
+
+    # a world file keeps both fields, as a version 6 file of two values
+    app.submit(?ap, command.Command.save_world{file(?ap, "out/test/exec_layers/both.cellar")});
+    app.submit(?ap, command.Command.clear{});
+    run(?ap, ?s, ?d);
+    if (sim.population(?s) != 0) { ret 4; }
+    val bytes: res[vector.Vector[u8], fs.FsError] = fs.read_bytes(?a, "out/test/exec_layers/both.cellar");
+    if (sel bytes.err) { ret 4; }
+    var head: vector.Vector[u8] = bytes.ok;
+    val six:  bool              = head.len > 9 && string.str_region_equals(head.data, 0, 9, "cellar 6\n");
+    vector.dnit[u8](?head);
+    if (!six) { ret 4; }
+    app.submit(?ap, command.Command.load_world{file(?ap, "out/test/exec_layers/both.cellar")});
+    run(?ap, ?s, ?d);
+    fs.remove_file("out/test/exec_layers/both.cellar");
+    if (!words_are(?s, 0, 0, 4, 3, ?vals[0])) { ret 5; }
+
+    # copied, through the clipboard's text and back, and stamped elsewhere
+    app.select(?ap, 0, 0, 3, 2);
+    app.area(?ap, command.AREA_COPY);
+    run(?ap, ?s, ?d);
+    if (!pattern.exact(?ap.custom) || ap.custom.w != 4 || ap.custom.h != 3 || ap.custom.values != 2) { ret 6; }
+    pattern.clear(?ap.custom);
+    app.paste(?ap, clipboard(?ap, ap.clip.data::str), false);
+    run(?ap, ?s, ?d);
+    if (!pattern.exact(?ap.custom) || ap.custom.w != 4 || ap.custom.h != 3) { ret 7; }
+    app.stamp(?ap, ?ap.custom, 0, 102, 51);
+    run(?ap, ?s, ?d);
+    if (!words_are(?s, 100, 50, 4, 3, ?vals[0])) { ret 8; }
+    # the stamp's state is read from both fields
+    if (pattern.get(?ap.custom, 1, 0) != 15 || pattern.get(?ap.custom, 2, 1) != 3 * 16 + 12) { ret 9; }
 
     app.dnit(?ap);
     sim.dnit(?s);
