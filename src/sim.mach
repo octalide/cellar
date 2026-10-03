@@ -89,6 +89,7 @@ use gfx: boom.graphics;
 use boom.window;
 use cellar.ceiling;
 use cellar.cpu;
+use cellar.fill;
 use cellar.gpu;
 use cellar.hashlife;
 use cellar.history;
@@ -132,7 +133,7 @@ use std.types.string;
 use std.types.string.str;
 
 # live-cell probability randomize uses when none is given
-pub val DEFAULT_DENSITY: f32 = 0.30;
+pub val DEFAULT_DENSITY: f32 = fill.DENSITY;
 # generations a GPU may be owed before further steps are dropped
 val MAX_PENDING: usize = 4096;
 # the most cells an edit's area may hold to be written cell by cell, where a
@@ -1965,6 +1966,38 @@ pub fun fill_end(s: *Sim) bool {
     ret ok;
 }
 
+# replace the world with a random soup over a shape, resetting the count. cells
+# off the world's grid are never filled
+# ---
+# s:   simulation
+# f:   what to fill
+# ret: false when the shape is the grid of a world that has none, which leaves
+#      the world as it was
+pub fun randomize_shape(s: *Sim, f: *fill.Fill) bool {
+    var grid: space.Box = space.Box{x0: 0, y0: 0, x1: 0, y1: 0};
+    if (sel f.shape.grid) {
+        val g: opt[space.Box] = fill.grid_box(?s.space.grid);
+        if (!sel g.some) { ret false; }
+        grid = g.some;
+    }
+    val b:      space.Box = fill.bounds(?f.shape, grid);
+    var thresh: i64       = (f.density * 1000.0)::i64;
+    if (thresh < 0)    { thresh = 0; }
+    if (thresh > 1000) { thresh = 1000; }
+    fill_begin(s);
+    var y: i64 = b.y0;
+    for (y < b.y1) {
+        var x: i64 = b.x0;
+        for (x < b.x1) {
+            if (fill.covers(?f.shape, x, y) && rand.range(?s.rng, 0, 1000) < thresh) { fill_cell(s, x, y, 1); }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    fill_end(s);
+    ret true;
+}
+
 # fill a square centred on the origin with live cells at the given density,
 # replacing the world and resetting the count
 # ---
@@ -1972,21 +2005,8 @@ pub fun fill_end(s: *Sim) bool {
 # density: live-cell probability in [0, 1]
 # side:    the square's side in cells
 pub fun randomize(s: *Sim, density: f32, side: usize) {
-    var thresh: i64 = (density * 1000.0)::i64;
-    if (thresh < 0)    { thresh = 0; }
-    if (thresh > 1000) { thresh = 1000; }
-    val half: i64 = (side / 2)::i64;
-    fill_begin(s);
-    var y: i64 = 0 - half;
-    for (y < half) {
-        var x: i64 = 0 - half;
-        for (x < half) {
-            if (rand.range(?s.rng, 0, 1000) < thresh) { fill_cell(s, x, y, 1); }
-            x = x + 1;
-        }
-        y = y + 1;
-    }
-    fill_end(s);
+    val f: fill.Fill = fill.square(0, 0, side, density);
+    randomize_shape(s, ?f);
 }
 
 # copy the world, its generation and its rule into a snapshot, pulling the
@@ -4297,6 +4317,30 @@ test randomize__fills_a_centred_square_and_clear_empties_the_pool {
     if (s.space.live != 16) { ret 4; }
     clear(?s);
     if (population(?s) != 0 || s.space.live != 0 || s.generation != 0) { ret 5; }
+    dnit(?s);
+    ret 0;
+}
+
+test randomize_shape__fills_a_circle_off_centre_and_a_grid_whole_or_refuses {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    Sim;
+    val made: err[allo.Error] = init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    var f: fill.Fill = fill.circle(100, -50, 64, 1.0);
+    if (!randomize_shape(?s, ?f)) { ret 2; }
+    # the circle's centre and its edge, and not its box's corner
+    if (!alive(?s, 100, -50) || !alive(?s, 131, -50) || alive(?s, 68, -82)) { ret 3; }
+    val n: usize = population(?s);
+    if (n < 3000 || n > 3300) { ret 4; }
+    # a grid fill of an unbounded world leaves it as it was
+    f.shape = fill.Shape.grid{};
+    if (randomize_shape(?s, ?f) || population(?s) != n) { ret 5; }
+    val g: Placed = place(?s, topology.Grid{shape: topology.PLANE, w: 40, h: 30, twist_w: false}, 0, 0);
+    if (!g.ok)                    { ret 6; }
+    if (!randomize_shape(?s, ?f)) { ret 7; }
+    # every cell of the 40 x 30 grid, and none past it
+    if (population(?s) != 1200 || alive(?s, 20, 0) || alive(?s, 0, 15)) { ret 8; }
     dnit(?s);
     ret 0;
 }
