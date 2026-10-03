@@ -1,0 +1,1071 @@
+# a world's boundary: the cells that exist, as drawn regions combined by
+# boolean operations
+#
+# a boundary says where the world is. outside it there are no cells: no chunk
+# is allocated wholly outside it, nothing is painted, stamped or grown there,
+# and a step reads it as its rule's open edge (cellar.space Block). it is not
+# a wall, which is a cell inside the world: a boundary changes the domain
+# itself, and nothing in it is a cell.
+#
+# a region is a set of cells kept as bands of rows, each band a run of rows
+# holding the same spans of columns, half-open, sorted and apart, and the
+# bands sorted and apart. a rectangle is one band however large, an ellipse
+# or a polygon a band per row of its outline at most, and a band per run of
+# rows with the same spans, so a region costs its outline's rows and never its
+# area. shapes are made as regions (rect, ellipse, polygon) and combined into
+# a boundary by adding, subtracting or intersecting (combine), every one a
+# region again.
+#
+# a boundary may hold any number of regions apart from one another. its
+# regions are its parts joined edge to edge, a cell joined to the cells beside
+# it and above and below it, and each is named by its place in reading order,
+# top row first and then leftmost, so a tool can ask for the one under a cell
+# (region_at) and act on it alone (region).
+#
+# a boundary is read by the pool chunk by chunk. a chunk lies wholly inside,
+# wholly outside, or crosses the edge (class), and only one crossing it holds
+# its cells' bits (mask), a row of 64 cells in two words, as a 1-bit layer
+# holds them (cellar.layer). an axis a boundary leaves unbounded runs out to
+# FAR, past every cell the pool reaches.
+
+use cellar.layout;
+use allo: std.allocator;
+use std.allocator.page;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use mem: std.memory;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+
+# side of a chunk in cells
+val SIDE: i64 = layout.SIDE::i64;
+# words of a chunk's mask, a bit a cell
+pub val MASK_WORDS: usize = (layout.CELLS / 32)::usize;
+
+# past every cell the pool reaches (cellar.space REACH), where an axis left
+# unbounded ends
+pub val FAR: i64 = 1099511627776;
+
+# the classes of a chunk against a boundary
+pub val OUT:  u32 = 0;
+pub val IN:   u32 = 1;
+pub val EDGE: u32 = 2;
+
+# how a shape combines with a boundary
+pub val ADD:       u32 = 0;
+pub val SUBTRACT:  u32 = 1;
+pub val INTERSECT: u32 = 2;
+
+# no region holds the cell (region_at)
+pub val NO_REGION: usize = 0xffffffffffffffff;
+
+# a run of rows [y0, y1) holding the same spans: n of them, from span at of
+# the region's spans
+pub rec Band {
+    y0: i64;
+    y1: i64;
+    at: usize;
+    n:  usize;
+}
+
+# a set of cells
+# ---
+# bands: its bands, sorted and apart
+# xs:    every band's spans, two columns each, the first and the one past the
+#        last
+pub rec Region {
+    bands: Vector[Band];
+    xs:    Vector[i64];
+}
+
+# an empty region
+pub fun init(a: *allo.Allocator) Region {
+    var r: Region;
+    r.bands = vector.init[Band](a);
+    r.xs    = vector.init[i64](a);
+    ret r;
+}
+
+# free a region
+pub fun dnit(r: *Region) {
+    vector.dnit[Band](?r.bands);
+    vector.dnit[i64](?r.xs);
+}
+
+# empty a region, keeping its storage
+pub fun clear(r: *Region) {
+    vector.clear[Band](?r.bands);
+    vector.clear[i64](?r.xs);
+}
+
+# whether a region holds no cell
+pub fun empty(r: *Region) bool {
+    ret r.bands.len == 0;
+}
+
+fun span_at(r: *Region, b: *Band) *i64 {
+    ret ?r.xs.data[b.at * 2];
+}
+
+# make dst hold what src does
+pub fun copy(dst: *Region, src: *Region) err[allo.Error] {
+    clear(dst);
+    var i: usize = 0;
+    for (i < src.bands.len) {
+        val b: *Band           = ?src.bands.data[i];
+        val e: err[allo.Error] = push_band(dst, b.y0, b.y1, span_at(src, b), b.n);
+        if (sel e.err) { ret e; }
+        i = i + 1;
+    }
+    ret err[allo.Error].ok{};
+}
+
+# take what tmp holds into dst, freeing what dst held
+fun take(dst: *Region, tmp: *Region) {
+    dnit(dst);
+    @dst = @tmp;
+}
+
+fun same_spans(a: *i64, b: *i64, n: usize) bool {
+    ret mem.equal[i64](a, b, n * 2);
+}
+
+# append the band [y0, y1) holding n spans, below every band the region holds,
+# joining it to the last where that ends at y0 with the same spans
+fun push_band(r: *Region, y0: i64, y1: i64, xs: *i64, n: usize) err[allo.Error] {
+    if (n == 0 || y1 <= y0) { ret err[allo.Error].ok{}; }
+    if (r.bands.len != 0) {
+        val last: *Band = ?r.bands.data[r.bands.len - 1];
+        if (last.y1 == y0 && last.n == n && same_spans(span_at(r, last), xs, n)) {
+            last.y1 = y1;
+            ret err[allo.Error].ok{};
+        }
+    }
+    val at: usize                  = r.xs.len / 2;
+    val gr: res[usize, allo.Error] = vector.reserve[i64](?r.xs, n * 2);
+    if (sel gr.err) { ret err[allo.Error].err{gr.err}; }
+    mem.copy[i64](?r.xs.data[r.xs.len], xs, n * 2);
+    r.xs.len = r.xs.len + n * 2;
+    val pb: res[usize, allo.Error] = vector.push[Band](?r.bands, Band{y0: y0, y1: y1, at: at, n: n});
+    if (sel pb.err) { ret err[allo.Error].err{pb.err}; }
+    ret err[allo.Error].ok{};
+}
+
+# whether an allocation failed
+fun failed(e: err[allo.Error]) bool {
+    ret sel e.err;
+}
+
+# whether a push was refused
+fun refused(r: res[usize, allo.Error]) bool {
+    ret sel r.err;
+}
+
+# whether op holds a cell held by a or not, and by b or not
+fun holds(op: u32, a: bool, b: bool) bool {
+    if (op == ADD)      { ret a || b; }
+    if (op == SUBTRACT) { ret a && !b; }
+    ret a && b;
+}
+
+# the spans of one row combining na spans of a with nb of b by op, into out,
+# sorted and apart however a's and b's touch
+fun merge(a: *i64, na: usize, b: *i64, nb: usize, op: u32, out: *Vector[i64]) err[allo.Error] {
+    vector.clear[i64](out);
+    val ea:  usize = na * 2;
+    val eb:  usize = nb * 2;
+    var i:   usize = 0;
+    var j:   usize = 0;
+    var ina: bool  = false;
+    var inb: bool  = false;
+    var was: bool  = false;
+    for (i < ea || j < eb) {
+        var x: i64 = FAR * 4;
+        if (i < ea)             { x = a[i]; }
+        if (j < eb && b[j] < x) { x = b[j]; }
+        for (i < ea && a[i] == x) {
+            ina = !ina;
+            i   = i + 1;
+        }
+        for (j < eb && b[j] == x) {
+            inb = !inb;
+            j   = j + 1;
+        }
+        val now: bool = holds(op, ina, inb);
+        if (now != was) {
+            val p: res[usize, allo.Error] = vector.push[i64](out, x);
+            if (sel p.err) { ret err[allo.Error].err{p.err}; }
+            was = now;
+        }
+    }
+    ret err[allo.Error].ok{};
+}
+
+# combine src into dst by op: dst becomes dst and src, dst less src, or the
+# cells both hold
+# ---
+# dst: the region combined into
+# src: the region combined
+# op:  ADD, SUBTRACT or INTERSECT
+# ret: ok, or the allocator's refusal, which leaves dst as it was
+pub fun combine(dst: *Region, src: *Region, op: u32) err[allo.Error] {
+    var out: Region      = init(dst.bands.a);
+    var row: Vector[i64] = vector.init[i64](dst.bands.a);
+    val na:  usize       = dst.bands.len;
+    val nb:  usize       = src.bands.len;
+    var ia:  usize       = 0;
+    var ib:  usize       = 0;
+    var y:   i64         = FAR * 4;
+    if (na != 0)                             { y = dst.bands.data[0].y0; }
+    if (nb != 0 && src.bands.data[0].y0 < y) { y = src.bands.data[0].y0; }
+    var none: [2]i64;
+    for (true) {
+        for (ia < na && dst.bands.data[ia].y1 <= y) { ia = ia + 1; }
+        for (ib < nb && src.bands.data[ib].y1 <= y) { ib = ib + 1; }
+        if (ia >= na && ib >= nb) { brk; }
+        val a_in: bool = ia < na && dst.bands.data[ia].y0 <= y;
+        val b_in: bool = ib < nb && src.bands.data[ib].y0 <= y;
+        var y1:   i64  = FAR * 4;
+        if (ia < na) {
+            if (a_in) { y1 = dst.bands.data[ia].y1; }
+            or        { y1 = dst.bands.data[ia].y0; }
+        }
+        if (ib < nb) {
+            var e: i64 = src.bands.data[ib].y0;
+            if (b_in)   { e = src.bands.data[ib].y1; }
+            if (e < y1) { y1 = e; }
+        }
+        if (a_in || b_in) {
+            var pa: *i64  = ?none[0];
+            var ca: usize = 0;
+            var pb: *i64  = ?none[0];
+            var cb: usize = 0;
+            if (a_in) {
+                pa = span_at(dst, ?dst.bands.data[ia]);
+                ca = dst.bands.data[ia].n;
+            }
+            if (b_in) {
+                pb = span_at(src, ?src.bands.data[ib]);
+                cb = src.bands.data[ib].n;
+            }
+            var e: err[allo.Error] = merge(pa, ca, pb, cb, op, ?row);
+            if (!failed(e)) { e = push_band(?out, y, y1, row.data, row.len / 2); }
+            if (sel e.err) {
+                dnit(?out);
+                vector.dnit[i64](?row);
+                ret e;
+            }
+        }
+        y = y1;
+    }
+    vector.dnit[i64](?row);
+    take(dst, ?out);
+    ret err[allo.Error].ok{};
+}
+
+# make r the rectangle [x0, x1) by [y0, y1), empty where it holds no cell
+pub fun rect(r: *Region, x0: i64, y0: i64, x1: i64, y1: i64) err[allo.Error] {
+    clear(r);
+    if (x1 <= x0) { ret err[allo.Error].ok{}; }
+    var xs: [2]i64 = [2]i64{x0, x1};
+    ret push_band(r, y0, y1, ?xs[0], 1);
+}
+
+# the largest m with m * m at most v
+fun isqrt(v: u64) u64 {
+    if (v < 2) { ret v; }
+    var x: u64 = v;
+    var y: u64 = (x + 1) / 2;
+    for (y < x) {
+        x = y;
+        y = (x + v / x) / 2;
+    }
+    ret x;
+}
+
+# a divided by b, b positive, rounded down
+fun floor_div(a: i64, b: i64) i64 {
+    var q: i64 = a / b;
+    if (a % b != 0 && a < 0) { q = q - 1; }
+    ret q;
+}
+
+# a divided by b, b positive, rounded up
+fun ceil_div(a: i64, b: i64) i64 {
+    ret 0 - floor_div(0 - a, b);
+}
+
+# make r the ellipse inscribed in the box [x0, x1) by [y0, y1): the cells whose
+# centres lie inside it
+pub fun ellipse(r: *Region, x0: i64, y0: i64, x1: i64, y1: i64) err[allo.Error] {
+    clear(r);
+    val w: i64 = x1 - x0;
+    val h: i64 = y1 - y0;
+    if (w <= 0 || h <= 0) { ret err[allo.Error].ok{}; }
+    val wf: f64 = w::f64;
+    val hf: f64 = h::f64;
+    var xs: [2]i64;
+    var y:  i64 = y0;
+    for (y < y1) {
+        # the centre's offsets doubled, so they stay whole: x's is 2x + 1 - x0 - x1
+        val dy: f64 = (2 * y + 1 - y0 - y1)::f64;
+        val t:  f64 = wf * wf * (hf * hf - dy * dy) / (hf * hf);
+        if (t >= 0.0) {
+            val m: i64 = isqrt(t::u64)::i64;
+            xs[0] = ceil_div(0 - m - 1 + x0 + x1, 2);
+            xs[1] = floor_div(m - 1 + x0 + x1, 2) + 1;
+            if (xs[0] < xs[1]) {
+                val e: err[allo.Error] = push_band(r, y, y + 1, ?xs[0], 1);
+                if (sel e.err) { ret e; }
+            }
+        }
+        y = y + 1;
+    }
+    ret err[allo.Error].ok{};
+}
+
+# make r the polygon whose n corners are the cells pts names, x then y each:
+# the cells whose centres it holds, by the even-odd rule, its corners' cells
+# on its top and left edges with them
+pub fun polygon(r: *Region, pts: *i64, n: usize) err[allo.Error] {
+    clear(r);
+    if (n < 3) { ret err[allo.Error].ok{}; }
+    var lo: i64   = pts[1];
+    var hi: i64   = pts[1];
+    var i:  usize = 1;
+    for (i < n) {
+        if (pts[i * 2 + 1] < lo) { lo = pts[i * 2 + 1]; }
+        if (pts[i * 2 + 1] > hi) { hi = pts[i * 2 + 1]; }
+        i = i + 1;
+    }
+    var cross: Vector[i64] = vector.init[i64](r.bands.a);
+    var row:   Vector[i64] = vector.init[i64](r.bands.a);
+    var y:     i64         = lo;
+    var e:     err[allo.Error];
+    e = err[allo.Error].ok{};
+    for (y < hi && !failed(e)) {
+        vector.clear[i64](?cross);
+        var k: usize = 0;
+        for (k < n && !failed(e)) {
+            val q:  usize = (k + 1) % n;
+            var ax: i64   = pts[k * 2];
+            var ay: i64   = pts[k * 2 + 1];
+            var bx: i64   = pts[q * 2];
+            var by: i64   = pts[q * 2 + 1];
+            if (by < ay) {
+                val tx: i64 = ax;
+                val ty: i64 = ay;
+                ax = bx;
+                ay = by;
+                bx = tx;
+                by = ty;
+            }
+            if (ay <= y && y < by) {
+                # the first cell whose centre lies at or past the crossing
+                val d: i64                    = by - ay;
+                val c: i64                    = ceil_div(ax * d + (y - ay) * (bx - ax), d);
+                val p: res[usize, allo.Error] = vector.push[i64](?cross, c);
+                if (sel p.err) { e = err[allo.Error].err{p.err}; }
+            }
+            k = k + 1;
+        }
+        if (!failed(e)) {
+            # the crossings in order, by insertion, since a row holds few
+            var s: usize = 1;
+            for (s < cross.len) {
+                val v: i64   = cross.data[s];
+                var t: usize = s;
+                for (t > 0 && cross.data[t - 1] > v) {
+                    cross.data[t] = cross.data[t - 1];
+                    t             = t - 1;
+                }
+                cross.data[t] = v;
+                s             = s + 1;
+            }
+            e = merge(cross.data, cross.len / 2, nil, 0, ADD, ?row);
+            if (!failed(e)) { e = push_band(r, y, y + 1, row.data, row.len / 2); }
+        }
+        y = y + 1;
+    }
+    vector.dnit[i64](?cross);
+    vector.dnit[i64](?row);
+    if (sel e.err) { clear(r); }
+    ret e;
+}
+
+# move every cell of a region by (dx, dy)
+pub fun translate(r: *Region, dx: i64, dy: i64) {
+    var i: usize = 0;
+    for (i < r.bands.len) {
+        r.bands.data[i].y0 = r.bands.data[i].y0 + dy;
+        r.bands.data[i].y1 = r.bands.data[i].y1 + dy;
+        i                  = i + 1;
+    }
+    i = 0;
+    for (i < r.xs.len) {
+        r.xs.data[i] = r.xs.data[i] + dx;
+        i            = i + 1;
+    }
+}
+
+# whether two regions hold the same cells
+pub fun same(a: *Region, b: *Region) bool {
+    if (a.bands.len != b.bands.len || a.xs.len != b.xs.len) { ret false; }
+    var i: usize = 0;
+    for (i < a.bands.len) {
+        val p: *Band = ?a.bands.data[i];
+        val q: *Band = ?b.bands.data[i];
+        if (p.y0 != q.y0 || p.y1 != q.y1 || p.n != q.n) { ret false; }
+        i = i + 1;
+    }
+    ret mem.equal[i64](a.xs.data, b.xs.data, a.xs.len);
+}
+
+# the first band ending past row y, or the band count when none does
+fun band_from(r: *Region, y: i64) usize {
+    var lo: usize = 0;
+    var hi: usize = r.bands.len;
+    for (lo < hi) {
+        val mid: usize = (lo + hi) / 2;
+        if (r.bands.data[mid].y1 <= y) { lo = mid + 1; }
+        or                             { hi = mid; }
+    }
+    ret lo;
+}
+
+# the spans of row y
+# ---
+# n:   receives how many
+# ret: the first span's two columns, the rest after it, nil when none
+pub fun row(r: *Region, y: i64, n: *usize) *i64 {
+    @n = 0;
+    val i: usize = band_from(r, y);
+    if (i == r.bands.len || r.bands.data[i].y0 > y) { ret nil; }
+    @n = r.bands.data[i].n;
+    ret span_at(r, ?r.bands.data[i]);
+}
+
+# whether a region holds the cell (x, y)
+pub fun contains(r: *Region, x: i64, y: i64) bool {
+    var n:  usize = 0;
+    val xs: *i64  = row(r, y, ?n);
+    var lo: usize = 0;
+    var hi: usize = n;
+    for (lo < hi) {
+        val mid: usize = (lo + hi) / 2;
+        if (xs[mid * 2 + 1] <= x) { lo = mid + 1; }
+        or                        { hi = mid; }
+    }
+    ret lo < n && xs[lo * 2] <= x;
+}
+
+# narrow the run [x0, x1) of row y to its first part the region holds
+# ---
+# ret: false when it holds none of it, leaving the run alone
+pub fun piece(r: *Region, y: i64, x0: *i64, x1: *i64) bool {
+    var n:  usize = 0;
+    val xs: *i64  = row(r, y, ?n);
+    var k:  usize = 0;
+    for (k < n && xs[k * 2 + 1] <= @x0) { k = k + 1; }
+    if (k == n || xs[k * 2] >= @x1) { ret false; }
+    if (xs[k * 2] > @x0)            { @x0 = xs[k * 2]; }
+    if (xs[k * 2 + 1] < @x1)        { @x1 = xs[k * 2 + 1]; }
+    ret true;
+}
+
+# the box a region's cells span, half-open
+# ---
+# out: receives its first column and row, and the column and row past its last
+# ret: false when the region is empty, leaving out alone
+pub fun bounds(r: *Region, out: *i64) bool {
+    if (empty(r)) { ret false; }
+    out[0] = FAR * 4;
+    out[1] = r.bands.data[0].y0;
+    out[2] = 0 - FAR * 4;
+    out[3] = r.bands.data[r.bands.len - 1].y1;
+    var i: usize = 0;
+    for (i < r.bands.len) {
+        val b:  *Band = ?r.bands.data[i];
+        val xs: *i64  = span_at(r, b);
+        if (xs[0] < out[0])           { out[0] = xs[0]; }
+        if (xs[b.n * 2 - 1] > out[2]) { out[2] = xs[b.n * 2 - 1]; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# whether a region's cells lie inside FAR on every side, so it ends
+pub fun finite(r: *Region) bool {
+    var b: [4]i64;
+    if (!bounds(r, ?b[0])) { ret true; }
+    ret b[0] > 0 - FAR && b[1] > 0 - FAR && b[2] < FAR && b[3] < FAR;
+}
+
+# the cells a region holds
+pub fun area(r: *Region) u64 {
+    var n: u64   = 0;
+    var i: usize = 0;
+    for (i < r.bands.len) {
+        val b:  *Band = ?r.bands.data[i];
+        val xs: *i64  = span_at(r, b);
+        var w:  u64   = 0;
+        var k:  usize = 0;
+        for (k < b.n) {
+            w = w + (xs[k * 2 + 1] - xs[k * 2])::u64;
+            k = k + 1;
+        }
+        n = n + w * (b.y1 - b.y0)::u64;
+        i = i + 1;
+    }
+    ret n;
+}
+
+# whether the chunk at (cx, cy) lies wholly inside a region, wholly outside it
+# or across its edge
+# ---
+# ret: IN, OUT or EDGE
+pub fun class(r: *Region, cx: i64, cy: i64) u32 {
+    val x0:   i64  = cx * SIDE;
+    val y0:   i64  = cy * SIDE;
+    var full: bool = true;
+    var any:  bool = false;
+    # the next row of the chunk a band must hold for it to lie wholly inside
+    var at: i64   = y0;
+    var i:  usize = band_from(r, y0);
+    for (i < r.bands.len && r.bands.data[i].y0 < y0 + SIDE) {
+        val b:  *Band = ?r.bands.data[i];
+        val xs: *i64  = span_at(r, b);
+        if (b.y0 > at) { full = false; }
+        var whole: bool  = false;
+        var k:     usize = 0;
+        for (k < b.n && xs[k * 2] < x0 + SIDE) {
+            if (xs[k * 2 + 1] > x0) {
+                any = true;
+                if (xs[k * 2] <= x0 && xs[k * 2 + 1] >= x0 + SIDE) { whole = true; }
+            }
+            k = k + 1;
+        }
+        if (!whole) { full = false; }
+        at = b.y1;
+        i  = i + 1;
+    }
+    if (at < y0 + SIDE) { full = false; }
+    if (full)           { ret IN; }
+    if (any)            { ret EDGE; }
+    ret OUT;
+}
+
+# the cells of the chunk at (cx, cy) a region holds, a bit a cell, row-major,
+# a row of 64 in two words from its low bit
+# ---
+# out: MASK_WORDS words
+pub fun mask(r: *Region, cx: i64, cy: i64, out: *u32) {
+    mem.zero[u32](out, MASK_WORDS);
+    val x0: i64   = cx * SIDE;
+    val y0: i64   = cy * SIDE;
+    var i:  usize = band_from(r, y0);
+    for (i < r.bands.len && r.bands.data[i].y0 < y0 + SIDE) {
+        val b:   *Band = ?r.bands.data[i];
+        val xs:  *i64  = span_at(r, b);
+        var row: u64   = 0;
+        var k:   usize = 0;
+        for (k < b.n && xs[k * 2] < x0 + SIDE) {
+            var lo: i64 = xs[k * 2] - x0;
+            var hi: i64 = xs[k * 2 + 1] - x0;
+            if (hi > 0) {
+                if (lo < 0)    { lo = 0; }
+                if (hi > SIDE) { hi = SIDE; }
+                var bits: u64 = 0xffffffffffffffff;
+                if (hi - lo < 64) { bits = ((1::u64) << (hi - lo)::u64) - 1; }
+                row = row | (bits << lo::u64);
+            }
+            k = k + 1;
+        }
+        var ly:  i64 = b.y0 - y0;
+        var end: i64 = b.y1 - y0;
+        if (ly < 0)     { ly = 0; }
+        if (end > SIDE) { end = SIDE; }
+        for (ly < end) {
+            out[(ly * 2)::usize]     = (row & 0xffffffff)::u32;
+            out[(ly * 2 + 1)::usize] = (row >> 32)::u32;
+            ly                       = ly + 1;
+        }
+        i = i + 1;
+    }
+}
+
+# the chunks of chunk row cy a region reaches, and those it holds whole, each
+# as runs of chunk columns [c0, c1)
+# ---
+# r:     the region
+# cy:    the chunk row
+# reach: receives the runs of chunks holding a cell of it
+# whole: receives the runs of chunks lying wholly inside it
+# ret:   the last chunk row from cy whose chunks it reaches and holds as it
+#        does cy's, so a caller may take them together, or the allocator's
+#        refusal
+pub fun chunk_row(r: *Region, cy: i64, reach: *Vector[i64], whole: *Vector[i64]) res[i64, allo.Error] {
+    vector.clear[i64](reach);
+    vector.clear[i64](whole);
+    val y0: i64   = cy * SIDE;
+    val i:  usize = band_from(r, y0);
+    if (i == r.bands.len) { ret res[i64, allo.Error].ok{cy}; }
+    val first: *Band = ?r.bands.data[i];
+    if (first.y0 >= y0 + SIDE) {
+        # no band reaches the row: nor any row before the next band's
+        ret res[i64, allo.Error].ok{(first.y0 >> 6) - 1};
+    }
+    var last: i64         = cy;
+    var u:    Vector[i64] = vector.init[i64](r.bands.a);
+    var w:    Vector[i64] = vector.init[i64](r.bands.a);
+    var t:    Vector[i64] = vector.init[i64](r.bands.a);
+    var e:    err[allo.Error];
+    e = err[allo.Error].ok{};
+    if (first.y0 <= y0 && first.y1 >= y0 + SIDE) {
+        # every row lies in one band, and the rows after it that do too
+        last = (first.y1 >> 6) - 1;
+        e    = merge(span_at(r, first), first.n, nil, 0, ADD, ?u);
+        if (!failed(e)) { e = merge(span_at(r, first), first.n, nil, 0, ADD, ?w); }
+    }
+    or {
+        var at:   i64   = y0;
+        var full: bool  = true;
+        var j:    usize = i;
+        for (j < r.bands.len && r.bands.data[j].y0 < y0 + SIDE && !failed(e)) {
+            val b: *Band = ?r.bands.data[j];
+            if (b.y0 > at) { full = false; }
+            e = merge(u.data, u.len / 2, span_at(r, b), b.n, ADD, ?t);
+            if (!failed(e)) {
+                val s: Vector[i64] = u;
+                u = t;
+                t = s;
+                if (j == i) { e = merge(span_at(r, b), b.n, nil, 0, ADD, ?w); }
+                or          { e = merge(w.data, w.len / 2, span_at(r, b), b.n, INTERSECT, ?t); }
+                if (!failed(e) && j != i) {
+                    val s2: Vector[i64] = w;
+                    w = t;
+                    t = s2;
+                }
+            }
+            at = b.y1;
+            j  = j + 1;
+        }
+        if (at < y0 + SIDE) { full = false; }
+        if (!full)          { vector.clear[i64](?w); }
+    }
+    # columns to chunks: every chunk a span reaches, and the chunks it covers
+    var k: usize = 0;
+    for (k < u.len && !failed(e)) {
+        val c0: i64 = u.data[k] >> 6;
+        val c1: i64 = ((u.data[k + 1] - 1) >> 6) + 1;
+        if (reach.len != 0 && reach.data[reach.len - 1] >= c0) { reach.data[reach.len - 1] = c1; }
+        or {
+            val p: res[usize, allo.Error] = vector.push[i64](reach, c0);
+            var q: res[usize, allo.Error] = res[usize, allo.Error].ok{0};
+            if (!refused(p)) { q = vector.push[i64](reach, c1); }
+            if (sel p.err)   { e = err[allo.Error].err{p.err}; }
+            or (sel q.err)   { e = err[allo.Error].err{q.err}; }
+        }
+        k = k + 2;
+    }
+    k = 0;
+    for (k < w.len && !failed(e)) {
+        val c0: i64 = ceil_div(w.data[k], SIDE);
+        val c1: i64 = floor_div(w.data[k + 1], SIDE);
+        if (c0 < c1) {
+            val p: res[usize, allo.Error] = vector.push[i64](whole, c0);
+            var q: res[usize, allo.Error] = res[usize, allo.Error].ok{0};
+            if (!refused(p)) { q = vector.push[i64](whole, c1); }
+            if (sel p.err)   { e = err[allo.Error].err{p.err}; }
+            or (sel q.err)   { e = err[allo.Error].err{q.err}; }
+        }
+        k = k + 2;
+    }
+    vector.dnit[i64](?u);
+    vector.dnit[i64](?w);
+    vector.dnit[i64](?t);
+    if (sel e.err) { ret res[i64, allo.Error].err{e.err}; }
+    ret res[i64, allo.Error].ok{last};
+}
+
+# the chunks holding a cell of a region, counted up to most and no further
+pub fun chunks(r: *Region, most: u64) res[u64, allo.Error] {
+    var n: u64 = 0;
+    if (empty(r)) { ret res[u64, allo.Error].ok{0}; }
+    var reach: Vector[i64] = vector.init[i64](r.bands.a);
+    var whole: Vector[i64] = vector.init[i64](r.bands.a);
+    var cy:    i64         = r.bands.data[0].y0 >> 6;
+    val end:   i64         = (r.bands.data[r.bands.len - 1].y1 - 1) >> 6;
+    for (cy <= end && n < most) {
+        val got: res[i64, allo.Error] = chunk_row(r, cy, ?reach, ?whole);
+        if (sel got.err) {
+            vector.dnit[i64](?reach);
+            vector.dnit[i64](?whole);
+            ret res[u64, allo.Error].err{got.err};
+        }
+        var per: u64   = 0;
+        var k:   usize = 0;
+        for (k < reach.len) {
+            per = per + (reach.data[k + 1] - reach.data[k])::u64;
+            k   = k + 2;
+        }
+        val rows: u64 = (got.ok - cy + 1)::u64;
+        if (per != 0 && rows > (most - n) / per) { n = most; }
+        or                                       { n = n + per * rows; }
+        cy = got.ok + 1;
+    }
+    vector.dnit[i64](?reach);
+    vector.dnit[i64](?whole);
+    if (n > most) { n = most; }
+    ret res[u64, allo.Error].ok{n};
+}
+
+fun find_root(up: *u32, k: u32) u32 {
+    var x: u32 = k;
+    for (up[x] != x) {
+        up[x] = up[up[x]];
+        x     = up[x];
+    }
+    ret x;
+}
+
+# the region each span of a region belongs to, by its place in reading order
+# ---
+# r:      the region
+# labels: receives a label a span, in the order the region holds them
+# ret:    how many regions it holds, or the allocator's refusal
+pub fun regions(r: *Region, labels: *Vector[u32]) res[usize, allo.Error] {
+    val n: usize = r.xs.len / 2;
+    vector.clear[u32](labels);
+    val g: res[usize, allo.Error] = vector.ensure[u32](labels, n);
+    if (sel g.err) { ret res[usize, allo.Error].err{g.err}; }
+    labels.len = n;
+    val up: *u32  = labels.data;
+    var k:  usize = 0;
+    for (k < n) {
+        up[k] = k::u32;
+        k     = k + 1;
+    }
+    # spans of bands one above the other join where they share a column
+    var i: usize = 0;
+    for (i + 1 < r.bands.len) {
+        val a: *Band = ?r.bands.data[i];
+        val b: *Band = ?r.bands.data[i + 1];
+        if (a.y1 == b.y0) {
+            var p: usize = 0;
+            var q: usize = 0;
+            for (p < a.n && q < b.n) {
+                val sa: usize = a.at + p;
+                val sb: usize = b.at + q;
+                val a0: i64   = r.xs.data[sa * 2];
+                val a1: i64   = r.xs.data[sa * 2 + 1];
+                val b0: i64   = r.xs.data[sb * 2];
+                val b1: i64   = r.xs.data[sb * 2 + 1];
+                if (a0 < b1 && b0 < a1) {
+                    val ra: u32 = find_root(up, sa::u32);
+                    val rb: u32 = find_root(up, sb::u32);
+                    # the earlier span stays the root, so a region is named by its first
+                    if (ra < rb) { up[rb] = ra; }
+                    or (rb < ra) { up[ra] = rb; }
+                }
+                if (a1 <= b1) { p = p + 1; }
+                or            { q = q + 1; }
+            }
+        }
+        i = i + 1;
+    }
+    # every span names its root, its region's first span, and naming the roots
+    # in order names the regions in reading order, a name marked apart from a
+    # span's index until every span has one
+    k = 0;
+    for (k < n) {
+        up[k] = find_root(up, k::u32);
+        k     = k + 1;
+    }
+    var named: u32 = 0;
+    k = 0;
+    for (k < n) {
+        if (up[k] == k::u32) {
+            up[k] = named | 0x80000000;
+            named = named + 1;
+        }
+        or { up[k] = up[up[k]]; }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < n) {
+        up[k] = up[k] & 0x7fffffff;
+        k     = k + 1;
+    }
+    ret res[usize, allo.Error].ok{named::usize};
+}
+
+# how many regions apart from one another a region holds
+pub fun count(r: *Region) res[usize, allo.Error] {
+    var labels: Vector[u32]            = vector.init[u32](r.bands.a);
+    val n:      res[usize, allo.Error] = regions(r, ?labels);
+    vector.dnit[u32](?labels);
+    ret n;
+}
+
+# make out the i-th region of r in reading order, empty past the last
+pub fun region(r: *Region, i: usize, out: *Region) err[allo.Error] {
+    clear(out);
+    var labels: Vector[u32]            = vector.init[u32](r.bands.a);
+    var row:    Vector[i64]            = vector.init[i64](r.bands.a);
+    val got:    res[usize, allo.Error] = regions(r, ?labels);
+    var e:      err[allo.Error];
+    e = err[allo.Error].ok{};
+    if (sel got.err) { e = err[allo.Error].err{got.err}; }
+    var b: usize = 0;
+    for (b < r.bands.len && !failed(e)) {
+        val band: *Band = ?r.bands.data[b];
+        vector.clear[i64](?row);
+        var k: usize = 0;
+        for (k < band.n && !failed(e)) {
+            val s: usize = band.at + k;
+            if (labels.data[s]::usize == i) {
+                var p: res[usize, allo.Error] = vector.push[i64](?row, r.xs.data[s * 2]);
+                if (!refused(p)) { p = vector.push[i64](?row, r.xs.data[s * 2 + 1]); }
+                if (sel p.err)   { e = err[allo.Error].err{p.err}; }
+            }
+            k = k + 1;
+        }
+        if (!failed(e)) { e = push_band(out, band.y0, band.y1, row.data, row.len / 2); }
+        b = b + 1;
+    }
+    vector.dnit[u32](?labels);
+    vector.dnit[i64](?row);
+    if (sel e.err) { clear(out); }
+    ret e;
+}
+
+# the region of r holding the cell (x, y), by its place in reading order
+# ---
+# ret: its place, NO_REGION where r holds no such cell, or the allocator's
+#      refusal
+pub fun region_at(r: *Region, x: i64, y: i64) res[usize, allo.Error] {
+    val i: usize = band_from(r, y);
+    if (i == r.bands.len || r.bands.data[i].y0 > y) { ret res[usize, allo.Error].ok{NO_REGION}; }
+    val b: *Band = ?r.bands.data[i];
+    var k: usize = 0;
+    for (k < b.n && r.xs.data[(b.at + k) * 2 + 1] <= x) { k = k + 1; }
+    if (k == b.n || r.xs.data[(b.at + k) * 2] > x) { ret res[usize, allo.Error].ok{NO_REGION}; }
+    var labels: Vector[u32]            = vector.init[u32](r.bands.a);
+    val got:    res[usize, allo.Error] = regions(r, ?labels);
+    var at:     usize                  = NO_REGION;
+    if (sel got.ok) { at = labels.data[b.at + k]::usize; }
+    vector.dnit[u32](?labels);
+    if (sel got.err) { ret res[usize, allo.Error].err{got.err}; }
+    ret res[usize, allo.Error].ok{at};
+}
+
+fun shape(a: *allo.Allocator, kind: u32, x0: i64, y0: i64, x1: i64, y1: i64) Region {
+    var r: Region = init(a);
+    if (kind == 0) { rect(?r, x0, y0, x1, y1); }
+    or             { ellipse(?r, x0, y0, x1, y1); }
+    ret r;
+}
+
+# every cell of the box [x0, x1) by [y0, y1), counted the slow way
+fun counted(r: *Region, x0: i64, y0: i64, x1: i64, y1: i64) u64 {
+    var n: u64 = 0;
+    var y: i64 = y0;
+    for (y < y1) {
+        var x: i64 = x0;
+        for (x < x1) {
+            if (contains(r, x, y)) { n = n + 1; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    ret n;
+}
+
+test combine__adds_subtracts_and_intersects_cell_for_cell {
+    var a: allo.Allocator;
+    page.make(?a);
+    var r:   Region = shape(?a, 0, 0, 0, 40, 30);
+    var e:   Region = shape(?a, 1, 20, 10, 60, 50);
+    var c:   Region = init(?a);
+    val ops: [3]u32 = [3]u32{ADD, SUBTRACT, INTERSECT};
+    var i:   usize  = 0;
+    for (i < 3) {
+        copy(?c, ?r);
+        val done: err[allo.Error] = combine(?c, ?e, ops[i]);
+        if (sel done.err) { ret 1; }
+        var y: i64 = -2;
+        for (y < 52) {
+            var x: i64 = -2;
+            for (x < 62) {
+                val want: bool = holds(ops[i], contains(?r, x, y), contains(?e, x, y));
+                if (contains(?c, x, y) != want) { ret 2 + i::i32; }
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        if (area(?c) != counted(?c, -2, -2, 62, 52)) { ret 5; }
+        i = i + 1;
+    }
+    # a rectangle is one band however tall, and taking it from itself leaves nothing
+    if (r.bands.len != 1) { ret 6; }
+    copy(?c, ?r);
+    combine(?c, ?r, SUBTRACT);
+    if (!empty(?c)) { ret 7; }
+    # two rectangles side by side join into one span
+    var left:  Region = shape(?a, 0, 0, 0, 10, 10);
+    var right: Region = shape(?a, 0, 10, 0, 20, 10);
+    combine(?left, ?right, ADD);
+    var whole: Region = shape(?a, 0, 0, 0, 20, 10);
+    if (!same(?left, ?whole)) { ret 8; }
+    dnit(?r);
+    dnit(?e);
+    dnit(?c);
+    dnit(?left);
+    dnit(?right);
+    dnit(?whole);
+    ret 0;
+}
+
+test shapes__an_ellipse_and_a_polygon_hold_the_cells_their_centres_do {
+    var a: allo.Allocator;
+    page.make(?a);
+    var e: Region = init(?a);
+    ellipse(?e, -5, -3, 5, 3);
+    # the 10 by 6 ellipse holds its centre rows' whole width and is symmetric
+    if (!contains(?e, -5, -1) || !contains(?e, 4, 0) || contains(?e, -5, -3) || contains(?e, 4, 2)) { ret 1; }
+    var y: i64 = -3;
+    for (y < 3) {
+        var x: i64 = -5;
+        for (x < 5) {
+            if (contains(?e, x, y) != contains(?e, -1 - x, -1 - y)) { ret 2; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    # a square polygon holds what the rectangle does, a triangle half of it
+    var p:  Region = init(?a);
+    var sq: [8]i64 = [8]i64{0, 0, 8, 0, 8, 8, 0, 8};
+    polygon(?p, ?sq[0], 4);
+    var r: Region = shape(?a, 0, 0, 0, 8, 8);
+    if (!same(?p, ?r)) { ret 3; }
+    var tri: [6]i64 = [6]i64{0, 0, 8, 0, 0, 8};
+    polygon(?p, ?tri[0], 3);
+    if (area(?p) != 36 || !contains(?p, 0, 7) || contains(?p, 7, 7) || !contains(?p, 7, 0)) { ret 4; }
+    dnit(?e);
+    dnit(?p);
+    dnit(?r);
+    ret 0;
+}
+
+test chunks__classes_masks_and_rows_agree_cell_for_cell {
+    var a: allo.Allocator;
+    page.make(?a);
+    # a ring: a disc with a hole, crossing chunks every way
+    var r: Region = shape(?a, 1, -100, -90, 150, 170);
+    var h: Region = shape(?a, 0, -10, 0, 70, 64);
+    combine(?r, ?h, SUBTRACT);
+    var m:     [128]u32;
+    var reach: Vector[i64] = vector.init[i64](?a);
+    var whole: Vector[i64] = vector.init[i64](?a);
+    var total: u64         = 0;
+    var cy:    i64         = -3;
+    for (cy < 4) {
+        val got: res[i64, allo.Error] = chunk_row(?r, cy, ?reach, ?whole);
+        if (sel got.err) { ret 1; }
+        var cx: i64 = -3;
+        for (cx < 4) {
+            mask(?r, cx, cy, ?m[0]);
+            var n: u32   = 0;
+            var i: usize = 0;
+            for (i < 4096) {
+                val x:  i64  = cx * 64 + (i % 64)::i64;
+                val y:  i64  = cy * 64 + (i / 64)::i64;
+                val on: bool = ((m[i / 32] >> (i % 32)::u32) & 1) != 0;
+                if (on != contains(?r, x, y)) { ret 2; }
+                if (on)                       { n = n + 1; }
+                i = i + 1;
+            }
+            val c: u32 = class(?r, cx, cy);
+            if ((n == 4096) != (c == IN) || (n == 0) != (c == OUT)) { ret 3; }
+            # the row's runs name the chunk as its class does
+            var reached: bool  = false;
+            var held:    bool  = false;
+            var k:       usize = 0;
+            for (k < reach.len) {
+                if (cx >= reach.data[k] && cx < reach.data[k + 1]) { reached = true; }
+                k = k + 2;
+            }
+            k = 0;
+            for (k < whole.len) {
+                if (cx >= whole.data[k] && cx < whole.data[k + 1]) { held = true; }
+                k = k + 2;
+            }
+            if (reached != (c != OUT) || held != (c == IN)) { ret 4; }
+            if (c != OUT)                                   { total = total + 1; }
+            cx = cx + 1;
+        }
+        cy = cy + 1;
+    }
+    val n: res[u64, allo.Error] = chunks(?r, 1000);
+    if (!(sel n.ok && n.ok == total)) { ret 5; }
+    # a strip reaching FAR either way counts up to the most asked
+    var strip: Region               = shape(?a, 0, 0 - FAR, 0, FAR, 100);
+    val many:  res[u64, allo.Error] = chunks(?strip, 5000);
+    if (!(sel many.ok && many.ok == 5000) || finite(?strip) || !finite(?r)) { ret 6; }
+    vector.dnit[i64](?reach);
+    vector.dnit[i64](?whole);
+    dnit(?r);
+    dnit(?h);
+    dnit(?strip);
+    ret 0;
+}
+
+test regions__names_each_part_apart_in_reading_order {
+    var a: allo.Allocator;
+    page.make(?a);
+    # three parts: two rectangles touching only at a corner stay apart, and a
+    # rectangle cut by a column-wide line becomes two
+    var r: Region = shape(?a, 0, 0, 0, 10, 10);
+    var b: Region = shape(?a, 0, 10, 10, 20, 20);
+    combine(?r, ?b, ADD);
+    var c: Region = shape(?a, 0, 30, 0, 50, 10);
+    combine(?r, ?c, ADD);
+    var cut: Region = shape(?a, 0, 39, 0, 41, 10);
+    combine(?r, ?cut, SUBTRACT);
+    val n: res[usize, allo.Error] = count(?r);
+    if (!(sel n.ok && n.ok == 4)) { ret 1; }
+    # reading order: the first row's parts left to right, then the one below
+    val first: res[usize, allo.Error] = region_at(?r, 5, 5);
+    val right: res[usize, allo.Error] = region_at(?r, 45, 9);
+    val low:   res[usize, allo.Error] = region_at(?r, 15, 15);
+    val none:  res[usize, allo.Error] = region_at(?r, 25, 5);
+    if (!(sel first.ok && first.ok == 0) || !(sel right.ok && right.ok == 2))   { ret 2; }
+    if (!(sel low.ok && low.ok == 3) || !(sel none.ok && none.ok == NO_REGION)) { ret 3; }
+    var one: Region = init(?a);
+    region(?r, 3, ?one);
+    if (!same(?one, ?b)) { ret 4; }
+    # a U joins its arms through its base, below them
+    var u:    Region = shape(?a, 0, 0, 0, 5, 20);
+    var arm:  Region = shape(?a, 0, 15, 0, 20, 20);
+    var base: Region = shape(?a, 0, 0, 15, 20, 20);
+    combine(?u, ?arm, ADD);
+    combine(?u, ?base, ADD);
+    val joined: res[usize, allo.Error] = count(?u);
+    if (!(sel joined.ok && joined.ok == 1)) { ret 5; }
+    translate(?u, 64, -64);
+    if (!contains(?u, 64, -64) || contains(?u, 0, 0)) { ret 6; }
+    dnit(?r);
+    dnit(?b);
+    dnit(?c);
+    dnit(?cut);
+    dnit(?one);
+    dnit(?u);
+    dnit(?arm);
+    dnit(?base);
+    ret 0;
+}
