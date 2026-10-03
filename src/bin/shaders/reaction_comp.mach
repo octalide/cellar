@@ -42,8 +42,8 @@ var srcu:  Layer;
 #[storage(1, 5)]
 var dstu:  Layer;
 
-$if (layout.STEP_BINDINGS != 4 || word.U != 1) {
-    $error("the U layer's bindings are not the contract's (cellar.layer binding)");
+$if (layout.STEP_BINDINGS != 4 || word.U != 1 || word.WIDTH != 16) {
+    $error("the U layer's bindings are not the contract's (cellar.layer binding), or a word does not hold two cells");
 }
 
 #[builtin("global_invocation")]
@@ -174,14 +174,66 @@ fun comp_main() {
     val f:    u32 = meta.rule[word.F_AT];
     val kill: u32 = meta.rule[word.K_AT];
     var live: u32 = 0;
+    # an unseamed frame's run of a row lies in one chunk, the row above and the
+    # one below too, so each is read a word of each layer at a time
+    var rows: [24]u32;
+    if (seamed == 0) {
+        var r: u32 = 0;
+        for (r < 3) {
+            var yy: i32 = ly + r::i32 - 1;
+            var cy: u32 = 1;
+            if (yy < 0) {
+                yy = yy + layout.SIDE::i32;
+                cy = 0;
+            }
+            or (yy >= layout.SIDE::i32) {
+                yy = yy - layout.SIDE::i32;
+                cy = 2;
+            }
+            val nb: u32 = meta.table[base + cy * 3 + 1];
+            var j:  u32 = 0;
+            for (j < 4) {
+                var bv: u32 = 0;
+                var bu: u32 = 0;
+                if (nb != layout.NONE) {
+                    val at: u32 = layer.addr_word(word.WIDTH, layer.addr(nb, yy::u32 * layout.SIDE + x0::u32)) + j;
+                    bv = src.v[at];
+                    bu = srcu.v[at];
+                }
+                # a word holds two cells, the first in its low bits
+                rows[r * 8 + j * 2]     = word.cell(bu & layer.mask(word.WIDTH), bv & layer.mask(word.WIDTH));
+                rows[r * 8 + j * 2 + 1] = word.cell(bu >> word.WIDTH, bv >> word.WIDTH);
+                j                       = j + 1;
+            }
+            r = r + 1;
+        }
+    }
     for (x < x0 + 8) {
-        val n:    u32 = word_at(slot, seamed, x, ly - 1);
-        val w:    u32 = word_at(slot, seamed, x - 1, ly);
-        val e:    u32 = word_at(slot, seamed, x + 1, ly);
-        val s:    u32 = word_at(slot, seamed, x, ly + 1);
+        val i: u32 = (x - x0)::u32;
+        var c: u32 = 0;
+        var n: u32 = 0;
+        var w: u32 = 0;
+        var e: u32 = 0;
+        var s: u32 = 0;
+        if (seamed == 0) {
+            c = rows[8 + i];
+            n = rows[i];
+            s = rows[16 + i];
+            if (i == 0) { w = word_at(slot, seamed, x - 1, ly); }
+            or          { w = rows[7 + i]; }
+            if (i == 7) { e = word_at(slot, seamed, x + 1, ly); }
+            or          { e = rows[9 + i]; }
+        }
+        or {
+            c = cell_of(row + x::u32);
+            n = word_at(slot, seamed, x, ly - 1);
+            w = word_at(slot, seamed, x - 1, ly);
+            e = word_at(slot, seamed, x + 1, ly);
+            s = word_at(slot, seamed, x, ly + 1);
+        }
         val sa:   u32 = word.a_of(n) + word.a_of(w) + word.a_of(e) + word.a_of(s);
         val sb:   u32 = word.b_of(n) + word.b_of(w) + word.b_of(e) + word.b_of(s);
-        var next: u32 = word.next(cell_of(row + x::u32), sa, sb, du, dv, f, kill);
+        var next: u32 = word.next(c, sa, sb, du, dv, f, kill);
         if (seamed != 0 && layout.edge_side(edge, x, ly) != 4) { next = 0; }
         if (next != 0)                                         { live = 1; }
         acc  = acc | layer.place(word.WIDTH, row + x::u32, word.b_of(next));
