@@ -412,6 +412,15 @@ fun cells_of(p: *Pool, k: usize, c: usize) *gfx.StorageBuffer {
     ret ?p.cells[k * 2 + c];
 }
 
+# pool c of a pool's shown layer (cellar.layer), which the census, the
+# reduction and the draw bind beside its state layer, or its state layer's
+# where it has none, which they then never read
+fun shown_cells(p: *Pool, c: usize) *gfx.StorageBuffer {
+    val k: opt[usize] = plane.shown(?p.set);
+    if (sel k.none) { ret cells_of(p, 0, c); }
+    ret cells_of(p, k.some, c);
+}
+
 # the bytes of a slot's span of a pool's layer k
 fun span_bytes(p: *Pool, k: usize) usize {
     ret plane.span_words(p.set.at[k].width) * 4;
@@ -1279,7 +1288,7 @@ fun sync_ink(g: *Gpu, r: *rule.Rule, look: *Look) err[gfx.Error] {
         for (st < rule.states(r)) {
             val c: opt[u32] = rule.colour(r, st);
             if (sel c.some) {
-                val h: usize = layout.texel_heat(rule.value(r, st), sn.heat_shift, sn.heat_mask)::usize;
+                val h: usize = layout.texel_heat(rule.sensed(r, st), sn.heat_shift, sn.heat_mask)::usize;
                 pal[h * 4]     = channel(theme.red(c.some), g.srgb);
                 pal[h * 4 + 1] = channel(theme.green(c.some), g.srgb);
                 pal[h * 4 + 2] = channel(theme.blue(c.some), g.srgb);
@@ -2406,7 +2415,7 @@ fun upload_view(g: *Gpu, sp: *space.Space, look: *Look) err[gfx.Error] {
                     val room: res[usize, allo.Error] = vector.reserve[u32](?g.pyrs, MIP);
                     if (sel room.err) { e = err[gfx.Error].err{gfx.Error.alloc{room.err}}; }
                     or {
-                        space.pyramid(space.plane_of(sp, 0, s), sp.sense, ?g.pyrs.data[g.pyrs.len]);
+                        space.pyramid(space.plane_of(sp, 0, s), space.shown_of(sp, s), sp.sense, ?g.pyrs.data[g.pyrs.len]);
                         g.pyrs.len = g.pyrs.len + MIP;
                         e          = queue(g, s * MIP * 4, nil, MIP * 4);
                     }
@@ -2485,7 +2494,7 @@ pub fun pyramids_hold(g: *Gpu, sp: *space.Space) bool {
         if (space.used(sp, s) && sp.dirty[s] == 0) {
             val e: err[gfx.Error] = gfx.storage_buffer_read(g.d, ?g.p.mip, s * MIP * 4, (?got[0])::*u8, MIP * 4);
             if (sel e.err) { ret false; }
-            space.pyramid(space.plane_of(sp, 0, s), sp.sense, ?g.built[0]);
+            space.pyramid(space.plane_of(sp, 0, s), space.shown_of(sp, s), sp.sense, ?g.built[0]);
             var i: usize = 0;
             for (i < MIP) {
                 if (got[i] != g.built[i]) { ret false; }
@@ -2527,8 +2536,10 @@ fun write_head(g: *Gpu, r: *rule.Rule, gen: u64) {
     # the frame's first step, of serial g.serial + 1, reads generation gen
     g.head[layout.GEN_AT::usize] = (((gen & 0xffffffff) + 0x200000000 - g.serial::u64 - 1) & 0xffffffff)::u32;
     if (rule.caps(r).b0) { g.head[layout.STROBE_AT::usize] = 1; }
-    # the shared stages read the pool's state layer at its width
+    # the shared stages read the pool's state layer at its width, and its
+    # shown layer at its own
     g.head[layout.WIDTH_AT::usize] = g.p.set.at[0].width;
+    g.head[layout.SHOWN_AT::usize] = plane.shown_width(?g.p.set);
     rule.pack(r, ?g.head[layout.SHARED]);
 }
 
@@ -2918,24 +2929,26 @@ pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, 
     if (g.going && g.counted) { ret res[usize, gfx.Error].ok{n}; }
     g.counted = true;
     if (g.hi != 0) {
-        var rb: [4]*gfx.StorageBuffer;
+        var rb: [5]*gfx.StorageBuffer;
         rb[0] = cells_of(?g.p, 0, g.front);
         rb[1] = ?g.p.meta;
         rb[2] = ?g.p.flags;
         rb[3] = ?g.p.mip;
-        val er: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.reduce, ?rb[0], 4, 1, g.hi::u32, 1);
+        rb[4] = shown_cells(?g.p, g.front);
+        val er: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.reduce, ?rb[0], 5, 1, g.hi::u32, 1);
         if (sel er.err) { ret res[usize, gfx.Error].err{er.err}; }
     }
 
     # a workgroup a slot, and one even with none, to write the census id
     var groups: u32 = g.hi::u32;
     if (groups == 0) { groups = 1; }
-    var cb: [4]*gfx.StorageBuffer;
+    var cb: [5]*gfx.StorageBuffer;
     cb[0] = cells_of(?g.p, 0, g.front);
     cb[1] = ?g.p.meta;
     cb[2] = ?g.p.status;
     cb[3] = ?g.p.flags;
-    val e19: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.census, ?cb[0], 4, 1, groups, 1);
+    cb[4] = shown_cells(?g.p, g.front);
+    val e19: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.census, ?cb[0], 5, 1, groups, 1);
     if (sel e19.err) { ret res[usize, gfx.Error].err{e19.err}; }
     val e20: err[gfx.Error] = gfx.renderer_readback(g.r, ?g.p.rb, ?g.p.status, 0);
     if (sel e20.err) { ret res[usize, gfx.Error].err{e20.err}; }
@@ -2988,12 +3001,13 @@ pub fun aim(g: *Gpu, look: *Look) err[gfx.Error] {
 # draw every chunk into an open pass
 pub fun draw(g: *Gpu, p: *gfx.Pass) {
     if (g.hi == 0) { ret; }
-    var bufs: [4]*gfx.StorageBuffer;
+    var bufs: [5]*gfx.StorageBuffer;
     bufs[0] = cells_of(?g.p, 0, g.front);
     bufs[1] = ?g.p.meta;
     bufs[2] = ?g.view;
     bufs[3] = ?g.p.mip;
-    gfx.pass_draw_storage(p, ?bufs[0], 4, 6, g.hi::u32, ?g.mat, ?g.xf, ?g.draw);
+    bufs[4] = shown_cells(?g.p, g.front);
+    gfx.pass_draw_storage(p, ?bufs[0], 5, 6, g.hi::u32, ?g.mat, ?g.xf, ?g.draw);
 }
 
 test pace_for__follows_the_refresh_interval_and_falls_back_to_sixty {
