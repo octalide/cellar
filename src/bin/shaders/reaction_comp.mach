@@ -1,22 +1,26 @@
 # one generation of the chunks on the active list, under the reaction family
 # (cellar.rules.reaction)
 #
-# a cell is its value in the family's state layer, read and written at the
-# width the family declares (word.WIDTH, cellar.layer), and an invocation
-# builds the words its run of cells fills before it writes them.
+# a cell is its values in the family's two layers, v in the state layer and
+# 1 - u in the rule layer word.U, each read and written at the width the
+# family declares (word.WIDTH, cellar.layer), the state layer bound at
+# bindings 0 and 1 and the U layer at its own (cellar.layer binding). an
+# invocation builds the words of each layer its run of cells fills before it
+# writes them.
 #
 # an invocation is a run of 8 cells in a row, and 8 workgroups of 64 cover a
 # chunk; workgroup y names the chunk's slot through the active list
 # (cellar.layout.Flags). a cell's four orthogonal neighbours are read straight
 # from the source pool through the chunk's page-table entry, and through its
 # links on a seamed chunk, so a chunk that does not exist, or a position past a
-# plane's dead edge, reads as the background, word zero. the step is the
+# plane's dead edge, reads as the background, zero in both. the step is the
 # family's integer arithmetic (cellar.rules.reaction.word), the CPU's bit for
 # bit.
 #
-# every word but zero is live, and the stamps are the lenia stage's: a chunk
-# with no live cell in its 3 by 3 block steps to zeros, and one that also held
-# none the step before already holds them in both pools and is skipped.
+# every cell holding either field is live, and the stamps are the lenia
+# stage's: a chunk with no live cell in its 3 by 3 block steps to zeros, and
+# one that also held none the step before already holds them in both pools
+# and is skipped.
 
 use cellar.layer;
 use cellar.layout;
@@ -33,14 +37,24 @@ var dst:   Layer;
 var meta:  Meta;
 #[storage(1, 3)]
 var flags: Flags;
+#[storage(1, 4, "readonly")]
+var srcu:  Layer;
+#[storage(1, 5)]
+var dstu:  Layer;
+
+$if (layout.STEP_BINDINGS != 4 || word.U != 1 || word.WIDTH != 16) {
+    $error("the U layer's bindings are not the contract's (cellar.layer binding), or a word does not hold two cells");
+}
 
 #[builtin("global_invocation")]
 var gid: u32x3;
 
-# the source's value of the cell at address a in the family's state layer
-# (cellar.layer)
+# the source's pair of the cell at address a (cellar.layer), its U layer's
+# value and its state layer's
 fun cell_of(a: u32) u32 {
-    ret layer.read(src.v[layer.addr_word(word.WIDTH, a)], word.WIDTH, a);
+    val b: u32 = layer.read(src.v[layer.addr_word(word.WIDTH, a)], word.WIDTH, a);
+    val u: u32 = layer.read(srcu.v[layer.addr_word(word.WIDTH, a)], word.WIDTH, a);
+    ret word.cell(u, b);
 }
 
 # the address (cellar.layer) of the cell at (x, y) of a slot's frame, taken
@@ -73,7 +87,7 @@ fun reach(slot: u32, x: i32, y: i32) u32 {
     ret at;
 }
 
-# the word of the cell at (x, y) of a slot's frame, within a chunk of it, zero
+# the pair of the cell at (x, y) of a slot's frame, within a chunk of it, zero
 # where no chunk holds it
 fun word_at(slot: u32, seamed: u32, x: i32, y: i32) u32 {
     var at: u32 = layout.NONE;
@@ -119,6 +133,7 @@ fun comp_main() {
     val base: u32 = slot * layout.ENTRY;
     val row:  u32 = layer.addr(slot, (ly * layout.SIDE::i32)::u32);
     var acc:  u32 = 0;
+    var accu: u32 = 0;
     if (meta.table[base + layout.INCARNATION_AT] == 0) { ret; }
     val edge:   u32 = meta.table[base + layout.EDGE_AT];
     val seamed: u32 = layout.seamed(edge);
@@ -146,8 +161,9 @@ fun comp_main() {
             # destination already holds them
             if (warm != last - 1) { ret; }
             for (x < x0 + 8) {
-                dst.v[layer.addr_word(word.WIDTH, row + x::u32)] = 0;
-                x                                                = x + 1;
+                dst.v[layer.addr_word(word.WIDTH, row + x::u32)]  = 0;
+                dstu.v[layer.addr_word(word.WIDTH, row + x::u32)] = 0;
+                x                                                 = x + 1;
             }
             ret;
         }
@@ -158,20 +174,75 @@ fun comp_main() {
     val f:    u32 = meta.rule[word.F_AT];
     val kill: u32 = meta.rule[word.K_AT];
     var live: u32 = 0;
+    # an unseamed frame's run of a row lies in one chunk, the row above and the
+    # one below too, so each is read a word of each layer at a time
+    var rows: [24]u32;
+    if (seamed == 0) {
+        var r: u32 = 0;
+        for (r < 3) {
+            var yy: i32 = ly + r::i32 - 1;
+            var cy: u32 = 1;
+            if (yy < 0) {
+                yy = yy + layout.SIDE::i32;
+                cy = 0;
+            }
+            or (yy >= layout.SIDE::i32) {
+                yy = yy - layout.SIDE::i32;
+                cy = 2;
+            }
+            val nb: u32 = meta.table[base + cy * 3 + 1];
+            var j:  u32 = 0;
+            for (j < 4) {
+                var bv: u32 = 0;
+                var bu: u32 = 0;
+                if (nb != layout.NONE) {
+                    val at: u32 = layer.addr_word(word.WIDTH, layer.addr(nb, yy::u32 * layout.SIDE + x0::u32)) + j;
+                    bv = src.v[at];
+                    bu = srcu.v[at];
+                }
+                # a word holds two cells, the first in its low bits
+                rows[r * 8 + j * 2]     = word.cell(bu & layer.mask(word.WIDTH), bv & layer.mask(word.WIDTH));
+                rows[r * 8 + j * 2 + 1] = word.cell(bu >> word.WIDTH, bv >> word.WIDTH);
+                j                       = j + 1;
+            }
+            r = r + 1;
+        }
+    }
     for (x < x0 + 8) {
-        val n:    u32 = word_at(slot, seamed, x, ly - 1);
-        val w:    u32 = word_at(slot, seamed, x - 1, ly);
-        val e:    u32 = word_at(slot, seamed, x + 1, ly);
-        val s:    u32 = word_at(slot, seamed, x, ly + 1);
+        val i: u32 = (x - x0)::u32;
+        var c: u32 = 0;
+        var n: u32 = 0;
+        var w: u32 = 0;
+        var e: u32 = 0;
+        var s: u32 = 0;
+        if (seamed == 0) {
+            c = rows[8 + i];
+            n = rows[i];
+            s = rows[16 + i];
+            if (i == 0) { w = word_at(slot, seamed, x - 1, ly); }
+            or          { w = rows[7 + i]; }
+            if (i == 7) { e = word_at(slot, seamed, x + 1, ly); }
+            or          { e = rows[9 + i]; }
+        }
+        or {
+            c = cell_of(row + x::u32);
+            n = word_at(slot, seamed, x, ly - 1);
+            w = word_at(slot, seamed, x - 1, ly);
+            e = word_at(slot, seamed, x + 1, ly);
+            s = word_at(slot, seamed, x, ly + 1);
+        }
         val sa:   u32 = word.a_of(n) + word.a_of(w) + word.a_of(e) + word.a_of(s);
         val sb:   u32 = word.b_of(n) + word.b_of(w) + word.b_of(e) + word.b_of(s);
-        var next: u32 = word.next(cell_of(row + x::u32), sa, sb, du, dv, f, kill);
+        var next: u32 = word.next(c, sa, sb, du, dv, f, kill);
         if (seamed != 0 && layout.edge_side(edge, x, ly) != 4) { next = 0; }
         if (next != 0)                                         { live = 1; }
-        acc = acc | layer.place(word.WIDTH, row + x::u32, next);
+        acc  = acc | layer.place(word.WIDTH, row + x::u32, word.b_of(next));
+        accu = accu | layer.place(word.WIDTH, row + x::u32, word.a_of(next));
         if (layer.ends(word.WIDTH, row + x::u32) != 0) {
-            dst.v[layer.addr_word(word.WIDTH, row + x::u32)] = acc;
-            acc                                              = 0;
+            dst.v[layer.addr_word(word.WIDTH, row + x::u32)]  = acc;
+            dstu.v[layer.addr_word(word.WIDTH, row + x::u32)] = accu;
+            acc                                               = 0;
+            accu                                              = 0;
         }
         x = x + 1;
     }
