@@ -101,6 +101,8 @@ use rd_word:   cellar.rules.reaction.word;
 use ruletable: cellar.rules.table;
 use cellar.rules.table.load;
 use cellar.rules.table.store;
+#[testing]
+use cellar.rules.trace;
 use cellar.rules.weighted;
 use cellar.rules.weighted.word;
 use cellar.snapshot;
@@ -3903,6 +3905,66 @@ fun same_world(a: *Sim, b: *Sim) bool {
         pass = pass + 1;
     }
     ret true;
+}
+
+# a world of the trace family (cellar.rules.trace): a cell live by its state
+# in the origin's chunk, and two live by their trace alone at the east edge of
+# chunk (3, 0), traces of 6 and 3, so its halo reaches the chunk east of it
+#[testing]
+fun seed_traces(s: *Sim) {
+    paint(s, 5, 5, 1);
+    var w: [4]u32 = [4]u32{0, 6, 0, 3};
+    edit_begin(s, 254, 10, 256, 11);
+    edit_words(s, 254, 10, 2, ?w[0]);
+    edit_end(s);
+}
+
+# the live cells of level 1 of a chunk's pyramid, built on the host
+#[testing]
+fun pyramid_live(sp: *space.Space, s: usize) u32 {
+    var lv:  space.Lives = space.lives_of(sp, s, false);
+    var mip: [layout.MIP]u32;
+    space.pyramid(space.plane_of(sp, 0, s), sp.sense, ?lv, ?mip[0]);
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < layout.mip_side(1) * layout.mip_side(1)) {
+        n = n + (mip[i::usize] & layout.TEXEL_LIVE);
+        i = i + 1;
+    }
+    ret n;
+}
+
+test frame__a_cell_live_by_a_rule_layer_alone_is_counted_and_kept_on_both_engines {
+    trace.register();
+    val r: res[rule.Rule, str] = rule.parse("trace");
+    if (sel r.err) { ret 1; }
+    var t:    Rig;
+    val code: i32 = rig_open(?t, r.ok, seed_traces);
+    if (code != 0) { ret code; }
+    val sp: *space.Space = ?t.cpu.space;
+    # the traces count as live, and the chunk they lie in, held by nothing
+    # else, asks for the one east of it
+    if (population(?t.cpu) != 3 || !alive(?t.cpu, 255, 10) || alive(?t.cpu, 253, 10)) { ret 2; }
+    rig_step(?t, 2);
+    if (!rig_same(?t)) { ret 3; }
+    val s3: u32 = space.find(sp, 3, 0);
+    if (population(?t.cpu) != 3 || s3 == space.NONE || space.find(sp, 4, 0) == space.NONE) { ret 4; }
+    if (pyramid_live(sp, s3::usize) != 2)                                                  { ret 5; }
+    if (t.on) {
+        if (population(?t.gpu) != 3)                { ret 6; }
+        if (!gpu.pyramids_hold(?t.g, ?t.gpu.space)) { ret 7; }
+    }
+    # the shorter trace runs out at generation 3, the longer at 6, and then
+    # its chunk holds nothing and is freed
+    rig_step(?t, 1);
+    if (!rig_same(?t) || population(?t.cpu) != 2) { ret 8; }
+    if (t.on && population(?t.gpu) != 2)          { ret 9; }
+    rig_step(?t, 5);
+    if (!rig_same(?t) || population(?t.cpu) != 1) { ret 10; }
+    if (t.on && population(?t.gpu) != 1)          { ret 11; }
+    if (space.find(sp, 3, 0) != space.NONE)       { ret 12; }
+    rig_close(?t);
+    ret 0;
 }
 
 # the live cells a world's pool holds, counted cell by cell
