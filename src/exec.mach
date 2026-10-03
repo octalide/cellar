@@ -26,6 +26,7 @@ use cellar.format;
 use cellar.formats;
 use cellar.identify.worker;
 use cellar.journal;
+use cellar.library;
 use cellar.pattern;
 use cellar.persist;
 use cellar.region;
@@ -309,7 +310,21 @@ fun paste(a: *app.App, s: *sim.Sim, d: *Deps, c: *command.Paste) Change {
     a.orient      = 0;
     a.tool        = app.TOOL_STAMP;
     app.say(a, "pasted to the stamp");
-    val named: str = pattern.rule(?a.custom);
+    var refused: bool = false;
+    ret offer_rule(a, s, pattern.rule(?a.custom), c.rule, "Ctrl+Shift+V takes it", ?refused);
+}
+
+# take the rule a pattern names, or offer to, saying what happened after the
+# message already flashed. a pattern without a rule leaves the world's alone
+# ---
+# a:       application state
+# s:       the simulation
+# named:   the pattern's rule, as its header names it, empty for none
+# take:    set it as the world's rule when it differs
+# how:     what takes it, for the offer
+# refused: set when taking was asked for and the rule could not be set
+# ret:     an edit when the rule changed
+fun offer_rule(a: *app.App, s: *sim.Sim, named: str, take: bool, how: str, refused: *bool) Change {
     if (named[0] == 0) { ret Change.none{}; }
     val k: res[rule.Rule, str] = rule.parse(named);
     if (sel k.err) {
@@ -317,18 +332,47 @@ fun paste(a: *app.App, s: *sim.Sim, d: *Deps, c: *command.Paste) Change {
         ret Change.none{};
     }
     if (rule.same(?s.rule, ?k.ok)) { ret Change.none{}; }
-    if (!c.rule) {
-        app.say_also(a, "its rule was not taken; Ctrl+Shift+V takes it");
+    if (!take) {
+        var m: [160]u8;
+        var o: usize = text.buf_str(?m[0], 0, "its rule was not taken; ");
+        o    = text.buf_str(?m[0], o, how);
+        m[o] = 0;
+        app.say_also(a, ?m[0]);
         ret Change.none{};
     }
     val why: str = sim.refusal(s, ?k.ok);
     if (why != nil) {
+        refused[0] = true;
         app.say_also(a, why);
         ret Change.none{};
     }
     sim.set_rule(s, k.ok);
+    if (!rule.same(?s.rule, ?k.ok)) {
+        refused[0] = true;
+        app.say_also(a, "its rule could not be taken");
+        ret Change.none{};
+    }
     app.say_also(a, "its rule was taken");
     ret Change.edit{};
+}
+
+# make a library pattern the stamp, taking its rule when asked. a pattern whose
+# rule could not be taken is not made the stamp, so it is never laid down
+# under a rule it was not asked for
+fun pick(a: *app.App, s: *sim.Sim, c: *command.Pick) Change {
+    val before: usize = a.pattern_sel;
+    app.choose(a, c.index);
+    if (a.pattern_sel != c.index) { ret Change.none{}; }
+    a.orient = 0;
+    a.tool   = app.TOOL_STAMP;
+    app.say(a, "stamp picked");
+    var refused: bool   = false;
+    val got:     Change = offer_rule(a, s, pattern.rule(app.chosen(a)), c.rule, "Shift-click takes it", ?refused);
+    if (refused) {
+        a.pattern_sel = before;
+        app.say_also(a, "so the stamp is unchanged");
+    }
+    ret got;
 }
 
 # shrink the selection to the box its live cells span, dropping it when none is alive
@@ -389,6 +433,11 @@ fun recorded(c: *command.Command) u8 {
         # shrink and identify only read the world
         if (c.area.op == command.AREA_SHRINK || c.area.op == command.AREA_IDENTIFY) { ret UNRECORDED; }
         ret journal.KIND_EDIT;
+    }
+    if (sel c.pick) {
+        # a pick that keeps the world's rule only changes the stamp
+        if (c.pick.rule) { ret journal.KIND_EDIT; }
+        ret UNRECORDED;
     }
     if (sel c.clear || sel c.randomize || sel c.stamp || sel c.rule || sel c.bounds || sel c.reset) { ret journal.KIND_EDIT; }
     if (sel c.load_world || sel c.load_pattern || sel c.open || sel c.paste || sel c.drop)          { ret journal.KIND_EDIT; }
@@ -561,6 +610,7 @@ fun apply(c: *command.Command, a: *app.App, s: *sim.Sim, d: *Deps) {
     if (sel c.load_pattern) { load_pattern(a, d, command.path(?c.load_pattern)); }
     if (sel c.open)         { change = open(a, s, d, command.path(?c.open)); }
     if (sel c.paste)        { change = paste(a, s, d, ?c.paste); }
+    if (sel c.pick)         { change = pick(a, s, ?c.pick); }
     if (sel c.drop) {
         change = open(a, s, d, command.path(?c.drop.file));
         if (c.drop.ignored > 0) { app.say_also(a, "the other dropped files were ignored"); }
@@ -1247,6 +1297,43 @@ test run__undo_and_redo_keep_the_states_a_stroke_paints_and_a_rule_change_clamps
     app.submit(?ap, command.Command.rule{rule.preset_rule(0)});
     run(?ap, ?s, ?d);
     if (ap.ink != 1) { ret 7; }
+
+    app.dnit(?ap);
+    sim.dnit(?s);
+    ret 0;
+}
+
+test run__a_library_pattern_offers_its_rule_and_taking_it_sets_the_rule_and_undoes {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    var ap: app.App;
+    app.init(?ap);
+    val shown: err[format.Error] = app.attach(?ap, ?a);
+    if (sel shown.err) { ret 1; }
+    var d:      Deps      = Deps{a: ?a};
+    var life:   rule.Rule = rule.preset_rule(0);
+    var buf:    [rule.FORMAT_MAX + 1]u8;
+    val orbium: usize     = library.find(?ap.library, "Orbium unicaudatus");
+    if (orbium >= library.count(?ap.library)) { ret 2; }
+
+    # declined, the pattern is the stamp under the world's rule, and the toast offers the rule
+    app.pick(?ap, orbium, false);
+    run(?ap, ?s, ?d);
+    if (ap.pattern_sel != orbium || ap.tool != app.TOOL_STAMP || !rule.same(?s.rule, ?life))        { ret 3; }
+    if (!string.str_equals(ap.toast, "stamp picked; its rule was not taken; Shift-click takes it")) { ret 4; }
+
+    # taken, the rule is set before the pattern is the stamp, and undo puts the old one back
+    app.choose_default(?ap);
+    app.pick(?ap, orbium, true);
+    run(?ap, ?s, ?d);
+    if (ap.pattern_sel != orbium || rule.same(?s.rule, ?life))                            { ret 5; }
+    if (!string.str_equals(rule.format(?s.rule, ?buf[0]), pattern.rule(app.chosen(?ap)))) { ret 6; }
+    app.submit(?ap, command.Command.undo{});
+    run(?ap, ?s, ?d);
+    if (!rule.same(?s.rule, ?life)) { ret 7; }
 
     app.dnit(?ap);
     sim.dnit(?s);
