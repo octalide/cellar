@@ -240,7 +240,8 @@ stops there, writes the world as it stood, says which and exits with status 3.
 
 ## Bench
 
-`cellar --bench <gpu|cpu> <world> [seconds [radius [speed]]]` runs a world on
+`cellar --bench <gpu|cpu> <world> [seconds [radius [speed]]] [--rule <rule>]`
+runs a world on
 that engine for ten seconds or the seconds given, after a warmup of 30 frames,
 prints one line and exits, leaving the saved settings alone. It runs uncapped,
 or at `speed` generations a second. The worlds:
@@ -267,6 +268,14 @@ The last three measure a bounded grid.
 
 The other worlds run Life with its eight weights widened to the radius, one by
 default, so a wider radius costs its spread but reads the same eight cells.
+
+`--rule` runs every world under a rule instead, in the syntax of `cellar run`,
+so any family can be measured. A weighted rule is widened to the radius as Life
+is. A continuous rule has no soup of live cells to run, so each world seeds what
+the rule needs: Orbium for Lenia and a square of ink for reaction-diffusion. The
+`footprint` world runs the vote it measures, and `torus`, `plane` and `box` need
+a rule that runs on a bounded grid, so a rule that cannot is refused with a
+message, as is one that does not parse.
 
 The line reads `bench <engine> radius <r> chunks <n> population <n> gens/s <n>
 step us <n> cells/s <n> frame us <n> bits/cell <n> pool bytes <n>`: chunks and
