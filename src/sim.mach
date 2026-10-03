@@ -268,6 +268,8 @@ pub rec Watch {
 #             live chunk had its halo, so the next settles the pool first
 # held:       a test's hold on the pool's ceiling in slots, 0 for none
 # pool:       the memory the pool takes and may take (pool_memory)
+# sparse:     counts in a row of the world's chunks below a quarter of the
+#             pool's capacity, toward giving memory back (weigh)
 # withheld:   the GPU keeps a pool the host could not take back, so the run
 #             paused and what needed the host's pool was refused, until a take
 #             next succeeds
@@ -306,6 +308,7 @@ pub rec Sim {
     unsettled:  bool;
     held:       usize;
     pool:       PoolMemory;
+    sparse:     usize;
     withheld:   bool;
     generation: u64;
     running:    u8;
@@ -365,6 +368,7 @@ pub fun init(s: *Sim, a: *allo.Allocator) err[allo.Error] {
     s.unsettled  = false;
     s.held       = 0;
     s.pool       = PoolMemory{taken: 0, bound: 0, heap: 0, share: 0};
+    s.sparse     = 0;
     s.withheld   = false;
     s.generation = 0;
     s.running    = 0;
@@ -502,12 +506,13 @@ pub fun set_views(s: *Sim, on: bool) opt[str] {
 }
 
 # fit the pool to a set of layers it is about to take up, a pool of cap slots
-# where they are to be taken up. a pool grows and never shrinks on its own,
-# so one grown for a world since cleared or gone may hold far more slots than
-# the device holds of the layers, while the world itself takes few: one the
-# device holds the layers in at its capacity stays as it is, and one grown
-# past it shrinks to the world it holds, the host's here and the GPU's
-# following it
+# where they are to be taken up. a pool gives its memory back only once its
+# world has stayed small for a while (weigh), so one grown for a world since
+# gone may hold far more slots than the device holds of the layers, while the
+# world itself takes few: one the device holds the layers in at its capacity
+# stays as it is, and one grown past it has its chunks moved below the room
+# and shrinks to the world it holds, the host's here and the GPU's following
+# it
 # ---
 # s:   simulation, holding no read or edit open
 # set: the layers
@@ -522,9 +527,14 @@ fun fit_pool(s: *Sim, set: *plane.Set, cap: usize) res[bool, str] {
     if (cap <= room.ok) { ret res[bool, str].ok{false}; }
     # the host's page table names every slot in use, the GPU's taken back
     if (!own(s)) { ret res[bool, str].err{gpu.untaken(s.gpu)}; }
-    val sp: *space.Space = ?s.space;
+    val sp:    *space.Space = ?s.space;
+    val large: str          = "the world is too large for the pool to hold the layers within its memory ceiling";
+    if (sp.live > room.ok || room.ok == 0) { ret res[bool, str].err{large}; }
+    # chunks lying past the room move below it, on the GPU too where it holds
+    # their cells (move_pool)
+    if (!sp.whole && !space.relocate(sp, gpu.fitted(sp.live, room.ok))) { ret res[bool, str].err{"there is not enough memory to fit the pool to the world"}; }
     space.compact(sp);
-    if (sp.hi > room.ok || room.ok == 0) { ret res[bool, str].err{"the world is too large for the pool to hold the layers within its memory ceiling"}; }
+    if (sp.hi > room.ok) { ret res[bool, str].err{large}; }
     val shrunk: err[allo.Error] = space.shrink(sp, gpu.fitted(sp.hi, room.ok));
     if (sel shrunk.err) { ret res[bool, str].err{"there is not enough memory to fit the pool to the world"}; }
     ret res[bool, str].ok{true};
@@ -794,7 +804,7 @@ pub fun attach(s: *Sim, g: *gpu.Gpu) {
     if (!gpu.prepare(g, rule.family_of(?s.rule))) { gpu.forgo_compute(g); }
     s.gpu = g;
     gpu.mirror(g, ?s.space);
-    space.set_mirror(?s.space, space.Mirror{ctx: s::*u8, reserve: reserve_pool, own: own_pool}, s.space.max_slots);
+    space.set_mirror(?s.space, space.Mirror{ctx: s::*u8, reserve: reserve_pool, own: own_pool, move: move_pool}, s.space.max_slots);
     var t: usize = 0;
     for (t < s.space.hi) {
         s.space.dirty[t] = space.DIRTY_ENTRY | space.DIRTY_CELLS;
@@ -892,6 +902,78 @@ fun reserve_pool(ctx: *u8, cap: usize) bool {
 fun own_pool(ctx: *u8) bool {
     val s: *Sim = ctx::*Sim;
     ret own(s);
+}
+
+# have chunks the host is about to move to other slots move on the GPU too,
+# where it steps the world and so holds their cells, else sent to the draw
+# as the host holds them
+fun move_pool(ctx: *u8, from: *u32, to: *u32, n: usize) space.Follow {
+    val s: *Sim = ctx::*Sim;
+    if (!on_gpu(s))                     { ret space.Follow.send{}; }
+    if (!gpu.moved(s.gpu, from, to, n)) { ret space.Follow.refuse{}; }
+    ret space.Follow.carry{};
+}
+
+# counts of the world's chunks in a row, each below a quarter of the pool's
+# capacity, before the pool gives its memory back (weigh): about two seconds
+# of censuses at 60 frames a second on the GPU, as many generations on the
+# CPU, so a world passing below the threshold for a moment keeps its pool
+val RECLAIM_AFTER: usize = 120;
+
+# the capacity a pool whose world holds used chunks gives its memory back
+# down to: a power of two holding them twice over and the slack the GPU keeps
+# above them (gpu.fitted). the world then fills half of it at most, so it
+# must grow by more than a quarter before the pool grows back, and fall below
+# a quarter of the grown pool again before the next reclaim
+pub fun reclaim_cap(used: usize) usize {
+    var cap: usize = gpu.fitted(used, gpu.MOST_SLOTS);
+    for (cap < used * 2) { cap = cap * 2; }
+    ret cap;
+}
+
+# whether a count of the world's chunks against the pool's capacity, after
+# the counts before it in a row (sparse), calls for the pool to give its
+# memory back: once RECLAIM_AFTER counts in a row are below a quarter of it,
+# any count at or above a quarter starting over
+# ---
+# sparse: the counts in a row below a quarter so far, which this updates
+# used:   chunks the world holds
+# cap:    slots the pool holds
+# ret:    the capacity to give the memory back down to (reclaim_cap), 0 for
+#         none
+pub fun weigh(sparse: *usize, used: usize, cap: usize) usize {
+    if (used * 4 >= cap) {
+        @sparse = 0;
+        ret 0;
+    }
+    @sparse = @sparse + 1;
+    if (@sparse < RECLAIM_AFTER) { ret 0; }
+    @sparse = 0;
+    val to: usize = reclaim_cap(used);
+    if (to >= cap) { ret 0; }
+    ret to;
+}
+
+# give memory back from a pool whose world died down, as weigh judges the
+# count: a pool the GPU owns is packed on the GPU alone (gpu.reclaim), and
+# any other has the host move its chunks below the capacity and shrink, the
+# GPU's pool following in the next frame. a world held whole, full or not yet
+# settled keeps its pool
+fun reclaim(s: *Sim, used: usize, cap: usize) {
+    val sp: *space.Space = ?s.space;
+    if (sp.whole || s.full || s.unsettled) {
+        s.sparse = 0;
+        ret;
+    }
+    val to: usize = weigh(?s.sparse, used, cap);
+    if (to == 0) { ret; }
+    if (s.gpu != nil && gpu.owned(s.gpu)) {
+        gpu.reclaim(s.gpu, to);
+        ret;
+    }
+    if (!space.relocate(sp, to)) { ret; }
+    space.shrink(sp, to);
+    note_pool(s);
 }
 
 # write every live chunk of the pool into the tree, emptied first
@@ -1191,6 +1273,7 @@ pub fun commit(s: *Sim) {
     }
     s.generation = s.generation + 1;
     note_pool(s);
+    reclaim(s, s.space.live, s.space.cap);
     val pop: u64 = population(s)::u64;
     history.add(?s.history, s.generation, pop);
     check(s, pop, took(s.began));
@@ -1389,6 +1472,10 @@ pub fun collect(s: *Sim) {
     note_pool(s);
     if (!got.fits)  { overflow(s); }
     if (!got.fresh) { ret; }
+    # the census counts the chunks in use: the GPU's own where it owns the
+    # pool, as of no edit since, else the host's it just settled
+    if (gpu.tallied(s.gpu)) { reclaim(s, s.gpu.used, s.gpu.p.cap); }
+    or (!gpu.owned(s.gpu))  { reclaim(s, s.space.live, s.space.cap); }
     # every census older than the last clear is refused, so it is never more
     # generations behind than have been counted since
     val pop: u64 = population(s)::u64;
@@ -1759,10 +1846,20 @@ pub fun clear(s: *Sim) {
     s.pending    = 0;
     s.full       = false;
     s.unsettled  = false;
+    s.sparse     = 0;
     history.clear(?s.history);
     disarm(s);
     if (!space.keep_rim(?s.space)) { overflow(s); }
     if (s.gpu != nil)              { gpu.note_bulk(s.gpu); }
+    # the pool gives its memory back down to what the empty world takes, as
+    # it started, the GPU's following in the next frame
+    val sp: *space.Space = ?s.space;
+    val to: usize        = gpu.fitted(sp.hi, gpu.MOST_SLOTS);
+    if (to < sp.cap) {
+        val shrunk: err[allo.Error] = space.shrink(sp, to);
+        if ((sel shrunk.ok) && on_gpu(s) && gpu.owned(s.gpu)) { gpu.shrink(s.gpu); }
+    }
+    note_pool(s);
 }
 
 # empty the world ahead of seeding it with fill_cell

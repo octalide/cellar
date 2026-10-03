@@ -1,0 +1,51 @@
+# list what a compaction moves, while the GPU owns the pool (cellar.gpu
+# compact): the slots below the capacity the pool packs into
+# (layout.CTL_TRIM) that are free, and the slots at or past it that hold a
+# chunk, each list in the order the atomics hand out (layout.List)
+#
+# an invocation is one slot below the top, a row of 64 of them a workgroup
+# (cellar.layout row). the move stage pairs the j-th slot moving with the j-th
+# free one, so a chunk past the packed capacity finds a slot of its own
+# whatever order the lists hold, and its arguments are raised here to cover
+# every slot moving.
+
+use cellar.layout;
+use cellar.layout.List;
+use cellar.layout.Meta;
+use cellar.layout.Status;
+use at: shader.atomic;
+use sy: shader.sync;
+
+#[storage(1, 0, "readonly")]
+var meta:   Meta;
+#[storage(1, 1)]
+var status: Status;
+#[storage(1, 2)]
+var list:   List;
+
+#[builtin("global_invocation")]
+var gid: u32x3;
+
+val DEV: u32 = sy.SCOPE_DEVICE;
+val RX:  u32 = sy.SEMANTICS_RELAXED;
+
+#[stage("compute")]
+#[workgroup(64, 1, 1)]
+fun comp_main() {
+    val fold: u32 = meta.base[layout.FOLD_AT - layout.BASE_AT];
+    val s:    u32 = layout.row(gid[1], gid[2], fold) * 64 + gid[0];
+    if (s >= status.head[layout.CTL_TOP]) { ret; }
+    val cap:  u32 = meta.base[layout.CAP_AT - layout.BASE_AT];
+    val trim: u32 = status.head[layout.CTL_TRIM];
+    val used: u32 = meta.table[s * layout.ENTRY + layout.INCARNATION_AT];
+    if (s < trim && used == 0) {
+        val i: u32 = at.atomic_add_u32(?list.n, DEV, RX, 1);
+        list.v[i] = s;
+    }
+    if (s >= trim && used != 0) {
+        val j: u32 = at.atomic_add_u32(?status.head[layout.CTL_MOVES], DEV, RX, 1);
+        list.v[layout.mover_at(cap, j)] = s;
+        at.atomic_max_u32(?status.head[layout.ARGS_CLEAR + 1], DEV, RX, layout.fold_y(j, fold));
+        at.atomic_max_u32(?status.head[layout.ARGS_CLEAR + 2], DEV, RX, layout.fold_z(j, fold));
+    }
+}

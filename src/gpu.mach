@@ -62,6 +62,19 @@
 # buffers (carry_comp) and keeps owning the pool, and the host's mirror, its
 # cells with it, grows only once take next brings it level.
 #
+# a pool whose world has died down gives its memory back (cellar.sim weigh),
+# and a cleared one goes back to the size it started at. where the host
+# allocates, it moves its chunks below the smaller capacity itself
+# (cellar.space relocate), the move stage moves the GPU's cells alike
+# (shift), and the pool follows the host's capacity down (shrink_pool). where
+# the GPU owns the pool it packs it alone, nothing read back: the pack, move
+# and relink stages move every chunk past the capacity into a free slot below
+# it and rename it in every entry, the passes claim below it from then on,
+# and once a census says every chunk lies there, buffers of that capacity
+# take the page table, the stamps and the allocator's words on the GPU and
+# the store's shards past it go (compact, shrink_owned). a world that grew
+# back meanwhile keeps its pool.
+#
 # a pass runs between generations, before the spread recorded since the last
 # would pass what the halo it left holds: each live chunk asks for the rule's
 # ring of chunks and claims a slot for any missing (mark_comp), the
@@ -175,6 +188,12 @@ val GATHER_SPV: [_]u8;
 val START_SPV:  [_]u8;
 #[embed("{artifact.stage-edit_comp.out}")]
 val EDIT_SPV:   [_]u8;
+#[embed("{artifact.stage-pack_comp.out}")]
+val PACK_SPV:   [_]u8;
+#[embed("{artifact.stage-move_comp.out}")]
+val MOVE_SPV:   [_]u8;
+#[embed("{artifact.stage-relink_comp.out}")]
+val RELINK_SPV: [_]u8;
 #[embed("{artifact.stage-cells_vert.out}")]
 val VERT_SPV:   [_]u8;
 #[embed("{artifact.stage-cells_frag.out}")]
@@ -802,6 +821,9 @@ fun pool_bytes(cap: usize) usize {
 # carry:    the stage that carries the page table and the allocator's words
 #           into larger buffers while the GPU owns the pool
 # edit:     the stage that writes painted cells into a layer narrower than a word
+# pack:     the stage that lists what a compaction moves (compact)
+# move:     the stage that moves chunks into free slots below a capacity
+# relink:   the stage that renames the chunks a compaction moved
 # start:    the stage that starts a shown layer the pool took up from its state
 #           layer
 # restart:  the pool took up a shown layer this frame, which start fills once
@@ -907,8 +929,18 @@ fun pool_bytes(cap: usize) usize {
 # used:     slots in use the newest census found while owned
 # tallied:  pop, box and used are the world's, no edit having come since
 # squeeze:  a test's hold on the top, until the pool is next taken, 0 for none
-# shrink:   the host's pool shrank to the world it holds (cellar.sim
-#           set_views), which the next flush fits the pool to (shrink_pool)
+# shrink:   the host's pool shrank to the world it holds while the GPU owns
+#           it, which the next flush fits the pool to (shrink_pool)
+# shifts:   chunks the host moved to other slots (moved) that the next flush
+#           moves on the GPU, in rounds each of a count, the slots moved from
+#           and the slots moved to
+# pack_to:  a capacity the next flush packs the pool the GPU owns below
+#           (reclaim, compact), 0 for none
+# trim:     the capacity a compaction recorded packs the pool below, until a
+#           census says whether every chunk lies below it, 0 for none
+# trim_seq: the census seq the compaction was recorded after
+# trimmed:  a census found every chunk below trim, so the next flush lets go
+#           of the rest of the pool (shrink_owned)
 # listed:   the active list holds every slot the next generation may change,
 #           gathered since the pool and the rule last changed
 # gathered: cells of spread recorded since the list was gathered
@@ -951,6 +983,9 @@ pub rec Gpu {
     grow:     gfx.Compute;
     carry:    gfx.Compute;
     edit:     gfx.Compute;
+    pack:     gfx.Compute;
+    move:     gfx.Compute;
+    relink:   gfx.Compute;
     start:    gfx.Compute;
     restart:  bool;
     lit:      u32;
@@ -1044,6 +1079,11 @@ pub rec Gpu {
     tallied:  bool;
     squeeze:  usize;
     shrink:   bool;
+    shifts:   Vector[u32];
+    pack_to:  usize;
+    trim:     usize;
+    trim_seq: u64;
+    trimmed:  bool;
     listed:   bool;
     gathered: usize;
     est:      usize;
@@ -1359,6 +1399,11 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     g.tallied  = false;
     g.squeeze  = 0;
     g.shrink   = false;
+    g.shifts   = vector.init[u32](a);
+    g.pack_to  = 0;
+    g.trim     = 0;
+    g.trim_seq = 0;
+    g.trimmed  = false;
     g.untaken  = "";
     g.listed   = false;
     g.gathered = 0;
@@ -1455,12 +1500,79 @@ pub fun fitted(hi: usize, room: usize) usize {
     ret fit;
 }
 
-# fit the pool to the host's, which shrank to the world it holds, in the next
-# flush (shrink_pool). only the render thread may call it, holding the world,
-# with the host's page table the GPU's (take) and the GPU's pool holding a set
-# of the host's layers in place (in_place)
+# fit the pool the GPU owns to the host's, which shrank to the world it holds,
+# in the next flush (shrink_pool). only the render thread may call it, holding
+# the world, with the host's page table the GPU's (take) and the GPU's pool
+# holding a set of the host's layers. a pool the host allocates follows the
+# host's capacity down on its own
 pub fun shrink(g: *Gpu) {
     g.shrink = true;
+}
+
+# give back the memory of a pool the GPU owns past cap slots, its world
+# having died down, without the host: the next flush moves every chunk past
+# cap into a free slot below it on the GPU and renames it there (compact), and
+# once a census says every chunk lies below cap, the flush after lets go of
+# the rest (shrink_owned). a world that outgrew cap meanwhile keeps its pool.
+# only the render thread may call it, holding the world
+# ---
+# g:   the GPU side
+# cap: the slots the pool is to hold, at least its world's and its slack
+pub fun reclaim(g: *Gpu, cap: usize) {
+    if (!g.stepping || !g.owns || g.trim != 0 || cap >= g.p.cap) { ret; }
+    g.pack_to = cap;
+}
+
+# give up a compaction under way: its census is no longer awaited, and the
+# next flush that seeds the hash lets the passes claim past its capacity again
+fun untrim(g: *Gpu) {
+    g.pack_to = 0;
+    if (g.trim == 0) { ret; }
+    g.trim    = 0;
+    g.trimmed = false;
+    g.rehash  = true;
+}
+
+# the host is about to move n chunks to other slots (cellar.space relocate),
+# whose cells the next flush moves on the GPU ahead of anything else it
+# records, in the order the host moved them, and whose painted cells not yet
+# uploaded follow them. only the thread holding the world calls it, while the
+# GPU steps it
+# ---
+# g:    the GPU side
+# from: the slots the chunks move from, ascending
+# to:   the slots each moves to
+# n:    how many
+# ret:  false when the moves could not be kept, so nothing may move
+pub fun moved(g: *Gpu, from: *u32, to: *u32, n: usize) bool {
+    if (n == 0) { ret true; }
+    val at:   usize                  = g.shifts.len;
+    val room: res[usize, allo.Error] = vector.ensure[u32](?g.shifts, at + 1 + n * 2);
+    if (sel room.err) { ret false; }
+    # a round: the count, the slots moved to, then the slots moved from last
+    # first, as the move list holds them (layout.mover_at)
+    g.shifts.data[at] = n::u32;
+    var i: usize = 0;
+    for (i < n) {
+        g.shifts.data[at + 1 + i]     = to[i];
+        g.shifts.data[at + 1 + n + i] = from[n - 1 - i];
+        i                             = i + 1;
+    }
+    g.shifts.len = at + 1 + n * 2;
+    i            = 0;
+    for (i < g.writes.len) {
+        val w:  *Write = ?g.writes.data[i];
+        var lo: usize  = 0;
+        var hi: usize  = n;
+        for (lo < hi) {
+            val mid: usize = (lo + hi) / 2;
+            if (from[mid] < w.slot) { lo = mid + 1; }
+            or                      { hi = mid; }
+        }
+        if (lo < n && from[lo] == w.slot) { w.slot = to[lo]; }
+        i = i + 1;
+    }
+    ret true;
 }
 
 # whether the next frame takes a set up in place (review): the GPU steps the
@@ -1617,13 +1729,28 @@ fun stage_of(g: *Gpu, i: usize, spv: **u8, len: *usize) *gfx.Compute {
         @len = $length_of(START_SPV);
         ret ?g.start;
     }
-    @spv = ?EDIT_SPV[0];
-    @len = $length_of(EDIT_SPV);
-    ret ?g.edit;
+    if (i == 13) {
+        @spv = ?EDIT_SPV[0];
+        @len = $length_of(EDIT_SPV);
+        ret ?g.edit;
+    }
+    if (i == 14) {
+        @spv = ?PACK_SPV[0];
+        @len = $length_of(PACK_SPV);
+        ret ?g.pack;
+    }
+    if (i == 15) {
+        @spv = ?MOVE_SPV[0];
+        @len = $length_of(MOVE_SPV);
+        ret ?g.move;
+    }
+    @spv = ?RELINK_SPV[0];
+    @len = $length_of(RELINK_SPV);
+    ret ?g.relink;
 }
 
 # the shared compute stages
-val STAGES: usize = 14;
+val STAGES: usize = 17;
 
 # hold the clocks a frame's stepping is timed by, all of them or none, none on
 # a device whose queue writes no timestamps, which leaves the frame time to
@@ -1915,8 +2042,9 @@ pub fun owe(g: *Gpu, cap: usize) bool {
 fun make_next(g: *Gpu, cap: usize, framed: bool, set: *plane.Set) bool {
     # nothing has been recorded into a pool made since the last frame
     drop_next(g);
+    untrim(g);
     var st: usize = g.p.store;
-    if (!plane.same_shape(?g.stores[st].set, set)) {
+    if (!g.stores[st].made || !plane.same_shape(?g.stores[st].set, set)) {
         st = 1 - g.p.store;
         # the pool a growth replaced may still hold the other store, and
         # deleting it waits for the frame that last read it
@@ -1994,6 +2122,7 @@ pub fun dnit(g: *Gpu) {
     vector.dnit[u32](?g.stamp);
     vector.dnit[u32](?g.pyrs);
     vector.dnit[u32](?g.edit_at);
+    vector.dnit[u32](?g.shifts);
     if (g.room != 0) { gfx.storage_buffer_delete(g.d, ?g.edited); }
 }
 
@@ -2318,6 +2447,12 @@ pub fun collect(g: *Gpu, sp: *space.Space) Landed {
             g.tallied = true;
         }
         g.settled = snap.seq;
+        # a census taken since a compaction says whether it packed every chunk
+        # below its capacity, so the rest of the pool may go (compact)
+        if (g.trim != 0 && !g.trimmed && snap.seq > g.trim_seq) {
+            if (g.p.got[layout.CTL_TRIM::usize]::usize == g.trim) { g.trimmed = true; }
+            or                                                    { untrim(g); }
+        }
         if (high + slack(high) / 2 > g.top) { make_room(g, sp, high + slack(high)); }
         ret Landed{fresh: true, fits: true, behind: g.gens - snap.gens, kept: false};
     }
@@ -2345,6 +2480,8 @@ pub fun collect(g: *Gpu, sp: *space.Space) Landed {
 # capacity once the next flush has moved the pool, as aim keeps it.
 fun make_room(g: *Gpu, sp: *space.Space, want: usize) {
     val ahead: usize = want + slack(want);
+    # a world grown back past what a compaction packed it into keeps its pool
+    if (g.trim != 0 && ahead > g.trim) { untrim(g); }
     if (ahead > g.p.cap) {
         var cap: usize = g.p.cap;
         for (cap < ahead && cap < sp.max_slots) { cap = cap * 2; }
@@ -2793,22 +2930,45 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
         g.listed = false;
     }
     g.lit = sp.lit;
-    if (g.shrink) {
+    # buffers made for other layers than the host's are made again for them
+    var aim: *Pool = ?g.p;
+    if (g.reserved) { aim = ?g.next; }
+    val relaid: bool = !plane.same_shape(?aim.set, space.layers(sp));
+    if (relaid) {
+        # the host's cells are the world's and go up whole, so chunks the host
+        # moved need no moving here, and the pool made for other layers goes
+        # before the one for these is made: the device never holds both
+        vector.clear[u32](?g.shifts);
+        untrim(g);
+        g.shrink = false;
+        drop_next(g);
+        drop_old(g);
+        drop_pool(g, ?g.p);
+        store_drop(g, store_of(g, ?g.p));
+    }
+    # chunks the host moved move here first, in the pool they lie in
+    val em: err[gfx.Error] = shift(g);
+    if (sel em.err) { ret em; }
+    # a trimmed pool the GPU owns lets go of what lies past its chunks, and a
+    # pool the host shrank follows it, which one the host allocates does on
+    # its own
+    if (g.trimmed) {
+        val et: err[gfx.Error] = shrink_owned(g, sp);
+        if (sel et.err) { ret et; }
+    }
+    if (!relaid && (g.shrink || (!g.owns && sp.cap < g.p.cap))) {
         val es: err[gfx.Error] = shrink_pool(g, sp);
         if (sel es.err) { ret es; }
     }
     val ev: err[gfx.Error] = review(g, sp);
     if (sel ev.err) { ret ev; }
     val owed: usize = atomic.exchange(?g.owed, 0)::usize;
-    if (owed > g.p.cap && !(g.reserved && owed <= g.next.cap) && !make_next(g, owed, true, space.layers(sp))) {
+    if (!relaid && owed > g.p.cap && !(g.reserved && owed <= g.next.cap) && !make_next(g, owed, true, space.layers(sp))) {
         ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.overrun{(owed * slot_bytes(space.layers(sp)))::u64}}};
     }
-    # buffers made for other layers than the host's are made again for them,
-    # at the host's capacity, which holds the world the host's cells now are
-    # and which the set's ceiling holds (sim.set_views), and filled from them
-    var aim: *Pool = ?g.p;
-    if (g.reserved) { aim = ?g.next; }
-    val relaid: bool = !plane.same_shape(?aim.set, space.layers(sp));
+    # the buffers for the host's layers are made at the host's capacity, which
+    # holds the world the host's cells now are and which the set's ceiling
+    # holds (sim.set_views), and filled from them
     if (relaid && !make_next(g, sp.cap, true, space.layers(sp))) {
         ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.overrun{(sp.cap * slot_bytes(space.layers(sp)))::u64}}};
     }
@@ -2816,6 +2976,8 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
     # a growth made in another store than the pool's, as a pool made for
     # other layers is, holds none of the world's cells
     val moved: bool = grew && g.next.store != g.p.store;
+    # a pool replaced earlier in this flush goes once this frame has run
+    if (grew) { drop_old(g); }
     if (grew && (relaid || moved)) {
         # the host's cells and page table are the world's, and go up whole
         g.old      = g.p;
@@ -2841,6 +3003,9 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
         g.reserved = false;
         g.est      = UNKNOWN;
         forget_censuses(g);
+        # the carry finds the larger pool's capacity in its head
+        val ew: err[gfx.Error] = write_pool_words(g);
+        if (sel ew.err) { ret ew; }
         if (g.hi != 0 && g.stepping) {
             var gb: [3]*gfx.StorageBuffer;
             gb[0] = ?g.old.flags;
@@ -3005,50 +3170,209 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
             val er: err[gfx.Error] = rehash(g);
             if (sel er.err) { ret er; }
         }
+        # a compaction reclaim asked for, once everything else is in
+        if (g.pack_to != 0) {
+            val ec: err[gfx.Error] = compact(g);
+            if (sel ec.err) { ret ec; }
+        }
     }
     ret err[gfx.Error].ok{};
 }
 
 # fit the pool to the host's capacity, which shrank to the world it holds
-# (shrink): buffers of that capacity beside the same store, whose shards past
-# it go (store_trim), the stamps of the slots below the host's top carried
-# into them, and the cells left where they lie. the host's page table is the
-# GPU's (take), so it goes up again and the GPU seeds its allocator from it
+# (cellar.space relocate, shrink): buffers of that capacity beside the same
+# store, whose shards past it go (store_trim), the stamps of the slots below
+# the host's top carried into them, and the cells left where they lie. the
+# host's page table is the world's, so it goes up again, and a pool the GPU
+# owns seeds its allocator from it
 fun shrink_pool(g: *Gpu, sp: *space.Space) err[gfx.Error] {
     g.shrink = false;
     val cap: usize = sp.cap;
     if (cap >= g.p.cap) { ret err[gfx.Error].ok{}; }
-    drop_next(g);
-    val made: err[gfx.Error] = make_pool(g, ?g.next, cap, true, ?g.p.set, g.p.store);
-    if (sel made.err) { ret made; }
-    if (g.stepping && sp.hi != 0) {
-        var gb: [3]*gfx.StorageBuffer;
-        gb[0] = ?g.p.flags;
-        gb[1] = ?g.next.flags;
-        gb[2] = ?g.p.meta;
-        val eg: err[gfx.Error] = dispatch_each(g, ?g.grow, ?gb[0], 3, sp.hi);
-        if (sel eg.err) { ret eg; }
-    }
-    g.old      = g.p;
-    g.retired  = true;
-    g.p        = g.next;
-    g.reserved = false;
-    val et: err[gfx.Error] = store_trim(g, store_of(g, ?g.p), cap);
-    if (sel et.err) { ret et; }
-    g.est = UNKNOWN;
-    forget_censuses(g);
+    untrim(g);
+    val ed: err[gfx.Error] = swap_down(g, cap, sp.hi);
+    if (sel ed.err) { ret ed; }
     var t: usize = 0;
     for (t < sp.hi) {
         sp.dirty[t] = sp.dirty[t] | space.DIRTY_ENTRY;
         t           = t + 1;
     }
     if (g.owns) { g.reseed = true; }
+    ret err[gfx.Error].ok{};
+}
+
+# let go of the pool the GPU owns past the capacity a compaction packed every
+# chunk below, as a census found (compact): buffers of that capacity beside
+# the same store, whose shards past it go, the page table, the stamps and the
+# allocator's words carried into them on the GPU, the hash and the free bits
+# seeded again, and the host's stale copy cut to the same capacity
+# (space.cede). nothing is read back, and no cell moves
+fun shrink_owned(g: *Gpu, sp: *space.Space) err[gfx.Error] {
+    val cap: usize = g.trim;
+    # a pool handed to the host or about to grow keeps its buffers, and its
+    # passes claim past the capacity again
+    if (!g.owns || g.reserved || cap >= g.p.cap) {
+        untrim(g);
+        ret err[gfx.Error].ok{};
+    }
+    g.trim    = 0;
+    g.trimmed = false;
+    val ed: err[gfx.Error] = swap_down(g, cap, cap);
+    if (sel ed.err) { ret ed; }
+    var cb: [4]*gfx.StorageBuffer;
+    cb[0] = ?g.old.meta;
+    cb[1] = ?g.p.meta;
+    cb[2] = ?g.old.status;
+    cb[3] = ?g.p.status;
+    val ec: err[gfx.Error] = dispatch_rows(g, ?g.carry, ?cb[0], 4, 1, cap);
+    if (sel ec.err) { ret ec; }
+    g.rehash = true;
+    # the host's copy is stale until it next takes the pool, which reads no
+    # slot past the GPU's top. a refusal leaves it larger, which take allows
+    space.cede(sp, cap);
+    ret err[gfx.Error].ok{};
+}
+
+# swap in buffers of cap slots beside the pool's store, smaller than the
+# pool's, inside the frame: the stamps of the first stamps slots carried into
+# them, the store's shards past cap let go (store_trim), the cells left where
+# they lie, and the frame's generation, list and censuses started over. the
+# buffers replaced go once this frame has run (drop_old)
+fun swap_down(g: *Gpu, cap: usize, stamps: usize) err[gfx.Error] {
+    drop_next(g);
+    drop_old(g);
+    val made: err[gfx.Error] = make_pool(g, ?g.next, cap, true, ?g.p.set, g.p.store);
+    if (sel made.err) { ret made; }
+    g.old      = g.p;
+    g.retired  = true;
+    g.p        = g.next;
+    g.reserved = false;
+    # the stages below find the smaller capacity in its head
+    val ew: err[gfx.Error] = write_pool_words(g);
+    if (sel ew.err) { ret ew; }
+    if (g.stepping && stamps != 0) {
+        var gb: [3]*gfx.StorageBuffer;
+        gb[0] = ?g.old.flags;
+        gb[1] = ?g.p.flags;
+        gb[2] = ?g.p.meta;
+        val eg: err[gfx.Error] = dispatch_each(g, ?g.grow, ?gb[0], 3, stamps);
+        if (sel eg.err) { ret eg; }
+    }
+    val et: err[gfx.Error] = store_trim(g, store_of(g, ?g.p), cap);
+    if (sel et.err) { ret et; }
+    g.est = UNKNOWN;
+    forget_censuses(g);
     g.going   = false;
     g.counted = false;
     g.listed  = false;
     g.aim     = 0;
     if (g.top > cap) { g.top = cap; }
     if (g.hi > cap)  { g.hi = cap; }
+    ret err[gfx.Error].ok{};
+}
+
+# move the chunks the host moved (moved) on the GPU, a round at a time in the
+# order the host moved them, each a dispatch of the move stage over the moves
+# the host listed (move_comp). the generation going, the list and the
+# censuses in flight read the slots as they were, so they start over
+fun shift(g: *Gpu) err[gfx.Error] {
+    if (g.shifts.len == 0) { ret err[gfx.Error].ok{}; }
+    var at: usize = 0;
+    for (at < g.shifts.len && g.stepping && g.p.cap != 0) {
+        val n:  usize          = g.shifts.data[at]::usize;
+        val e0: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.list, 0, (?g.shifts.data[at])::*u8, (1 + n) * 4);
+        if (sel e0.err) { ret e0; }
+        val e1: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.list, (1 + g.p.cap - n) * 4, (?g.shifts.data[at + 1 + n])::*u8, n * 4);
+        if (sel e1.err) { ret e1; }
+        val count: u32            = n::u32;
+        val e2:    err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.status, layout.CTL_MOVES::usize * 4, (?count)::*u8, 4);
+        if (sel e2.err) { ret e2; }
+        var mb: [4]*gfx.StorageBuffer;
+        mb[0] = ?g.p.meta;
+        mb[1] = ?g.p.status;
+        mb[2] = ?g.p.list;
+        mb[3] = ?g.p.flags;
+        val e3: err[gfx.Error] = dispatch_rows(g, ?g.move, ?mb[0], 4, move_groups(?g.p), n);
+        if (sel e3.err) { ret e3; }
+        at = at + 1 + n * 2;
+    }
+    vector.clear[u32](?g.shifts);
+    g.est = UNKNOWN;
+    forget_censuses(g);
+    g.going   = false;
+    g.counted = false;
+    g.listed  = false;
+    ret err[gfx.Error].ok{};
+}
+
+# the move stage's workgroups along x for a pool: 64 words of the widest
+# layer's span or of the pyramid each
+fun move_groups(p: *Pool) u32 {
+    val c: u32 = clear_groups(p);
+    val m: u32 = (MIP / 64)::u32;
+    if (c > m) { ret c; }
+    ret m;
+}
+
+# pack the pool the GPU owns below the capacity reclaim asked for, on the GPU
+# alone: the slots in use past it and the free ones below it listed
+# (pack_comp), each chunk past it moved whole into a free slot below
+# (move_comp), every entry naming one renamed and the capacity left in the
+# status head where every chunk now lies below it (relink_comp), then the
+# hash and the free bits seeded from the table as it now is. the passes claim
+# below the capacity from then on, and the census of a later frame says
+# whether it held (collect), after which the rest of the pool goes
+# (shrink_owned). a world that outgrew the capacity keeps its pool, its
+# chunks lower than they were. nothing waits for the device
+fun compact(g: *Gpu) err[gfx.Error] {
+    val cap: usize = g.pack_to;
+    g.pack_to = 0;
+    if (!g.owns || !g.stepping || g.reserved || g.trim != 0 || cap == 0 || cap >= g.p.cap) { ret err[gfx.Error].ok{}; }
+    var w: [2]u32;
+    w[0] = cap::u32;
+    w[1] = 0;
+    val ew: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.status, layout.CTL_TRIM::usize * 4, (?w[0])::*u8, 8);
+    if (sel ew.err) { ret ew; }
+    # the move's arguments cover no row until the pack raises them, the
+    # widest span or the pyramid across
+    var args: [3]u32;
+    args[0] = move_groups(?g.p);
+    args[1] = 0;
+    args[2] = 1;
+    val ea: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.status, layout.ARGS_CLEAR::usize * 4, (?args[0])::*u8, 12);
+    if (sel ea.err) { ret ea; }
+    val none: u32            = 0;
+    val el:   err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.list, 0, (?none)::*u8, 4);
+    if (sel el.err) { ret el; }
+    var pb: [3]*gfx.StorageBuffer;
+    pb[0] = ?g.p.meta;
+    pb[1] = ?g.p.status;
+    pb[2] = ?g.p.list;
+    val ep: err[gfx.Error] = dispatch_each(g, ?g.pack, ?pb[0], 3, g.top);
+    if (sel ep.err) { ret ep; }
+    var mb: [4]*gfx.StorageBuffer;
+    mb[0] = ?g.p.meta;
+    mb[1] = ?g.p.status;
+    mb[2] = ?g.p.list;
+    mb[3] = ?g.p.flags;
+    val em: err[gfx.Error] = gfx.renderer_dispatch_indirect(g.r, ?g.move, ?mb[0], 4, ?g.p.status, layout.ARGS_CLEAR::usize * 4);
+    if (sel em.err) { ret em; }
+    var rb: [3]*gfx.StorageBuffer;
+    rb[0] = ?g.p.meta;
+    rb[1] = ?g.p.status;
+    rb[2] = ?g.p.list;
+    val er: err[gfx.Error] = dispatch_each(g, ?g.relink, ?rb[0], 3, g.top);
+    if (sel er.err) { ret er; }
+    val es: err[gfx.Error] = seed_hash(g);
+    if (sel es.err) { ret es; }
+    g.trim     = cap;
+    g.trim_seq = g.seq;
+    g.moved    = true;
+    g.est      = UNKNOWN;
+    forget_censuses(g);
+    g.going   = false;
+    g.counted = false;
+    g.listed  = false;
     ret err[gfx.Error].ok{};
 }
 
@@ -3107,6 +3431,8 @@ fun start_shown(g: *Gpu, sp: *space.Space) err[gfx.Error] {
 # the hash and the free bits seeded from the page table just uploaded. the next
 # generation waits for a pass, which gives the host's chunks their halo
 fun hand_back(g: *Gpu, sp: *space.Space) err[gfx.Error] {
+    # what a compaction found no longer holds for the pool the host changed
+    untrim(g);
     var w: [4]u32;
     w[0] = 0;
     w[1] = 0;
@@ -3126,6 +3452,15 @@ fun rehash(g: *Gpu) err[gfx.Error] {
     val top: u32            = g.top::u32;
     val et:  err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.status, layout.CTL_TOP::usize * 4, (?top)::*u8, 4);
     if (sel et.err) { ret et; }
+    # no compaction holds the passes below a capacity (compact)
+    val none: u32            = 0;
+    val en:   err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.status, layout.CTL_TRIM::usize * 4, (?none)::*u8, 4);
+    if (sel en.err) { ret en; }
+    ret seed_hash(g);
+}
+
+# empty the GPU's hash and free bits and seed them from its page table again
+fun seed_hash(g: *Gpu) err[gfx.Error] {
     var wb: [2]*gfx.StorageBuffer;
     wb[0] = ?g.p.meta;
     wb[1] = ?g.p.status;
