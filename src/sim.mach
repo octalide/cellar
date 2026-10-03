@@ -5229,6 +5229,25 @@ test frame__uncapped_steps_past_the_old_reach_exactly_as_the_cpu_does {
     ret 0;
 }
 
+test frame__a_device_holding_few_workgroups_along_y_steps_exactly_as_the_cpu_does {
+    var t:    Rig;
+    val code: i32 = rig_open(?t, rule.preset_rule(2), seed_edges);
+    if (code != 0) { ret code; }
+    if (!t.on) {
+        rig_close(?t);
+        ret 0;
+    }
+    # every dispatch past 5 rows folds them onto z, as one past a device's most
+    # does: the passes, the gathers and the steps over hundreds of entries, the
+    # census and the growth of the pool the GPU owns
+    gpu.fix_fold(?t.g, 5);
+    if (uncapped_frames(?t.r, ?t.gpu, 200) == 0) { ret 1; }
+    if (t.g.p.cap <= t.gpu.space.cap)            { ret 2; }
+    if (!caught_up(?t))                          { ret 3; }
+    rig_close(?t);
+    ret 0;
+}
+
 test frame__a_host_refused_the_memory_leaves_the_pool_to_the_gpu_and_pauses {
     var t:    Rig;
     val code: i32 = rig_open(?t, rule.preset_rule(2), seed_edges);
@@ -6369,6 +6388,95 @@ test frame__a_bounded_grid_past_the_pools_ceiling_allocates_around_its_cells_on_
         rig_close(?t);
         k = k + 1;
     }
+    ret 0;
+}
+
+# gliders near a torus's top left corner, at its centre and near its bottom
+# right corner, the last crossing both seams
+#[testing]
+fun seed_far_gliders(s: *Sim) {
+    val g:  *topology.Grid = ?s.rule.grid;
+    val xs: [3]i64         = [3]i64{topology.left(g) + 8, -1, topology.left(g) + g.w - 12};
+    val ys: [3]i64         = [3]i64{topology.top(g) + 8, -1, topology.top(g) + g.h - 12};
+    fill_begin(s);
+    var k: usize = 0;
+    for (k < 3) {
+        fill_cell(s, xs[k] + 1, ys[k], 1);
+        fill_cell(s, xs[k] + 2, ys[k] + 1, 1);
+        fill_cell(s, xs[k], ys[k] + 2, 1);
+        fill_cell(s, xs[k] + 1, ys[k] + 2, 1);
+        fill_cell(s, xs[k] + 2, ys[k] + 2, 1);
+        k = k + 1;
+    }
+    fill_end(s);
+}
+
+# the live cells of the square of side n at (x, y), which differ between the
+# worlds of a rig where -1
+#[testing]
+fun window_same(t: *Rig, x: i64, y: i64, n: i64) i64 {
+    var live: i64 = 0;
+    var j:    i64 = 0;
+    for (j < n) {
+        var i: i64 = 0;
+        for (i < n) {
+            val on: bool = alive(?t.cpu, x + i, y + j);
+            if (on != alive(?t.gpu, x + i, y + j)) { ret -1; }
+            if (on)                                { live = live + 1; }
+            i = i + 1;
+        }
+        j = j + 1;
+    }
+    ret live;
+}
+
+test frame__a_torus_of_more_chunks_than_a_dispatch_holds_along_y_steps_as_on_the_cpu {
+    # 260 by 260 chunks, past the 65535 workgroups a device need hold along
+    # y. the GPU's world holds every one, which the host's pool holds only once
+    # the GPU steps it, so it is seeded again then, and the census, the clear
+    # of the chunks held empty and the pyramids fold their rows of a slot each
+    # onto z (cellar.gpu dispatch_rows). the CPU's world allocates around its
+    # cells
+    val r:    rule.Rule = rule_named("B3/S23:T16640,16640");
+    val held: usize     = space.grid_chunks(?r.grid);
+    var t:    Rig;
+    val code: i32       = rig_open_within(?t, r, seed_nothing, held);
+    if (code != 0) { ret code; }
+    if (!t.on) {
+        rig_close(?t);
+        ret 0;
+    }
+    clear(?t.gpu);
+    seed_far_gliders(?t.cpu);
+    seed_far_gliders(?t.gpu);
+    if (held <= 65535 || !t.gpu.space.whole || t.gpu.space.live != held) { ret 1; }
+    # the glider at the far corner lies in a slot past the fold
+    val g:    *topology.Grid = ?t.cpu.rule.grid;
+    val far:  i64            = topology.left(g) + g.w - 12;
+    val slot: u32            = space.find(?t.gpu.space, far >> 6, (topology.top(g) + g.h - 12) >> 6);
+    if (slot == space.NONE || slot <= 65535) { ret 2; }
+    # the frames step what the device holds rather than a few slots each
+    gpu.fix_span(?t.g, gpu.MAX_SPAN);
+    # 64 generations take each glider 16 cells on, the far one across both seams
+    # to the top left corner
+    rig_step(?t, 64);
+    if (!rig_settle(?t)) { ret 3; }
+    # the GPU's census counts what the CPU holds
+    if (population(?t.cpu) != 15 || population(?t.gpu) != 15) { ret 4; }
+    val bc: opt[space.Box] = bounds(?t.cpu);
+    val bg: opt[space.Box] = bounds(?t.gpu);
+    if (sel bc.none) { ret 5; }
+    if (sel bg.none) { ret 5; }
+    val c: space.Box = bc.some;
+    val d: space.Box = bg.some;
+    if (c.x0 != d.x0 || c.y0 != d.y0 || c.x1 != d.x1 || c.y1 != d.y1) { ret 6; }
+    # and its cells are the CPU's, every live cell of either lying in these
+    val synced: err[gfx.Error] = sync(?t.gpu);
+    if (sel synced.err) { ret 7; }
+    val corner: i64 = window_same(?t, topology.left(g), topology.top(g), 48);
+    val centre: i64 = window_same(?t, -8, -8, 32);
+    if (corner != 10 || centre != 5) { ret 8; }
+    rig_close(?t);
     ret 0;
 }
 
