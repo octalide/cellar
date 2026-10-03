@@ -51,10 +51,12 @@ pub val FILL_SQUARE: usize = 0;
 pub val FILL_CIRCLE: usize = 1;
 # randomize fills the whole of a bounded grid
 pub val FILL_GRID: usize = 2;
+# randomize fills the boundary region last chosen with a click
+pub val FILL_REGION: usize = 3;
 # randomize fills the selection, leaving the rest of the world as it is
-pub val FILL_SELECTION: usize = 3;
+pub val FILL_SELECTION: usize = 4;
 # number of things randomize fills
-pub val FILL_COUNT: usize = 4;
+pub val FILL_COUNT: usize = 5;
 
 # the pattern_sel that selects the custom pattern rather than a library one
 pub val CUSTOM: usize = 0xffffffffffffffff;
@@ -117,6 +119,7 @@ pub val ZOOM_TREE_MIN: f32 = 0.000000000001;
 # bounds_idx:   index into the power-of-two randomize-area table, the size of a
 #               shape fill
 # fill_target:  what randomize fills (FILL_*), which the randomize key repeats
+# picking:      the next click in the world chooses the region to fill
 # fill_density: the live-cell probability of a fill, in [0, 1]
 # pattern_sel:  the selected library pattern's index, or CUSTOM
 # library:      the bundled patterns, once attach has run
@@ -201,6 +204,7 @@ pub rec App {
     ink:          u8;
     bounds_idx:   usize;
     fill_target:  usize;
+    picking:      bool;
     fill_density: f32;
     pattern_sel:  usize;
     library:      library.Library;
@@ -305,6 +309,7 @@ pub fun fill_of(a: *App) fill.Fill {
     var f:    fill.Fill = fill.square(cx, cy, side, a.fill_density);
     if (a.fill_target == FILL_CIRCLE) { f = fill.circle(cx, cy, side, a.fill_density); }
     if (a.fill_target == FILL_GRID)   { f.shape = fill.Shape.grid{}; }
+    if (a.fill_target == FILL_REGION) { f.shape = fill.Shape.region{}; }
     ret f;
 }
 
@@ -332,15 +337,23 @@ pub fun fit_engine(a: *App, tree: bool) {
 }
 
 # frame the fill randomize would make now: its target around the view's centre
-# at its size, the grid, or the selection
+# at its size, the grid, the chosen region or the selection
 # ---
-# a:    application state
-# grid: the world's grid
-pub fun frame_area(a: *App, grid: *topology.Grid) {
+# a:      application state
+# grid:   the world's grid
+# bound:  the box of the world's boundary, which holds its grid's place
+# region: the box of the chosen region, or none
+pub fun frame_area(a: *App, grid: *topology.Grid, bound: opt[space.Box], region: opt[space.Box]) {
+    if (a.fill_target == FILL_REGION) {
+        if (sel region.some) { frame_box(a, region.some); }
+        or                   { say(a, "no region is chosen to frame"); }
+        ret;
+    }
     if (a.fill_target == FILL_GRID) {
-        val b: opt[space.Box] = fill.grid_box(grid);
-        if (sel b.some) { frame_box(a, b.some); }
-        or              { say(a, "the world has no bounded grid to frame"); }
+        var b: opt[space.Box] = bound;
+        if (!sel b.some) { b = fill.grid_box(grid); }
+        if (sel b.some)  { frame_box(a, b.some); }
+        or               { say(a, "the world has no bounded grid to frame"); }
         ret;
     }
     if (a.fill_target == FILL_SELECTION) {
@@ -348,8 +361,9 @@ pub fun frame_area(a: *App, grid: *topology.Grid) {
         or              { say(a, "nothing is selected"); }
         ret;
     }
-    val f: fill.Fill = fill_of(a);
-    frame_box(a, fill.bounds(?f.shape, space.Box{x0: 0, y0: 0, x1: 0, y1: 0}));
+    val f:    fill.Fill   = fill_of(a);
+    val none: fill.Domain = fill.nowhere();
+    frame_box(a, fill.bounds(?f.shape, ?none));
 }
 
 # frame the origin square of the randomize size, as a launch does
@@ -734,6 +748,7 @@ pub fun init(a: *App) {
     a.ink          = 1;
     a.bounds_idx   = DEFAULT_BOUNDS;
     a.fill_target  = FILL_SQUARE;
+    a.picking      = false;
     a.fill_density = fill.DENSITY;
     a.pattern_sel  = 0;
     library.empty(?a.library);
@@ -860,19 +875,24 @@ test frame_area__frames_the_fill_around_the_view_floored_for_negative_centres {
     val f: fill.Fill = fill_of(?a);
     if (!sel f.shape.square)                                { ret 1; }
     if (f.shape.square.x != -1 || f.shape.square.y != -101) { ret 1; }
-    var g: topology.Grid = topology.Grid{shape: topology.PLANE, w: 40, h: 30, twist_w: false};
-    frame_area(?a, ?g);
+    var g:  topology.Grid  = topology.Grid{shape: topology.PLANE, w: 40, h: 30, twist_w: false};
+    val no: opt[space.Box] = opt[space.Box].none{};
+    frame_area(?a, ?g, no, no);
     if (!a.refit || !sel a.fit.some) { ret 2; }
     val b: space.Box = fit_box(?a);
     if (b.x0 != -17 || b.x1 != 15 || b.y0 != -117 || b.y1 != -85) { ret 3; }
     a.fill_target = FILL_GRID;
-    frame_area(?a, ?g);
+    frame_area(?a, ?g, no, no);
     val c: space.Box = fit_box(?a);
     if (c.x0 != -20 || c.x1 != 20 || c.y0 != -15 || c.y1 != 15) { ret 4; }
+    a.fill_target = FILL_REGION;
+    frame_area(?a, ?g, no, opt[space.Box].some{space.Box{x0: 7, y0: 8, x1: 9, y1: 12}});
+    val r: space.Box = fit_box(?a);
+    if (r.x0 != 7 || r.x1 != 9 || r.y1 != 12) { ret 6; }
     a.fill_target = FILL_SELECTION;
     a.selected    = true;
     a.area        = space.Box{x0: 3, y0: 4, x1: 9, y1: 8};
-    frame_area(?a, ?g);
+    frame_area(?a, ?g, no, no);
     val d: space.Box = fit_box(?a);
     if (d.x0 != 3 || d.x1 != 9 || d.y1 != 8) { ret 5; }
     ret 0;
