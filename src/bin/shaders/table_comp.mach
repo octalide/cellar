@@ -22,49 +22,38 @@
 # zeros, since the empty neighbourhood steps to 0 under every table, and one
 # cold the step before too already holds zeros in both pools and is skipped.
 
+use cellar.bin.shaders.pool;
 use cellar.layer;
 use cellar.layout;
 use cellar.layout.Flags;
-use cellar.layout.Layer;
 use cellar.layout.Meta;
 use cellar.layout.Table;
 use cellar.rules.table.word;
 
 #[storage(1, 0, "readonly")]
-var src:   Layer;
-#[storage(1, 1)]
-var dst:   Layer;
-#[storage(1, 2, "readonly")]
 var meta:  Meta;
-#[storage(1, 3)]
+#[storage(1, 1)]
 var flags: Flags;
-#[storage(1, 4, "readonly")]
+#[storage(1, 2, "readonly")]
 var table: Table;
 
 #[builtin("global_invocation")]
 var gid: u32x3;
 
-# the source's value of the cell at address a in the family's state layer
-# (cellar.layer)
-fun cell_of(a: u32) u32 {
-    ret layer.read(src.v[layer.addr_word(word.WIDTH, a)], word.WIDTH, a);
-}
-
-# the address (cellar.layer) of the cell at (x, y) of a slot's frame, taken
-# through the links where it lies outside the window (cellar.layout), or NONE
-# where no chunk holds it
-fun reach(slot: u32, x: i32, y: i32) u32 {
-    var sl: u32 = slot;
-    var px: i32 = x;
-    var py: i32 = y;
-    var at: u32 = layout.NONE;
-    var h:  u32 = 0;
+# the cell at (x, y) of a slot's frame, taken through the links where it lies
+# outside the window (cellar.layout), its slot NONE where no chunk holds it
+fun reach(slot: u32, x: i32, y: i32) pool.Spot {
+    var sl: u32       = slot;
+    var px: i32       = x;
+    var py: i32       = y;
+    var at: pool.Spot = pool.Spot{slot: layout.NONE, i: 0};
+    var h:  u32       = 0;
     for (h <= layout.HOPS) {
         val b: u32 = sl * layout.ENTRY;
         val k: u32 = layout.edge_side(meta.table[b + layout.EDGE_AT], px, py);
         val n: u32 = meta.table[b + k];
         if (k == 4) {
-            at = layer.addr(sl, (py * layout.SIDE::i32 + px)::u32);
+            at = pool.Spot{slot: sl, i: (py * layout.SIDE::i32 + px)::u32};
             h  = layout.HOPS;
         }
         or (n == layout.NONE) { h = layout.HOPS; }
@@ -87,11 +76,11 @@ fun comp_main() {
     # and a dispatch may run past the list's end
     val entry: u32 = gid[1] + meta.base[0];
     if (entry >= flags.args[1]) { ret; }
-    val slot: u32 = flags.list[entry];
+    val slot: u32 = flags.v[layout.list_at(meta.base[layout.CAP_AT - layout.BASE_AT]) + entry];
     val ly:   i32 = (gid[0] / 8)::i32;
     val x0:   u32 = (gid[0] % 8) * 8;
     val base: u32 = slot * layout.ENTRY;
-    val row:  u32 = layer.addr(slot, (ly * layout.SIDE::i32)::u32);
+    val row:  u32 = (ly * layout.SIDE::i32)::u32;
     var acc:  u32 = 0;
     if (meta.table[base + layout.INCARNATION_AT] == 0) { ret; }
     # a seamed chunk reads its block through its links, and holds its cells
@@ -114,7 +103,13 @@ fun comp_main() {
         k = k + 1;
     }
     if (seamed != 0) { busy = 1; }
-    var x: u32 = x0;
+    # the source cells are the last step's, the destination this one's
+    # (cellar.layer)
+    val sh:  *layout.Shards = meta.shards;
+    val m:   u32            = meta.base[layout.SHARD_AT - layout.BASE_AT];
+    val src: u32            = last & 1;
+    val dst: layout.Span    = layer.span(sh, 0, now & 1, layout.where(slot, m), word.WIDTH);
+    var x:   u32            = x0;
     if (busy == 0) {
         val warm: u32 = flags.v[slot * 2 + 1];
         if (warm != last && warm != now) {
@@ -122,12 +117,19 @@ fun comp_main() {
             # destination already holds zeros
             if (warm != last - 1) { ret; }
             for (x < x0 + 8) {
-                dst.v[layer.addr_word(word.WIDTH, row + x)] = 0;
-                x                                           = x + 1;
+                dst.p.v[dst.at + layer.cell_word(word.WIDTH, row + x)] = 0;
+                x                                                      = x + 1;
             }
             ret;
         }
     }
+    var nb: pool.Nine;
+    k = 0;
+    for (k < 9) {
+        nb.v[k] = meta.table[base + k];
+        k       = k + 1;
+    }
+    val blk: pool.Block = pool.block(m, nb, 0, src, word.WIDTH);
 
     val n:      u32 = meta.rule[word.STATES_AT];
     val inputs: u32 = meta.rule[word.INPUTS_AT];
@@ -160,14 +162,15 @@ fun comp_main() {
                 xx = xx - layout.SIDE::i32;
                 cx = 2;
             }
-            var at: u32 = layout.NONE;
-            if (seamed != 0) { at = reach(slot, x::i32 + dx, ly + dy); }
-            or {
-                val nb: u32 = meta.table[base + cy * 3 + cx];
-                if (nb != layout.NONE) { at = layer.addr(nb, (y * layout.SIDE::i32 + xx)::u32); }
-            }
             var st: u32 = 0;
-            if (at != layout.NONE) { st = word.state(cell_of(at), n); }
+            if (seamed != 0) {
+                val at: pool.Spot = reach(slot, x::i32 + dx, ly + dy);
+                if (at.slot != layout.NONE) { st = word.state(pool.cell(sh, m, 0, src, at.slot, word.WIDTH, at.i), n); }
+            }
+            or {
+                val j: u32 = cy * 3 + cx;
+                if (nb.v[j] != layout.NONE) { st = word.state(pool.read(sh, blk, j, word.WIDTH, (y * layout.SIDE::i32 + xx)::u32), n); }
+            }
             p = table.v[p + st];
             i = i + 1;
         }
@@ -176,8 +179,8 @@ fun comp_main() {
         if (next != 0)                                              { live = 1; }
         acc = acc | layer.place(word.WIDTH, row + x, word.word(next, n));
         if (layer.ends(word.WIDTH, row + x) != 0) {
-            dst.v[layer.addr_word(word.WIDTH, row + x)] = acc;
-            acc                                         = 0;
+            dst.p.v[dst.at + layer.cell_word(word.WIDTH, row + x)] = acc;
+            acc                                                    = 0;
         }
         x = x + 1;
     }

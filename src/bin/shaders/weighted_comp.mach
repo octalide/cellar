@@ -3,8 +3,8 @@
 #
 # a cell is a bit in the family's state layer (word.WIDTH, cellar.layer), a
 # row of 32 to a word, and its display channels, age << 8 | heat, lie in the
-# view layer the family keeps beside it (word.SHOWN), bound after the rule
-# buffer (layer.binding).
+# view layer the family keeps beside it (word.SHOWN), layer 1 of its set. the
+# stage reaches both by address.
 #
 # an invocation is a run of 8 cells in a row, and 8 workgroups of 64 cover a
 # chunk, a band of 8 rows each; workgroup y names the chunk's slot through the
@@ -51,29 +51,21 @@
 # buffer at layout.TABLE_BINDING, as cellar.rules.weighted pack and pack_table
 # lay them out.
 
+use cellar.bin.shaders.pool;
 use cellar.layer;
 use cellar.layout;
 use cellar.layout.Flags;
-use cellar.layout.Layer;
 use cellar.layout.Meta;
 use cellar.layout.Table;
 use cellar.rules.weighted.word;
 use sy: shader.sync;
 
 #[storage(1, 0, "readonly")]
-var src:   Layer;
-#[storage(1, 1)]
-var dst:   Layer;
-#[storage(1, 2, "readonly")]
 var meta:  Meta;
-#[storage(1, 3)]
+#[storage(1, 1)]
 var flags: Flags;
-#[storage(1, 4, "readonly")]
+#[storage(1, 2, "readonly")]
 var table: Table;
-#[storage(1, 5, "readonly")]
-var hsrc:  Layer;
-#[storage(1, 6)]
-var hdst:  Layer;
 
 #[builtin("global_invocation")]
 var gid: u32x3;
@@ -110,31 +102,29 @@ var runs: Runs;
 #[shared]
 var full: u32;
 
-# the source's bit of the cell at address a (cellar.layer)
-fun cell_of(a: u32) u32 {
-    ret layer.read(src.v[layer.addr_word(word.WIDTH, a)], word.WIDTH, a);
-}
+# the shown layer's place in the family's set
+val SHOWN_LAYER: u32 = 1;
 
-# the address (cellar.layer) of the cell at (x, y) of a slot's frame, taken
-# through the links where it lies outside the window (cellar.layout), NONE
-# where no chunk holds it, or PAST past a plane's dead edge
-fun reach(slot: u32, x: i32, y: i32) u32 {
-    var sl: u32 = slot;
-    var px: i32 = x;
-    var py: i32 = y;
-    var at: u32 = layout.NONE;
-    var h:  u32 = 0;
+# the cell at (x, y) of a slot's frame, taken through the links where it lies
+# outside the window (cellar.layout), its slot NONE where no chunk holds it,
+# or PAST past a plane's dead edge
+fun reach(slot: u32, x: i32, y: i32) pool.Spot {
+    var sl: u32       = slot;
+    var px: i32       = x;
+    var py: i32       = y;
+    var at: pool.Spot = pool.Spot{slot: layout.NONE, i: 0};
+    var h:  u32       = 0;
     for (h <= layout.HOPS) {
         val b: u32 = sl * layout.ENTRY;
         val k: u32 = layout.edge_side(meta.table[b + layout.EDGE_AT], px, py);
         val n: u32 = meta.table[b + k];
         val t: u32 = meta.table[b + layout.LINK_AT + k];
         if (k == 4) {
-            at = layer.addr(sl, (py * layout.SIDE::i32 + px)::u32);
+            at = pool.Spot{slot: sl, i: (py * layout.SIDE::i32 + px)::u32};
             h  = layout.HOPS;
         }
         or (n == layout.NONE) {
-            if ((t & layout.LINK_EDGE) != 0) { at = layout.PAST; }
+            if ((t & layout.LINK_EDGE) != 0) { at = pool.Spot{slot: layout.PAST, i: 0}; }
             h = layout.HOPS;
         }
         or {
@@ -224,14 +214,11 @@ fun comp_main() {
     # and a dispatch may run past the list's end
     val entry: u32 = gid[1] + meta.base[0];
     if (entry >= flags.args[1]) { ret; }
-    val slot: u32 = flags.list[entry];
+    val slot: u32 = flags.v[layout.list_at(meta.base[layout.CAP_AT - layout.BASE_AT]) + entry];
     val ly:   i32 = (gid[0] / 8)::i32;
     val band: i32 = ((gid[0] / 64) * BAND)::i32;
     val x0:   u32 = (gid[0] % 8) * 8;
     val base: u32 = slot * layout.ENTRY;
-    # the state layer's word holding the run, and the run's first display word
-    val sw: u32 = layer.span_at(word.WIDTH, slot) + ly::u32 * 2 + x0 / 32;
-    val hw: u32 = layer.span_at(word.SHOWN, slot) + (ly::u32 * layout.SIDE + x0) / 2;
     if (meta.table[base + layout.INCARNATION_AT] == 0) { ret; }
     # a seamed chunk reads its block through its links, and holds its cells
     # off the grid at zero
@@ -243,6 +230,18 @@ fun comp_main() {
     # chunk that is live or warm at the source carries one of the two
     val last: u32 = meta.serial - 1;
     val now:  u32 = meta.serial;
+    # the source cells are the last step's, the destination this one's
+    # (cellar.layer): the state layer's word holding the run, and the run's
+    # first display word
+    val sh:    *layout.Shards = meta.shards;
+    val m:     u32            = meta.base[layout.SHARD_AT - layout.BASE_AT];
+    val src:   u32            = last & 1;
+    val place: layout.Where   = layout.where(slot, m);
+    val dst:   layout.Span    = layer.span(sh, 0, now & 1, place, word.WIDTH);
+    val hsrc:  layout.Span    = layer.span(sh, SHOWN_LAYER, src, place, word.SHOWN);
+    val hdst:  layout.Span    = layer.span(sh, SHOWN_LAYER, now & 1, place, word.SHOWN);
+    val sw:    u32            = dst.at + ly::u32 * 2 + x0 / 32;
+    val hw:    u32            = (ly::u32 * layout.SIDE + x0) / 2;
     if (lid == 0) {
         var busy: u32 = 0;
         var k:    u32 = 0;
@@ -267,20 +266,20 @@ fun comp_main() {
             # cold at the source; if it was cold a step earlier too, the
             # destination already holds zeros
             if (warm != last - 1) { ret; }
-            if (x0 % 32 == 0)     { dst.v[sw] = 0; }
+            if (x0 % 32 == 0)     { dst.p.v[sw] = 0; }
             for (j < 4) {
-                hdst.v[hw + j] = 0;
-                j              = j + 1;
+                hdst.p.v[hdst.at + hw + j] = 0;
+                j                          = j + 1;
             }
             ret;
         }
-        if (x0 % 32 == 0) { dst.v[sw] = 0; }
+        if (x0 % 32 == 0) { dst.p.v[sw] = 0; }
         var any: u32 = 0;
         for (j < 4) {
-            val c: u32 = cool2(hsrc.v[hw + j]);
-            hdst.v[hw + j] = c;
-            any            = any | c;
-            j              = j + 1;
+            val c: u32 = cool2(hsrc.p.v[hsrc.at + hw + j]);
+            hdst.p.v[hdst.at + hw + j] = c;
+            any                        = any | c;
+            j                          = j + 1;
         }
         if (any != 0) { flags.v[slot * 2 + 1] = now; }
         ret;
@@ -314,10 +313,10 @@ fun comp_main() {
         if (seamed != 0) {
             var c: i32 = lo;
             for (c < hi) {
-                val a:  u32 = reach(slot, c, y);
-                var on: u32 = 0;
-                if (a == layout.PAST) { on = past; }
-                or (a != layout.NONE) { on = cell_of(a); }
+                val a:  pool.Spot = reach(slot, c, y);
+                var on: u32       = 0;
+                if (a.slot == layout.PAST) { on = past; }
+                or (a.slot != layout.NONE) { on = pool.cell(sh, m, 0, src, a.slot, word.WIDTH, a.i); }
                 bits = bits | (on << (c - c0)::u32);
                 c    = c + 1;
             }
@@ -338,7 +337,8 @@ fun comp_main() {
             val cx: u32 = (k + 1) / 2;
             val n:  u32 = meta.table[base + cy * 3 + cx];
             if (n != layout.NONE) {
-                val w: u32 = src.v[layer.span_at(word.WIDTH, n) + yy::u32 * 2 + (k + 1) % 2];
+                val ns: layout.Span = layer.span(sh, 0, src, layout.where(n, m), word.WIDTH);
+                val w:  u32         = ns.p.v[ns.at + yy::u32 * 2 + (k + 1) % 2];
                 bits = w & span((lo - c0)::u32, (hi - c0)::u32);
             }
         }
@@ -465,21 +465,21 @@ fun comp_main() {
     # the run's display channels follow its cells
     var warm: u32 = 0;
     for (j < 4) {
-        val h: u32 = hsrc.v[hw + j];
+        val h: u32 = hsrc.p.v[hsrc.at + hw + j];
         var v: u32 = word.become(h & 0xffff, (next >> (j * 2)) & 1) | (word.become(h >> 16, (next >> (j * 2 + 1)) & 1) << 16);
         if (seamed != 0) {
             if (layout.edge_side(edge, (x0 + j * 2)::i32, ly) != 4)     { v = v & 0xffff0000; }
             if (layout.edge_side(edge, (x0 + j * 2 + 1)::i32, ly) != 4) { v = v & 0xffff; }
         }
-        hdst.v[hw + j] = v;
-        warm           = warm | v;
-        j              = j + 1;
+        hdst.p.v[hdst.at + hw + j] = v;
+        warm                       = warm | v;
+        j                          = j + 1;
     }
 
     # the run's word of the state layer, from the four runs it holds
     runs.v[lid] = next << (x0 % 32);
     sy.workgroup_barrier();
-    if (x0 % 32 == 0) { dst.v[sw] = runs.v[lid] | runs.v[lid + 1] | runs.v[lid + 2] | runs.v[lid + 3]; }
+    if (x0 % 32 == 0) { dst.p.v[sw] = runs.v[lid] | runs.v[lid + 1] | runs.v[lid + 2] | runs.v[lid + 3]; }
     if (next != 0)    { flags.v[slot * 2] = now; }
     if (warm != 0)    { flags.v[slot * 2 + 1] = now; }
 }

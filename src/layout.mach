@@ -27,16 +27,17 @@ pub val INCARNATION_AT: u32 = 11;
 pub val LINK_AT: u32 = 12;
 # the entry's edge word
 pub val EDGE_AT: u32 = 21;
-# the most slots any pool may hold: the stages' arrays are declared this long,
-# and a pool's own ceiling, the device's or the host's, lies at or below it
-pub val MAX_SLOTS: u32 = 32768;
+# the words a stage declares a buffer it reaches or binds to hold past its
+# head: the most a 32-bit word index into one buffer of 2 GiB names. a pool's
+# buffers are sized at runtime, and none holds more
+pub val WORDS: u32 = 536870912;
 # words of the meta buffer ahead of the page table: the shared words, then the
 # rule family's window
-pub val HEAD: u32 = 128;
+pub val HEAD: u32 = 138;
 # shared words at the head of the meta buffer: the census id, the slots in
-# use, the step serial, the sense, the generation base, the strobe and the
-# first slot of a step's dispatch
-pub val SHARED: u32 = 16;
+# use, the step serial, the sense, the generation base, the strobe, the base
+# words and the address of the shard table (Meta)
+pub val SHARED: u32 = 26;
 # words of the head a rule family packs its rule into
 pub val RULE: u32 = 112;
 # the word of the step serial in the meta buffer
@@ -55,21 +56,30 @@ pub val BASE_AT: u32 = 13;
 # the word of the state layer's width (cellar.layer), which the shared stages
 # read the state layer at: the second of Meta's base words
 pub val WIDTH_AT: u32 = 14;
-# the word of the live rule layers' widths (cellar.layer live_add), which the
-# stages that judge a cell live read them at, and of the shown layer's at its
-# own place in it (cellar.layer SHOWN_SLOT): the third of Meta's base words
-pub val LIVE_AT: u32 = 15;
+# the word of the set (cellar.layer set_word): its layers, its shown layer and
+# its live rule layers, which the stages that judge a cell live read
+pub val SET_AT: u32 = 15;
+# the word of every layer's width (cellar.layer widths_add)
+pub val WIDTHS_AT: u32 = 16;
+# the word of the slots the pool's buffers hold, which the stages find the
+# runtime-sized parts of the flags and status buffers by (Flags, Status)
+pub val CAP_AT: u32 = 17;
+# the word of the pool's shard geometry: the log2 of its largest shard's slots
+# (shard_of)
+pub val SHARD_AT: u32 = 18;
+# the words of the shard table's address, past the base words (Meta)
+pub val SHARDS_AT: u32 = 24;
 # a neighbour that does not exist
 pub val NONE: u32 = 0xffffffff;
 # a position past a plane's dead edge, as a step stage's reach finds it
 pub val PAST: u32 = 0xfffffffe;
 
-# storage buffers every step stage binds: the source and destination cells,
-# the meta buffer and the stamps, at bindings 0 to 3
-pub val STEP_BINDINGS: u32 = 4;
+# storage buffers every step stage binds: the meta buffer and the flags, at
+# bindings 0 and 1. the cells it reaches by address (Shards)
+pub val STEP_BINDINGS: u32 = 2;
 # the binding of a rule buffer, which a family whose rule does not fit its
-# window of the meta head declares (see cellar.rule), after the four above
-pub val TABLE_BINDING: u32 = 4;
+# window of the meta head declares (see cellar.rule), after the two above
+pub val TABLE_BINDING: u32 = 2;
 # the most words a rule buffer is declared to hold, the 128 MiB of storage
 # every device can bind
 pub val TABLE_MAX: u32 = 33554432;
@@ -233,11 +243,113 @@ pub fun texel(live: u32, heat: u32, ages: u32) u32 {
     ret live | (heat << TEXEL_HEAT) | (mean << TEXEL_AGE);
 }
 
-# a layer's words as a stage binds them: every slot's span, the length a
-# 32-bit layer takes, read through cellar.layer's addressing at the layer's
-# width
-pub rec Layer {
-    v: [MAX_SLOTS * CELLS]u32;
+# where the pool's cells and pyramids lie
+#
+# each layer's two cells (cellar.layer) and the coverage pyramids lie in
+# shards: buffers each holding the spans of a run of slots, which the stages
+# reach by device address through the shard table the meta head names
+# (Shards). the first shard holds SHARD_FIRST slots and each after it as many
+# as every one before it, so a pool that doubles adds a shard, until a shard
+# holds 2^m slots, the pool's shard geometry (SHARD_AT), and every shard after
+# that holds as many. a slot's shard and its place there follow from the slot
+# alone (shard_of, shard_start), the same for the host and the stages, so a
+# pool grows by making shards and nothing it holds moves.
+
+# the log2 of the first shard's slots, and the slots it holds
+pub val SHARD_LOG:   u32 = 6;
+pub val SHARD_FIRST: u32 = 64;
+# the largest geometry: a shard of 2^17 slots of a 32-bit layer is the 2 GiB a
+# stage's word index reaches (WORDS), and of the pyramids less
+pub val SHARD_LOG_MAX: u32 = 17;
+# the most shards a layer's cells or the pyramids lie in
+pub val SHARDS_MAX: u32 = 64;
+# the most layers the shard table names, cellar.layer's LAYERS_MAX
+pub val SHARD_LAYERS: u32 = 8;
+# addresses in the shard table: each layer's two cells' shards, then the
+# pyramids'
+pub val SHARD_TABLE: u32 = (SHARD_LAYERS * 2 + 1) * SHARDS_MAX;
+
+# the bit of x's highest set bit, x nonzero
+pub fun msb(x: u32) u32 {
+    var n: u32 = 0;
+    var v: u32 = x;
+    if (v >= 0x10000) {
+        n = n + 16;
+        v = v >> 16;
+    }
+    if (v >= 0x100) {
+        n = n + 8;
+        v = v >> 8;
+    }
+    if (v >= 0x10) {
+        n = n + 4;
+        v = v >> 4;
+    }
+    if (v >= 0x4) {
+        n = n + 2;
+        v = v >> 2;
+    }
+    if (v >= 0x2) { n = n + 1; }
+    ret n;
+}
+
+# the shard holding slot s under geometry m
+pub fun shard_of(s: u32, m: u32) u32 {
+    if (s < SHARD_FIRST) { ret 0; }
+    if ((s >> m) < 2)    { ret msb(s) - SHARD_LOG + 1; }
+    ret (s >> m) + m - SHARD_LOG;
+}
+
+# the first slot of shard k under geometry m
+pub fun shard_start(k: u32, m: u32) u32 {
+    if (k == 0)                 { ret 0; }
+    if (k <= m - SHARD_LOG + 1) { ret 1 << (k + SHARD_LOG - 1); }
+    ret (k + SHARD_LOG - m) << m;
+}
+
+# the shard table's entry for shard j of layer k's cells c, 0 or 1
+pub fun cells_entry(k: u32, c: u32, j: u32) u32 {
+    ret (k * 2 + c) * SHARDS_MAX + j;
+}
+
+# the shard table's entry for shard j of the pyramids
+pub fun mip_entry(j: u32) u32 {
+    ret SHARD_LAYERS * 2 * SHARDS_MAX + j;
+}
+
+# a shard's words, as a stage reaches them by address
+pub rec Words {
+    v: [WORDS]u32;
+}
+
+# the shard table: the address of every shard made, by entry (cells_entry,
+# mip_entry), and nothing past them
+pub rec Shards {
+    v: [SHARD_TABLE]*Words;
+}
+
+# where a slot's span lies: its shard, and the word of it the span starts at
+pub rec Span {
+    p:  *Words;
+    at: u32;
+}
+
+# a slot's place in the shards: the shard holding it, the same in every
+# layer, and its index among the shard's slots
+pub rec Where {
+    shard: u32;
+    index: u32;
+}
+
+# where slot lies under geometry m
+pub fun where(slot: u32, m: u32) Where {
+    val j: u32 = shard_of(slot, m);
+    ret Where{shard: j, index: slot - shard_start(j, m)};
+}
+
+# where a slot's pyramid lies, the slot found by where
+pub fun mip_span(sh: *Shards, at: Where) Span {
+    ret Span{p: sh.v[mip_entry(at.shard)], at: at.index * MIP};
 }
 
 # how a step reaches past a chunk, shared by the host and the step stages
@@ -343,53 +455,57 @@ pub fun edge_side(e: u32, x: i32, y: i32) u32 {
 }
 
 # the shared words, the rule family's window, then one page-table entry per
-# slot: the slots of the 3 by 3 block of chunks around it, its chunk
-# coordinates biased by 2^30, its incarnation, zero while the slot is free, a
-# link word per neighbour slot, and the edge word. the words from live_mask to
-# age_mask are a Sense, in order, and gen, strobe and base lie at GEN_AT,
-# STROBE_AT and BASE_AT. base's second word is the state layer's width, at
-# WIDTH_AT, and its third the live rule layers' and the shown layer's widths,
-# at LIVE_AT, held in one field since a stage's storage block has at most 16
+# slot of the pool's capacity: the slots of the 3 by 3 block of chunks around
+# it, its chunk coordinates biased by 2^30, its incarnation, zero while the
+# slot is free, a link word per neighbour slot, and the edge word. sense
+# holds the running rule's, and gen, strobe and base lie at GEN_AT, STROBE_AT
+# and BASE_AT. base's words are the first entry of a step's dispatch, then
+# the words at WIDTH_AT, SET_AT, WIDTHS_AT, CAP_AT and SHARD_AT, and shards,
+# at SHARDS_AT, is the address of the shard table. a stage's storage block
+# has at most 16 fields, so these are gathered rather than one each
 pub rec Meta {
-    census:     u32;
-    hi:         u32;
-    serial:     u32;
-    live_mask:  u32;
-    live_lo:    u32;
-    live_hi:    u32;
-    warm_mask:  u32;
-    heat_shift: u32;
-    heat_mask:  u32;
-    age_shift:  u32;
-    age_mask:   u32;
-    gen:        u32;
-    strobe:     u32;
-    base:       [3]u32;
-    rule:       [RULE]u32;
-    table:      [MAX_SLOTS * ENTRY]u32;
+    census: u32;
+    hi:     u32;
+    serial: u32;
+    sense:  Sense;
+    gen:    u32;
+    strobe: u32;
+    base:   [SHARDS_AT - BASE_AT]u32;
+    shards: *Shards;
+    rule:   [RULE]u32;
+    table:  [WORDS]u32;
 }
 
 # the slots a stage works on, named by the host
 pub rec List {
-    v: [MAX_SLOTS]u32;
+    v: [WORDS]u32;
 }
 
-# per slot two words, each the serial of the last step that left a live cell
-# and a warm one, then the active list: the slots the steps until the next
-# gather may change (gather_comp), ahead of them the indirect arguments the
-# steps over it are dispatched from, whose second is its length, and the
-# gather's header bits in the fourth. the buffer is FLAGS_WORDS long whatever
-# the pool's capacity, so the list lies where the record puts it
+# the indirect arguments the steps over the active list are dispatched from,
+# whose second is the list's length, and the gather's header bits in the
+# fourth, then per slot of the pool's capacity two words, each the serial of
+# the last step that left a live cell and a warm one, then the active list:
+# the slots the steps until the next gather may change (gather_comp), from
+# list_at of the capacity on (CAP_AT)
 pub rec Flags {
-    v:    [MAX_SLOTS * 2]u32;
     args: [4]u32;
-    list: [MAX_SLOTS]u32;
+    v:    [WORDS]u32;
 }
 
-# the word of the flags buffer where the list's arguments start, and the
-# buffer's words
-pub val FLAGS_ARGS:  u32 = MAX_SLOTS * 2;
-pub val FLAGS_WORDS: u32 = MAX_SLOTS * 3 + 4;
+# the word of the flags buffer where the list's arguments start
+pub val FLAGS_ARGS: u32 = 0;
+
+# where the active list starts in a flags buffer's words past its arguments,
+# for cap slots
+pub fun list_at(cap: u32) u32 {
+    ret cap * 2;
+}
+
+# the words of a flags buffer for cap slots
+pub fun flags_words(cap: u32) u32 {
+    ret 4 + cap * 3;
+}
+
 # the gather's header bits: the GPU owns the pool, so a closed gate (Status)
 # leaves the list empty, and the rule reads a plane's dead edge live on some
 # generation, so every seamed chunk steps (cellar.rule.rimmed)
@@ -405,24 +521,25 @@ pub rec Table {
     v: [TABLE_MAX]u32;
 }
 
-# painted cells of a layer narrower than a word, which the edit stage writes
-# into the layer on the GPU (cellar.gpu): n edits, then each as three words,
-# the word of the layer the cell lies in (cellar.layer addr_word), the bits it
-# takes there and its value placed in them. the buffer holds as many as a
-# frame paints, and the record is declared at the most a stage may bind
+# painted cells of layers narrower than a word, which the edit stage writes
+# into the front cells on the GPU (cellar.gpu): n edits, which cells of each
+# layer are the front, 0 or 1, then each edit as four words, the slot, its
+# layer above EDIT_LAYER and the word of the slot's span the cell lies in
+# below, the bits the cell takes there and its value placed in them. the
+# buffer holds as many as a frame paints, and the record is declared at the
+# most a stage may bind
 pub rec Edits {
-    n:   u32;
-    pad: [3]u32;
-    v:   [EDITS_MAX * 3]u32;
+    n:     u32;
+    front: u32;
+    pad:   [2]u32;
+    v:     [EDITS_MAX * 4]u32;
 }
+
+# where an edit's second word holds its layer
+pub val EDIT_LAYER: u32 = 16;
 
 # the most edits a stage's record declares
 pub val EDITS_MAX: u32 = 8388608;
-
-# every slot's coverage pyramid
-pub rec Mip {
-    v: [MAX_SLOTS * MIP]u32;
-}
 
 # the status buffer: what the GPU reports to the host, and the allocator it
 # keeps while it owns the pool (cellar.gpu)
@@ -432,7 +549,9 @@ pub rec Mip {
 # so a readback of the head and the rows below a pool's capacity brings back
 # everything the host reads each frame. the rest is the allocator's alone: the
 # pass each slot was last asked for by, the slots claimed this pass, a bit per
-# free slot, and a hash from chunk coordinates to slots.
+# free slot, and a hash from chunk coordinates to slots, each sized for the
+# pool's capacity (CAP_AT) and found from it (asked_at, fresh_at, bitmap_at,
+# hash_at).
 #
 # while the GPU owns the pool it alone writes the page table, the allocator
 # words and the hash. the host writes only the words marked as its own, in
@@ -454,8 +573,6 @@ pub val CTL_TOMBS: u32 = 3;
 pub val CTL_SERIAL: u32 = 4;
 # the host's: slots below which a pass claims, every slot the frame's stages cover
 pub val CTL_TOP: u32 = 5;
-# the host's: slots the pool's buffers hold
-pub val CTL_CAP: u32 = 6;
 # the active list's length as the census found it, which the host estimates
 # the next generations' work from
 pub val CTL_LISTED: u32 = 7;
@@ -474,32 +591,57 @@ pub val ARGS_SETTLE: u32 = 16;
 pub val ARGS_CLEAR:  u32 = 19;
 # census words per slot: the packed count, the extent, and the coordinates
 pub val ROW: u32 = 4;
-# buckets of the GPU's hash: a power of two, four a slot
-pub val HASH: u32 = MAX_SLOTS * 4;
 # a hash bucket nothing ever held, which ends a probe
 pub val EMPTY: u32 = 0xffffffff;
 # a hash bucket whose slot was freed, which a probe passes and a claim reuses
 pub val TOMB: u32 = 0xfffffffe;
 
+# the head, then the census rows, ROW words a slot, and past them the
+# allocator's words, each from the word its function names on
 pub rec Status {
-    head:   [STATUS_HEAD]u32;
-    rows:   [MAX_SLOTS * ROW]u32;
-    asked:  [MAX_SLOTS]u32;
-    fresh:  [MAX_SLOTS]u32;
-    bitmap: [MAX_SLOTS / 32]u32;
-    hash:   [HASH]u32;
+    head: [STATUS_HEAD]u32;
+    v:    [WORDS]u32;
 }
 
-# words of the status buffer
-pub val STATUS_WORDS: u32 = STATUS_HEAD + MAX_SLOTS * ROW + MAX_SLOTS * 2 + MAX_SLOTS / 32 + HASH;
+# where the pass each slot was last asked for by starts, a word a slot, in a
+# status buffer for cap slots
+pub fun asked_at(cap: u32) u32 {
+    ret cap * ROW;
+}
 
-# the first bucket a chunk's biased coordinates probe from
-pub fun bucket(bx: u32, by: u32) u32 {
+# where the slots claimed this pass start, a word each
+pub fun fresh_at(cap: u32) u32 {
+    ret cap * (ROW + 1);
+}
+
+# where the free bits start, a bit a slot
+pub fun bitmap_at(cap: u32) u32 {
+    ret cap * (ROW + 2);
+}
+
+# where the hash's buckets start
+pub fun hash_at(cap: u32) u32 {
+    ret bitmap_at(cap) + (cap + 31) / 32;
+}
+
+# buckets of the GPU's hash for cap slots: a power of two, at least four a slot
+pub fun buckets(cap: u32) u32 {
+    if (cap <= 1) { ret 4; }
+    ret 1 << (msb(cap - 1) + 3);
+}
+
+# words of a status buffer past its head for cap slots
+pub fun status_words(cap: u32) u32 {
+    ret hash_at(cap) + buckets(cap);
+}
+
+# the first bucket a chunk's biased coordinates probe from, of n, a power of two
+pub fun bucket(bx: u32, by: u32, n: u32) u32 {
     var h: u32 = (bx * 0x9e3779b1) ^ (by * 0x85ebca77);
     h = h ^ (h >> 15);
     h = h * 0x2c1b3c6d;
     h = h ^ (h >> 12);
-    ret h & (HASH - 1);
+    ret h & (n - 1);
 }
 
 test link__takes_a_position_through_every_transform_and_back {
@@ -514,5 +656,32 @@ test link__takes_a_position_through_every_transform_and_back {
     if (edge(0, 64, 0, 64, 0) != EDGE_WHOLE)                                                { ret 5; }
     if (edge_side(e, 13, 0) != 3 || edge_side(e, 14, 49) != 4 || edge_side(e, 20, 50) != 7) { ret 6; }
     if (edge_side(e, 64, -1) != 2)                                                          { ret 7; }
+    ret 0;
+}
+
+test shard__finds_every_slot_in_the_shard_that_holds_it {
+    var m: u32 = SHARD_LOG;
+    for (m <= SHARD_LOG_MAX) {
+        # each shard starts where the last ends, doubling up to the geometry
+        if (shard_start(0, m) != 0 || shard_start(1, m) != SHARD_FIRST) { ret 1; }
+        var k: u32 = 1;
+        for (k < SHARDS_MAX) {
+            val lo:  u32 = shard_start(k, m);
+            val hi:  u32 = shard_start(k + 1, m);
+            val big: u32 = 1 << m;
+            if (hi <= lo || hi - lo > big)                                            { ret 2; }
+            if (lo >= big && hi - lo != big)                                          { ret 3; }
+            if (shard_of(lo, m) != k || shard_of(hi - 1, m) != k)                     { ret 4; }
+            if (shard_of(lo + (hi - lo) / 2, m) != k || shard_of(lo - 1, m) != k - 1) { ret 5; }
+            k = k + 1;
+        }
+        m = m + 1;
+    }
+    if (shard_of(0, 10) != 0 || shard_of(SHARD_FIRST - 1, 10) != 0) { ret 6; }
+    # a pool that doubles from the first shard adds one a doubling
+    if (shard_start(3, 12) != 256 || shard_start(7, 12) != 4096 || shard_start(8, 12) != 8192 || shard_start(9, 12) != 12288) { ret 7; }
+    if (msb(1) != 0 || msb(0x80000000) != 31 || msb(4095) != 11)                                                              { ret 8; }
+    # a status buffer's parts follow one another, the hash a power of two
+    if (buckets(64) != 256 || buckets(65) != 512 || hash_at(64) != 64 * 6 + 2) { ret 9; }
     ret 0;
 }

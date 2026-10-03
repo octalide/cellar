@@ -188,12 +188,19 @@ run the loaded rule starts on the chunk engine with a message. The first run
 brings over anything an older version left in
 `arrangements/` in the working directory.
 
-A run pauses with a message when it crosses a ceiling: a population, chunks of
-the pool in use (20,000 by default), the memory HashLife's nodes take (500 MiB
-by default, collected before it counts), or the time one step takes. Each is
-switched on or off in the settings and kept with them. Playing on
-carries the run past the ceiling it paused at, which stays quiet until the world
-falls back under it.
+A run pauses with a message when it crosses a ceiling: a population, the
+memory the pool takes, the memory HashLife's nodes take (500 MiB by default,
+collected before it counts), or the time one step takes. Each is switched on or
+off in the settings and kept with them. Playing on carries the run past the
+ceiling it paused at, which stays quiet until the world falls back under it.
+
+The pool's memory is a bound rather than a check: the pool is sized to it, on
+the GPU where the GPU steps the world, across as many buffers as the world
+needs. Left at its default it takes three quarters of a discrete GPU's memory
+and a quarter where the GPU shares the system's, and switched off it may take
+all of it. A world that reaches it pauses, and the message offers to raise it
+so the run can go on. cellar needs a Vulkan 1.2 GPU with buffer device
+addresses, and says so at start on one without.
 
 `cellar <file>` opens a file at startup: a `.cellar` world loads as the world,
 a `.rule` file's rule runs on the world, and a pattern in any format cellar reads (RLE, plaintext `.cells`, Life 1.05
@@ -227,8 +234,8 @@ would at startup, runs under `--rule` or else its own rule for `n`
 generations on the CPU, and is written in the format `--out`'s extension names
 (`.rle`, `.cells`, `.mc`, `.rlw`), or as RLE on stdout without one. The
 generation and population go to stderr unless `--quiet`. It honours the saved
-ceilings, which `--max-population`, `--max-chunks`, `--max-memory` (MiB) and
-`--max-step-ms` set to a limit or `off` for that run. A run that crosses one
+ceilings, which `--max-population`, `--max-pool-memory` (MiB), `--max-memory`
+(MiB) and `--max-step-ms` set to a limit or `off` for that run. A run that crosses one
 stops there, writes the world as it stood, says which and exits with status 3.
 
 ## Bench
@@ -262,9 +269,11 @@ The other worlds run Life with its eight weights widened to the radius, one by
 default, so a wider radius costs its spread but reads the same eight cells.
 
 The line reads `bench <engine> radius <r> chunks <n> population <n> gens/s <n>
-step us <n> cells/s <n> frame us <n>`: chunks and population as the run ended,
-generations a second, the time a generation took on average, the cells of the
-chunks the pool held stepped a second, and the time a frame took on average.
+step us <n> cells/s <n> frame us <n> bits/cell <n> pool bytes <n>`: chunks and
+population as the run ended, generations a second, the time a generation took
+on average, the cells of the chunks the pool held stepped a second, the time a
+frame took on average, the bits a cell takes in the pool, and the bytes the
+pool took, on the GPU where it steps.
 
 `cellar --bench <gpu|cpu> pause [seconds]` runs Seeds from a soup, pauses it
 after each run of that long and resumes it, and prints how long each pause took
