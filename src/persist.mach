@@ -1849,3 +1849,107 @@ test parse_chunk__reads_a_version_6_chunk_of_words_of_several_values {
     vector.dnit[u8](?b);
     ret 0;
 }
+
+# a reaction-diffusion world as 0.8.0 holds one: an inked square, and two
+# cells holding u below 1, one of them with no v, inside one chunk, stepped
+# 20 generations
+#[testing]
+fun seed_legacy_reaction(s: *sim.Sim) bool {
+    val r: res[rule.Rule, str] = rule.parse("F=0.0367,k=0.0649");
+    if (sel r.err)              { ret false; }
+    if (!sim.set_rule(s, r.ok)) { ret false; }
+    sim.fill_begin(s);
+    var y: i64 = 0;
+    for (y < 12) {
+        var x: i64 = 0;
+        for (x < 12) {
+            sim.fill_cell(s, 26 + x, 26 + y, rule.ink(?s.rule));
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    sim.fill_cell(s, 44, 30, 9);
+    sim.fill_cell(s, 45, 30, 9 + 16 * 3);
+    if (!sim.fill_end(s)) { ret false; }
+    var g: usize = 0;
+    for (g < 20) {
+        sim.step(s);
+        g = g + 1;
+    }
+    ret s.generation == 20;
+}
+
+# the files 0.8.0's encoders wrote for the world seed_legacy_reaction makes,
+# each cell one value holding both fields
+#[testing]
+#[embed("../res/test/reaction-0.8.0.cellar")]
+val LEGACY_WORLD: [_]u8;
+#[testing]
+#[embed("../res/test/reaction-0.8.0.rlw")]
+val LEGACY_RLW:   [_]u8;
+
+test load__a_reaction_world_and_pattern_0_8_0_wrote_load_both_fields_exactly {
+    var a: allo.Allocator;
+    page.make(?a);
+    var want: sim.Sim;
+    var got:  sim.Sim;
+    val m1:   err[allo.Error] = sim.init(?want, ?a);
+    val m2:   err[allo.Error] = sim.init(?got, ?a);
+    if (sel m1.err || sel m2.err)     { ret 1; }
+    if (!seed_legacy_reaction(?want)) { ret 1; }
+    if (sim.word_len(?want) != 2)     { ret 1; }
+
+    # the world file, a version 5 file of one value a cell
+    var data: Vector[u8]             = vector.init[u8](?a);
+    val held: res[usize, allo.Error] = vector.reserve[u8](?data, $length_of(LEGACY_WORLD));
+    if (sel held.err) { ret 2; }
+    mem.copy[u8](data.data, ?LEGACY_WORLD[0], $length_of(LEGACY_WORLD));
+    data.len = $length_of(LEGACY_WORLD);
+    var v:      View;
+    val loaded: res[Loaded, Error] = world_from(?a, ?got, ?v, ?data);
+    vector.dnit[u8](?data);
+    if (sel loaded.err)                                                              { ret 2; }
+    if (!rule.same(?got.rule, ?want.rule) || got.generation != 20 || v.zoom != 4.0)  { ret 3; }
+    if (sim.population(?got) != sim.population(?want) || sim.population(?want) == 0) { ret 3; }
+    var w: [layer.LAYERS_MAX]u32;
+    var g: [layer.LAYERS_MAX]u32;
+    var y: i64 = -64;
+    for (y < 128) {
+        var x: i64 = -64;
+        for (x < 128) {
+            sim.word_at(?want, x, y, ?w[0]);
+            sim.word_at(?got, x, y, ?g[0]);
+            if (w[0] != g[0] || w[1] != g[1]) { ret 4; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+
+    # the pattern, a version 1 RLW file of one value a cell, read as words of
+    # two, each cell's state from both
+    var p:    pattern.Pattern;
+    val made: err[allo.Error] = pattern.init(?p, ?a, 0, 0, "");
+    if (sel made.err) { ret 5; }
+    val read: err[Error] = pattern_from(?a, ?p, ?LEGACY_RLW[0], $length_of(LEGACY_RLW));
+    if (sel read.err)                                    { ret 5; }
+    if (!pattern.exact(?p) || p.values != 2 || p.w == 0) { ret 6; }
+    var cells: usize = 0;
+    y = 0;
+    for (y < p.h::i64) {
+        var x: i64 = 0;
+        for (x < p.w::i64) {
+            sim.word_at(?want, p.x + x, p.y + y, ?w[0]);
+            val pw: *u32 = pattern.word(?p, x::usize, y::usize);
+            if (pw[0] != w[0] || pw[1] != w[1])                                                 { ret 7; }
+            if (pattern.get(?p, x::usize, y::usize)::u32 != rule.word_state(?want.rule, ?w[0])) { ret 8; }
+            if (w[0] != 0 || w[1] != 0)                                                         { cells = cells + 1; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    if (cells == 0) { ret 9; }
+    pattern.dnit(?p);
+    sim.dnit(?want);
+    sim.dnit(?got);
+    ret 0;
+}
