@@ -1092,12 +1092,25 @@ fun bench_grid(s: *sim.Sim, suffix: str) {
     sim.set_rule(s, r);
 }
 
+fun bench_engine(g: *Game) str {
+    if (world.hashlife(?g.shown)) { ret "hashlife"; }
+    if (!g.gpu.stepping)          { ret "cpu"; }
+    ret "gpu";
+}
+
 # count a measured frame, and report and stop once the time is up
 fun bench_frame(ctx: *Context, g: *Game) {
     val now: time.InstantClock = time.instant();
     if (sel now.err) { ret; }
     # the first frames seed the GPU and grow the pool, which is not the rate
     g.frames = g.frames + 1;
+    # a world that stopped on its own, full or at a ceiling, has no rate to report
+    if (g.bench != args.BENCH_PAUSE && !g.shown.running) {
+        print.printlnf("bench {} stopped on its own at generation {}: full {} ceiling {}, no rate", bench_engine(g), g.shown.generation,
+            g.shown.full, sim.tripped(?g.sim)::u64);
+        context_stop(ctx);
+        ret;
+    }
     if (g.frames <= WARMUP) { ret; }
     if (g.frames == WARMUP + 1) {
         g.started  = now.ok;
@@ -1109,13 +1122,18 @@ fun bench_frame(ctx: *Context, g: *Game) {
         ret;
     }
     # the generations a frame completed are counted at the pool it shows after them
-    val done: u64 = g.shown.generation - g.gen_seen;
+    # a closed gate voids generations off the count, so a frame can show fewer than the last
+    val done: i64 = g.shown.generation::i64 - g.gen_seen::i64;
     g.cell_gens = g.cell_gens + done::f64 * g.shown.chunks::f64 * space.CELLS::f64;
     g.gen_seen  = g.shown.generation;
     val secs: f64 = time.instant_sub(now.ok, g.started)::f64 / SECOND::f64;
     if (secs < g.bench_secs) { ret; }
-    val gens: f64 = (g.shown.generation - g.gen0)::f64;
+    val gens: f64 = (g.shown.generation::i64 - g.gen0::i64)::f64;
     # the clock started with the first measured frame, so the frames after it span the seconds
+    var gps: f64 = gens / secs;
+    var cps: f64 = g.cell_gens / secs;
+    if (gps < 0.0) { gps = 0.0; }
+    if (cps < 0.0) { cps = 0.0; }
     var spans: u64 = g.frames - WARMUP - 1;
     if (spans == 0) { spans = 1; }
     val frame: f64 = secs * 1000000.0 / spans::f64;
@@ -1134,8 +1152,8 @@ fun bench_frame(ctx: *Context, g: *Game) {
         k    = k + 1;
     }
     print.printlnf("bench {} radius {} chunks {} population {} gens/s {} step us {} cells/s {} frame us {} bits/cell {} pool bytes {}", engine,
-        rule.radius(?g.shown.rule)::u64, g.shown.chunks::u64, g.shown.population::u64, (gens / secs)::u64, step::u64,
-        (g.cell_gens / secs)::u64, frame::u64, bits, g.shown.pool.taken);
+        rule.radius(?g.shown.rule)::u64, g.shown.chunks::u64, g.shown.population::u64, gps::u64, step::u64,
+        cps::u64, frame::u64, bits, g.shown.pool.taken);
     context_stop(ctx);
 }
 
