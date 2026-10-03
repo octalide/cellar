@@ -6,6 +6,29 @@ All notable changes to cellar are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-03
+
+### Added
+
+- The GPU pool is sized from the device's memory instead of a fixed 32,768 chunks. Each layer is split into shards reached by buffer device address, so a world can use as much of the GPU as you allow: a 4.9 GiB world runs on an 8 GiB card (#233). The default limit is three quarters of the GPU's memory, or a quarter where GPU memory is system RAM. Reaching it pauses the run with a toast that offers to raise it. Stats shows the pool's memory and its limit.
+- A Lenia category of 13 creatures from Bert Chan's Lenia collection, Lenia rule presets (Orbium, Gyrorbium, Scutium, Hydrogeminium) and a Gray-Scott category of seeds (#239).
+- Picking a library pattern whose rule differs from the world's offers to take it, as a paste does. Shift-click takes it (#273).
+- `--bench ... --rule <rule>` runs a bench under any rule, with a seed that suits Lenia and Gray-Scott (#257), and `--colour <solid|trails|age>` runs it in a colour mode (#237).
+- A rule family registered after the GPU starts gets its GPU stage built on first use (#251).
+
+### Changed
+
+- Trails, heat and age are kept only while a colour mode shows them. A solid-colour Life world holds 2 bits a cell instead of 34. Switching modes on a GPU world builds or drops the layer on the GPU (#237).
+- The chunk ceiling is now a pool memory limit. `cellar run --max-chunks` is replaced by `--max-pool-memory <MiB|off>`, and a saved ceiling carries over (#233).
+- A Vulkan 1.2 device with buffer device addresses is required. Every current desktop driver, lavapipe, the Raspberry Pi 5 and MoltenVK on macOS 13 or later have them (#233).
+- The readout is padded 12 px at the sides and 8 px above and below again. Built on boom 0.49 and blit 0.13.
+
+### Fixed
+
+- A world past 65,535 chunks stepped wrongly on the GPU, because some dispatches went past the device's workgroup count limit (#275).
+- Leaving HashLife for the GPU with a rule the GPU cannot step left the world frozen without a word. It is now refused with the reason (#266).
+- A bench whose world stopped printed a wrapped rate (#258).
+
 ## [0.9.0] - 2026-10-02
 
 ### Added
