@@ -6,6 +6,26 @@ All notable changes to cellar are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-02
+
+### Added
+
+- cellar notices a software Vulkan device, such as Mesa's llvmpipe, and steps the world on its CPU engine, which outruns the GPU engine emulated on the CPU. It says so once at start, and `--engine gpu` still steps on the device. Settings and Stats show the graphics device in use. The README has a troubleshooting section for slow drawing (#259).
+- Tab hides the toolbar as well as the panels, leaving the two stat overlays (#241).
+- The zoom readout shows px per cell exactly, with buttons that step zoom by powers of two (#242).
+
+### Changed
+
+- Two-state rules (Life, isotropic and non-totalistic, Larger than Life, weighted) store each cell in one bit and step 32 cells at a time on the GPU, 1.4 to 3 times faster in the benches (#234).
+- Generations and rule tables store each cell's state in one byte, 1.8 to 2.3 times faster on the GPU (#235).
+- Cells are kept in layers of fixed width with one contract for every rule family, and families are registered in one place (#232, #249, #255, #256). Reaction-diffusion keeps its two fields as two 16-bit layers. Worlds and patterns written by 0.8.0 load exactly (#236).
+- boom picks a hardware GPU over a software device. `BOOM_DEVICE` names a device by index or name to override that.
+- Built on boom 0.48. Building needs Mach 6.10.1 or newer.
+
+### Fixed
+
+- Some glyphs drew one pixel below the rest of their line (#243).
+
 ## [0.8.0] - 2026-10-02
 
 ### Changed
