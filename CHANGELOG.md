@@ -6,6 +6,18 @@ All notable changes to cellar are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-10-03
+
+### Changed
+
+- The cell coordinates sit beside the zoom bar as their own x and y boxes, which stay put when the cursor leaves the world (#280).
+
+### Fixed
+
+- The zoom bar flickered under the cursor and its buttons could not be clicked (#280).
+- Trails and Age could not be chosen again once a world had grown a large pool, even after a clear. The pool now shrinks to fit the world when a mode needs room, and a refused switch says why (#279).
+- Changing a grown world to a rule with wider cells, such as Life to Lenia, could overrun the GPU pool. Rule changes now fit the pool the same way, and a refused change says why (#283).
+
 ## [0.10.0] - 2026-10-03
 
 ### Added
