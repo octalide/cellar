@@ -5557,6 +5557,160 @@ test frame__a_pool_grown_under_narrow_layers_fits_its_world_to_take_a_wider_rule
     ret 0;
 }
 
+# a lone cell in each of 32 by 32 chunks, which dies at once under Life, and
+# a block in each of the four last chunks the lattice allocates, which lives
+# on in the slots at the top of the pool. the grid's chunks are the same on
+# the plane and on a torus of 64 by 64 chunks
+#[testing]
+fun seed_dying(s: *Sim) {
+    fill_begin(s);
+    var cy: i64 = 0 - 16;
+    for (cy < 16) {
+        var cx: i64 = 0 - 16;
+        for (cx < 16) {
+            fill_cell(s, cx * space.SIDE + 32, cy * space.SIDE + 32, 1);
+            cx = cx + 1;
+        }
+        cy = cy + 1;
+    }
+    var k: i64 = 0;
+    for (k < 4) {
+        var i: i64 = 0;
+        for (i < 4) {
+            fill_cell(s, (12 + k) * space.SIDE + 10 + i % 2, 15 * space.SIDE + 10 + i / 2, 1);
+            i = i + 1;
+        }
+        k = k + 1;
+    }
+    fill_end(s);
+}
+
+# step the GPU's world a generation a frame, a census each, until its pool
+# holds fewer than cap slots, and a frame more for the memory it takes to be
+# noted
+#[testing]
+fun frames_below(t: *Rig, cap: usize) bool {
+    var n: usize = 0;
+    for (t.g.p.cap >= cap && n < 400) {
+        step(?t.gpu);
+        if (!rig_frame(t)) { ret false; }
+        n = n + 1;
+    }
+    ret t.g.p.cap < cap && rig_frame(t);
+}
+
+test reclaim__a_pool_gives_its_memory_back_once_its_world_stays_below_a_quarter {
+    # a world a slot under a quarter of the pool for one count fewer than it
+    # takes, then at a quarter, starts over
+    var sparse: usize = 0;
+    var i:      usize = 0;
+    for (i + 1 < RECLAIM_AFTER) {
+        if (weigh(?sparse, 1023, 4096) != 0) { ret 1; }
+        i = i + 1;
+    }
+    if (weigh(?sparse, 1024, 4096) != 0 || sparse != 0) { ret 2; }
+    # a world hovering about the quarter never gives the pool back
+    i = 0;
+    for (i < RECLAIM_AFTER * 4) {
+        if (weigh(?sparse, 1023 + (i % 2) * 2, 4096) != 0) { ret 3; }
+        i = i + 1;
+    }
+    # one below it throughout gives it back to half, which the world fills
+    # half of at most, so it stays below a quarter of no pool it is given
+    sparse = 0;
+    i      = 0;
+    var to: usize = 0;
+    for (i < RECLAIM_AFTER && to == 0) {
+        to = weigh(?sparse, 1023, 4096);
+        i  = i + 1;
+    }
+    if (to != 2048 || i != RECLAIM_AFTER) { ret 4; }
+    i = 0;
+    for (i < RECLAIM_AFTER * 2) {
+        if (weigh(?sparse, 1023, to) != 0) { ret 5; }
+        i = i + 1;
+    }
+    # the capacity holds every world twice over with the GPU's slack, and is
+    # always smaller than a pool the world fills less than a quarter of
+    var used: usize = 0;
+    for (used < 100000) {
+        val cap: usize = reclaim_cap(used);
+        if (cap < used * 2 || cap < gpu.fitted(used, gpu.MOST_SLOTS)) { ret 6; }
+        var c: usize = 256;
+        for (c <= 1048576) {
+            if (used * 4 < c && cap >= c) { ret 7; }
+            c = c * 2;
+        }
+        used = used + 37;
+    }
+    ret 0;
+}
+
+test frame__clear_gives_the_pool_back_as_it_started_on_both_engines {
+    var t:    Rig;
+    val code: i32 = rig_open(?t, rule_named("B3/S23"), seed_dying);
+    if (code != 0) { ret code; }
+    if (!t.on) {
+        rig_close(?t);
+        ret 0;
+    }
+    if (uncapped_frames(?t.r, ?t.gpu, 4) == 0) { ret 1; }
+    val grown: usize = t.g.p.cap;
+    val bytes: u64   = gpu.pool_bytes_of(?t.g);
+    val taken: u64   = pool_memory(?t.gpu).taken;
+    clear(?t.cpu);
+    clear(?t.gpu);
+    if (!rig_frame(?t) || !rig_frame(?t)) { ret 2; }
+    # the pool takes what an empty world started with, on the host and the GPU
+    val first: usize = gpu.fitted(0, gpu.MOST_SLOTS);
+    if (grown <= first || t.g.p.cap != first)                                      { ret 3; }
+    if (t.gpu.space.cap != first || t.cpu.space.cap != first)                      { ret 4; }
+    if (gpu.pool_bytes_of(?t.g) >= bytes)                                          { ret 5; }
+    if (pool_memory(?t.gpu).taken >= taken)                                        { ret 6; }
+    if (pool_memory(?t.cpu).taken > (first * space.slot_bytes(?t.cpu.space))::u64) { ret 7; }
+    # and a world seeded afresh grows it again and steps as on the CPU
+    seed_edges(?t.cpu);
+    seed_edges(?t.gpu);
+    if (uncapped_frames(?t.r, ?t.gpu, 200) == 0) { ret 8; }
+    if (!caught_up(?t))                          { ret 9; }
+    rig_close(?t);
+    ret 0;
+}
+
+test frame__a_world_that_dies_down_gives_its_pool_back_on_both_engines {
+    # on the plane the GPU owns the pool and packs it alone; on a torus past
+    # the pool's ceiling the host allocates, and moves the chunks itself
+    val strings: [2]str = [2]str{"B3/S23", "B3/S23:T4096,4096"};
+    var k:       usize  = 0;
+    for (k < 2) {
+        var t:    Rig;
+        val code: i32 = rig_open_within(?t, rule_named(strings[k]), seed_dying, 4095);
+        if (code != 0) { ret code; }
+        if (!t.on) {
+            rig_close(?t);
+            ret 0;
+        }
+        val base:  i32   = 10 * k::i32;
+        val grown: usize = t.g.p.cap;
+        val cpu:   usize = t.cpu.space.cap;
+        # the lone cells die and their chunks go, the blocks living on in the
+        # slots at the top of the pool
+        if (uncapped_frames(?t.r, ?t.gpu, 8) == 0) { ret base + 1; }
+        val bytes: u64 = gpu.pool_bytes_of(?t.g);
+        val taken: u64 = pool_memory(?t.gpu).taken;
+        if (!frames_below(?t, grown))                                               { ret base + 2; }
+        if (t.g.p.cap > reclaim_cap(64) || t.gpu.space.cap > t.g.p.cap)             { ret base + 3; }
+        if (gpu.pool_bytes_of(?t.g) >= bytes || pool_memory(?t.gpu).taken >= taken) { ret base + 4; }
+        # the world steps on as on the CPU, whose pool gives its memory back too
+        if (uncapped_frames(?t.r, ?t.gpu, t.gpu.generation + 200) == 0) { ret base + 5; }
+        if (!caught_up(?t))                                             { ret base + 6; }
+        if (t.cpu.space.cap >= cpu || population(?t.cpu) != 16)         { ret base + 7; }
+        rig_close(?t);
+        k = k + 1;
+    }
+    ret 0;
+}
+
 # a glider heading away from chunk (0, 0) for good
 #[testing]
 fun seed_leaving(s: *Sim) {
