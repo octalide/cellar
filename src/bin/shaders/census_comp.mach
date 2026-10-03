@@ -8,15 +8,18 @@
 # only has its zeros counted.
 #
 # a workgroup is one slot. a cell is its sensed value, its value in the state
-# layer with its value in the shown layer above it, each at the width the meta
-# head holds (cellar.layer). an invocation reads four words of the state
-# layer's span at a time, the workgroup 256 words a step, and a word of zeros
-# whose cells' shown values are zero too holds nothing to count. an invocation counts its live cells, notes
-# whether any cell is still warm, both as the rule family's sense in the meta
-# head reads a cell, and the columns and rows its live cells span and the
-# quadrants they lie in. the
-# workgroup reduces those in shared memory with atomics, which every vulkan
-# device has, so the census needs no device feature. the first invocation
+# layer with its shown layer's above it, at the widths the meta head holds
+# (cellar.layer), the variant that binds the layers beside the state layer
+# reading the shown layer, and the plain one a set with none. an invocation
+# reads four words of
+# the slot's span at a time, the workgroup 256 words a step, and a word of
+# zeros holds nothing to count but where a live rule layer may hold more. an
+# invocation counts its live cells, notes whether any cell is still warm,
+# both as the rule family's sense in the meta head reads a cell and as its
+# live rule layers make one live (cellar.layer), and the columns and rows its
+# live cells span and the quadrants they lie in. the workgroup reduces those
+# in shared memory with atomics, which every vulkan device has, so the census
+# needs no device feature. the first invocation
 # then writes the slot's row: the count, the extent and its quadrants, from
 # which the host works out the halo they need (cellar.space.halo), and the
 # slot's incarnation and its chunk's coordinates, so the host can tell a
@@ -48,8 +51,6 @@ var meta:   Meta;
 var status: Status;
 #[storage(1, 3, "readonly")]
 var flags:  Flags;
-#[storage(1, 4, "readonly")]
-var shown:  Layer;
 
 # the workgroup's sums as its invocations reduce them
 rec Tally {
@@ -64,6 +65,36 @@ rec Tally {
 
 #[shared]
 var tally: Tally;
+
+# the live rule layers' values of the cell at address a (cellar.layer), or'd,
+# in the variant built for a rule with live rule layers, and none in the other
+$if ($bin.name == "stage-census_live_comp") {
+    use cellar.bin.shaders.lives;
+    use cellar.bin.shaders.shown;
+
+    fun more(a: u32) u32 {
+        ret lives.more(meta.base[layout.LIVE_AT - layout.BASE_AT], a);
+    }
+
+    # the sensed value of the cell at address a whose state layer's value is
+    # c, read at width w
+    fun sensed(c: u32, w: u32, a: u32) u32 {
+        ret shown.sensed(meta.base[layout.LIVE_AT - layout.BASE_AT], c, w, a);
+    }
+
+    val LIVE: u32 = 1;
+}
+$or {
+    fun more(a: u32) u32 {
+        ret 0;
+    }
+
+    fun sensed(c: u32, w: u32, a: u32) u32 {
+        ret c;
+    }
+
+    val LIVE: u32 = 0;
+}
 
 #[builtin("workgroup_id")]
 var wid: u32x3;
@@ -102,7 +133,6 @@ fun comp_main() {
     val f: u32 = flags.v[slot * 2 + 1];
     if (inc != 0 && (f == meta.serial || f == meta.serial + 1)) {
         val w:     u32 = meta.base[layout.WIDTH_AT - layout.BASE_AT];
-        val hw:    u32 = meta.base[layout.SHOWN_AT - layout.BASE_AT];
         val per:   u32 = layer.per_word(w);
         val words: u32 = layer.span_words(w);
         val base:  u32 = layer.span_at(w, slot);
@@ -110,27 +140,16 @@ fun comp_main() {
         for (q < words) {
             var e: u32 = 0;
             for (e < 4) {
-                val word:  u32 = cells.v[base + q + e];
-                val first: u32 = (q + e) * per;
-                # the shown layer's words holding the same cells
-                var any: u32 = word;
-                if (hw != 0) {
-                    val hper: u32 = layer.per_word(hw);
-                    val h0:   u32 = layer.span_at(hw, slot) + first / hper;
-                    var j:    u32 = 0;
-                    for (j < (per + hper - 1) / hper) {
-                        any = any | shown.v[h0 + j];
-                        j   = j + 1;
-                    }
-                }
-                if (any != 0) {
-                    val y: u32 = first / layout.SIDE;
-                    var k: u32 = 0;
+                val word: u32 = cells.v[base + q + e];
+                if (word != 0 || LIVE != 0) {
+                    val first: u32 = (q + e) * per;
+                    val y:     u32 = first / layout.SIDE;
+                    var k:     u32 = 0;
                     for (k < per) {
                         val i: u32 = first + k;
-                        var c: u32 = layer.read(word, w, i);
-                        if (hw != 0) { c = layer.sensed(c, layer.read(shown.v[layer.cell_at(hw, slot, i)], hw, i), w); }
-                        if (alive(c) != 0) {
+                        val c: u32 = sensed(layer.read(word, w, i), w, layer.addr(slot, i));
+                        val m: u32 = more(layer.addr(slot, i));
+                        if (alive(c) != 0 || m != 0) {
                             val x: u32 = i % layout.SIDE;
                             live  = live + 1;
                             quads = quads | layout.quadrant(x, y);
@@ -139,7 +158,7 @@ fun comp_main() {
                             if (y < y0) { y0 = y; }
                             if (y > y1) { y1 = y; }
                         }
-                        if ((c & meta.warm_mask) != 0) { warm = 1; }
+                        if ((c & meta.warm_mask) != 0 || m != 0) { warm = 1; }
                         k = k + 1;
                     }
                 }

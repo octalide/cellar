@@ -172,6 +172,16 @@ val VERT_SPV:   [_]u8;
 #[embed("{artifact.stage-cells_frag.out}")]
 val FRAG_SPV:   [_]u8;
 
+# the census's, the reduce's and the mark's variants that bind the live rule
+# layers (cellar.layer LIVE_BINDING), and the census's and the reduce's the
+# shown layer past them (cellar.layer SHOWN_BINDING)
+#[embed("{artifact.stage-census_live_comp.out}")]
+val CENSUS_LIVE_SPV: [_]u8;
+#[embed("{artifact.stage-reduce_live_comp.out}")]
+val REDUCE_LIVE_SPV: [_]u8;
+#[embed("{artifact.stage-mark_live_comp.out}")]
+val MARK_LIVE_SPV:   [_]u8;
+
 # words of the meta buffer ahead of the page table: the shared words and the rule
 pub val HEAD: usize = layout.HEAD::usize;
 # words of the view buffer ahead of the palettes: the look, then the heat, age
@@ -541,6 +551,9 @@ fun span_offset(p: *Pool, k: usize, s: usize) usize {
 # head:     the meta header staged for upload
 # built:    a pyramid built on the host, staged for upload
 # mark:     a pass's stage that asks for halos and claims slots
+# lives:    the census's, the reduce's and the mark's variants that bind the
+#           live rule layers (cellar.layer LIVE_BINDING), in that order
+# lived:    lives were built, the device's dispatches binding enough
 # free:     a pass's stage that frees what nothing asked for
 # settle:   a pass's stage that keeps one twin and links it in
 # gate:     the stage that zeroes the frame's steps while the gate is closed
@@ -671,6 +684,8 @@ pub rec Gpu {
     head:     [128]u32;
     built:    [layout.MIP]u32;
     mark:     gfx.Compute;
+    lives:    [LIVES]gfx.Compute;
+    lived:    bool;
     free:     gfx.Compute;
     settle:   gfx.Compute;
     gate:     gfx.Compute;
@@ -1030,8 +1045,11 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
 
     g.stepping = false;
     if (build_steps(g)) {
-        if (build_stages(g)) { g.stepping = true; }
-        or                   { drop_steps(g, rule.FAMILIES_MAX); }
+        if (build_stages(g)) {
+            g.stepping = true;
+            build_lives(g);
+        }
+        or { drop_steps(g, rule.FAMILIES_MAX); }
     }
     if (g.stepping) { hold_clocks(g); }
 
@@ -1175,6 +1193,118 @@ fun drop_stages(g: *Gpu, n: usize) {
     }
 }
 
+# the variants of the stages that judge a cell live, the census, the reduce
+# and the mark, that bind the live rule layers
+val LIVES: usize = 3;
+
+# the variant i of LIVES, as build_lives makes them
+fun live_of(g: *Gpu, i: usize, spv: **u8, len: *usize) *gfx.Compute {
+    if (i == 0) {
+        @spv = ?CENSUS_LIVE_SPV[0];
+        @len = $length_of(CENSUS_LIVE_SPV);
+    }
+    or (i == 1) {
+        @spv = ?REDUCE_LIVE_SPV[0];
+        @len = $length_of(REDUCE_LIVE_SPV);
+    }
+    or {
+        @spv = ?MARK_LIVE_SPV[0];
+        @len = $length_of(MARK_LIVE_SPV);
+    }
+    ret ?g.lives[i];
+}
+
+# build the variants that bind the live rule layers and the shown layer, all
+# of them or none, where the device's dispatches bind them all. without them
+# the GPU steps no rule whose family declares a live rule layer or a shown
+# layer (refusal)
+fun build_lives(g: *Gpu) {
+    g.lived = false;
+    if ((layer.SHOWN_BINDING + 1)::usize > g.most) { ret; }
+    var i: usize = 0;
+    for (i < LIVES) {
+        var spv: *u8            = nil;
+        var len: usize          = 0;
+        val c:   *gfx.Compute   = live_of(g, i, ?spv, ?len);
+        val e:   err[gfx.Error] = gfx.compute(c, g.d, spv, len);
+        if (sel e.err) {
+            drop_some_lives(g, i);
+            ret;
+        }
+        i = i + 1;
+    }
+    g.lived = true;
+}
+
+# delete the variants that bind the live rule layers, where they were built
+fun drop_lives(g: *Gpu) {
+    if (g.lived) { drop_some_lives(g, LIVES); }
+    g.lived = false;
+}
+
+# delete the first n variants that bind the live rule layers
+fun drop_some_lives(g: *Gpu, n: usize) {
+    var spv: *u8   = nil;
+    var len: usize = 0;
+    var i:   usize = 0;
+    for (i < n) {
+        gfx.compute_delete(live_of(g, i, ?spv, ?len), g.d);
+        i = i + 1;
+    }
+}
+
+# whether the pool's layers are read through the variants that bind the
+# layers beside the state layer: they have a live rule layer or a shown layer
+fun layered(g: *Gpu) bool {
+    ret g.lived && (plane.lives(?g.p.set) != 0 || plane.shown_width(?g.p.set) != 0);
+}
+
+# the stage that judges a cell live to dispatch for the pool's layers: the
+# plain one, or for layers with a live rule layer or a shown layer its
+# variant i of LIVES
+fun judge(g: *Gpu, plain: *gfx.Compute, i: usize) *gfx.Compute {
+    if (layered(g)) { ret ?g.lives[i]; }
+    ret plain;
+}
+
+# bind the pool's live rule layers' cells c, front or back, past a stage's
+# four fixed bindings, as the variant judge picks reads them (cellar.layer
+# LIVE_BINDING), every binding past the last live one the state layer's
+# ---
+# bufs: the stage's buffers, room for LIVE_BINDING + LIVE_MAX
+# ret:  the buffers the stage binds
+fun bind_lives(g: *Gpu, bufs: **gfx.StorageBuffer, c: usize) usize {
+    val first: usize = layer.LIVE_BINDING::usize;
+    if (!layered(g)) { ret first; }
+    var j: usize = 0;
+    var k: usize = 1;
+    for (k < plane.exact(?g.p.set) && j < layer.LIVE_MAX::usize) {
+        if (g.p.set.at[k].live) {
+            bufs[first + j] = cells_of(?g.p, k, c);
+            j               = j + 1;
+        }
+        k = k + 1;
+    }
+    for (j < layer.LIVE_MAX::usize) {
+        bufs[first + j] = cells_of(?g.p, 0, c);
+        j               = j + 1;
+    }
+    ret first + layer.LIVE_MAX::usize;
+}
+
+# bind the pool's shown layer's cells c past the live rule layers bind_lives
+# bound, as the census's and the reduce's variant reads it (cellar.layer
+# SHOWN_BINDING), the state layer's where it has none
+# ---
+# bufs: the stage's buffers, room for SHOWN_BINDING + 1
+# n:    the buffers bind_lives bound
+# ret:  the buffers the stage binds
+fun bind_shown(g: *Gpu, bufs: **gfx.StorageBuffer, n: usize, c: usize) usize {
+    if (!layered(g)) { ret n; }
+    bufs[layer.SHOWN_BINDING::usize] = shown_cells(?g.p, c);
+    ret layer.SHOWN_BINDING::usize + 1;
+}
+
 # build the step stage of every rule family that has one and whose bindings
 # the device's dispatches hold, all of those or none. a family registered
 # later has none built, and the CPU steps it
@@ -1230,6 +1360,10 @@ pub fun refusal(g: *Gpu, r: *rule.Rule) str {
     if (rule.table(f)) { tab = 1; }
     var len: usize = 0;
     if (rule.stage(f, ?len) == nil) { ret "this rule's family has no GPU stage, so it cannot run while the GPU steps the world"; }
+    # the census, the reduce and the mark read every live rule layer, and the
+    # census and the reduce the shown layer
+    val lives: usize = plane.lives(?set);
+    if ((lives != 0 || plane.shown_width(?set) != 0) && (!g.lived || lives > layer.LIVE_MAX::usize)) { ret "this GPU's compute stages bind too few storage buffers for the layers this rule's cells are read by, so it cannot run while it steps the world"; }
     # a family's stage was built only where its state layer's bindings fit
     if (g.ready[f] && (set.n == 1 || layer.bindings(set.n::u32, tab)::usize <= g.most)) { ret nil; }
     ret "this GPU's compute stages bind too few storage buffers for the rule buffer and layers this rule needs, so it cannot run while it steps the world";
@@ -1416,6 +1550,7 @@ pub fun forgo_compute(g: *Gpu) {
     if (!g.stepping) { ret; }
     drop_steps(g, rule.FAMILIES_MAX);
     drop_stages(g, STAGES);
+    drop_lives(g);
     g.stepping = false;
 }
 
@@ -1432,6 +1567,7 @@ pub fun dnit(g: *Gpu) {
     if (g.stepping) {
         drop_steps(g, rule.FAMILIES_MAX);
         drop_stages(g, STAGES);
+        drop_lives(g);
     }
     if (g.clocked) { drop_clocks(g, TIMERS); }
     vector.dnit[Write](?g.writes);
@@ -2518,7 +2654,8 @@ fun upload_view(g: *Gpu, sp: *space.Space, look: *Look) err[gfx.Error] {
                     val room: res[usize, allo.Error] = vector.reserve[u32](?g.pyrs, MIP);
                     if (sel room.err) { e = err[gfx.Error].err{gfx.Error.alloc{room.err}}; }
                     or {
-                        space.pyramid(space.plane_of(sp, 0, s), space.shown_of(sp, s), sp.sense, ?g.pyrs.data[g.pyrs.len]);
+                        var lv: space.Lives = space.lives_of(sp, s, false);
+                        space.pyramid(space.plane_of(sp, 0, s), sp.sense, ?lv, ?g.pyrs.data[g.pyrs.len]);
                         g.pyrs.len = g.pyrs.len + MIP;
                         e          = queue(g, s * MIP * 4, nil, MIP * 4);
                     }
@@ -2597,7 +2734,8 @@ pub fun pyramids_hold(g: *Gpu, sp: *space.Space) bool {
         if (space.used(sp, s) && sp.dirty[s] == 0) {
             val e: err[gfx.Error] = gfx.storage_buffer_read(g.d, ?g.p.mip, s * MIP * 4, (?got[0])::*u8, MIP * 4);
             if (sel e.err) { ret false; }
-            space.pyramid(space.plane_of(sp, 0, s), space.shown_of(sp, s), sp.sense, ?g.built[0]);
+            var lv: space.Lives = space.lives_of(sp, s, false);
+            space.pyramid(space.plane_of(sp, 0, s), sp.sense, ?lv, ?g.built[0]);
             var i: usize = 0;
             for (i < MIP) {
                 if (got[i] != g.built[i]) { ret false; }
@@ -2639,10 +2777,22 @@ fun write_head(g: *Gpu, r: *rule.Rule, gen: u64) {
     # the frame's first step, of serial g.serial + 1, reads generation gen
     g.head[layout.GEN_AT::usize] = (((gen & 0xffffffff) + 0x200000000 - g.serial::u64 - 1) & 0xffffffff)::u32;
     if (rule.caps(r).b0) { g.head[layout.STROBE_AT::usize] = 1; }
-    # the shared stages read the pool's state layer at its width, and its
-    # shown layer at its own
+    # the shared stages read the pool's state layer at its width
     g.head[layout.WIDTH_AT::usize] = g.p.set.at[0].width;
-    g.head[layout.SHOWN_AT::usize] = plane.shown_width(?g.p.set);
+    # and its live rule layers at theirs, and its shown layer at its own
+    var live: u32   = 0;
+    var j:    u32   = 0;
+    var k:    usize = 1;
+    for (k < plane.exact(?g.p.set) && j < layer.LIVE_MAX) {
+        if (g.p.set.at[k].live) {
+            live = layer.live_add(live, j, g.p.set.at[k].width);
+            j    = j + 1;
+        }
+        k = k + 1;
+    }
+    val shown: u32 = plane.shown_width(?g.p.set);
+    if (shown != 0) { live = layer.live_add(live, layer.SHOWN_SLOT, shown); }
+    g.head[layout.LIVE_AT::usize] = live;
     rule.pack(r, ?g.head[layout.SHARED]);
 }
 
@@ -2759,12 +2909,13 @@ fun record_pass(g: *Gpu, op: *Op) err[gfx.Error] {
     h[16] = 1;
     val eh: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.status, layout.CTL_TOP::usize * 4, (?h[0])::*u8, 17 * 4);
     if (sel eh.err) { ret eh; }
-    var mb: [4]*gfx.StorageBuffer;
+    var mb: [layer.LIVE_BINDING + layer.LIVE_MAX]*gfx.StorageBuffer;
     mb[0] = cells_of(?g.p, 0, op.src);
     mb[1] = ?g.p.meta;
     mb[2] = ?g.p.status;
     mb[3] = ?g.p.flags;
-    val em: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.mark, ?mb[0], 4, 1, g.top::u32, 1);
+    val mn: usize          = bind_lives(g, ?mb[0], op.src);
+    val em: err[gfx.Error] = gfx.renderer_dispatch(g.r, judge(g, ?g.mark, 2), ?mb[0], mn, 1, g.top::u32, 1);
     if (sel em.err) { ret em; }
     if (op.free) {
         var fb: [3]*gfx.StorageBuffer;
@@ -3036,26 +3187,26 @@ pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, 
     if (g.going && g.counted) { ret res[usize, gfx.Error].ok{n}; }
     g.counted = true;
     if (g.hi != 0) {
-        var rb: [5]*gfx.StorageBuffer;
+        var rb: [layer.SHOWN_BINDING + 1]*gfx.StorageBuffer;
         rb[0] = cells_of(?g.p, 0, g.front);
         rb[1] = ?g.p.meta;
         rb[2] = ?g.p.flags;
         rb[3] = ?g.p.mip;
-        rb[4] = shown_cells(?g.p, g.front);
-        val er: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.reduce, ?rb[0], 5, 1, g.hi::u32, 1);
+        val rn: usize          = bind_shown(g, ?rb[0], bind_lives(g, ?rb[0], g.front), g.front);
+        val er: err[gfx.Error] = gfx.renderer_dispatch(g.r, judge(g, ?g.reduce, 1), ?rb[0], rn, 1, g.hi::u32, 1);
         if (sel er.err) { ret res[usize, gfx.Error].err{er.err}; }
     }
 
     # a workgroup a slot, and one even with none, to write the census id
     var groups: u32 = g.hi::u32;
     if (groups == 0) { groups = 1; }
-    var cb: [5]*gfx.StorageBuffer;
+    var cb: [layer.SHOWN_BINDING + 1]*gfx.StorageBuffer;
     cb[0] = cells_of(?g.p, 0, g.front);
     cb[1] = ?g.p.meta;
     cb[2] = ?g.p.status;
     cb[3] = ?g.p.flags;
-    cb[4] = shown_cells(?g.p, g.front);
-    val e19: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.census, ?cb[0], 5, 1, groups, 1);
+    val cn:  usize          = bind_shown(g, ?cb[0], bind_lives(g, ?cb[0], g.front), g.front);
+    val e19: err[gfx.Error] = gfx.renderer_dispatch(g.r, judge(g, ?g.census, 0), ?cb[0], cn, 1, groups, 1);
     if (sel e19.err) { ret res[usize, gfx.Error].err{e19.err}; }
     val e20: err[gfx.Error] = gfx.renderer_readback(g.r, ?g.p.rb, ?g.p.status, 0);
     if (sel e20.err) { ret res[usize, gfx.Error].err{e20.err}; }
