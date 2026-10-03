@@ -596,7 +596,9 @@ fun fresh_words(s: *Sim, st: *u8, n: usize, out: *u32) {
 
 # why the world cannot run a rule, or nil when it can: a GPU steps the pool the
 # rule would run on and its dispatches bind too few storage buffers for the
-# rule's family
+# rule's family, or it could not build the stage of a family registered once
+# it started, which it builds here (cellar.gpu.prepare), so while a GPU is
+# attached only the render thread asks
 # ---
 # s:   simulation
 # r:   the rule
@@ -631,7 +633,7 @@ pub fun on_gpu(s: *Sim) bool {
 # s: simulation, which must not move while attached
 # g: the GPU side, initialized with at least the pool's capacity
 pub fun attach(s: *Sim, g: *gpu.Gpu) {
-    if (!gpu.steps(g, rule.family_of(?s.rule))) { gpu.forgo_compute(g); }
+    if (!gpu.prepare(g, rule.family_of(?s.rule))) { gpu.forgo_compute(g); }
     s.gpu = g;
     gpu.mirror(g, ?s.space);
     space.set_mirror(?s.space, space.Mirror{ctx: s::*u8, reserve: reserve_pool, own: own_pool}, g.slots);
@@ -4018,6 +4020,34 @@ test frame__a_cell_live_by_a_rule_layer_alone_is_counted_and_kept_on_both_engine
     ret 0;
 }
 
+test frame__a_family_registered_once_the_gpu_started_has_its_stage_built_on_first_use {
+    var t:    Rig;
+    val code: i32 = rig_open(?t, rule.preset_rule(0), seed_world);
+    if (code != 0) { ret code; }
+    if (!t.on) {
+        rig_close(?t);
+        ret 0;
+    }
+    trace.register();
+    val r: res[rule.Rule, str] = rule.parse("trace");
+    if (sel r.err) { ret 1; }
+    val f: usize = rule.family_of(?r.ok);
+    if (t.g.tried[f] || t.g.ready[f])                       { ret 2; }
+    if (!set_rule(?t.cpu, r.ok) || !set_rule(?t.gpu, r.ok)) { ret 3; }
+    if (!t.g.ready[f] || !on_gpu(?t.gpu))                   { ret 4; }
+    clear(?t.cpu);
+    clear(?t.gpu);
+    seed_traces(?t.cpu);
+    seed_traces(?t.gpu);
+    # the traces count down on the GPU as on the CPU, and run out at 3 and 6
+    rig_step(?t, 2);
+    if (!rig_same(?t) || population(?t.gpu) != 3) { ret 5; }
+    rig_step(?t, 5);
+    if (!rig_same(?t) || population(?t.gpu) != 1) { ret 6; }
+    rig_close(?t);
+    ret 0;
+}
+
 # a block of reaction-diffusion words by the origin: both fields, and either
 # alone, as a world under the reaction family's first sample holds them
 #[testing]
@@ -6253,6 +6283,9 @@ test set_rule__refuses_a_family_the_stepping_gpu_cannot_bind {
     g.stepping = true;
     g.ready[0] = false;
     g.ready[1] = true;
+    g.tried[0] = true;
+    g.tried[1] = true;
+    g.most     = 0;
     s.gpu      = ?g;
     var life: rule.Rule = rule.preset_rule(0);
     if (refusal(?s, ?life) == nil) { ret 2; }

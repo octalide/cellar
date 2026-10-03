@@ -104,7 +104,9 @@
 # dispatches, only when the rule it holds is not the one running, and made
 # larger, waiting for the device, only when a rule needs more words than it
 # holds. a family whose stage binds more storage buffers than the device's
-# dispatches can is not built, and its rules cannot be stepped here (steps).
+# dispatches can is not built, and its rules cannot be stepped here. a family
+# registered once the stages were built has its stage built on the render
+# thread the first time a rule of it is asked for or stepped (prepare).
 #
 # where the compute stages cannot be built, the CPU steps and this only draws,
 # uploading the chunks in view whose cells changed since they were last sent,
@@ -474,6 +476,8 @@ fun span_offset(p: *Pool, k: usize, s: usize) usize {
 # view:     the look and the palettes
 # steps:    each rule family's step stage
 # ready:    which families' step stages were built
+# tried:    which families' step stages were asked for, built or not, so a
+#           family registered once the stages were built is built on first use
 # most:     the storage buffers the device's dispatches bind
 # table:    the running family's rule buffer, once one needed it
 # words:    words table holds, 0 before it is made
@@ -614,6 +618,7 @@ pub rec Gpu {
     view:     gfx.StorageBuffer;
     steps:    [rule.FAMILIES_MAX]gfx.Compute;
     ready:    [rule.FAMILIES_MAX]bool;
+    tried:    [rule.FAMILIES_MAX]bool;
     most:     usize;
     table:    gfx.StorageBuffer;
     words:    usize;
@@ -1314,31 +1319,40 @@ fun bind_shown(g: *Gpu, bufs: **gfx.StorageBuffer, n: usize, c: usize) usize {
     ret layer.SHOWN_BINDING::usize + 1;
 }
 
-# build the step stage of every rule family that has one and whose bindings
-# the device's dispatches hold, all of those or none. a family registered
-# later has none built, and the CPU steps it
+# build the step stage of every rule family registered so far that has one
+# and whose bindings the device's dispatches hold, all of those or none. a
+# family registered later is built on first use (prepare)
 fun build_steps(g: *Gpu) bool {
-    val most: usize = gfx.renderer_limits(g.r).max_dispatch_bindings;
-    g.most = most;
+    g.most = gfx.renderer_limits(g.r).max_dispatch_bindings;
     var i: usize = 0;
     for (i < rule.FAMILIES_MAX) {
         g.ready[i] = false;
+        g.tried[i] = false;
         i          = i + 1;
     }
     i = 0;
     for (i < rule.families()) {
-        var len: usize = 0;
-        val spv: *u8   = rule.stage(i, ?len);
-        if (spv != nil && rule.bindings(i) <= most) {
-            val sc: err[gfx.Error] = gfx.compute(?g.steps[i], g.d, spv, len);
-            if (sel sc.err) {
-                drop_steps(g, i);
-                ret false;
-            }
-            g.ready[i] = true;
+        if (!build_step(g, i)) {
+            drop_steps(g, i);
+            ret false;
         }
         i = i + 1;
     }
+    ret true;
+}
+
+# build family f's step stage where it has one and the device's dispatches
+# hold its bindings, noting it was tried either way, so it is never tried again
+# ---
+# ret: false when the device refused to build it
+fun build_step(g: *Gpu, f: usize) bool {
+    g.tried[f] = true;
+    var len: usize = 0;
+    val spv: *u8   = rule.stage(f, ?len);
+    if (spv == nil || rule.bindings(f) > g.most) { ret true; }
+    val sc: err[gfx.Error] = gfx.compute(?g.steps[f], g.d, spv, len);
+    if (sel sc.err) { ret false; }
+    g.ready[f] = true;
     ret true;
 }
 
@@ -1352,15 +1366,22 @@ fun drop_steps(g: *Gpu, n: usize) {
     }
 }
 
-# whether the GPU steps rules of family f
-pub fun steps(g: *Gpu, f: usize) bool {
-    ret g.stepping && g.ready[f];
+# whether the GPU steps rules of family f, building its stage first when it
+# was registered after the stages were built and no rule of it was asked of
+# the GPU since. it creates a pipeline, so only the render thread, the
+# device's owner, may call it
+pub fun prepare(g: *Gpu, f: usize) bool {
+    if (!g.stepping) { ret false; }
+    if (!g.tried[f]) { build_step(g, f); }
+    ret g.ready[f];
 }
 
 # why the GPU cannot step a rule, or nil when it can or does not step: its
-# family has no stage built, or its family's stage, or the layers the rule
-# stores its cells in, bind more storage buffers than the device's
-# dispatches can
+# family has no stage, the device refused to build it, or its family's stage,
+# or the layers the rule stores its cells in, bind more storage buffers than
+# the device's dispatches can. a family registered after the stages were
+# built has its stage built here, the first time one of its rules is asked
+# for (prepare), so only the render thread may call it
 pub fun refusal(g: *Gpu, r: *rule.Rule) str {
     if (!g.stepping) { ret nil; }
     val f:   usize     = rule.family_of(r);
@@ -1374,7 +1395,9 @@ pub fun refusal(g: *Gpu, r: *rule.Rule) str {
     val lives: usize = plane.lives(?set);
     if ((lives != 0 || plane.shown_width(?set) != 0) && (!g.lived || lives > layer.LIVE_MAX::usize)) { ret "this GPU's compute stages bind too few storage buffers for the layers this rule's cells are read by, so it cannot run while it steps the world"; }
     # a family's stage was built only where its state layer's bindings fit
-    if (g.ready[f] && (set.n == 1 || layer.bindings(set.n::u32, tab)::usize <= g.most)) { ret nil; }
+    val built: bool = prepare(g, f);
+    if (built && (set.n == 1 || layer.bindings(set.n::u32, tab)::usize <= g.most)) { ret nil; }
+    if (!built && rule.bindings(f) <= g.most)                                      { ret "this GPU could not build this rule's family's stage, so it cannot run while it steps the world"; }
     ret "this GPU's compute stages bind too few storage buffers for the rule buffer and layers this rule needs, so it cannot run while it steps the world";
 }
 
@@ -3070,8 +3093,10 @@ pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, 
     for (n < steps) {
         if (!g.going) {
             # a family the device could not build a stage for is refused before
-            # it runs (cellar.sim), so it is never asked to step here
-            if (!g.ready[fam]) { brk; }
+            # it runs (cellar.sim), so it is never asked to step here. one the
+            # world met in the tree, where no rule is asked of the GPU, is
+            # built the first frame it steps here
+            if (!prepare(g, fam)) { brk; }
             if (!g.owns && budget(g, radius) == 0) {
                 g.cut = true;
                 brk;
