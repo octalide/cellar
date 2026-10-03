@@ -180,26 +180,46 @@ pub fun step_chunk(r: *Rule, b: *space.Block, t: *space.Tally) {
     val tb:   *load.Table = store.get(r.id);
     val n:    u32         = tb.states;
     val tree: *u32        = tb.tree.data;
-    var dx:   [9]i64;
-    var dy:   [9]i64;
-    var q:    usize       = 0;
+    # each input's place in the frame, from the cell's
+    var off: [9]i64;
+    var q:   usize = 0;
     for (q < tb.inputs::usize) {
-        dx[q] = (tb.at[q] % 3)::i64 - 1;
-        dy[q] = (tb.at[q] / 3)::i64 - 1;
-        q     = q + 1;
+        off[q] = ((tb.at[q] / 3)::i64 - 1) * FRAME + (tb.at[q] % 3)::i64 - 1;
+        q      = q + 1;
+    }
+    # the state of every value and the value of every state, worked out once
+    var state_of_value: [256]u8;
+    var value_of_state: [256]u32;
+    var k:              u32 = 0;
+    for (k <= word.HEAT_MASK) {
+        state_of_value[k::usize] = word.state(k, n)::u8;
+        value_of_state[k::usize] = word.word(k, n);
+        k                        = k + 1;
+    }
+    # the chunk's states and the ring of cells around it, each read and
+    # decoded once rather than once per input that reads it
+    var frame: [FRAME * FRAME]u8;
+    var fy:    i64 = 0;
+    for (fy < FRAME) {
+        var fx: i64 = 0;
+        for (fx < FRAME) {
+            frame[(fy * FRAME + fx)::usize] = state_of_value[space.block_cell(b, word.WIDTH, fx - 1, fy - 1)::usize];
+            fx                              = fx + 1;
+        }
+        fy = fy + 1;
     }
     var ly: i64 = 0;
     for (ly < 64) {
         var lx: i64 = 0;
         for (lx < 64) {
-            var p: u32 = tb.root;
+            val at: i64 = (ly + 1) * FRAME + lx + 1;
+            var p:  u32 = tb.root;
             q = 0;
             for (q < tb.inputs::usize) {
-                val c: u32 = word.state(space.block_cell(b, word.WIDTH, lx + dx[q], ly + dy[q]), n);
-                p = tree[(p + c)::usize];
+                p = tree[(p + frame[(at + off[q])::usize]::u32)::usize];
                 q = q + 1;
             }
-            val v: u32 = word.word(p, n);
+            val v: u32 = value_of_state[p::usize];
             plane.store(out, word.WIDTH, (ly * 64 + lx)::usize, v);
             space.note(t, v, lx::u32, ly::u32);
             lx = lx + 1;
@@ -207,6 +227,10 @@ pub fun step_chunk(r: *Rule, b: *space.Block, t: *space.Tally) {
         ly = ly + 1;
     }
 }
+
+# side of the frame the CPU step reads a chunk's cells into, the chunk and a
+# cell around it
+val FRAME: i64 = 66;
 
 # pack a rule into the family's window of the meta head, as its stage reads it
 # ---
@@ -389,4 +413,25 @@ fun fam_pack_table(p: *family.Payload, w: *u32) {
 
 fun fam_colour(p: *family.Payload, state: u32) opt[u32] {
     ret colour(held(p), state);
+}
+
+test word__gives_every_state_its_own_heat {
+    val sn: layout.Sense = word.sense();
+    var n:  u32          = 2;
+    for (n <= word.STATES_MAX) {
+        var st:   u32 = 0;
+        var last: u32 = 0;
+        for (st < n) {
+            val c: u32 = word.word(st, n);
+            if (word.state(c, n) != st || c > word.HEAT_MASK) { ret 1; }
+            val h: u32 = layout.texel_heat(c, sn.heat_shift, sn.heat_mask);
+            if (st != 0 && h <= last)                                                   { ret 2; }
+            if (layout.live(c, sn.live_mask, sn.live_lo, sn.live_hi) != (st != 0)::u32) { ret 3; }
+            last = h;
+            st   = st + 1;
+        }
+        if (last != word.HEAT_MASK) { ret 4; }
+        n = n + 1;
+    }
+    ret 0;
 }
