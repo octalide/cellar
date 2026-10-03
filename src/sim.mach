@@ -2993,9 +2993,13 @@ pub fun edit_begin(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64) bool {
 
 # open a bulk edit as edit_begin does, whose writes do mode to walls
 #
-# a wall edit takes the wall layer up first (hold_walls). while the GPU steps a
-# world that holds walls every edit pulls its chunks, small ones too, so the
-# host's walls there are the world's when the edit reads and writes them.
+# a wall edit takes the wall layer up first (hold_walls). a small edit on the
+# GPU writes its cells blind as any small edit does, nothing read back: a cell
+# edit goes up kept out of the walls the GPU holds (gpu.note_write), a wall
+# edit makes its cells walls, and an erase clears them, leaving its chunk's
+# walled bit set until the host's cells are the world's again
+# (space.mark_all_walls), since the host's staging may not hold the chunk's
+# other walls.
 # ---
 # mode: EDIT_CELLS, EDIT_WALLS or EDIT_ERASE
 # ret:  false as edit_begin, or when a wall edit's world could not take walls
@@ -3019,7 +3023,6 @@ pub fun edit_begin_as(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64, mode: u8) boo
     e.lost    = false;
     e.sparse  = e.x1 - e.x0 <= SPARSE_CELLS::i64 && e.y1 - e.y0 <= SPARSE_CELLS::i64
         && (e.x1 - e.x0) * (e.y1 - e.y0) <= SPARSE_CELLS::i64;
-    if (walls(s) && on_gpu(s))  { e.sparse = false; }
     if (!on_tree(s) && !own(s)) { ret false; }
     val watch: bool = e.x1 > e.x0 && wanted(s, e.x0, e.y0, e.x1, e.y1, false);
     if (on_tree(s)) {
@@ -3063,7 +3066,7 @@ fun put_sparse(s: *Sim, x: i64, y: i64, c: *u32) bool {
     if (!none)                        { space.surround(sp, slot); }
     # the GPU's copy takes the cell alone while it steps, and the chunk whole
     # while it only draws
-    if (on_gpu(s)) { gpu.note_write(s.gpu, sp, slot, i); }
+    if (on_gpu(s)) { gpu.note_write(s.gpu, sp, slot, i, s.edit.mode == EDIT_CELLS && walls(s)); }
     or             { space.touch(sp, slot); }
     ret true;
 }
@@ -3134,8 +3137,9 @@ fun editing(s: *Sim, x: i64, y: i64, n: usize) bool {
 # ---
 # ret: whether any cell was written
 fun put_cells(s: *Sim, sl: usize, i: usize, n: usize, c: *u32) bool {
-    val sp:   *space.Space = ?s.space;
-    val mode: u8           = s.edit.mode;
+    val sp:    *space.Space = ?s.space;
+    val mode:  u8           = s.edit.mode;
+    val blind: bool         = s.edit.sparse && on_gpu(s);
     if (mode == EDIT_CELLS && walls(s) && space.walled(sp, sl)) {
         var any: bool  = false;
         var k:   usize = 0;
@@ -3149,8 +3153,13 @@ fun put_cells(s: *Sim, sl: usize, i: usize, n: usize, c: *u32) bool {
         ret any;
     }
     space.fill_words(sp, sl, i, n, c);
-    if (mode == EDIT_WALLS)             { space.put_walls(sp, sl, i, n, true); }
-    if (mode == EDIT_ERASE && walls(s)) { space.put_walls(sp, sl, i, n, false); }
+    if (mode == EDIT_WALLS) { space.put_walls(sp, sl, i, n, true); }
+    # an erase written blind clears the host's walls too, which go up as they
+    # stand, whatever the chunk's other walls are
+    if (mode == EDIT_ERASE && walls(s)) {
+        if (blind || !space.walled(sp, sl)) { space.clear_walls(sp, sl, i, n); }
+        or                                  { space.put_walls(sp, sl, i, n, false); }
+    }
     ret true;
 }
 
@@ -8468,5 +8477,55 @@ test randomize__a_fill_of_any_shape_leaves_the_walls_where_they_stand {
         k = k + 1;
     }
     dnit(?s);
+    ret 0;
+}
+
+# paint a stroke of cells, live and dead, across the walls seed_walls drew,
+# small edits each, as the pen paints them
+#[testing]
+fun paint_over_walls(s: *Sim) {
+    val ink: u8  = rule.ink(?s.rule)::u8;
+    var x:   i64 = -44;
+    for (x < 44) {
+        # across the ring at both sides, the live line and the ellipse
+        paint(s, x, 0, ink);
+        paint(s, x, -39, ink);
+        paint(s, x, 20, 0);
+        x = x + 1;
+    }
+}
+
+test frame__cells_painted_over_walls_on_the_gpu_leave_them_and_read_nothing_back {
+    # a rule of one bit, of one byte, and Lenia's word-wide cells
+    val strings: [3]str = [3]str{"B3/S23", "345/2/4", "R=13,T=10,b=[1],m=0.15,s=0.015,kn=1,gn=1"};
+    var k:       usize  = 0;
+    for (k < 3) {
+        var t:    Rig;
+        val code: i32 = rig_open(?t, rule_named(strings[k]), seed_walls);
+        if (code != 0) { ret code; }
+        rig_step(?t, 3);
+        if (!rig_same(?t)) { ret 1; }
+        var read: usize = 0;
+        if (t.on) { read = t.g.read; }
+        # the stroke goes up blind, nothing read back, and the GPU keeps it
+        # out of the walls as the CPU does
+        paint_over_walls(?t.cpu);
+        paint_over_walls(?t.gpu);
+        if (t.on && t.g.read != read) {
+            print.eprintlnf("{}: painting read back {} slots", strings[k], t.g.read - read);
+            ret 2;
+        }
+        if (t.on && !rig_frame(?t))   { ret 3; }
+        if (t.on && t.g.read != read) { ret 4; }
+        if (!rig_same(?t)) {
+            print.eprintlnf("{} differs between the engines after painting", strings[k]);
+            ret 10 + k::i32;
+        }
+        if (!walls_stand(?t.cpu) || !walls_stand(?t.gpu)) { ret 20 + k::i32; }
+        rig_step(?t, 5);
+        if (!rig_same(?t) || !walls_stand(?t.gpu)) { ret 30 + k::i32; }
+        rig_close(?t);
+        k = k + 1;
+    }
     ret 0;
 }

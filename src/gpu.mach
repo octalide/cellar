@@ -399,11 +399,13 @@ rec Op {
 # slot: its slot
 # i:    the cell
 # v:    its value in the layer
+# kept: a cell edit, which a wall there keeps out (layout.EDIT_GUARD)
 rec Write {
     k:    u32;
     slot: u32;
     i:    u32;
     v:    u32;
+    kept: bool;
 }
 
 # the shards a pool's cells and pyramids lie in (cellar.layout): each
@@ -987,6 +989,7 @@ fun pool_bytes(cap: usize) usize {
 # nops:     how many
 # ctl:      the status head's first words, as take read them
 # untaken:  why the last take that failed left the pool the GPU's
+# read:     slots whose cells were read back, ever, which a test watches
 # dom:      the world's boundary as the stages read it (layout.Domain), once
 #           a world had one
 # dom_room: words dom holds, 0 before it is made
@@ -1139,6 +1142,7 @@ pub rec Gpu {
     nops:     usize;
     ctl:      [16]u32;
     untaken:  str;
+    read:     usize;
     dom:      gfx.StorageBuffer;
     dom_room: usize;
     dom_at:   u64;
@@ -1467,6 +1471,7 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     g.trim_seq = 0;
     g.trimmed  = false;
     g.untaken  = "";
+    g.read     = 0;
     g.listed   = false;
     g.gathered = 0;
     g.est      = UNKNOWN;
@@ -2250,8 +2255,11 @@ pub fun note_bulk(g: *Gpu) {
 # queue a painted cell, already written to the host's staging cells: its
 # value in each layer an edit writes, the state and rule layers, the wall
 # layer where the pool holds one, and the shown layer it starts over
-# (cellar.layer)
-pub fun note_write(g: *Gpu, sp: *space.Space, s: usize, i: usize) {
+# (cellar.layer). a cell edit (kept) writes no wall and is kept out of a wall
+# the GPU holds there, which the host's staging may not know of: the edit
+# stage drops it (layout.EDIT_GUARD), and a pull replays it only where the
+# cell read back is no wall
+pub fun note_write(g: *Gpu, sp: *space.Space, s: usize, i: usize, kept: bool) {
     if ((sp.dirty[s] & space.DIRTY_CELLS) != 0) { ret; }
     val set: *plane.Set = space.layers(sp);
     val sh:  opt[usize] = plane.shown(set);
@@ -2260,8 +2268,10 @@ pub fun note_write(g: *Gpu, sp: *space.Space, s: usize, i: usize) {
     if (sel sh.some)       { n = sh.some + 1; }
     var k: usize = 0;
     for (k < n) {
-        val v: u32 = plane.get(space.plane_of(sp, k, s), i);
-        vector.push[Write](?g.writes, Write{k: k::u32, slot: s::u32, i: i::u32, v: v});
+        if (!(kept && space.static_layer(set, k))) {
+            val v: u32 = plane.get(space.plane_of(sp, k, s), i);
+            vector.push[Write](?g.writes, Write{k: k::u32, slot: s::u32, i: i::u32, v: v, kept: kept});
+        }
         k = k + 1;
     }
     vector.push[u32](?g.stamped, s::u32);
@@ -2722,13 +2732,15 @@ pub fun pull(g: *Gpu, sp: *space.Space) err[gfx.Error] {
         if (sel e.err) { ret e; }
         s = s + run;
     }
-    # a painted cell not yet uploaded is newer than what was just read
+    # a painted cell not yet uploaded is newer than what was just read, but
+    # where a wall read back keeps a cell edit out
     var i: usize = 0;
     for (i < g.writes.len) {
         val w: Write = g.writes.data[i];
-        plane.put(space.plane_of(sp, w.k::usize, w.slot::usize), w.i::usize, w.v);
+        if (!(w.kept && space.wall_at(sp, w.slot::usize, w.i::usize))) { plane.put(space.plane_of(sp, w.k::usize, w.slot::usize), w.i::usize, w.v); }
         i = i + 1;
     }
+    space.mark_all_walls(sp);
     ret err[gfx.Error].ok{};
 }
 
@@ -2769,7 +2781,12 @@ pub fun pull_chunks(g: *Gpu, sp: *space.Space, lo: usize, n: usize) err[gfx.Erro
     for (i < g.writes.len) {
         val w:    Write = g.writes.data[i];
         val slot: usize = w.slot::usize;
-        if (slot >= lo && slot < lo + n) { plane.put(space.plane_of(sp, w.k::usize, slot), w.i::usize, w.v); }
+        if (slot >= lo && slot < lo + n && !(w.kept && space.wall_at(sp, slot, w.i::usize))) { plane.put(space.plane_of(sp, w.k::usize, slot), w.i::usize, w.v); }
+        i = i + 1;
+    }
+    i = lo;
+    for (i < lo + n && i < sp.hi) {
+        if (space.used(sp, i)) { space.mark_walls(sp, i); }
         i = i + 1;
     }
     ret err[gfx.Error].ok{};
@@ -2802,6 +2819,7 @@ pub fun forget_writes(g: *Gpu, lo: usize, n: usize) {
 # yet made are read as that flush starts them: the layers both hold are read,
 # and a shown layer the GPU lacks starts from the state layer just read
 fun read_run(g: *Gpu, sp: *space.Space, s: usize, run: usize) err[gfx.Error] {
+    g.read = g.read + run;
     val set:  *plane.Set = space.layers(sp);
     val nest: bool       = views_nest(?g.p.set, set);
     # layers changed otherwise since the last flush leave every slot's
@@ -2881,8 +2899,10 @@ fun paint_keys(g: *Gpu, sp: *space.Space, filled: bool, l: usize, word: bool) er
 fun upload_layer(g: *Gpu, sp: *space.Space, filled: bool, chunks: usize, top: usize, l: usize) err[gfx.Error] {
     val st:    *Store = store_of(g, ?g.p);
     val width: u32    = g.p.set.at[l].width;
-    val wide:  bool   = width >= layer.WIDTH_MAX;
-    var keyed: usize  = 0;
+    # where the pool holds walls a word-wide cell goes through the edit stage
+    # too, which keeps a cell edit out of a wall (edits_of)
+    val wide:  bool  = width >= layer.WIDTH_MAX && !plane.walled(?g.p.set);
+    var keyed: usize = 0;
     if (wide) {
         val ek: err[gfx.Error] = paint_keys(g, sp, filled, l, true);
         if (sel ek.err) { ret ek; }
@@ -2931,14 +2951,15 @@ fun upload_layer(g: *Gpu, sp: *space.Space, filled: bool, chunks: usize, top: us
     ret err[gfx.Error].ok{};
 }
 
-# add the painted cells of a layer l narrower than a word to the frame's
-# edits, none in a chunk going up whole (filled): each cell's last edit as the
+# add the painted cells of a layer l narrower than a word, or of any width
+# where the pool holds walls, to the frame's edits, none in a chunk going up
+# whole (filled): each cell's last edit as the
 # bits it takes in its word and its value in them, which the edit stage
 # writes into the front with atomics, so the word's other cells stay as the
 # GPU holds them and the host need not pull them first (cellar.sim edit_begin)
 fun edits_of(g: *Gpu, sp: *space.Space, filled: bool, l: usize) err[gfx.Error] {
     val width: u32 = g.p.set.at[l].width;
-    if (width >= layer.WIDTH_MAX || !g.stepping) { ret err[gfx.Error].ok{}; }
+    if ((width >= layer.WIDTH_MAX && !plane.walled(?g.p.set)) || !g.stepping) { ret err[gfx.Error].ok{}; }
     val ek: err[gfx.Error] = paint_keys(g, sp, filled, l, false);
     if (sel ek.err)      { ret ek; }
     if (g.keys.len == 0) { ret err[gfx.Error].ok{}; }
@@ -2953,8 +2974,10 @@ fun edits_of(g: *Gpu, sp: *space.Space, filled: bool, l: usize) err[gfx.Error] {
         val w:  *Write = ?g.writes.data[(k & 0xfffffff)::usize];
         val sh: u32    = layer.cell_shift(width, w.i);
         val at: usize  = g.edit_at.len;
-        g.edit_at.data[at]     = w.slot;
-        g.edit_at.data[at + 1] = (l::u32 << layout.EDIT_LAYER) | layer.cell_word(width, w.i);
+        g.edit_at.data[at] = w.slot;
+        var kw: u32 = (l::u32 << layout.EDIT_LAYER) | layer.cell_word(width, w.i);
+        if (w.kept) { kw = kw | layout.EDIT_GUARD; }
+        g.edit_at.data[at + 1] = kw;
         g.edit_at.data[at + 2] = layer.mask(width) << sh;
         g.edit_at.data[at + 3] = (w.v & layer.mask(width)) << sh;
         g.edit_at.len          = at + 4;
