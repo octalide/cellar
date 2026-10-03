@@ -1,19 +1,33 @@
 # one generation of the chunks on the active list, under the weighted
 # outer-totalistic family (cellar.rules.weighted)
 #
+# a cell is a bit in the family's state layer (word.WIDTH, cellar.layer), a
+# row of 32 to a word, and its display channels, age << 8 | heat, lie in the
+# view layer the family keeps beside it (word.SHOWN), bound after the rule
+# buffer (layer.binding).
+#
 # an invocation is a run of 8 cells in a row, and 8 workgroups of 64 cover a
 # chunk, a band of 8 rows each; workgroup y names the chunk's slot through the
-# active list (cellar.layout.Flags). a cell is age << 8 | heat, alive while its
-# age is nonzero.
+# active list (cellar.layout.Flags). the four invocations whose runs share a
+# word of the state layer leave their bits in workgroup memory, and the first
+# writes the word, so no invocation writes a word another does. an invocation
+# writes its own cells' display channels, four words of two cells each.
 #
 # a workgroup reads its band and an apron of the radius around it from the
-# source pool once, as one bit a cell, into a shared tile, and every
-# neighbourhood is read from the tile after a workgroup barrier. the apron is
-# read through the chunk's page-table entry, which names the slot of each of
-# its eight neighbours, so a chunk that does not exist reads as dead. the
-# tile's words are aligned to the chunk's columns from -32, so each word lies
-# in one chunk, and the tile holds the widest radius (word.RADIUS_MAX) in 640
-# bytes, well inside the 16 KiB of workgroup memory every device has.
+# source pool once, into a shared tile of bits, a word of the source at a
+# time: the tile's words are aligned to the chunk's columns from -32, so each
+# is one word of one chunk's row. every neighbourhood is read from the tile
+# after a workgroup barrier. the apron is read through the chunk's page-table
+# entry, which names the slot of each of its eight neighbours, so a chunk that
+# does not exist reads as dead. the tile holds the widest radius
+# (word.RADIUS_MAX) in 640 bytes, well inside the 16 KiB of workgroup memory
+# every device has.
+#
+# the kernel's path (cellar.rules.weighted path) picks how a run's sums are
+# found. a SLICED kernel, Life's ring of unit weights, adds its eight
+# neighbours bit-sliced, the run's 8 cells at once in the lanes of a word. a
+# ROWS kernel counts each row of its footprint's run of bits once and slides
+# it along the run. any other weighs every cell of its footprint.
 #
 # whether a chunk is stepped in full is decided once a workgroup, by its first
 # invocation, since a neighbour's stamp may change while the dispatch runs and
@@ -32,28 +46,34 @@
 # cell past a plane's dead edge reads as the form holds the edge at that
 # parity (word.past).
 #
-# the radius, form, total weight and sums' extent are in the family's window
-# of the meta head, and the sets and the weights in the rule buffer at
-# layout.TABLE_BINDING, as cellar.rules.weighted pack_table lays them out.
+# the radius, form, total weight, sums' extent, path and runs are in the
+# family's window of the meta head, and the sets and the weights in the rule
+# buffer at layout.TABLE_BINDING, as cellar.rules.weighted pack and pack_table
+# lay them out.
 
+use cellar.layer;
 use cellar.layout;
-use cellar.layout.Cells;
 use cellar.layout.Flags;
+use cellar.layout.Layer;
 use cellar.layout.Meta;
 use cellar.layout.Table;
 use cellar.rules.weighted.word;
 use sy: shader.sync;
 
 #[storage(1, 0, "readonly")]
-var src:   Cells;
+var src:   Layer;
 #[storage(1, 1)]
-var dst:   Cells;
+var dst:   Layer;
 #[storage(1, 2, "readonly")]
 var meta:  Meta;
 #[storage(1, 3)]
 var flags: Flags;
 #[storage(1, 4, "readonly")]
 var table: Table;
+#[storage(1, 5, "readonly")]
+var hsrc:  Layer;
+#[storage(1, 6)]
+var hdst:  Layer;
 
 #[builtin("global_invocation")]
 var gid: u32x3;
@@ -75,15 +95,27 @@ rec Sums {
     v: [8]i32;
 }
 
+# each invocation's 8 cells one generation on, at their place in their word
+rec Runs {
+    v: [64]u32;
+}
+
 # the band's live cells and its apron's, bit c + 32 of a row's words the cell
 # at column c, and a cell past a plane's dead edge as the form holds the edge
 #[shared]
 var tile: Tile;
+#[shared]
+var runs: Runs;
 # 1 when the workgroup's chunk steps in full, as its first invocation found
 #[shared]
 var full: u32;
 
-# the index in the source pool of the cell at (x, y) of a slot's frame, taken
+# the source's bit of the cell at address a (cellar.layer)
+fun cell_of(a: u32) u32 {
+    ret layer.read(src.v[layer.addr_word(word.WIDTH, a)], word.WIDTH, a);
+}
+
+# the address (cellar.layer) of the cell at (x, y) of a slot's frame, taken
 # through the links where it lies outside the window (cellar.layout), NONE
 # where no chunk holds it, or PAST past a plane's dead edge
 fun reach(slot: u32, x: i32, y: i32) u32 {
@@ -98,7 +130,7 @@ fun reach(slot: u32, x: i32, y: i32) u32 {
         val n: u32 = meta.table[b + k];
         val t: u32 = meta.table[b + layout.LINK_AT + k];
         if (k == 4) {
-            at = sl * layout.CELLS + (py * layout.SIDE::i32 + px)::u32;
+            at = layer.addr(sl, (py * layout.SIDE::i32 + px)::u32);
             h  = layout.HOPS;
         }
         or (n == layout.NONE) {
@@ -116,10 +148,73 @@ fun reach(slot: u32, x: i32, y: i32) u32 {
     ret at;
 }
 
-fun cool(v: u32) u32 {
-    val heat: u32 = v & word.HEAT_MASK;
-    if (heat > word.DECAY) { ret heat - word.DECAY; }
-    ret 0;
+# two cells' display channels, a word of their layer, one generation on with
+# neither live: their heat fades and they have no age, a lane at a time
+fun cool2(h: u32) u32 {
+    val x: u32 = h & 0x00ff00ff;
+    val y: u32 = (x | 0x80008000) - ((word.DECAY << 16) | word.DECAY);
+    val m: u32 = ((y >> 15) & 0x00010001) * word.HEAT_MASK;
+    ret y & m;
+}
+
+# the bits of a mask from bit lo to before bit hi, lo below hi
+fun span(lo: u32, hi: u32) u32 {
+    if (hi - lo >= 32) { ret 0xffffffff; }
+    ret ((1 << (hi - lo)) - 1) << lo;
+}
+
+# the n bits of a tile row from bit p, p + n at most 64 past the row's word t
+fun window(t: u32, p: u32, n: u32) u32 {
+    val ws: u32 = p / 32;
+    val sh: u32 = p % 32;
+    var w:  u32 = tile.v[t + ws] >> sh;
+    if (sh + n > 32) { w = w | (tile.v[t + ws + 1] << (32 - sh)); }
+    if (n >= 32)     { ret w; }
+    ret w & ((1 << n) - 1);
+}
+
+# the tile row's bit of column c, from -32
+fun at(t: u32, c: i32) u32 {
+    val p: u32 = (c + 32)::u32;
+    ret (tile.v[t + p / 32] >> (p % 32)) & 1;
+}
+
+# the lanes, of 8, whose bit-sliced count s3 s2 s1 s0 a set mask of the sums
+# 0 to 8 holds
+fun counted(mask: u32, s0: u32, s1: u32, s2: u32, s3: u32) u32 {
+    var m: u32 = 0;
+    var n: u32 = 0;
+    for (n < 9) {
+        if (((mask >> n) & 1) != 0) {
+            var e: u32 = s0;
+            if ((n & 1) == 0) { e = ~s0; }
+            if ((n & 2) != 0) { e = e & s1; }
+            or                { e = e & ~s1; }
+            if ((n & 4) != 0) { e = e & s2; }
+            or                { e = e & ~s2; }
+            if ((n & 8) != 0) { e = e & s3; }
+            or                { e = e & ~s3; }
+            m = m | e;
+        }
+        n = n + 1;
+    }
+    ret m & 0xff;
+}
+
+# the rule's answer as held for a cell held alive or not at a held sum
+fun answer(alive: u32, held: i32, total: i32, top: i32, words: u32, inv_in: u32, inv_out: u32) u32 {
+    var on:  u32 = alive;
+    var sum: i32 = held;
+    if (inv_in != 0) {
+        on  = 1 - on;
+        sum = total - sum;
+    }
+    var s: u32 = 0;
+    if (sum > top) { s = top::u32; }
+    or (sum > 0)   { s = sum::u32; }
+    var set: u32 = 0;
+    if (on != 0) { set = words; }
+    ret ((table.v[set + s / 32] >> (s % 32)) & 1) ^ inv_out;
 }
 
 #[stage("compute")]
@@ -134,7 +229,9 @@ fun comp_main() {
     val band: i32 = ((gid[0] / 64) * BAND)::i32;
     val x0:   u32 = (gid[0] % 8) * 8;
     val base: u32 = slot * layout.ENTRY;
-    val row:  u32 = slot * layout.CELLS + (ly * layout.SIDE::i32)::u32;
+    # the state layer's word holding the run, and the run's first display word
+    val sw: u32 = layer.span_at(word.WIDTH, slot) + ly::u32 * 2 + x0 / 32;
+    val hw: u32 = layer.span_at(word.SHOWN, slot) + (ly::u32 * layout.SIDE + x0) / 2;
     if (meta.table[base + layout.INCARNATION_AT] == 0) { ret; }
     # a seamed chunk reads its block through its links, and holds its cells
     # off the grid at zero
@@ -162,25 +259,28 @@ fun comp_main() {
     }
     sy.workgroup_barrier();
     val busy: u32 = full;
-    var x:    u32 = x0;
+    var j:    u32 = 0;
     if (busy == 0) {
+        # every cell is dead and stays so, and only cools
         val warm: u32 = flags.v[slot * 2 + 1];
         if (warm != last && warm != now) {
             # cold at the source; if it was cold a step earlier too, the
             # destination already holds zeros
             if (warm != last - 1) { ret; }
-            for (x < x0 + 8) {
-                dst.v[row + x] = 0;
-                x              = x + 1;
+            if (x0 % 32 == 0)     { dst.v[sw] = 0; }
+            for (j < 4) {
+                hdst.v[hw + j] = 0;
+                j              = j + 1;
             }
             ret;
         }
+        if (x0 % 32 == 0) { dst.v[sw] = 0; }
         var any: u32 = 0;
-        for (x < x0 + 8) {
-            val c: u32 = cool(src.v[row + x]);
-            dst.v[row + x] = c;
+        for (j < 4) {
+            val c: u32 = cool2(hsrc.v[hw + j]);
+            hdst.v[hw + j] = c;
             any            = any | c;
-            x              = x + 1;
+            j              = j + 1;
         }
         if (any != 0) { flags.v[slot * 2 + 1] = now; }
         ret;
@@ -192,12 +292,11 @@ fun comp_main() {
     val total:   i32 = meta.rule[word.TOTAL_AT]:~i32;
     val top:     i32 = meta.rule[word.TOP_AT]::i32;
     val words:   u32 = meta.rule[word.WORDS_AT];
+    val path:    u32 = meta.rule[word.PATH_AT];
     val gen:     u32 = meta.gen + meta.serial;
     val inv_in:  u32 = word.inverted(form, gen & 1);
     val inv_out: u32 = word.inverted(form, (gen + 1) & 1);
     val past:    u32 = word.past(form, gen & 1);
-    var live:    u32 = 0;
-    var warm:    u32 = 0;
 
     # the tile's rows from the band's first less the radius; a word's columns
     # outside the apron stay clear
@@ -215,12 +314,10 @@ fun comp_main() {
         if (seamed != 0) {
             var c: i32 = lo;
             for (c < hi) {
-                val at: u32 = reach(slot, c, y);
+                val a:  u32 = reach(slot, c, y);
                 var on: u32 = 0;
-                if (at == layout.PAST) { on = past; }
-                or (at != layout.NONE) {
-                    if (src.v[at] >= word.LIVE) { on = 1; }
-                }
+                if (a == layout.PAST) { on = past; }
+                or (a != layout.NONE) { on = cell_of(a); }
                 bits = bits | (on << (c - c0)::u32);
                 c    = c + 1;
             }
@@ -236,16 +333,13 @@ fun comp_main() {
                 yy = yy - layout.SIDE::i32;
                 cy = 2;
             }
-            # words 0 and 3 lie in the west and east neighbours, 1 and 2 in the chunk
+            # words 0 and 3 lie in the west and east neighbours, 1 and 2 in
+            # the chunk, and each is one word of that chunk's row
             val cx: u32 = (k + 1) / 2;
             val n:  u32 = meta.table[base + cy * 3 + cx];
             if (n != layout.NONE) {
-                val from: i32 = (n * layout.CELLS)::i32 + yy * layout.SIDE::i32 - (cx::i32 - 1) * layout.SIDE::i32;
-                var c:    i32 = lo;
-                for (c < hi) {
-                    if (src.v[(from + c)::u32] >= word.LIVE) { bits = bits | (1 << (c - c0)::u32); }
-                    c = c + 1;
-                }
+                val w: u32 = src.v[layer.span_at(word.WIDTH, n) + yy::u32 * 2 + (k + 1) % 2];
+                bits = w & span((lo - c0)::u32, (hi - c0)::u32);
             }
         }
         tile.v[i] = bits;
@@ -253,81 +347,139 @@ fun comp_main() {
     }
     sy.workgroup_barrier();
 
-    # every weight is loaded once and applied to the run's 8 cells: cell c's
-    # footprint row starts at bit sh + c of word ws of its tile row. the run
-    # starts on a multiple of 8, so sh + r is one no larger than 40, and the
-    # row's footprints end by bit r + 47 of the two words, inside them
-    # while the radius is at most word.RADIUS_MAX
-    var sums: Sums;
-    var c:    u32 = 0;
-    for (c < 8) {
-        sums.v[c] = 0;
-        c         = c + 1;
+    # the tile row of the run's own cells
+    val own:  u32 = (ly - band + r)::u32 * TILE_WORDS;
+    var next: u32 = 0;
+    if (path == word.SLICED) {
+        # the rows above, at and below the run, from the cell west of its first
+        # to the one east of its last, as the world holds them: lane c of a
+        # word the cell c of the run's west, own or east neighbour
+        val fin:  u32 = (0 - inv_in) & 0x3ff;
+        val a:    u32 = window(own - TILE_WORDS, x0 + 31, 10) ^ fin;
+        val c:    u32 = window(own, x0 + 31, 10) ^ fin;
+        val d:    u32 = window(own + TILE_WORDS, x0 + 31, 10) ^ fin;
+        val sa:   u32 = a ^ (a >> 1) ^ (a >> 2);
+        val ca:   u32 = (a & (a >> 1)) | ((a >> 2) & (a ^ (a >> 1)));
+        val sd:   u32 = d ^ (d >> 1) ^ (d >> 2);
+        val cd:   u32 = (d & (d >> 1)) | ((d >> 2) & (d ^ (d >> 1)));
+        val sc:   u32 = c ^ (c >> 2);
+        val cc:   u32 = c & (c >> 2);
+        val s0:   u32 = sa ^ sd ^ sc;
+        val c0:   u32 = (sa & sd) | (sc & (sa ^ sd));
+        val u:    u32 = ca ^ cd ^ cc;
+        val v:    u32 = (ca & cd) | (cc & (ca ^ cd));
+        val s1:   u32 = u ^ c0;
+        val w:    u32 = u & c0;
+        val s2:   u32 = v ^ w;
+        val s3:   u32 = v & w;
+        val me:   u32 = (c >> 1) & 0xff;
+        val born: u32 = ~me & counted(table.v[0], s0, s1, s2, s3);
+        val kept: u32 = me & counted(table.v[words], s0, s1, s2, s3);
+        next = ((born | kept) & 0xff) ^ ((0 - inv_out) & 0xff);
     }
-    val at: u32 = (x0::i32 - r + 32)::u32;
-    val ws: u32 = at / 32;
-    val sh: u32 = at % 32;
-    var dy: i32 = 0 - r;
-    for (dy <= r) {
-        val t: u32 = (ly - band + dy + r)::u32 * TILE_WORDS + ws;
-        val a: u32 = tile.v[t];
-        val b: u32 = tile.v[t + 1];
-        var j: i32 = 0;
-        for (j < width) {
-            val w: i32 = table.v[2 * words + ((dy + r) * width + j)::u32]:~i32;
-            if (w != 0) {
-                # the 8 bits from p, bit c the cell c's footprint reads at j
-                val p:   u32 = sh + j::u32;
-                var run: u32 = 0;
-                if (p >= 32) { run = b >> (p - 32); }
-                or {
-                    run = a >> p;
-                    if (p > 24) { run = run | (b << (32 - p)); }
+    or (path == word.ROWS) {
+        # each footprint row's run of unit weights counted once for the run's
+        # first cell, then slid a cell at a time
+        var sums: Sums;
+        var c:    u32 = 0;
+        for (c < 8) {
+            sums.v[c] = 0;
+            c         = c + 1;
+        }
+        var dy: i32 = 0 - r;
+        for (dy <= r) {
+            val q:  u32 = word.RUNS_AT + ((dy + r) * 2)::u32;
+            val rl: i32 = meta.rule[q]::i32 - word.RADIUS_MAX::i32;
+            val rh: i32 = meta.rule[q + 1]::i32 - word.RADIUS_MAX::i32;
+            if (rl < rh) {
+                val t: u32 = (ly - band + dy + r)::u32 * TILE_WORDS;
+                var n: i32 = 0;
+                var e: i32 = x0::i32 + rl;
+                for (e < x0::i32 + rh) {
+                    n = n + at(t, e)::i32;
+                    e = e + 1;
                 }
                 c = 0;
                 for (c < 8) {
-                    sums.v[c] = sums.v[c] + w * ((run >> c) & 1)::i32;
-                    c         = c + 1;
+                    sums.v[c] = sums.v[c] + n;
+                    val x: i32 = x0::i32 + c::i32;
+                    n = n + at(t, x + rh)::i32 - at(t, x + rl)::i32;
+                    c = c + 1;
                 }
             }
-            j = j + 1;
+            dy = dy + 1;
         }
-        dy = dy + 1;
+        val hole: u32 = meta.rule[word.HOLE_AT];
+        c = 0;
+        for (c < 8) {
+            val alive: u32 = at(own, x0::i32 + c::i32);
+            var s:     i32 = sums.v[c];
+            if (hole != 0) { s = s - alive::i32; }
+            next = next | (answer(alive, s, total, top, words, inv_in, inv_out) << c);
+            c    = c + 1;
+        }
+    }
+    or {
+        # every weight is loaded once and applied to the run's 8 cells: cell
+        # c's footprint row starts at bit sh + c of word ws of its tile row
+        var sums: Sums;
+        var c:    u32 = 0;
+        for (c < 8) {
+            sums.v[c] = 0;
+            c         = c + 1;
+        }
+        val at0: u32 = (x0::i32 - r + 32)::u32;
+        var dy:  i32 = 0 - r;
+        for (dy <= r) {
+            val t: u32 = (ly - band + dy + r)::u32 * TILE_WORDS;
+            var k: i32 = 0;
+            for (k < width) {
+                val w: i32 = table.v[2 * words + ((dy + r) * width + k)::u32]:~i32;
+                if (w != 0) {
+                    val run: u32 = window(t, at0 + k::u32, 8);
+                    c = 0;
+                    for (c < 8) {
+                        sums.v[c] = sums.v[c] + w * ((run >> c) & 1)::i32;
+                        c         = c + 1;
+                    }
+                }
+                k = k + 1;
+            }
+            dy = dy + 1;
+        }
+        c = 0;
+        for (c < 8) {
+            next = next | (answer(at(own, x0::i32 + c::i32), sums.v[c], total, top, words, inv_in, inv_out) << c);
+            c    = c + 1;
+        }
+    }
+    # cells off the grid are held at zero
+    if (seamed != 0) {
+        var c: u32 = 0;
+        for (c < 8) {
+            if (layout.edge_side(edge, (x0 + c)::i32, ly) != 4) { next = next & ~(1 << c); }
+            c = c + 1;
+        }
     }
 
-    for (x < x0 + 8) {
-        val lx:  i32 = x::i32;
-        var sum: i32 = sums.v[x - x0];
-
-        # a cell held inverted reads as its complement, its sum as total less the held one
-        val cur:   u32 = src.v[row + x];
-        var alive: u32 = 0;
-        if (cur >= word.LIVE) { alive = 1; }
-        if (inv_in != 0) {
-            alive = 1 - alive;
-            sum   = total - sum;
+    # the run's display channels follow its cells
+    var warm: u32 = 0;
+    for (j < 4) {
+        val h: u32 = hsrc.v[hw + j];
+        var v: u32 = word.become(h & 0xffff, (next >> (j * 2)) & 1) | (word.become(h >> 16, (next >> (j * 2 + 1)) & 1) << 16);
+        if (seamed != 0) {
+            if (layout.edge_side(edge, (x0 + j * 2)::i32, ly) != 4)     { v = v & 0xffff0000; }
+            if (layout.edge_side(edge, (x0 + j * 2 + 1)::i32, ly) != 4) { v = v & 0xffff; }
         }
-        var s: u32 = 0;
-        if (sum > top) { s = top::u32; }
-        or (sum > 0)   { s = sum::u32; }
-        var set: u32 = 0;
-        if (alive != 0) { set = words; }
-        var bit: u32 = (table.v[set + s / 32] >> (s % 32)) & 1;
-        bit = bit ^ inv_out;
-
-        var next: u32 = 0;
-        if (bit != 0) {
-            var age: u32 = (cur >> word.AGE_SHIFT) + 1;
-            if (age > word.AGE_MAX) { age = word.AGE_MAX; }
-            next = (age << word.AGE_SHIFT) | word.HEAT_MASK;
-        }
-        or                                                      { next = cool(cur); }
-        if (seamed != 0 && layout.edge_side(edge, lx, ly) != 4) { next = 0; }
-        if (next >= word.LIVE)                                  { live = 1; }
-        warm           = warm | (next & word.HEAT_MASK);
-        dst.v[row + x] = next;
-        x              = x + 1;
+        hdst.v[hw + j] = v;
+        warm           = warm | v;
+        j              = j + 1;
     }
-    if (live != 0) { flags.v[slot * 2] = now; }
-    if (warm != 0) { flags.v[slot * 2 + 1] = now; }
+
+    # the run's word of the state layer, from the four runs it holds
+    runs.v[lid] = next << (x0 % 32);
+    sy.workgroup_barrier();
+    if (x0 % 32 == 0) { dst.v[sw] = runs.v[lid] | runs.v[lid + 1] | runs.v[lid + 2] | runs.v[lid + 3]; }
+    if (next != 0)    { flags.v[slot * 2] = now; }
+    if (warm != 0)    { flags.v[slot * 2 + 1] = now; }
 }

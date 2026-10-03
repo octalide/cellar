@@ -1,0 +1,129 @@
+# the two-state families' cells as their CPU steps read and write them, a row
+# at a time: the weighted family's and the non-totalistic family's, whose
+# cells are cellar.rules.weighted.word's
+#
+# a chunk's state layer holds a row of 64 cells in two words, so a row read as
+# a u64 holds cell x at bit x, and a step works the row's 64 cells at once.
+# its display channels' layer holds a row in SHOWN_ROW words, two cells each,
+# which follow the row's cells as they are written (emit).
+
+use cellar.layer.plane;
+use cellar.rules.weighted.word;
+use cellar.space;
+use mem: std.memory;
+use std.types.size.usize;
+
+# words of a row of the display channels' layer
+pub val SHOWN_ROW: usize = (64 * word.SHOWN / 32)::usize;
+
+# the live cells as held of row y of the block's chunk column cx, bit x for
+# column x, none where the chunk does not exist
+# ---
+# b:  the block
+# cx: 0 the chunk to the west, 1 the chunk itself, 2 the one to the east
+# y:  the row, in [-SIDE, 2 * SIDE)
+#[inline]
+pub fun bits(b: *space.Block, cx: usize, y: i64) u64 {
+    var ly: i64   = y;
+    var cy: usize = 1;
+    if (ly < 0) {
+        ly = ly + space.SIDE;
+        cy = 0;
+    }
+    or (ly >= space.SIDE) {
+        ly = ly - space.SIDE;
+        cy = 2;
+    }
+    val w: *u32 = b.nb[cy * 3 + cx];
+    if (w == nil) { ret 0; }
+    val at: usize = (ly * 2)::usize;
+    ret w[at]::u64 | (w[at + 1]::u64 << 32);
+}
+
+# the live cells as held of row y of a block, from column x - 64 to x + 63:
+# bit i for column x - 64 + i, read across the chunks either side
+# ---
+# b:   the block
+# y:   the row, in [-SIDE, 2 * SIDE)
+# out: receives the west, own and east chunks' rows
+#[inline]
+pub fun span(b: *space.Block, y: i64, out: *u64) {
+    out[0] = bits(b, 0, y);
+    out[1] = bits(b, 1, y);
+    out[2] = bits(b, 2, y);
+}
+
+# the bit of column x, in [-SIDE, 2 * SIDE), of a row span read
+#[inline]
+pub fun at(row: *u64, x: i64) u64 {
+    val i: i64 = x + space.SIDE;
+    ret (row[(i >> 6)::usize] >> (i & 63)::u64) & 1;
+}
+
+# two cells' display channels, a word of the layer, one generation on with
+# neither live: their heat fades and they have no age, a lane at a time
+#[inline]
+pub fun cool2(h: u32) u32 {
+    val x: u32 = h & 0x00ff00ff;
+    # each lane's heat less DECAY, its top bit set where that does not go below 0
+    val y: u32 = (x | 0x80008000) - ((word.DECAY << 16) | word.DECAY);
+    val m: u32 = ((y >> 15) & 0x00010001) * word.HEAT_MASK;
+    ret y & m;
+}
+
+# step a chunk with nothing alive in its block: every cell is dead and stays
+# so, and its display channels only cool
+# ---
+# b: the block, whose layers are the families' (cellar.rules.weighted layers)
+# t: the tally of the cells written
+pub fun cool_chunk(b: *space.Block, t: *space.Tally) {
+    mem.zero[u32](b.out[0], plane.span_words(word.WIDTH));
+    val own:  *u32  = b.nb[9 + 4];
+    val out:  *u32  = b.out[1];
+    val n:    usize = plane.span_words(word.SHOWN);
+    var warm: u32   = 0;
+    var i:    usize = 0;
+    for (i < n) {
+        val v: u32 = cool2(own[i]);
+        out[i] = v;
+        warm   = warm | v;
+        i      = i + 1;
+    }
+    if (warm != 0) { t.warm = 1; }
+}
+
+# write row y of a chunk one generation on, its display channels following
+# its cells, and count it
+# ---
+# b:    the block
+# y:    the row
+# live: the row's cells live one generation on, as held, bit x for column x
+# t:    the tally
+pub fun emit(b: *space.Block, y: i64, live: u64, t: *space.Tally) {
+    val at: usize = y::usize * 2;
+    b.out[0][at]     = (live & 0xffffffff)::u32;
+    b.out[0][at + 1] = (live >> 32)::u32;
+    val own:  *u32  = ?b.nb[9 + 4][y::usize * SHOWN_ROW];
+    val out:  *u32  = ?b.out[1][y::usize * SHOWN_ROW];
+    var warm: u32   = 0;
+    var j:    usize = 0;
+    if (live == 0) {
+        for (j < SHOWN_ROW) {
+            val v: u32 = cool2(own[j]);
+            out[j] = v;
+            warm   = warm | v;
+            j      = j + 1;
+        }
+    }
+    or {
+        for (j < SHOWN_ROW) {
+            val h: u32 = own[j];
+            val l: u32 = ((live >> (j * 2)::u64) & 3)::u32;
+            val v: u32 = word.become(h & 0xffff, l & 1) | (word.become(h >> 16, l >> 1) << 16);
+            out[j] = v;
+            warm   = warm | v;
+            j      = j + 1;
+        }
+    }
+    space.note_row(t, live, warm != 0, y::u32);
+}

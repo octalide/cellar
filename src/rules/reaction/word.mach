@@ -1,11 +1,15 @@
-# the reaction family's cell word, its window of the meta head and the step,
-# one source for the host and the family's step stage
+# the reaction family's layers, its window of the meta head and the step, one
+# source for the host and the family's step stage
 #
 # a cell holds Gray-Scott's two concentrations, u and v, each in [0, 1] as a
-# 16-bit field of 65536ths: the low half is a = 1 - u and the high half b = v.
-# the background, u = 1 and v = 0, is then word zero, and both fields decay
-# toward it. b's top byte is the heat the draw reads, so the palette shades a
-# cell by v.
+# 16-bit field of 65536ths, each in a layer of its own (cellar.layer): b = v
+# in the state layer and a = 1 - u in a rule layer declared live, so a cell
+# holding either is live and keeps its chunk. the background, u = 1 and v =
+# 0, is then zero in both, and both fields decay toward it. b's top byte is
+# the heat the draw reads, so the palette shades a cell by v.
+#
+# the step works on a cell's two fields as one pair, a | b << 16 (cell, a_of
+# and b_of), which is only its arithmetic's: the fields are stored apart.
 #
 # a generation is Pearson's forward Euler step of unit time over the 5-point
 # Laplacian:
@@ -17,11 +21,17 @@
 # 2^-24ths, every term is summed in 2^-30ths in an i32, and the sum is floored
 # to the field once. no product passes 32 bits and the sum stays inside an i32
 # while Du and Dv are at most 1/4, the explicit step's stability bound, and F
-# and k are at most 1/4, so the host and the stage compute the same word bit
+# and k are at most 1/4, so the host and the stage compute the same fields bit
 # for bit. the floor takes a lone residue down to zero, so empty space stays
 # empty and a chunk the pattern left is freed.
 
 use cellar.layout;
+
+# bits of each of the family's layers (cellar.layer): v in the state layer,
+# then 1 - u in the rule layer U
+pub val WIDTH: u32 = 16;
+# the rule layer holding a = 1 - u
+pub val U: u32 = 1;
 
 # the bits of a field, and where b's lies
 pub val FIELD:   u32 = 0xffff;
@@ -35,8 +45,8 @@ val U_ONE: u32 = 65536;
 pub val RATE_ONE: u64 = 16384;
 pub val FEED_ONE: u64 = 16777216;
 
-# where the heat display channel starts: v in 256ths
-pub val HEAT_SHIFT: u32 = 24;
+# where the heat display channel starts in the state layer's value: v in 256ths
+pub val HEAT_SHIFT: u32 = 8;
 pub val HEAT_MASK:  u32 = 0xff;
 
 # the window's words: Du and Dv in 2^-14ths, F and k in 2^-24ths
@@ -45,19 +55,19 @@ pub val DV_AT: u32 = 1;
 pub val F_AT:  u32 = 2;
 pub val K_AT:  u32 = 3;
 
-# a cell's a field, 1 - u
+# a pair's a field, 1 - u
 #[inline]
 pub fun a_of(c: u32) u32 {
     ret c & FIELD;
 }
 
-# a cell's b field, v
+# a pair's b field, v
 #[inline]
 pub fun b_of(c: u32) u32 {
     ret c >> B_SHIFT;
 }
 
-# the word of a cell holding fields a and b, each at most MAX
+# the pair of a cell holding fields a and b, each at most MAX
 #[inline]
 pub fun cell(a: u32, b: u32) u32 {
     ret a | (b << B_SHIFT);
@@ -79,9 +89,9 @@ fun field(x: i32) u32 {
     ret v;
 }
 
-# the word a cell becomes one generation on
+# the pair a cell becomes one generation on
 # ---
-# c:  the cell's word
+# c:  the cell's pair
 # sa: the sum of its four orthogonal neighbours' a fields
 # sb: the sum of their b fields
 # du: Du in 2^-14ths, at most 4096
@@ -101,14 +111,15 @@ pub fun next(c: u32, sa: u32, sb: u32, du: u32, dv: u32, f: u32, k: u32) u32 {
     ret cell(field(na), field(nb));
 }
 
-# how the shared stages read the word: any field above zero is live and keeps
-# its chunk, and v is the heat
+# how the shared stages read the state layer: any v above zero is live and
+# keeps its chunk, as any a above zero does through its live layer, and v is
+# the heat
 pub fun sense() layout.Sense {
     ret layout.Sense{
-        live_mask:  0xffffffff,
+        live_mask:  FIELD,
         live_lo:    1,
-        live_hi:    0xffffffff,
-        warm_mask:  0xffffffff,
+        live_hi:    FIELD,
+        warm_mask:  FIELD,
         heat_shift: HEAT_SHIFT,
         heat_mask:  HEAT_MASK,
         age_shift:  0,

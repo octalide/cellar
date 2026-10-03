@@ -1,9 +1,10 @@
 # a copy of the world at one moment: its chunks or its tree, its generation
 # and its rule
 #
-# a world in the pool is kept as its chunks: only those holding a live or warm
-# cell, each as its coordinates and its cells whole, so a snapshot costs what
-# the world's front cells do and never a dense grid of its extent. a world in
+# a world in the pool is kept as its chunks: only those holding a word but 0,
+# each as its coordinates and its image, the spans of the rule's state and
+# rule layers (cellar.layer), so a snapshot costs what the world's front cells
+# do at their widths and never a dense grid of its extent. a world in
 # the quadtree is kept as the tree's distinct nodes (hashlife.export), so it
 # costs what the tree does, however large the world. the simulation fills one
 # from whichever holds the world (sim.take) and replays either form into
@@ -14,9 +15,11 @@
 # generation kept beside them say, so a restore resumes in the same phase.
 
 use cellar.hashlife;
+use cellar.layer.plane;
 use cellar.rule;
 use cellar.space;
 use allo: std.allocator;
+use std.allocator.page;
 use std.collections.vector;
 use std.collections.vector.Vector;
 use mem: std.memory;
@@ -33,10 +36,12 @@ use std.types.size.usize;
 # held:       a copy was taken and not dropped since
 # generation: the world's generation when it was taken
 # rule:       the rule it ran under, whose family the cells are words of
+# set:        the rule's state and rule layers, which the images are of
+# words:      words of a chunk's image under set
 # n:          chunks held
 # cap:        chunks the buffers hold
 # at:         each chunk's column and row, 2 a chunk
-# cells:      each chunk's cells, space.CELLS a chunk
+# images:     each chunk's image, words a chunk
 # treed:      the copy is a tree's, in tree rather than the chunks
 # tree:       the tree's nodes as hashlife.export writes them
 pub rec Snapshot {
@@ -44,10 +49,12 @@ pub rec Snapshot {
     held:       bool;
     generation: u64;
     rule:       rule.Rule;
+    set:        plane.Set;
+    words:      usize;
     n:          usize;
     cap:        usize;
     at:         *i64;
-    cells:      *u32;
+    images:     *u32;
     treed:      bool;
     tree:       Vector[u32];
 }
@@ -57,23 +64,24 @@ pub rec Snapshot {
 # sn: the snapshot
 # a:  allocator for its buffers, outliving it
 pub fun init(sn: *Snapshot, a: *allo.Allocator) {
-    sn.a     = a;
-    sn.held  = false;
-    sn.n     = 0;
-    sn.cap   = 0;
-    sn.at    = nil;
-    sn.cells = nil;
-    sn.treed = false;
-    sn.tree  = vector.init[u32](a);
+    sn.a      = a;
+    sn.held   = false;
+    sn.n      = 0;
+    sn.cap    = 0;
+    sn.at     = nil;
+    sn.images = nil;
+    sn.words  = 0;
+    sn.treed  = false;
+    sn.tree   = vector.init[u32](a);
 }
 
 fun release(sn: *Snapshot) {
     if (sn.cap == 0) { ret; }
     allo.deallocate[i64](sn.a, sn.at, sn.cap * 2);
-    allo.deallocate[u32](sn.a, sn.cells, sn.cap * space.CELLS);
-    sn.at    = nil;
-    sn.cells = nil;
-    sn.cap   = 0;
+    allo.deallocate[u32](sn.a, sn.images, sn.cap * sn.words);
+    sn.at     = nil;
+    sn.images = nil;
+    sn.cap    = 0;
 }
 
 # forget the copy and free its buffers
@@ -91,24 +99,25 @@ pub fun dnit(sn: *Snapshot) {
     vector.dnit[u32](?sn.tree);
 }
 
-# whether a chunk's cells hold one that is not the quiescent background
-pub fun any(c: *u32) bool {
-    var i: usize = 0;
-    for (i < space.CELLS) {
-        if (c[i] != 0) { ret true; }
-        i = i + 1;
-    }
-    ret false;
+# take up the layers of a rule's cells as the ones the images are of, dropping
+# buffers of another image size
+fun shape(sn: *Snapshot, r: *rule.Rule) {
+    var set: plane.Set = rule.layers(r);
+    shape_set(sn, ?set);
 }
 
-# whether a slot in use holds a cell that is not the quiescent background
-fun holds(sp: *space.Space, s: usize) bool {
-    ret any(?sp.cells[s * space.CELLS]);
+# take up a set's state and rule layers as the ones the images are of
+fun shape_set(sn: *Snapshot, set: *plane.Set) {
+    val bare:  plane.Set = plane.without_views(set);
+    val words: usize     = plane.image_words(?bare);
+    if (words != sn.words) { release(sn); }
+    sn.set   = bare;
+    sn.words = words;
 }
 
 # the bytes the buffers take, the chunks' and the tree's
 pub fun bytes(sn: *Snapshot) usize {
-    ret sn.cap * (2 * 8 + space.CELLS * 4) + sn.tree.cap * 4;
+    ret sn.cap * (2 * 8 + sn.words * 4) + sn.tree.cap * 4;
 }
 
 # the index of the chunk at (cx, cy), or n when none is held
@@ -121,9 +130,32 @@ pub fun find(sn: *Snapshot, cx: i64, cy: i64) usize {
     ret sn.n;
 }
 
-# the cells of held chunk i
-pub fun cells_of(sn: *Snapshot, i: usize) *u32 {
-    ret ?sn.cells[i * space.CELLS];
+# the image of held chunk i, its layers' spans under the snapshot's set
+pub fun image_of(sn: *Snapshot, i: usize) *u32 {
+    ret ?sn.images[i * sn.words];
+}
+
+# values a held chunk's word holds, its rule's state and rule layers'
+pub fun word_len(sn: *Snapshot) usize {
+    ret plane.exact(?sn.set);
+}
+
+# words of a held chunk's image
+pub fun image_words(sn: *Snapshot) usize {
+    ret sn.words;
+}
+
+# the words of held chunk i's cells, row-major
+# ---
+# out: receives space.CELLS words, a cell's values together
+pub fun words_of(sn: *Snapshot, i: usize, out: *u32) {
+    val img: *u32  = image_of(sn, i);
+    val m:   usize = plane.exact(?sn.set);
+    var k:   usize = 0;
+    for (k < space.CELLS) {
+        space.image_word(?sn.set, img, k, ?out[k * m]);
+        k = k + 1;
+    }
 }
 
 # buffers for exactly n chunks, reused when they are big enough and not more
@@ -134,14 +166,14 @@ fun fit(sn: *Snapshot, n: usize) err[allo.Error] {
     if (n == 0) { ret err[allo.Error].ok{}; }
     val at: res[*i64, allo.Error] = allo.allocate[i64](sn.a, n * 2);
     if (sel at.err) { ret err[allo.Error].err{at.err}; }
-    val cells: res[*u32, allo.Error] = allo.allocate[u32](sn.a, n * space.CELLS);
-    if (sel cells.err) {
+    val images: res[*u32, allo.Error] = allo.allocate[u32](sn.a, n * sn.words);
+    if (sel images.err) {
         allo.deallocate[i64](sn.a, at.ok, n * 2);
-        ret err[allo.Error].err{cells.err};
+        ret err[allo.Error].err{images.err};
     }
-    sn.at    = at.ok;
-    sn.cells = cells.ok;
-    sn.cap   = n;
+    sn.at     = at.ok;
+    sn.images = images.ok;
+    sn.cap    = n;
     ret err[allo.Error].ok{};
 }
 
@@ -151,6 +183,7 @@ fun fit(sn: *Snapshot, n: usize) err[allo.Error] {
 # generation: the world's generation
 # r:          the rule
 pub fun open(sn: *Snapshot, generation: u64, r: *rule.Rule) {
+    shape(sn, r);
     sn.n     = 0;
     sn.treed = false;
     vector.clear[u32](?sn.tree);
@@ -164,7 +197,8 @@ pub fun open(sn: *Snapshot, generation: u64, r: *rule.Rule) {
 # sn:    the snapshot, held
 # cx:    the chunk's column
 # cy:    the chunk's row
-# cells: space.CELLS cells, row-major
+# cells: space.CELLS words, row-major, a cell's values together, of the rule
+#        the copy was opened with
 # ret:   ok, or the allocator's refusal, which leaves the copy as it was
 pub fun add(sn: *Snapshot, cx: i64, cy: i64, cells: *u32) err[allo.Error] {
     if (sn.n == sn.cap) {
@@ -172,30 +206,38 @@ pub fun add(sn: *Snapshot, cx: i64, cy: i64, cells: *u32) err[allo.Error] {
         if (cap == 0) { cap = 1; }
         val at: res[*i64, allo.Error] = allo.allocate[i64](sn.a, cap * 2);
         if (sel at.err) { ret err[allo.Error].err{at.err}; }
-        val cs: res[*u32, allo.Error] = allo.allocate[u32](sn.a, cap * space.CELLS);
+        val cs: res[*u32, allo.Error] = allo.allocate[u32](sn.a, cap * sn.words);
         if (sel cs.err) {
             allo.deallocate[i64](sn.a, at.ok, cap * 2);
             ret err[allo.Error].err{cs.err};
         }
         if (sn.n != 0) {
             mem.copy[i64](at.ok, sn.at, sn.n * 2);
-            mem.copy[u32](cs.ok, sn.cells, sn.n * space.CELLS);
+            mem.copy[u32](cs.ok, sn.images, sn.n * sn.words);
         }
         release(sn);
-        sn.at    = at.ok;
-        sn.cells = cs.ok;
-        sn.cap   = cap;
+        sn.at     = at.ok;
+        sn.images = cs.ok;
+        sn.cap    = cap;
     }
     sn.at[sn.n * 2]     = cx;
     sn.at[sn.n * 2 + 1] = cy;
-    mem.copy[u32](?sn.cells[sn.n * space.CELLS], cells, space.CELLS);
+    val img: *u32 = image_of(sn, sn.n);
+    mem.zero[u32](img, sn.words);
+    val m: usize = plane.exact(?sn.set);
+    var k: usize = 0;
+    for (k < space.CELLS) {
+        space.put_image_word(?sn.set, img, k, ?cells[k * m]);
+        k = k + 1;
+    }
     sn.n = sn.n + 1;
     ret err[allo.Error].ok{};
 }
 
 # copy a pool's host cells, replacing whatever was held
 #
-# the host's cells must be current: on the GPU, sync first.
+# the host's cells must be current: on the GPU, sync first, and stored in the
+# rule's layers.
 # ---
 # sn:         the snapshot
 # sp:         the pool
@@ -207,20 +249,21 @@ pub fun capture(sn: *Snapshot, sp: *space.Space, generation: u64, r: *rule.Rule)
     sn.n     = 0;
     sn.treed = false;
     vector.clear[u32](?sn.tree);
+    shape(sn, r);
     var n: usize = 0;
     var s: usize = 0;
     for (s < sp.hi) {
-        if (space.used(sp, s) && holds(sp, s)) { n = n + 1; }
+        if (space.used(sp, s) && space.holds_word(sp, s)) { n = n + 1; }
         s = s + 1;
     }
     val made: err[allo.Error] = fit(sn, n);
     if (sel made.err) { ret made; }
     s = 0;
     for (s < sp.hi) {
-        if (space.used(sp, s) && holds(sp, s)) {
+        if (space.used(sp, s) && space.holds_word(sp, s)) {
             sn.at[sn.n * 2]     = space.slot_x(sp, s);
             sn.at[sn.n * 2 + 1] = space.slot_y(sp, s);
-            mem.copy[u32](?sn.cells[sn.n * space.CELLS], ?sp.cells[s * space.CELLS], space.CELLS);
+            space.get_image(sp, s, image_of(sn, sn.n));
             sn.n = sn.n + 1;
         }
         s = s + 1;
@@ -249,4 +292,39 @@ pub fun capture_tree(sn: *Snapshot, t: *hashlife.Tree, generation: u64, r: *rule
     sn.rule       = @r;
     sn.held       = true;
     ret true;
+}
+
+test add__keeps_every_value_of_words_wider_than_a_u32 {
+    var a: allo.Allocator;
+    page.make(?a);
+    var sn: Snapshot;
+    init(?sn, ?a);
+    # a hand-built set of three 16-bit layers, 48 bits a cell
+    var r: rule.Rule = rule.preset_rule(0);
+    open(?sn, 7, ?r);
+    var set: plane.Set = plane.state("state", 16);
+    plane.add_rule(?set, "age", 16);
+    plane.add_rule(?set, "mix", 16);
+    shape_set(?sn, ?set);
+    if (word_len(?sn) != 3 || image_words(?sn) != 3 * plane.span_words(16)) { ret 1; }
+    var w: [12288]u32;
+    var i: usize = 0;
+    for (i < 4096) {
+        w[i * 3]     = (i & 1)::u32;
+        w[i * 3 + 1] = (i * 7)::u32 & 0xffff;
+        w[i * 3 + 2] = 0xffff - i::u32;
+        i            = i + 1;
+    }
+    val one: err[allo.Error] = add(?sn, 2, -3, ?w[0]);
+    if (sel one.err) { ret 2; }
+    w[5] = 0xabcd;
+    val two: err[allo.Error] = add(?sn, -1, 4, ?w[0]);
+    if (sel two.err) { ret 2; }
+    var back: [12288]u32;
+    words_of(?sn, 0, ?back[0]);
+    if (back[5] != 0xfffe || back[3 * 4095 + 1] != 28665) { ret 3; }
+    words_of(?sn, 1, ?back[0]);
+    if (!mem.equal[u32](?back[0], ?w[0], 12288) || find(?sn, -1, 4) != 1) { ret 4; }
+    dnit(?sn);
+    ret 0;
 }

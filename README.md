@@ -122,11 +122,12 @@ dropped.
 | `B`                      | shrink the selection to its live cells                           |
 | right or middle mouse    | drag to pan                                                      |
 | scroll                   | zoom toward the cursor                                           |
+| `PgUp`, `PgDn`           | zoom in or out to the next power of two of pixels per cell       |
 | arrow keys               | pan                                                              |
 | `F`                      | frame the randomize area                                         |
 | `M`                      | next colour mode                                                 |
 | `G`                      | grid lines                                                       |
-| `Tab`                    | hide / show the panels                                           |
+| `Tab`                    | hide / show the toolbar and panels                               |
 | `H`, `F1`                | key reference                                                    |
 | `F11`                    | toggle borderless fullscreen                                     |
 | `F12`                    | screenshot                                                       |
@@ -166,10 +167,11 @@ at the sides, grouped by purpose:
 - **view**: colour mode (a solid colour from a set of swatches, fading trails,
   or colour by age; a rule table's states show in its own colours in place of
   the solid one), grid lines, and framing the randomize area
-- **stats**: the population graph, the readout in full, and what the last
-  identified selection holds
+- **stats**: the population graph, the readout in full, the graphics device
+  drawing the window, and what the last identified selection holds
 - **settings**, a floating window closed at first: the ceilings a run pauses
-  at, and the interface size from 100 to 200 percent
+  at, the interface size from 100 to 200 percent, and the graphics device's
+  name, kind and driver
 
 Each panel is a window that can be docked at either side, tabbed with another,
 floated or closed, and the panels menu reopens a closed one or resets the
@@ -275,9 +277,30 @@ Release archives for linux (x86-64 and arm64), windows (x86-64) and macOS
 [releases page](https://github.com/octalide/cellar/releases). cellar needs a
 Vulkan driver; on macOS that is MoltenVK.
 
+## Troubleshooting
+
+**cellar is slow.** It may be drawing on a software Vulkan device, such as
+Mesa's lavapipe (`llvmpipe`), which runs on the CPU rather than a GPU. cellar
+then says that no hardware GPU was found, warns in the settings and the stats,
+and steps the world on its CPU engine, which outruns its GPU engine emulated on
+such a device. `--engine gpu` steps on the device anyway. Drawing stays slow
+until a hardware driver is installed.
+
+`vulkaninfo --summary` (from the Vulkan tools package) lists the devices the
+installed drivers offer. A `deviceType` of `PHYSICAL_DEVICE_TYPE_CPU` is a
+software one. With only that listed, no driver for the GPU is installed, so
+install your GPU's Mesa or vendor Vulkan driver. Linux on Apple silicon needs
+the Asahi Linux Mesa, whose Honeykrisp driver is the hardware Vulkan driver
+for those GPUs.
+
+cellar takes a hardware GPU over a software one, and a discrete GPU over an
+integrated one. `BOOM_DEVICE` overrides that choice with a device's index in
+`vulkaninfo`'s list (`BOOM_DEVICE=1` for `GPU1`) or a part of its name
+(`BOOM_DEVICE=intel`).
+
 ## Build
 
-Requires [Mach](https://github.com/briar-systems/mach) 6.7 or newer and a C
+Requires [Mach](https://github.com/briar-systems/mach) 6.10.1 or newer and a C
 compiler for GLFW, which mach-glfw builds from source (on linux, the X11 and
 Wayland development headers and `wayland-scanner`).
 

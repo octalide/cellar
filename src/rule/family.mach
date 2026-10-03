@@ -1,0 +1,223 @@
+# the rule family contract, and the table families are registered in at run time
+#
+# a family is a kind of rule: its own rule string, cell word, the layers it
+# stores its cells in (cellar.layer), CPU step and GPU step stage. a family is
+# a module that declares a Family, the record of its operations below, over its
+# rule held in an opaque Payload. cellar.rule reaches every rule through its
+# family's record, so it never learns what a family's rule holds or what its
+# cell word means, and a family added touches its own module and the line that
+# registers it, cellar.rules for the families every build runs, or a call to
+# register for one added at run time, as a test's is.
+#
+# a family's rule is a value of its own type R, which the family reads from
+# and writes to the payload by view. R fits PAYLOAD_BYTES at an alignment of at
+# most 8, which the family asserts at compile time. a family whose rule is
+# larger, a rule table or a user's ruleset of any size, keeps it in a store of
+# its own and holds a handle to it in its payload (cellar.rules.table).
+#
+# the record's operations, for a family's rule type R:
+#
+#   id                               the name its rule strings are recorded
+#                                    under in world and settings files, which
+#                                    never changes once a file records it
+#   size                             $size_of(R)
+#   parse(s, p) err[str]             read its rule string into p, or say what
+#                                    is wrong. p is left as it was on a refusal
+#   claims(s) bool                   whether s is plausibly its syntax, so that
+#                                    parse reports the error of the family a
+#                                    string every family refuses meant. the
+#                                    first family in order to claim a string
+#                                    wins, so a claim need only be exact among
+#                                    the families before it
+#   format(p, buf) str               write the string parse reads back as p,
+#                                    at most FORMAT_MAX bytes
+#   display(p, buf) str              a short form for the readout, at most
+#                                    DISPLAY_MAX bytes
+#   same(a, b) bool                  whether two rules step alike
+#   states(p) u32                    how many states a cell can be in
+#   layers(p) plane.Set              the layers its cells are stored in, its
+#                                    state layer and any rule layers its step
+#                                    needs, those whose values make a cell
+#                                    live declared so (cellar.layer), and a
+#                                    view layer its step keeps its display
+#                                    channels in, for a family whose state
+#                                    layer is too narrow to hold them
+#   word_of(p, state) u32            the value a fresh cell of a state holds
+#                                    in its state layer
+#   rest_of(p, state, k) u32         the value a fresh cell of a state holds
+#                                    in layer k, from 1, so a fresh cell's
+#                                    word is word_of then rest_of for each
+#                                    rule layer (cellar.layer), and a view
+#                                    layer the family declares starts there
+#   adopt(p, from, n, out) bool      the word a cell an older version of the
+#                                    family recorded as n values, a count
+#                                    its layers no longer hold, as its word
+#                                    now, into out, or false for a count it
+#                                    never recorded. nil for a family whose
+#                                    words were only ever recorded as they
+#                                    are, so the files earlier versions wrote
+#                                    load exactly however its layers change
+#   state_of(p, c) u32               the state a state layer's value holds
+#                                    under the rule p, for a family whose
+#                                    state layer alone says it
+#   word_state(p, w) u32             the state a cell's word holds, its
+#                                    values in every state and rule layer,
+#                                    under the rule p, which every family
+#                                    gives: the state layer's for one whose
+#                                    state layer alone says it
+#   ink(p) u32                       the state painted or seeded when none is
+#                                    chosen, the fully live one
+#   slack(p) u32                     how far the GPU's word for a cell may lie
+#                                    from the CPU's a generation on from the
+#                                    same cells, 0 for a family the engines
+#                                    step bit for bit
+#   sense() layout.Sense             how shared code reads a value of its
+#                                    state layer
+#   radius(p) usize                  how far one generation reaches, at most
+#                                    layout.REACH_MAX
+#   caps(p) Caps                     what the rule can do (see Caps)
+#   step_chunk(p, b, t)              one chunk's CPU step from generation
+#                                    b.gen (see space.Block)
+#   next_of(p, nb) u32               the state a cell becomes from the states
+#                                    of its 3 by 3 block, row-major with it at
+#                                    4, for a rule whose caps.no_tree is nil: the
+#                                    quadtree engine's base case (cellar.hashlife)
+#   pack(p, w)                       its rule, into layout.RULE words of the
+#                                    meta head, for its stage
+#   table                            its stage binds a rule buffer
+#   table_words(p) usize             the words of the rule buffer p needs, 0
+#                                    for a family without one
+#   pack_table(p, w)                 its rule, into table_words(p) words of
+#                                    the rule buffer, for its stage
+#   colour(p, state) opt[u32]        the colour, 0xrrggbb, the rule draws a
+#                                    live cell of a state in, or none to draw
+#                                    it in the view's solid colour
+#   stage(len) *u8                   its step stage's SPIR-V, or nil for a
+#                                    family the CPU alone steps. a stage reads
+#                                    and writes each layer at the width the
+#                                    family declares it, whatever that is
+#   samples, sample(i) str           rule strings the per-family tests run
+#
+# the test that runs every function over every family's samples
+# (cellar.rule dispatch__every_function_handles_every_family) holds a family
+# to the contract, a test-only family's included.
+
+use cellar.layer.plane;
+use cellar.layout;
+use cellar.space;
+use std.system.panic;
+use std.types.bool.bool;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.size.usize;
+use std.types.string.str;
+
+# the bytes a family's rule may take: a kernel's quarter of 32-bit weights at
+# the farthest reach, and 512 bytes beside it
+pub val PAYLOAD_BYTES: usize = ((layout.REACH_MAX + 1) * (layout.REACH_MAX + 1) * 4 + 512)::usize;
+
+# a family's rule, opaque to all but its family
+pub rec Payload {
+    w: [(PAYLOAD_BYTES + 7) / 8]u64;
+}
+
+# the most a family's rule string may take, less its NUL: the weighted
+# family's structure form of its widest kernel, the longest any family writes
+pub val FORMAT_MAX: usize = 24604;
+# the most a family's display form may take, less its NUL
+pub val DISPLAY_MAX: usize = 199;
+
+# families that can be registered at run time, beside the ones every build runs
+pub val ADDED_MAX: usize = 10;
+
+# what a rule can do, which engines and features ask before taking it on
+# ---
+# b0:         a dead cell with no live neighbour is born and the background
+#             flips each generation: odd generations' cells hold the world's
+#             complement, drawn and edited inverted
+# isotropic:  it treats every rotation and reflection of a pattern alike
+# no_tree:    why a quadtree engine cannot run it, nil when it can, as "a B0
+#             rule" or "a bounded grid"
+# bounded:    it can run on a bounded grid
+# life_like:  it is a Life-like rule, two states on the radius-1 Moore
+#             neighbourhood, outer totalistic, the rules whose patterns
+#             Catagolue's apgcodes name, and not one that births on 0, whose
+#             held cells are the world's complement
+# continuous: a cell holds a value its state only approximates, a level of
+#             it: a world file keeps the words, a pattern format the levels,
+#             and a format that holds fewer states than the rule refuses it
+pub rec Caps {
+    b0:         bool;
+    isotropic:  bool;
+    no_tree:    str;
+    bounded:    bool;
+    life_like:  bool;
+    continuous: bool;
+}
+
+# a family's operations, over its rule held in a payload (see the module's notes)
+pub rec Family {
+    id:          str;
+    size:        usize;
+    parse:       fun(str, *Payload) err[str];
+    claims:      fun(str) bool;
+    format:      fun(*Payload, *u8) str;
+    display:     fun(*Payload, *u8) str;
+    same:        fun(*Payload, *Payload) bool;
+    states:      fun(*Payload) u32;
+    layers:      fun(*Payload) plane.Set;
+    word_of:     fun(*Payload, u32) u32;
+    rest_of:     fun(*Payload, u32, usize) u32;
+    state_of:    fun(*Payload, u32) u32;
+    word_state:  fun(*Payload, *u32) u32;
+    adopt:       fun(*Payload, *u32, usize, *u32) bool;
+    ink:         fun(*Payload) u32;
+    slack:       fun(*Payload) u32;
+    sense:       fun() layout.Sense;
+    radius:      fun(*Payload) usize;
+    caps:        fun(*Payload) Caps;
+    step_chunk:  fun(*Payload, *space.Block, *space.Tally);
+    next_of:     fun(*Payload, *u32) u32;
+    pack:        fun(*Payload, *u32);
+    table:       bool;
+    table_words: fun(*Payload) usize;
+    pack_table:  fun(*Payload, *u32);
+    colour:      fun(*Payload, u32) opt[u32];
+    stage:       fun(*usize) *u8;
+    samples:     usize;
+    sample:      fun(usize) str;
+}
+
+# a payload as the family's rule type it holds
+pub fun view[T](p: *Payload) *T {
+    ret (p::ptr)::*T;
+}
+
+# the families registered at run time, in the order they were
+var added:   [ADDED_MAX]*Family;
+var added_n: usize = 0;
+
+# add a family to the table beside the ones every build runs, before any rule
+# of it is made. registering one again does nothing
+# ---
+# f: the family's record, which lives as long as the program
+pub fun register(f: *Family) {
+    var i: usize = 0;
+    for (i < added_n) {
+        if (added[i] == f) { ret; }
+        i = i + 1;
+    }
+    if (added_n == ADDED_MAX) { panic.panic("cellar.rule.family: too many families registered"); }
+    added[added_n] = f;
+    added_n        = added_n + 1;
+}
+
+# how many families have been registered at run time
+pub fun added_count() usize {
+    ret added_n;
+}
+
+# the family registered at run time i-th
+pub fun added_at(i: usize) *Family {
+    ret added[i];
+}

@@ -2,8 +2,13 @@
 # for the host and the family's step stage. the non-totalistic family's cells
 # are this word too, run in the same forms (cellar.rules.nontotalistic)
 #
-# a cell is age << 8 | heat: alive while its age is nonzero, 255 heat while
-# alive and fading by DECAY a generation once dead.
+# a cell is one bit in the family's state layer, 1 while it lives, so a
+# 32-bit word holds a row's run of 32 cells and a step works them at once
+# (cellar.layer). its display channels lie in a view layer the step keeps
+# beside it, until the view keeps them itself: age << 8 | heat, 255 heat while
+# alive and fading by DECAY a generation once dead, and the age a live cell has
+# lived, up to AGE_MAX. a cell's sensed value is the two together, the bit
+# then the channels (sense).
 #
 # a rule that births on 0 is run as Golly runs it, so the background the pool
 # holds is always dead: a generation's cells are either the world's or its
@@ -12,15 +17,18 @@
 
 use cellar.layout;
 
+# bits of the family's state layer (cellar.layer): a cell is one bit
+pub val WIDTH: u32 = 1;
+# bits of the view layer holding its display channels, age << 8 | heat
+pub val SHOWN: u32 = 16;
+
 pub val HEAT_MASK: u32 = 255;
 pub val AGE_SHIFT: u32 = 8;
-# the least value of a live cell
-pub val LIVE: u32 = 256;
-# the oldest age a cell records
-pub val AGE_MAX: u32 = 0xffffff;
+# the oldest age a cell records, the oldest the draw tells apart
+pub val AGE_MAX: u32 = 255;
 # heat a dead cell loses per generation, giving fading trails
 pub val DECAY: u32 = 12;
-# a live cell painted or seeded fresh: age 1, full heat
+# the display channels of a live cell painted or seeded fresh: age 1, full heat
 pub val BORN: u32 = 511;
 
 # the window's words: the radius, the rule's form, the footprint's total
@@ -34,6 +42,26 @@ pub val FORM_AT: u32 = 1;
 pub val TOTAL_AT: u32 = 2;
 pub val TOP_AT:   u32 = 3;
 pub val WORDS_AT: u32 = 4;
+# the path a step takes, SLICED, ROWS or GENERAL (cellar.rules.weighted path)
+pub val PATH_AT: u32 = 5;
+# for ROWS, 1 when the center lies inside its row's run with weight 0
+pub val HOLE_AT: u32 = 6;
+# for ROWS, two words a footprint row from the top, its run's first column and
+# the column past its last, each biased by RADIUS_MAX, equal for a row with
+# no weight
+pub val RUNS_AT: u32 = 8;
+
+# how a kernel's step is computed, chosen from the shape of its footprint
+# ---
+# SLICED:  unit weights on the radius-1 Moore ring, the Life-like rules: a
+#          row's cells a word, the eight neighbours added bit-sliced
+# ROWS:    unit weights, each row of the footprint one run of them with the
+#          center perhaps left out, Larger than Life's box and HROT's diamond,
+#          circle and cross at any radius: each row's count of its run
+# GENERAL: any other kernel: every weight of the footprint, cell by cell
+pub val SLICED:  u32 = 0;
+pub val ROWS:    u32 = 1;
+pub val GENERAL: u32 = 2;
 
 # the widest radius a footprint reaches, which sizes the stage's shared tile
 pub val RADIUS_MAX: u32 = 16;
@@ -60,26 +88,28 @@ pub fun inverted(form: u32, parity: u32) u32 {
     ret 0;
 }
 
-# a cell one generation on when it is not live: its heat fades
-pub fun cool(c: u32) u32 {
-    val heat: u32 = c & HEAT_MASK;
+# a cell's display channels one generation on when it is not live: its heat
+# fades and it has no age
+#[inline]
+pub fun cool(h: u32) u32 {
+    val heat: u32 = h & HEAT_MASK;
     if (heat > DECAY) { ret heat - DECAY; }
     ret 0;
 }
 
-# the word a cell becomes one generation on, as held: a generation older at
-# full heat when it lives, cooled when it does not
+# a cell's display channels one generation on: a generation older at full
+# heat when it lives, cooled when it does not
 # ---
-# c:    the cell as held, age << 8 | heat
+# h:    the channels as they were, age << 8 | heat
 # live: 1 when it lives one generation on, as held, else 0
 #[inline]
-pub fun become(c: u32, live: u32) u32 {
+pub fun become(h: u32, live: u32) u32 {
     if (live != 0) {
-        var age: u32 = (c >> AGE_SHIFT) + 1;
+        var age: u32 = (h >> AGE_SHIFT) + 1;
         if (age > AGE_MAX) { age = AGE_MAX; }
         ret (age << AGE_SHIFT) | HEAT_MASK;
     }
-    ret cool(c);
+    ret cool(h);
 }
 
 # 1 when a cell past a plane's dead edge is held live to a step from a
@@ -94,16 +124,18 @@ pub fun past(form: u32, parity: u32) u32 {
     ret 0;
 }
 
-# how the shared stages read the word
+# how the shared stages read a cell's sensed value: the live bit, then the
+# display channels above it (cellar.layer sensed). a live cell is warm, as is
+# a dead one whose heat has not faded
 pub fun sense() layout.Sense {
     ret layout.Sense{
-        live_mask:  0xffffffff,
-        live_lo:    LIVE,
-        live_hi:    0xffffffff,
-        warm_mask:  HEAT_MASK,
-        heat_shift: 0,
+        live_mask:  1,
+        live_lo:    1,
+        live_hi:    1,
+        warm_mask:  1 | (HEAT_MASK << WIDTH),
+        heat_shift: WIDTH,
         heat_mask:  HEAT_MASK,
-        age_shift:  AGE_SHIFT,
+        age_shift:  WIDTH + AGE_SHIFT,
         age_mask:   AGE_MAX,
     };
 }

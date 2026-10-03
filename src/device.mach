@@ -1,0 +1,118 @@
+# the graphics device cellar draws on, as the settings and the stats show it
+#
+# boom picks the device, ranking hardware GPUs first, and BOOM_DEVICE overrides
+# its pick (boom.graphics.physical). a device of type cpu is the host processor
+# emulating a GPU, such as Mesa's lavapipe, where cellar's compute stages step
+# the world slower than its CPU engine does and drawing is slow too. a session
+# on one steps on the CPU unless the command line asks for the GPU
+# (cellar.game pick_engine).
+
+use gfx: boom.graphics;
+use cellar.text;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+# room for the name and the driver line, each with its terminator
+val NAME_MAX:   usize = 256;
+val DRIVER_MAX: usize = 512;
+
+# the device as cellar shows it, its strings NUL-terminated in place
+# ---
+# name:     the device's name, empty until the renderer has picked one
+# kind:     what kind of device it is, in words
+# driver:   the driver's name and its description of itself, empty where the
+#           device reports neither
+# software: the device runs on the host processor
+pub rec Device {
+    name:     [256]u8;
+    kind:     str;
+    driver:   [512]u8;
+    software: bool;
+}
+
+# a device not yet known
+pub fun none(d: *Device) {
+    d.name[0]   = 0;
+    d.kind      = "";
+    d.driver[0] = 0;
+    d.software  = false;
+}
+
+# the renderer has picked a device
+pub fun known(d: *Device) bool {
+    ret d.name[0] != 0;
+}
+
+# what kind of device a device type is, in words
+fun kind_of(t: gfx.DeviceType) str {
+    if (sel t.discrete)   { ret "discrete GPU"; }
+    if (sel t.integrated) { ret "integrated GPU"; }
+    if (sel t.virtual)    { ret "virtual GPU"; }
+    if (sel t.cpu)        { ret "software, on the CPU"; }
+    ret "other device";
+}
+
+# copy s into buf at off, stopping short of cap with room for a terminator
+fun put(buf: *u8, off: usize, s: str, cap: usize) usize {
+    var o: usize = off;
+    var i: usize = 0;
+    for (s[i] != 0 && o + 1 < cap) {
+        buf[o] = s[i];
+        o      = o + 1;
+        i      = i + 1;
+    }
+    ret o;
+}
+
+# take the device the renderer described
+# ---
+# d:    the device to fill
+# info: what boom's renderer_device_info says of it
+pub fun of(d: *Device, info: *gfx.DeviceInfo) {
+    d.name[put(?d.name[0], 0, ?info.name[0], NAME_MAX)] = 0;
+    d.kind                                              = kind_of(info.device_type);
+    d.software                                          = sel info.device_type.cpu;
+    var o: usize = put(?d.driver[0], 0, ?info.driver_name[0], DRIVER_MAX);
+    if (o != 0 && info.driver_info[0] != 0) { o = put(?d.driver[0], o, " ", DRIVER_MAX); }
+    o           = put(?d.driver[0], o, ?info.driver_info[0], DRIVER_MAX);
+    d.driver[o] = 0;
+}
+
+# a device info naming a device and its driver, the rest zeroed
+fun info_of(name: str, t: gfx.DeviceType, driver: str, about: str) gfx.DeviceInfo {
+    var info: gfx.DeviceInfo;
+    info.name[text.buf_str(?info.name[0], 0, name)]                 = 0;
+    info.device_type                                                = t;
+    info.vendor_id                                                  = 0;
+    info.device_id                                                  = 0;
+    info.api_version                                                = 0;
+    info.driver_version                                             = 0;
+    info.driver_id                                                  = 0;
+    info.driver_name[text.buf_str(?info.driver_name[0], 0, driver)] = 0;
+    info.driver_info[text.buf_str(?info.driver_info[0], 0, about)]  = 0;
+    ret info;
+}
+
+test of__marks_a_cpu_device_software_and_joins_its_driver_line {
+    var d: Device;
+    none(?d);
+    if (known(?d) || d.software) { ret 1; }
+    var soft: gfx.DeviceInfo = info_of("llvmpipe (LLVM 20.1.8, 256 bits)", gfx.DeviceType.cpu{}, "llvmpipe", "Mesa 25.2.4");
+    of(?d, ?soft);
+    if (!known(?d) || !d.software)                                   { ret 2; }
+    if (!str_equals(?d.name[0], "llvmpipe (LLVM 20.1.8, 256 bits)")) { ret 3; }
+    if (!str_equals(?d.driver[0], "llvmpipe Mesa 25.2.4"))           { ret 4; }
+    if (!str_equals(d.kind, "software, on the CPU"))                 { ret 5; }
+    # a hardware GPU is not software, and a driver reporting no description
+    # leaves its name alone
+    var hard: gfx.DeviceInfo = info_of("AMD Radeon RX 7900 XTX", gfx.DeviceType.discrete{}, "radv", "");
+    of(?d, ?hard);
+    if (d.software || !str_equals(?d.driver[0], "radv") || !str_equals(d.kind, "discrete GPU")) { ret 6; }
+    var bare: gfx.DeviceInfo = info_of("SwiftShader Device", gfx.DeviceType.cpu{}, "", "");
+    of(?d, ?bare);
+    if (!d.software || d.driver[0] != 0) { ret 7; }
+    ret 0;
+}

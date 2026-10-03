@@ -7,13 +7,19 @@
 # a stamp of either serial counts; the next step's stamp on a chunk cold here
 # only has its zeros counted.
 #
-# a workgroup is one slot. an invocation reads four cells of a row at once,
-# sixteen invocations side by side cover a row, and the workgroup four rows a
-# step. an invocation counts its live cells, notes whether any cell is still
-# warm, both as the rule family's sense in the meta head reads a cell, and the
-# columns and rows its live cells span and the quadrants they lie in. the
-# workgroup reduces those in shared memory with atomics, which every vulkan
-# device has, so the census needs no device feature. the first invocation
+# a workgroup is one slot. a cell is its sensed value, its value in the state
+# layer with its shown layer's above it, at the widths the meta head holds
+# (cellar.layer), the variant that binds the layers beside the state layer
+# reading the shown layer, and the plain one a set with none. an invocation
+# reads four words of
+# the slot's span at a time, the workgroup 256 words a step, and a word of
+# zeros holds nothing to count but where a live rule layer may hold more. an
+# invocation counts its live cells, notes whether any cell is still warm,
+# both as the rule family's sense in the meta head reads a cell and as its
+# live rule layers make one live (cellar.layer), and the columns and rows its
+# live cells span and the quadrants they lie in. the workgroup reduces those
+# in shared memory with atomics, which every vulkan device has, so the census
+# needs no device feature. the first invocation
 # then writes the slot's row: the count, the extent and its quadrants, from
 # which the host works out the halo they need (cellar.space.halo), and the
 # slot's incarnation and its chunk's coordinates, so the host can tell a
@@ -28,20 +34,17 @@
 # extent (cellar.layout.extent) and the quadrants they lie in, then the chunk's
 # biased coordinates
 
+use cellar.layer;
 use cellar.layout;
 use cellar.layout.Flags;
+use cellar.layout.Layer;
 use cellar.layout.Meta;
 use cellar.layout.Status;
 use at: shader.atomic;
 use sy: shader.sync;
 
-# the cells four at a time
-rec Quads {
-    v: [layout.MAX_SLOTS * layout.CELLS / 4]u32x4;
-}
-
 #[storage(1, 0, "readonly")]
-var cells:  Quads;
+var cells:  Layer;
 #[storage(1, 1, "readonly")]
 var meta:   Meta;
 #[storage(1, 2)]
@@ -63,6 +66,37 @@ rec Tally {
 #[shared]
 var tally: Tally;
 
+# the live rule layers' values of the cell at address a (cellar.layer), or'd,
+# and its sensed value through the shown layer, in the variant built for a
+# rule with live rule layers or a shown layer, and none in the other
+$if ($bin.name == "stage-census_live_comp") {
+    use cellar.bin.shaders.lives;
+    use cellar.bin.shaders.shown;
+
+    fun more(a: u32) u32 {
+        ret lives.more(meta.base[layout.LIVE_AT - layout.BASE_AT], a);
+    }
+
+    # the sensed value of the cell at address a whose state layer's value is
+    # c, read at width w
+    fun sensed(c: u32, w: u32, a: u32) u32 {
+        ret shown.sensed(meta.base[layout.LIVE_AT - layout.BASE_AT], c, w, a);
+    }
+
+    val LIVE: u32 = 1;
+}
+$or {
+    fun more(a: u32) u32 {
+        ret 0;
+    }
+
+    fun sensed(c: u32, w: u32, a: u32) u32 {
+        ret c;
+    }
+
+    val LIVE: u32 = 0;
+}
+
 #[builtin("workgroup_id")]
 var wid: u32x3;
 #[builtin("local_invocation_index")]
@@ -77,19 +111,6 @@ fun alive(c: u32) u32 {
 }
 
 # the lowest and highest set bit of a nonzero 4-bit mask
-fun low(m: u32) u32 {
-    if ((m & 1) != 0) { ret 0; }
-    if ((m & 2) != 0) { ret 1; }
-    if ((m & 4) != 0) { ret 2; }
-    ret 3;
-}
-
-fun high(m: u32) u32 {
-    if ((m & 8) != 0) { ret 3; }
-    if ((m & 4) != 0) { ret 2; }
-    if ((m & 2) != 0) { ret 1; }
-    ret 0;
-}
 
 #[stage("compute")]
 #[workgroup(64, 1, 1)]
@@ -112,24 +133,39 @@ fun comp_main() {
     # next step's, is cold and empty, and needs no count
     val f: u32 = flags.v[slot * 2 + 1];
     if (inc != 0 && (f == meta.serial || f == meta.serial + 1)) {
-        val cx:   u32 = (lid & 15) * 4;
-        val base: u32 = (slot * layout.CELLS + cx) / 4;
-        var y:    u32 = lid >> 4;
-        for (y < layout.SIDE) {
-            val q: u32x4 = cells.v[base + y * (layout.SIDE / 4)];
-            val m: u32   = alive(q[0]) | (alive(q[1]) << 1) | (alive(q[2]) << 2) | (alive(q[3]) << 3);
-            if (m != 0) {
-                live  = live + (m & 1) + ((m >> 1) & 1) + ((m >> 2) & 1) + ((m >> 3) & 1);
-                quads = quads | layout.quadrant(cx, y);
-                val lo: u32 = cx + low(m);
-                val hi: u32 = cx + high(m);
-                if (lo < x0) { x0 = lo; }
-                if (hi > x1) { x1 = hi; }
-                if (y < y0)  { y0 = y; }
-                y1 = y;
+        val w:     u32 = meta.base[layout.WIDTH_AT - layout.BASE_AT];
+        val per:   u32 = layer.per_word(w);
+        val words: u32 = layer.span_words(w);
+        val base:  u32 = layer.span_at(w, slot);
+        var q:     u32 = lid * 4;
+        for (q < words) {
+            var e: u32 = 0;
+            for (e < 4) {
+                val word: u32 = cells.v[base + q + e];
+                if (word != 0 || LIVE != 0) {
+                    val first: u32 = (q + e) * per;
+                    val y:     u32 = first / layout.SIDE;
+                    var k:     u32 = 0;
+                    for (k < per) {
+                        val i: u32 = first + k;
+                        val c: u32 = sensed(layer.read(word, w, i), w, layer.addr(slot, i));
+                        val m: u32 = more(layer.addr(slot, i));
+                        if (alive(c) != 0 || m != 0) {
+                            val x: u32 = i % layout.SIDE;
+                            live  = live + 1;
+                            quads = quads | layout.quadrant(x, y);
+                            if (x < x0) { x0 = x; }
+                            if (x > x1) { x1 = x; }
+                            if (y < y0) { y0 = y; }
+                            if (y > y1) { y1 = y; }
+                        }
+                        if ((c & meta.warm_mask) != 0 || m != 0) { warm = 1; }
+                        k = k + 1;
+                    }
+                }
+                e = e + 1;
             }
-            if (((q[0] | q[1] | q[2] | q[3]) & meta.warm_mask) != 0) { warm = 1; }
-            y = y + 4;
+            q = q + 256;
         }
     }
     if (lid == 0) {

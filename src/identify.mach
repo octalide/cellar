@@ -16,6 +16,8 @@
 # or GPU, so a headless run can use it as the app does.
 
 use cellar.cpu;
+use cellar.layer;
+use cellar.layer.plane;
 use cellar.pattern;
 use cellar.rule;
 use cellar.rules.weighted;
@@ -241,7 +243,9 @@ fun load(run: *Run, p: *pattern.Pattern, b: space.Box) bool {
                 val wy: i64 = y - b.y0;
                 val s:  u32 = space.alloc(sp, space.chunk_of(wx), space.chunk_of(wy));
                 if (s == space.NONE) { ret false; }
-                sp.cells[s::usize * space.CELLS + space.local_of(wy) * 64 + space.local_of(wx)] = rule.word(run.r, st::u32);
+                var w: [layer.LAYERS_MAX]u32;
+                rule.fresh(run.r, st::u32, ?w[0]);
+                space.put_word(sp, s::usize, space.local_of(wy) * 64 + space.local_of(wx), ?w[0]);
             }
             x = x + 1;
         }
@@ -253,6 +257,15 @@ fun load(run: *Run, p: *pattern.Pattern, b: space.Box) bool {
         s = s + 1;
     }
     ret space.settle(sp, sp.census, sp.hi, false);
+}
+
+# the state of cell i of slot sl of the run's pool, whose state layer holds
+# c, read from its whole word where the rule's word holds more than that
+fun state_at(run: *Run, sl: usize, i: usize, c: u32) u32 {
+    if (space.word_len(?run.sp) == 1) { ret rule.state(run.r, c); }
+    var w: [layer.LAYERS_MAX]u32;
+    space.get_word(?run.sp, sl, i, ?w[0]);
+    ret rule.word_state(run.r, ?w[0]);
 }
 
 # the box every cell in a state other than 0 spans, which for a family with
@@ -272,10 +285,11 @@ fun extent(run: *Run) opt[space.Box] {
         if (space.used(sp, s) && (cn[0] != 0 || cn[1] != 0)) {
             val ox: i64   = space.slot_x(sp, s) * space.SIDE;
             val oy: i64   = space.slot_y(sp, s) * space.SIDE;
-            val c:  *u32  = ?sp.cells[s * space.CELLS];
+            var c:  [4096]u32;
             var i:  usize = 0;
+            space.get_sensed(sp, s, 0, space.CELLS, ?c[0]);
             for (i < space.CELLS) {
-                if (c[i] != 0 && rule.state(run.r, c[i]) != 0) {
+                if ((c[i] != 0 || space.word_len(sp) > 1) && state_at(run, s, i, c[i]) != 0) {
                     val x: i64 = ox + (i & 63)::i64;
                     val y: i64 = oy + (i >> 6)::i64;
                     if (!any || x < b.x0)     { b.x0 = x; }
@@ -325,10 +339,10 @@ fun read(run: *Run, side: usize, f: *Seen) bool {
             val sl: u32   = space.find(sp, space.chunk_of(at), space.chunk_of(y));
             if (sl == space.NONE) { mem.zero[u8](?row[o], k); }
             or {
-                val c: *u32  = ?sp.cells[sl::usize * space.CELLS + space.local_of(y) * 64 + space.local_of(at)];
+                val c: usize = space.local_of(y) * 64 + space.local_of(at);
                 var i: usize = 0;
                 for (i < k) {
-                    row[o + i] = rule.state(run.r, c[i])::u8;
+                    row[o + i] = state_at(run, sl::usize, c + i, space.sensed(sp, sl::usize, c + i))::u8;
                     i          = i + 1;
                 }
             }
@@ -559,7 +573,11 @@ pub fun classify(a: *allo.Allocator, r: *rule.Rule, p: *pattern.Pattern, lim: Li
     val made: err[allo.Error] = space.init(?run.sp, a, true);
     if (sel made.err) { ret made; }
     fin { space.dnit(?run.sp); }
+    var lay:  plane.Set       = rule.layers(r);
+    val laid: err[allo.Error] = space.relayer(?run.sp, ?lay, nil, nil);
+    if (sel laid.err) { ret laid; }
     run.sp.sense = rule.sense(r);
+    run.sp.lit   = rule.lit(r);
     run.sp.reach = rule.radius(r);
     # a form side cells across spans side / 64 + 1 chunks, and the pool keeps a
     # ring of chunks around those
@@ -822,7 +840,7 @@ pub fun fate_id(f: Fate) u8 {
 
 #[testing]
 pub fun life() rule.Rule {
-    ret rule.of(rule.Kind.weighted{weighted.life()});
+    ret rule.make[weighted.Kernel](?weighted.FAMILY, weighted.life());
 }
 
 val PULSAR: str = "..OOO...OOO../............./O....O.O....O/O....O.O....O/O....O.O....O/..OOO...OOO../............./..OOO...OOO../O....O.O....O/O....O.O....O/O....O.O....O/............./..OOO...OOO..";
@@ -866,7 +884,7 @@ test classify__gives_no_apgcode_under_a_rule_that_is_not_life_like {
     # Life on a radius-2 footprint whose outer ring weighs nothing steps as Life does
     var k: weighted.Kernel = weighted.life();
     weighted.set_radius(?k, 2);
-    if (expect(rule.of(rule.Kind.weighted{k}), "OOO", Fate.oscillator{}, 2, 0, 0, "") != 0) { ret 1; }
+    if (expect(rule.make[weighted.Kernel](?weighted.FAMILY, k), "OOO", Fate.oscillator{}, 2, 0, 0, "") != 0) { ret 1; }
     ret 0;
 }
 

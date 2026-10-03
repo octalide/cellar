@@ -8,28 +8,30 @@
 #
 # a workgroup is one slot, and a chunk the step left a live cell in at the
 # front, stamped with the serial in the pass header, scans its cells for the
-# quadrants holding one, an invocation a row. a generation an edit started over
-# may have stamped the next serial on a chunk live at the front, so a stamp of
-# either counts, as the census counts it. the first invocation then marks
-# every chunk of the halo that exists as asked for this pass, so the free
-# stage keeps it, and claims a slot for each that does not: the lowest free
-# slot below the top, its entry stamped with the chunk's coordinates and a new
-# incarnation and put in the hash. two live chunks beside the same missing one
-# each claim a slot for it; the settle stage keeps one and gives the others
-# back. a slot that cannot be claimed, because none below the top is free,
-# closes the gate: no pass claims and no step runs until the host has given the
-# pool more room.
+# quadrants holding one, an invocation a row, each cell its value in the state
+# layer at the width the meta head holds and in any live rule layer
+# (cellar.layer). a generation an edit started over may have stamped the next
+# serial on a chunk live at the front, so a stamp of either counts, as the
+# census counts it. the first invocation then marks every chunk of the halo that
+# exists as asked for this pass, so the free stage keeps it, and claims a slot
+# for each that does not: the lowest free slot below the top, its entry stamped
+# with the chunk's coordinates and a new incarnation and put in the hash. two
+# live chunks beside the same missing one each claim a slot for it; the settle
+# stage keeps one and gives the others back. a slot that cannot be claimed,
+# because none below the top is free, closes the gate: no pass claims and no
+# step runs until the host has given the pool more room.
 
+use cellar.layer;
 use cellar.layout;
-use cellar.layout.Cells;
 use cellar.layout.Flags;
+use cellar.layout.Layer;
 use cellar.layout.Meta;
 use cellar.layout.Status;
 use at: shader.atomic;
 use sy: shader.sync;
 
 #[storage(1, 0, "readonly")]
-var cells:  Cells;
+var cells:  Layer;
 #[storage(1, 1)]
 var meta:   Meta;
 #[storage(1, 2)]
@@ -40,6 +42,25 @@ var flags:  Flags;
 # the quadrants holding a live cell, and the gate as the workgroup read it
 #[shared]
 var quads: [2]u32;
+
+# the live rule layers' values of the cell at address a (cellar.layer), or'd,
+# in the variant built for a rule with live rule layers, and none in the other
+$if ($bin.name == "stage-mark_live_comp") {
+    use cellar.bin.shaders.lives;
+
+    fun more(a: u32) u32 {
+        ret lives.more(meta.base[layout.LIVE_AT - layout.BASE_AT], a);
+    }
+
+    val LIVE: u32 = 1;
+}
+$or {
+    fun more(a: u32) u32 {
+        ret 0;
+    }
+
+    val LIVE: u32 = 0;
+}
 
 #[builtin("workgroup_id")]
 var wid: u32x3;
@@ -165,6 +186,13 @@ fun ask(slot: u32, live: u32) {
     }
 }
 
+# the state layer's value of cell i of a slot, at the width the meta head holds
+# (cellar.layer)
+fun cell(slot: u32, i: u32) u32 {
+    val w: u32 = meta.base[layout.WIDTH_AT - layout.BASE_AT];
+    ret layer.read(cells.v[layer.cell_at(w, slot, i)], w, i);
+}
+
 # the quadrants of a live slot holding a live cell, an invocation a row, then
 # its asks. the gate is read once for the workgroup, so all of it skips
 # together, though another workgroup may close it meanwhile: while it is
@@ -177,11 +205,12 @@ fun scan(slot: u32) {
     }
     sy.workgroup_barrier();
     if (quads[1] == 0) {
-        val row: u32 = slot * layout.CELLS + lid * layout.SIDE;
+        val row: u32 = lid * layout.SIDE;
         var q:   u32 = 0;
         var x:   u32 = 0;
         for (x < layout.SIDE) {
-            if (layout.live(cells.v[row + x], meta.live_mask, meta.live_lo, meta.live_hi) != 0) { q = q | layout.quadrant(x, lid); }
+            val c: u32 = cell(slot, row + x);
+            if (layout.live(c, meta.live_mask, meta.live_lo, meta.live_hi) != 0 || more(layer.addr(slot, row + x)) != 0) { q = q | layout.quadrant(x, lid); }
             x = x + 1;
         }
         if (q != 0) { at.atomic_or_u32(?quads[0], sy.SCOPE_WORKGROUP, sy.SEMANTICS_RELAXED, q); }

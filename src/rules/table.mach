@@ -8,11 +8,14 @@
 # is looked up as the store says. every state but 0 is live, a neighbourhood
 # the table gives no transition for keeps the cell, and a table whose empty
 # neighbourhood gives a live cell is refused, so no rule of the family births
-# on 0. its cell word is cellar.rules.table.word's, its step stage table_comp,
+# on 0. its cells are an 8-bit state layer of cellar.rules.table.word's values,
+# its step stage table_comp,
 # which walks the tree the rule buffer holds, and its palette the table's
 # @COLORS, or Golly's gradient from red to yellow without them.
 
+use cellar.layer.plane;
 use cellar.layout;
+use cellar.rule.family;
 use cellar.rules.table.load;
 use cellar.rules.table.store;
 use cellar.rules.table.word;
@@ -21,6 +24,7 @@ use mem: std.memory;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
@@ -29,23 +33,6 @@ use std.types.string.str;
 
 #[embed("{artifact.stage-table_comp.out}")]
 val STAGE: [_]u8;
-
-# what the family's capabilities come to for one rule
-# ---
-# b0:         a dead cell with no live neighbour is born, which the loader refuses
-# isotropic:  the table's symmetries take in every rotation and reflection
-# no_tree:    why a quadtree engine cannot run it, nil when it can
-# bounded:    it can run on a bounded grid
-# life_like:  it is a Life-like rule, which no table is taken as
-# continuous: a cell's state is all it holds, in every rule
-pub rec Caps {
-    b0:         bool;
-    isotropic:  bool;
-    no_tree:    str;
-    bounded:    bool;
-    life_like:  bool;
-    continuous: bool;
-}
 
 # a rule table
 # ---
@@ -112,14 +99,14 @@ pub fun states(r: *Rule) u32 {
     ret store.get(r.id).states;
 }
 
-# the word a fresh cell of a state is written as
+# the value a fresh cell of a state is written as
 pub fun word_of(r: *Rule, state: u32) u32 {
     ret word.word(state, states(r));
 }
 
-# the state a word holds, its heat aside
-pub fun state_of(c: u32) u32 {
-    ret c & word.STATE_MASK;
+# the state a value holds
+pub fun state_of(r: *Rule, c: u32) u32 {
+    ret word.state(c, states(r));
 }
 
 # the state painted or seeded when none is chosen: the live one
@@ -133,7 +120,19 @@ pub fun slack(r: *Rule) u32 {
     ret 0;
 }
 
-# how shared code reads the family's cell word
+# the value a fresh cell of a state holds in rule layer k: none, since the
+# family's cells are its state layer alone
+pub fun rest_of(r: *Rule, state: u32, k: usize) u32 {
+    ret 0;
+}
+
+# the layers the family's cells are stored in (cellar.layer): the state
+# layer alone, word.WIDTH bits wide
+pub fun layers(r: *Rule) plane.Set {
+    ret plane.state("state", word.WIDTH);
+}
+
+# how shared code reads a value of the family's state layer
 pub fun sense() layout.Sense {
     ret word.sense();
 }
@@ -143,9 +142,15 @@ pub fun radius(r: *Rule) usize {
     ret 1;
 }
 
-# the capabilities the family has for a rule
-pub fun caps(r: *Rule) Caps {
-    ret Caps{b0: false, isotropic: store.get(r.id).iso, no_tree: "a rule table", bounded: true, life_like: false, continuous: false};
+# what the family's capabilities come to for one rule
+# b0:         a dead cell with no live neighbour is born, which the loader refuses
+# isotropic:  the table's symmetries take in every rotation and reflection
+# no_tree:    why a quadtree engine cannot run it, nil when it can
+# bounded:    it can run on a bounded grid
+# life_like:  it is a Life-like rule, which no table is taken as
+# continuous: a cell's state is all it holds, in every rule
+pub fun caps(r: *Rule) family.Caps {
+    ret family.Caps{b0: false, isotropic: store.get(r.id).iso, no_tree: "a rule table", bounded: true, life_like: false, continuous: false};
 }
 
 # the state a cell becomes from the states of the 3 by 3 block around it
@@ -167,41 +172,65 @@ pub fun next_of(r: *Rule, nb: *u32) u32 {
 # b: the chunk's block and back cells
 # t: the tally of the cells written
 pub fun step_chunk(r: *Rule, b: *space.Block, t: *space.Tally) {
-    val out: *u32 = b.out;
+    val out: *u32 = space.block_out(b, 0).w;
     if (!b.busy) {
-        mem.zero[u32](out, space.CELLS);
+        plane.clear(plane.at(out, word.WIDTH));
         ret;
     }
     val tb:   *load.Table = store.get(r.id);
     val n:    u32         = tb.states;
     val tree: *u32        = tb.tree.data;
-    var dx:   [9]i64;
-    var dy:   [9]i64;
-    var q:    usize       = 0;
+    # each input's place in the frame, from the cell's
+    var off: [9]i64;
+    var q:   usize = 0;
     for (q < tb.inputs::usize) {
-        dx[q] = (tb.at[q] % 3)::i64 - 1;
-        dy[q] = (tb.at[q] / 3)::i64 - 1;
-        q     = q + 1;
+        off[q] = ((tb.at[q] / 3)::i64 - 1) * FRAME + (tb.at[q] % 3)::i64 - 1;
+        q      = q + 1;
+    }
+    # the state of every value and the value of every state, worked out once
+    var state_of_value: [256]u8;
+    var value_of_state: [256]u32;
+    var k:              u32 = 0;
+    for (k <= word.HEAT_MASK) {
+        state_of_value[k::usize] = word.state(k, n)::u8;
+        value_of_state[k::usize] = word.word(k, n);
+        k                        = k + 1;
+    }
+    # the chunk's states and the ring of cells around it, each read and
+    # decoded once rather than once per input that reads it
+    var frame: [FRAME * FRAME]u8;
+    var fy:    i64 = 0;
+    for (fy < FRAME) {
+        var fx: i64 = 0;
+        for (fx < FRAME) {
+            frame[(fy * FRAME + fx)::usize] = state_of_value[space.block_cell(b, word.WIDTH, fx - 1, fy - 1)::usize];
+            fx                              = fx + 1;
+        }
+        fy = fy + 1;
     }
     var ly: i64 = 0;
     for (ly < 64) {
         var lx: i64 = 0;
         for (lx < 64) {
-            var p: u32 = tb.root;
+            val at: i64 = (ly + 1) * FRAME + lx + 1;
+            var p:  u32 = tb.root;
             q = 0;
             for (q < tb.inputs::usize) {
-                val c: u32 = space.block_cell(b, lx + dx[q], ly + dy[q]) & word.STATE_MASK;
-                p = tree[(p + c)::usize];
+                p = tree[(p + frame[(at + off[q])::usize]::u32)::usize];
                 q = q + 1;
             }
-            val v: u32 = word.word(p, n);
-            out[(ly * 64 + lx)::usize] = v;
+            val v: u32 = value_of_state[p::usize];
+            plane.store(out, word.WIDTH, (ly * 64 + lx)::usize, v);
             space.note(t, v, lx::u32, ly::u32);
             lx = lx + 1;
         }
         ly = ly + 1;
     }
 }
+
+# side of the frame the CPU step reads a chunk's cells into, the chunk and a
+# cell around it
+val FRAME: i64 = 66;
 
 # pack a rule into the family's window of the meta head, as its stage reads it
 # ---
@@ -260,4 +289,155 @@ pub val SAMPLE_COUNT: usize = 2;
 pub fun sample(i: usize) str {
     if (i == 1) { ret "Langtons-Loops"; }
     ret "WireWorld";
+}
+
+# the family's record (cellar.rule.family)
+pub val FAMILY: family.Family = family.Family{
+    id:          "table",
+    size:        $size_of(Rule),
+    parse:       fam_parse,
+    claims:      claims,
+    format:      fam_format,
+    display:     fam_display,
+    same:        fam_same,
+    states:      fam_states,
+    layers:      fam_layers,
+    word_of:     fam_word_of,
+    rest_of:     fam_rest_of,
+    state_of:    fam_state_of,
+    word_state:  fam_word_state,
+    ink:         fam_ink,
+    slack:       fam_slack,
+    sense:       sense,
+    radius:      fam_radius,
+    caps:        fam_caps,
+    step_chunk:  fam_step_chunk,
+    next_of:     fam_next_of,
+    pack:        fam_pack,
+    table:       TABLE,
+    table_words: fam_table_words,
+    pack_table:  fam_pack_table,
+    colour:      fam_colour,
+    stage:       stage,
+    samples:     SAMPLE_COUNT,
+    sample:      sample,
+};
+
+$if ($size_of(Rule) > family.PAYLOAD_BYTES || $align_of(Rule) > 8) {
+    $error("the family's rule does not fit a rule's payload");
+}
+
+$if (FORMAT_MAX > family.FORMAT_MAX) {
+    $error("the family's rule string is longer than a rule's");
+}
+
+# the family's operations over a payload, for its record
+fun held(p: *family.Payload) *Rule {
+    ret family.view[Rule](p);
+}
+
+fun fam_parse(s: str, p: *family.Payload) err[str] {
+    val r: res[Rule, str] = parse(s);
+    if (sel r.err) { ret err[str].err{r.err}; }
+    val d: *Rule = held(p);
+    @d = r.ok;
+    ret err[str].ok{};
+}
+
+fun fam_format(p: *family.Payload, buf: *u8) str {
+    ret format(held(p), buf);
+}
+
+fun fam_display(p: *family.Payload, buf: *u8) str {
+    ret display(held(p), buf);
+}
+
+fun fam_same(a: *family.Payload, b: *family.Payload) bool {
+    ret same_rule(held(a), held(b));
+}
+
+fun fam_states(p: *family.Payload) u32 {
+    ret states(held(p));
+}
+
+fun fam_layers(p: *family.Payload) plane.Set {
+    ret layers(held(p));
+}
+
+fun fam_word_of(p: *family.Payload, state: u32) u32 {
+    ret word_of(held(p), state);
+}
+
+fun fam_rest_of(p: *family.Payload, state: u32, k: usize) u32 {
+    ret rest_of(held(p), state, k);
+}
+
+fun fam_state_of(p: *family.Payload, c: u32) u32 {
+    ret state_of(held(p), c);
+}
+
+# a cell's state, read from its state layer alone
+fun fam_word_state(p: *family.Payload, w: *u32) u32 {
+    ret state_of(held(p), w[0]);
+}
+
+fun fam_ink(p: *family.Payload) u32 {
+    ret ink(held(p));
+}
+
+fun fam_slack(p: *family.Payload) u32 {
+    ret slack(held(p));
+}
+
+fun fam_radius(p: *family.Payload) usize {
+    ret radius(held(p));
+}
+
+fun fam_caps(p: *family.Payload) family.Caps {
+    ret caps(held(p));
+}
+
+fun fam_step_chunk(p: *family.Payload, b: *space.Block, t: *space.Tally) {
+    step_chunk(held(p), b, t);
+}
+
+fun fam_next_of(p: *family.Payload, nb: *u32) u32 {
+    ret next_of(held(p), nb);
+}
+
+fun fam_pack(p: *family.Payload, w: *u32) {
+    pack(held(p), w);
+}
+
+fun fam_table_words(p: *family.Payload) usize {
+    ret table_words(held(p));
+}
+
+fun fam_pack_table(p: *family.Payload, w: *u32) {
+    pack_table(held(p), w);
+}
+
+fun fam_colour(p: *family.Payload, state: u32) opt[u32] {
+    ret colour(held(p), state);
+}
+
+test word__gives_every_state_its_own_heat {
+    val sn: layout.Sense = word.sense();
+    var n:  u32          = 2;
+    for (n <= word.STATES_MAX) {
+        var st:   u32 = 0;
+        var last: u32 = 0;
+        for (st < n) {
+            val c: u32 = word.word(st, n);
+            if (word.state(c, n) != st || c > word.HEAT_MASK) { ret 1; }
+            val h: u32 = layout.texel_heat(c, sn.heat_shift, sn.heat_mask);
+            if (st != 0 && h <= last)                                                   { ret 2; }
+            if (layout.live(c, sn.live_mask, sn.live_lo, sn.live_hi) != (st != 0)::u32) { ret 3; }
+            last = h;
+            st   = st + 1;
+        }
+        if (last != word.HEAT_MASK) { ret 4; }
+        n = n + 1;
+    }
+    ret 0;
 }
