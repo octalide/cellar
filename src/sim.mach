@@ -262,6 +262,9 @@ pub rec Watch {
 # pending:    generations asked of the GPU and not yet recorded
 # full:       the world outgrew the pool or the tree's table, and stepping
 #             stopped rather than go wrong
+# unsettled:  the CPU's last step reached the pool's ceiling before every
+#             live chunk had its halo, so the next settles the pool first
+# held:       a test's hold on the pool's ceiling in slots, 0 for none
 # withheld:   the GPU keeps a pool the host could not take back, so the run
 #             paused and what needed the host's pool was refused, until a take
 #             next succeeds
@@ -296,6 +299,8 @@ pub rec Sim {
     gpu:        *gpu.Gpu;
     pending:    usize;
     full:       bool;
+    unsettled:  bool;
+    held:       usize;
     withheld:   bool;
     generation: u64;
     running:    u8;
@@ -351,6 +356,8 @@ pub fun init(s: *Sim, a: *allo.Allocator) err[allo.Error] {
     s.gpu        = nil;
     s.pending    = 0;
     s.full       = false;
+    s.unsettled  = false;
+    s.held       = 0;
     s.withheld   = false;
     s.generation = 0;
     s.running    = 0;
@@ -507,6 +514,7 @@ pub fun set_rule(s: *Sim, r: rule.Rule) bool {
         s.space.lit   = rule.lit(?old);
         ret false;
     }
+    refit(s);
     s.rule        = r;
     s.space.reach = rule.radius(?s.rule);
     s.space.rim   = rule.rimmed(?s.rule);
@@ -636,7 +644,7 @@ pub fun attach(s: *Sim, g: *gpu.Gpu) {
     if (!gpu.prepare(g, rule.family_of(?s.rule))) { gpu.forgo_compute(g); }
     s.gpu = g;
     gpu.mirror(g, ?s.space);
-    space.set_mirror(?s.space, space.Mirror{ctx: s::*u8, reserve: reserve_pool, own: own_pool}, g.slots);
+    space.set_mirror(?s.space, space.Mirror{ctx: s::*u8, reserve: reserve_pool, own: own_pool}, s.space.max_slots);
     var t: usize = 0;
     for (t < s.space.hi) {
         s.space.dirty[t] = space.DIRTY_ENTRY | space.DIRTY_CELLS;
@@ -648,8 +656,41 @@ pub fun attach(s: *Sim, g: *gpu.Gpu) {
     if (g.stepping)  { space.set_stepped(?s.space, false); }
     or               { space.set_pyramids(?s.space, true); }
     if (!on_tree(s)) { s.engine = pool_engine(s); }
+    refit(s);
     s.seen.valid = false;
     s.viewed     = false;
+}
+
+# fit the pool's ceiling to its layers and its memory ceiling (cellar.ceiling
+# POOL): while a GPU steps the world, the most slots of those layers the
+# device holds in the memory the ceiling allows, which the host's mirror
+# follows; while the CPU steps it, the host's own, HOST_SLOTS or fewer to the
+# ceiling's limit, and no more than a GPU drawing it holds
+# ---
+# s: simulation
+pub fun refit(s: *Sim) {
+    val set: *plane.Set = space.layers(?s.space);
+    val on:  bool       = s.ceil.on[ceiling.POOL];
+    val lim: u64        = ceiling.raw(?s.ceil, ceiling.POOL);
+    var n:   usize      = space.HOST_SLOTS;
+    if (on && lim != 0) {
+        val fit: u64 = lim / space.slot_bytes(?s.space)::u64;
+        if (fit < n::u64) { n = fit::usize; }
+    }
+    if (s.gpu != nil) {
+        val dev: usize = gpu.fit(s.gpu, set, gpu.memory_limit(s.gpu, on, lim));
+        if (on_gpu(s) || dev < n) { n = dev; }
+    }
+    if (s.held != 0 && s.held < n) { n = s.held; }
+    space.set_ceiling(?s.space, n);
+}
+
+# hold the pool's ceiling to slots, below what refit fits it to, so a test can
+# run a world into it
+#[testing]
+pub fun hold_pool(s: *Sim, slots: usize) {
+    s.held = slots;
+    refit(s);
 }
 
 # make room on the GPU before the pool grows. the render thread holds the world
@@ -763,7 +804,8 @@ pub fun use_hashlife(s: *Sim, on: bool) bool {
             hashlife.clear(t);
             ret false;
         }
-        s.engine  = Engine.hashlife{};
+        s.engine = Engine.hashlife{};
+        refit(s);
         s.pending = 0;
         space.reset(?s.space);
         if (s.gpu != nil) { gpu.note_bulk(s.gpu); }
@@ -787,6 +829,7 @@ pub fun use_hashlife(s: *Sim, on: bool) bool {
     val laid: err[allo.Error] = space.relayer(?s.space, ?held, nil, nil);
     if (sel laid.err) { ret false; }
     s.engine = pool_engine(s);
+    refit(s);
     val ok: bool = tree_to_pool(s);
     hashlife.clear(t);
     if (!ok) { overflow(s); }
@@ -905,6 +948,13 @@ pub fun advance(s: *Sim) bool {
         if (s.pending < MAX_PENDING) { s.pending = s.pending + 1; }
         ret false;
     }
+    if (s.unsettled) {
+        if (!space.settle(?s.space, s.space.census, s.space.hi, false)) {
+            overflow(s);
+            ret false;
+        }
+        s.unsettled = false;
+    }
     s.began = clock(s);
     if (cpu.compute(?s.space, ?s.rule, s.generation, ?s.team, ?s.asked)) { ret true; }
     atomic.store(?s.asked, 0);
@@ -939,8 +989,15 @@ pub fun commit(s: *Sim) {
         ret;
     }
     if (!cpu.commit(?s.space)) {
-        overflow(s);
-        ret;
+        # the step's cells are the world's either way. at the pool's ceiling
+        # they are counted, and the halo the ceiling kept from them is made
+        # before the next step, once it allows (advance)
+        if (!capped(s)) {
+            overflow(s);
+            ret;
+        }
+        s.unsettled = true;
+        trip(s, ceiling.POOL);
     }
     s.generation = s.generation + 1;
     val pop: u64 = population(s)::u64;
@@ -969,13 +1026,9 @@ fun took(t0: opt[time.Instant]) opt[u64] {
 # a ceiling's measure of the world, raw: cells, chunks, bytes or nanoseconds
 fun measure(s: *Sim, k: usize, pop: u64, step_ns: u64) u64 {
     if (k == ceiling.POPULATION) { ret pop; }
-    # the pool only draws the tree, so its chunks are the pool's only off it.
-    # a bounded grid held whole cannot grow past the chunks taken when it was
-    # set, which were the grid's bound, so it has no growth to stop
-    if (k == ceiling.POOL) {
-        if (on_tree(s) || s.space.whole) { ret 0; }
-        ret s.space.live::u64;
-    }
+    # the pool's ceiling bounds its capacity rather than being measured: a
+    # world reaching it pauses there (capped)
+    if (k == ceiling.POOL)   { ret 0; }
     if (k == ceiling.MEMORY) { ret hashlife.memory(?s.tree)::u64; }
     ret step_ns;
 }
@@ -1037,6 +1090,7 @@ pub fun ceilings(s: *Sim) ceiling.Ceilings {
 pub fun set_ceilings(s: *Sim, c: ceiling.Ceilings) {
     s.ceil = c;
     rearm(s);
+    refit(s);
 }
 
 # the ceiling the run is paused at, or ceiling.COUNT for none
@@ -1097,11 +1151,24 @@ pub fun jump(s: *Sim, gen: u64) bool {
 # stop until the world is cleared once a chunk it needs could not be made, or
 # the tree's table filled: a pattern reaching past the pool would be stepped as
 # if it met dead space. the simulation only holds the state, and the game layer
-# reports it.
+# reports it. a pool that reached its ceiling instead pauses there (capped),
+# for a higher limit to carry it on
 fun overflow(s: *Sim) {
+    if (capped(s)) {
+        trip(s, ceiling.POOL);
+        ret;
+    }
     s.full    = true;
     s.running = 0;
     s.pending = 0;
+}
+
+# whether the pool holds as many slots as its ceiling lets it, so
+# a chunk it could not make was refused by the ceiling rather than by the
+# memory under it
+fun capped(s: *Sim) bool {
+    if (on_tree(s) || s.space.whole) { ret false; }
+    ret s.space.hi >= s.space.max_slots;
 }
 
 # what the world being full means, for a message
@@ -1499,6 +1566,7 @@ pub fun clear(s: *Sim) {
     s.generation = 0;
     s.pending    = 0;
     s.full       = false;
+    s.unsettled  = false;
     history.clear(?s.history);
     disarm(s);
     if (!space.keep_rim(?s.space)) { overflow(s); }
@@ -3285,33 +3353,55 @@ test ceiling__hashlife_cancels_a_step_past_its_deadline_or_when_asked {
     ret 0;
 }
 
-test step__past_the_ceiling_stops_the_world_without_counting {
+test step__at_the_pools_ceiling_pauses_and_a_higher_one_carries_it_on_as_if_never_held {
     var a: allo.Allocator;
     page.make(?a);
     var s:    Sim;
     val made: err[allo.Error] = init(?s, ?a);
     if (sel made.err) { ret 1; }
+    var free: Sim;
+    val mf:   err[allo.Error] = init(?free, ?a);
+    if (sel mf.err) { ret 1; }
     # a soup fills 2 x 2 chunks and the ring around them, and a pool held to
     # those has no room for the chunks its edge spreads into
     randomize(?s, 0.5, 128);
-    s.space.max_slots = s.space.hi;
+    var sn: snapshot.Snapshot;
+    snapshot.init(?sn, ?a);
+    if (!take(?s, ?sn) || !restore(?free, ?sn)) { ret 1; }
+    hold_pool(?s, s.space.hi);
     step(?s);
-    if (!s.full || s.generation != 0) { ret 2; }
+    step(?free);
+    # the step is the world's, counted, and the run pauses at the ceiling
+    if (s.full || s.tripped != ceiling.POOL || s.generation != 1 || !same_live(?s, ?free)) { ret 2; }
+    step(?s);
+    if (s.generation != 1) { ret 3; }
+    # a higher ceiling carries it on, the halo the ceiling kept made first
+    hold_pool(?s, space.HOST_SLOTS);
+    pass(?s);
+    var i: usize = 0;
+    for (i < 5) {
+        step(?s);
+        step(?free);
+        i = i + 1;
+    }
+    if (s.full || s.tripped != ceiling.COUNT || s.generation != 6 || !same_live(?s, ?free)) { ret 4; }
+    snapshot.dnit(?sn);
     dnit(?s);
+    dnit(?free);
     ret 0;
 }
 
-test edit__a_cell_the_pool_cannot_hold_marks_the_world_full {
+test edit__a_cell_past_the_pools_ceiling_pauses_the_run_there {
     var a: allo.Allocator;
     page.make(?a);
     var s:    Sim;
     val made: err[allo.Error] = init(?s, ?a);
     if (sel made.err) { ret 1; }
     paint(?s, 0, 0, 1);
-    s.space.max_slots = s.space.hi;
-    if (!edit_begin(?s, 1000, 1000, 1001, 1001)) { ret 2; }
-    if (edit_set(?s, 1000, 1000, 1))             { ret 3; }
-    if (edit_end(?s) || !s.full)                 { ret 4; }
+    hold_pool(?s, s.space.hi);
+    if (!edit_begin(?s, 1000, 1000, 1001, 1001))             { ret 2; }
+    if (edit_set(?s, 1000, 1000, 1))                         { ret 3; }
+    if (edit_end(?s) || s.full || s.tripped != ceiling.POOL) { ret 4; }
     dnit(?s);
     ret 0;
 }
@@ -4230,8 +4320,8 @@ pub fun rig_open_within(t: *Rig, r: rule.Rule, seed: fun(*Sim), slots: usize) i3
     if (sel m1.err) { ret 1; }
     val m2: err[allo.Error] = init(?t.gpu, ?t.a);
     if (sel m2.err) { ret 2; }
-    t.cpu.space.max_slots = slots;
-    t.gpu.space.max_slots = slots;
+    hold_pool(?t.cpu, slots);
+    hold_pool(?t.gpu, slots);
     set_rule(?t.cpu, r);
     set_rule(?t.gpu, r);
     seed(?t.cpu);
@@ -4244,7 +4334,7 @@ pub fun rig_open_within(t: *Rig, r: rule.Rule, seed: fun(*Sim), slots: usize) i3
     }
     t.w    = opened.ok;
     t.made = 1;
-    val up: err[gfx.Error] = gfx.renderer_init(?t.r, ?t.w);
+    val up: err[gfx.Error] = gpu.renderer_init(?t.r, ?t.w);
     if (sel up.err) {
         print.eprintlnf("no renderer: the CPU alone runs: {}", gfx.error_message(up.err));
         ret 0;
@@ -4548,7 +4638,7 @@ test reset__run_reset_run_reproduces_the_generations_on_both_engines {
     }
     var w:  window.Window  = opened.ok;
     var r:  gfx.Renderer;
-    val up: err[gfx.Error] = gfx.renderer_init(?r, ?w);
+    val up: err[gfx.Error] = gpu.renderer_init(?r, ?w);
     if (sel up.err) {
         print.eprintlnf("skipped on the GPU: no renderer: {}", gfx.error_message(up.err));
         ret 0;
@@ -5483,7 +5573,7 @@ test record__the_draw_holds_what_the_cpu_steps_and_is_sent_only_changed_chunks {
     }
     var w:  window.Window  = opened.ok;
     var r:  gfx.Renderer;
-    val up: err[gfx.Error] = gfx.renderer_init(?r, ?w);
+    val up: err[gfx.Error] = gpu.renderer_init(?r, ?w);
     if (sel up.err) {
         print.eprintln("skipped: no renderer");
         window.window_close(?w);
