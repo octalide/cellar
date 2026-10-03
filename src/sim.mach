@@ -101,6 +101,8 @@ use rd_word:   cellar.rules.reaction.word;
 use ruletable: cellar.rules.table;
 use cellar.rules.table.load;
 use cellar.rules.table.store;
+#[testing]
+use cellar.rules.trace;
 use cellar.rules.weighted;
 use cellar.rules.weighted.word;
 use cellar.snapshot;
@@ -511,7 +513,7 @@ rec Recode {
 # first reads in it, a state the other lacks becoming 0 (see cellar.rule)
 fun recode(ctx: *u8, from: *u32, to: *u32) {
     val rc: *Recode = ctx::*Recode;
-    var st: u32     = rule.state(rc.from, from[0]);
+    var st: u32     = rule.word_state(rc.from, from);
     if (st >= rule.states(rc.to)) { st = 0; }
     rule.fresh(rc.to, st, to);
 }
@@ -1513,7 +1515,7 @@ pub fun fill_chunk(s: *Sim, cx: i64, cy: i64, cells: *u32) bool {
         if (p == nil) { ret false; }
         var i: usize = 0;
         for (i < space.CELLS) {
-            p[i] = rule.state(?s.rule, cells[i * m])::u8;
+            p[i] = rule.word_state(?s.rule, ?cells[i * m])::u8;
             i    = i + 1;
         }
         hashlife.wrote(?s.tree, cx, cy);
@@ -1787,7 +1789,7 @@ pub fun place(s: *Sim, g: topology.Grid, dx: i64, dy: i64) Placed {
                 val x: i64 = x0 + (k % 64)::i64;
                 val y: i64 = y0 + (k / 64)::i64;
                 if (!space.holds(sp, x, y)) {
-                    if (space.live(sp, w[0])) { out.dropped = out.dropped + 1; }
+                    if (space.live_word(sp, w)) { out.dropped = out.dropped + 1; }
                 }
                 or {
                     val sl: u32 = space.alloc(sp, space.chunk_of(x), space.chunk_of(y));
@@ -2149,7 +2151,7 @@ pub fun edit_words(s: *Sim, x: i64, y: i64, n: usize, w: *u32) bool {
     for (i < n) {
         var k: usize = i + 1;
         for (k < n && mem.equal[u32](?w[k * m], ?w[i * m], m)) { k = k + 1; }
-        if (!put_run(s, x + i::i64, y, k - i, ?w[i * m], rule.state(?s.rule, w[i * m])::u8)) { ok = false; }
+        if (!put_run(s, x + i::i64, y, k - i, ?w[i * m], rule.word_state(?s.rule, ?w[i * m])::u8)) { ok = false; }
         i = k;
     }
     ret ok;
@@ -2234,7 +2236,7 @@ pub fun edit_chunk(s: *Sim, cx: i64, cy: i64, cells: *u32) bool {
         var i: usize = 0;
         for (i < space.CELLS) {
             p[i] = 0;
-            if (cells != nil) { p[i] = rule.state(?s.rule, cells[i * m])::u8; }
+            if (cells != nil) { p[i] = rule.word_state(?s.rule, ?cells[i * m])::u8; }
             i = i + 1;
         }
         hashlife.wrote(?s.tree, cx, cy);
@@ -2598,7 +2600,9 @@ pub fun word_at(s: *Sim, x: i64, y: i64, out: *u32) {
 # a cell off a bounded grid is dead
 pub fun alive(s: *Sim, x: i64, y: i64) bool {
     if (!topology.holds(?s.rule.grid, x, y)) { ret false; }
-    ret space.live(?s.space, cell(s, x, y)) != flipped(s);
+    var w: [layer.LAYERS_MAX]u32;
+    word_at(s, x, y, ?w[0]);
+    ret space.live_word(?s.space, ?w[0]) != flipped(s);
 }
 
 # whether reads report the true cells of a world the pool holds as the
@@ -3854,8 +3858,9 @@ fun settle_frames(r: *gfx.Renderer, s: *Sim, want: u64) bool {
     ret s.generation == want && sampled(s) == want;
 }
 
-# whether every cell either world holds is the same in the other, or as near
-# as the rule's slack lets two engines' words lie a generation apart
+# whether every cell either world holds is the same in the other, every value
+# of its word, or as near as the rule's slack lets two engines' words lie a
+# generation apart
 #[testing]
 fun same_world(a: *Sim, b: *Sim) bool {
     val slack: u32   = rule.slack(?a.rule);
@@ -3876,13 +3881,21 @@ fun same_world(a: *Sim, b: *Sim) bool {
                 for (i < space.CELLS) {
                     val cx: i64 = ox + (i % 64)::i64;
                     val cy: i64 = oy + (i / 64)::i64;
-                    val p:  u32 = cell(x, cx, cy);
-                    val q:  u32 = cell(y, cx, cy);
-                    var d:  u32 = p - q;
-                    if (q > p) { d = q - p; }
-                    if (d > slack) {
-                        print.eprintlnf("cells differ at ({}, {}): {} and {}", cx, cy, cell(x, cx, cy), cell(y, cx, cy));
-                        ret false;
+                    var wp: [layer.LAYERS_MAX]u32;
+                    var wq: [layer.LAYERS_MAX]u32;
+                    word_at(x, cx, cy, ?wp[0]);
+                    word_at(y, cx, cy, ?wq[0]);
+                    var k: usize = 0;
+                    for (k < word_len(x)) {
+                        val p: u32 = wp[k];
+                        val q: u32 = wq[k];
+                        var d: u32 = p - q;
+                        if (q > p) { d = q - p; }
+                        if (d > slack) {
+                            print.eprintlnf("cells differ at ({}, {}) in layer {}: {} and {}", cx, cy, k, p, q);
+                            ret false;
+                        }
+                        k = k + 1;
                     }
                     i = i + 1;
                 }
@@ -3894,6 +3907,66 @@ fun same_world(a: *Sim, b: *Sim) bool {
     ret true;
 }
 
+# a world of the trace family (cellar.rules.trace): a cell live by its state
+# in the origin's chunk, and two live by their trace alone at the east edge of
+# chunk (3, 0), traces of 6 and 3, so its halo reaches the chunk east of it
+#[testing]
+fun seed_traces(s: *Sim) {
+    paint(s, 5, 5, 1);
+    var w: [4]u32 = [4]u32{0, 6, 0, 3};
+    edit_begin(s, 254, 10, 256, 11);
+    edit_words(s, 254, 10, 2, ?w[0]);
+    edit_end(s);
+}
+
+# the live cells of level 1 of a chunk's pyramid, built on the host
+#[testing]
+fun pyramid_live(sp: *space.Space, s: usize) u32 {
+    var lv:  space.Lives = space.lives_of(sp, s, false);
+    var mip: [layout.MIP]u32;
+    space.pyramid(space.plane_of(sp, 0, s), sp.sense, ?lv, ?mip[0]);
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < layout.mip_side(1) * layout.mip_side(1)) {
+        n = n + (mip[i::usize] & layout.TEXEL_LIVE);
+        i = i + 1;
+    }
+    ret n;
+}
+
+test frame__a_cell_live_by_a_rule_layer_alone_is_counted_and_kept_on_both_engines {
+    trace.register();
+    val r: res[rule.Rule, str] = rule.parse("trace");
+    if (sel r.err) { ret 1; }
+    var t:    Rig;
+    val code: i32 = rig_open(?t, r.ok, seed_traces);
+    if (code != 0) { ret code; }
+    val sp: *space.Space = ?t.cpu.space;
+    # the traces count as live, and the chunk they lie in, held by nothing
+    # else, asks for the one east of it
+    if (population(?t.cpu) != 3 || !alive(?t.cpu, 255, 10) || alive(?t.cpu, 253, 10)) { ret 2; }
+    rig_step(?t, 2);
+    if (!rig_same(?t)) { ret 3; }
+    val s3: u32 = space.find(sp, 3, 0);
+    if (population(?t.cpu) != 3 || s3 == space.NONE || space.find(sp, 4, 0) == space.NONE) { ret 4; }
+    if (pyramid_live(sp, s3::usize) != 2)                                                  { ret 5; }
+    if (t.on) {
+        if (population(?t.gpu) != 3)                { ret 6; }
+        if (!gpu.pyramids_hold(?t.g, ?t.gpu.space)) { ret 7; }
+    }
+    # the shorter trace runs out at generation 3, the longer at 6, and then
+    # its chunk holds nothing and is freed
+    rig_step(?t, 1);
+    if (!rig_same(?t) || population(?t.cpu) != 2) { ret 8; }
+    if (t.on && population(?t.gpu) != 2)          { ret 9; }
+    rig_step(?t, 5);
+    if (!rig_same(?t) || population(?t.cpu) != 1) { ret 10; }
+    if (t.on && population(?t.gpu) != 1)          { ret 11; }
+    if (space.find(sp, 3, 0) != space.NONE)       { ret 12; }
+    rig_close(?t);
+    ret 0;
+}
+
 # the live cells a world's pool holds, counted cell by cell
 #[testing]
 fun live_cells(s: *Sim) usize {
@@ -3903,7 +3976,7 @@ fun live_cells(s: *Sim) usize {
         if (space.used(?s.space, sl)) {
             var i: usize = 0;
             for (i < space.CELLS) {
-                if (space.live(?s.space, space.sensed(?s.space, sl, i))) { n = n + 1; }
+                if (space.live_at(?s.space, sl, i)) { n = n + 1; }
                 i = i + 1;
             }
         }

@@ -10,12 +10,13 @@
 # a workgroup is one slot. a cell is its value in the state layer, at the
 # width the meta head holds (cellar.layer). an invocation reads four words of
 # the slot's span at a time, the workgroup 256 words a step, and a word of
-# zeros holds nothing to count. an invocation counts its live cells, notes
-# whether any cell is still warm, both as the rule family's sense in the meta
-# head reads a cell, and the columns and rows its live cells span and the
-# quadrants they lie in. the
-# workgroup reduces those in shared memory with atomics, which every vulkan
-# device has, so the census needs no device feature. the first invocation
+# zeros holds nothing to count but where a live rule layer may hold more. an
+# invocation counts its live cells, notes whether any cell is still warm,
+# both as the rule family's sense in the meta head reads a cell and as its
+# live rule layers make one live (cellar.layer), and the columns and rows its
+# live cells span and the quadrants they lie in. the workgroup reduces those
+# in shared memory with atomics, which every vulkan device has, so the census
+# needs no device feature. the first invocation
 # then writes the slot's row: the count, the extent and its quadrants, from
 # which the host works out the halo they need (cellar.space.halo), and the
 # slot's incarnation and its chunk's coordinates, so the host can tell a
@@ -62,6 +63,25 @@ rec Tally {
 #[shared]
 var tally: Tally;
 
+# the live rule layers' values of the cell at address a (cellar.layer), or'd,
+# in the variant built for a rule with live rule layers, and none in the other
+$if ($bin.name == "stage-census_live_comp") {
+    use cellar.bin.shaders.lives;
+
+    fun more(a: u32) u32 {
+        ret lives.more(meta.base[layout.LIVE_AT - layout.BASE_AT], a);
+    }
+
+    val LIVE: u32 = 1;
+}
+$or {
+    fun more(a: u32) u32 {
+        ret 0;
+    }
+
+    val LIVE: u32 = 0;
+}
+
 #[builtin("workgroup_id")]
 var wid: u32x3;
 #[builtin("local_invocation_index")]
@@ -107,14 +127,15 @@ fun comp_main() {
             var e: u32 = 0;
             for (e < 4) {
                 val word: u32 = cells.v[base + q + e];
-                if (word != 0) {
+                if (word != 0 || LIVE != 0) {
                     val first: u32 = (q + e) * per;
                     val y:     u32 = first / layout.SIDE;
                     var k:     u32 = 0;
                     for (k < per) {
                         val i: u32 = first + k;
                         val c: u32 = layer.read(word, w, i);
-                        if (alive(c) != 0) {
+                        val m: u32 = more(layer.addr(slot, i));
+                        if (alive(c) != 0 || m != 0) {
                             val x: u32 = i % layout.SIDE;
                             live  = live + 1;
                             quads = quads | layout.quadrant(x, y);
@@ -123,7 +144,7 @@ fun comp_main() {
                             if (y < y0) { y0 = y; }
                             if (y > y1) { y1 = y; }
                         }
-                        if ((c & meta.warm_mask) != 0) { warm = 1; }
+                        if ((c & meta.warm_mask) != 0 || m != 0) { warm = 1; }
                         k = k + 1;
                     }
                 }

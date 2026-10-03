@@ -21,7 +21,8 @@
 # a chunk's cells are stored in layers (cellar.layer), the set the running
 # rule declares and any the view keeps, each holding every slot's span at its
 # width. the pool reads a cell's state through the family's sense
-# (cellar.layout.Sense), and everything outside it reads and writes cells
+# (cellar.layout.Sense) and its live rule layers (cellar.layer), and
+# everything outside it reads and writes cells
 # through the planes and exact values below, never knowing a cell's width.
 # each layer's front cells are the world; its back cells, kept only when the
 # CPU steps, take the next generation. a hash over chunk coordinates finds a
@@ -408,7 +409,8 @@ pub fun tally(sense: layout.Sense) Tally {
     ret Tally{sense: sense, live: 0, warm: 0, x0: 63, y0: 63, x1: 0, y1: 0, quads: 0};
 }
 
-# count the cell written at (x, y) of the chunk
+# count the cell written at (x, y) of the chunk, of a rule with no live rule
+# layer, or one whose live rule layers hold zero there
 #[inline]
 pub fun note(t: *Tally, c: u32, x: u32, y: u32) {
     if (layout.live(c, t.sense.live_mask, t.sense.live_lo, t.sense.live_hi) != 0) {
@@ -420,6 +422,62 @@ pub fun note(t: *Tally, c: u32, x: u32, y: u32) {
         if (y > t.y1) { t.y1 = y; }
     }
     if ((c & t.sense.warm_mask) != 0) { t.warm = 1; }
+}
+
+# count the cell written at (x, y) of the chunk, of a rule with live rule
+# layers (cellar.layer): its state layer's value and its live rule layers'
+# values or'd, as lives_get gives them, live and warm where not zero
+#[inline]
+pub fun note_with(t: *Tally, c: u32, more: u32, x: u32, y: u32) {
+    if (more == 0) {
+        note(t, c, x, y);
+        ret;
+    }
+    t.live  = t.live + 1;
+    t.quads = t.quads | layout.quadrant(x, y);
+    t.warm  = 1;
+    if (x < t.x0) { t.x0 = x; }
+    if (y < t.y0) { t.y0 = y; }
+    if (x > t.x1) { t.x1 = x; }
+    if (y > t.y1) { t.y1 = y; }
+}
+
+# a slot's spans of the rule layers that make a cell live, read beside its
+# state layer (cellar.layer)
+# ---
+# n:  how many
+# at: each one's span
+pub rec Lives {
+    n:  usize;
+    at: [layer.LAYERS_MAX]plane.Plane;
+}
+
+# the spans of a slot's live rule layers, its front cells' or its back cells'
+pub fun lives_of(sp: *Space, s: usize, back: bool) Lives {
+    var l: Lives;
+    l.n = 0;
+    var k: usize = 1;
+    for (k < plane.exact(?sp.set)) {
+        if (sp.set.at[k].live) {
+            if (back) { l.at[l.n] = back_of(sp, k, s); }
+            or        { l.at[l.n] = plane_of(sp, k, s); }
+            l.n = l.n + 1;
+        }
+        k = k + 1;
+    }
+    ret l;
+}
+
+# the live rule layers' values of cell i, or'd: zero where none makes it live
+#[inline]
+pub fun lives_get(l: *Lives, i: usize) u32 {
+    var v: u32   = 0;
+    var k: usize = 0;
+    for (k < l.n) {
+        v = v | plane.get(l.at[k], i);
+        k = k + 1;
+    }
+    ret v;
 }
 
 # count a row of the chunk written at once, as note would each of its cells
@@ -459,9 +517,23 @@ pub fun tally_census(t: *Tally, cn: *u32, inc: u32) {
     }
 }
 
-# whether a state layer's value is live, as the pool's sense reads it
+# whether a state layer's value is live, as the pool's sense reads it, for a
+# rule with no live rule layer
 pub fun live(sp: *Space, c: u32) bool {
     ret layout.live(c, sp.sense.live_mask, sp.sense.live_lo, sp.sense.live_hi) != 0;
+}
+
+# whether a cell's word is live: its state layer's value through the pool's
+# sense, or a value but zero in a live rule layer (cellar.layer)
+pub fun live_word(sp: *Space, w: *u32) bool {
+    ret plane.live_word(?sp.set, sp.sense, w);
+}
+
+# whether cell i of slot s is live, as live_word reads its word
+pub fun live_at(sp: *Space, s: usize, i: usize) bool {
+    var w: [layer.LAYERS_MAX]u32;
+    get_word(sp, s, i, ?w[0]);
+    ret live_word(sp, ?w[0]);
 }
 
 # the layers the pool stores its cells in
@@ -1253,19 +1325,20 @@ pub fun set_pyramids(sp: *Space, on: bool) err[allo.Error] {
 # ---
 # cells: the chunk's span of its state layer
 # sn:    how a cell is read, the rule's sense
+# lv:    the chunk's spans of its live rule layers (lives_of)
 # out:   receives MIP texels
-pub fun pyramid(cells: plane.Plane, sn: layout.Sense, out: *u32) {
+pub fun pyramid(cells: plane.Plane, sn: layout.Sense, lv: *Lives, out: *u32) {
     # a word-wide layer named as such, so its cells are read a word each
     if (cells.width == layer.WIDTH_MAX) {
-        pyramid_at(cells.w, layer.WIDTH_MAX, sn, out);
+        pyramid_at(cells.w, layer.WIDTH_MAX, sn, lv, out);
         ret;
     }
-    pyramid_at(cells.w, cells.width, sn, out);
+    pyramid_at(cells.w, cells.width, sn, lv, out);
 }
 
 # pyramid over a span's words w at a width
 #[inline]
-fun pyramid_at(w: *u32, wd: u32, sn: layout.Sense, out: *u32) {
+fun pyramid_at(w: *u32, wd: u32, sn: layout.Sense, lv: *Lives, out: *u32) {
     var live: [1024]u32;
     var heat: [1024]u32;
     var ages: [1024]u32;
@@ -1281,8 +1354,11 @@ fun pyramid_at(w: *u32, wd: u32, sn: layout.Sense, out: *u32) {
         var g:  u32 = 0;
         var i:  u32 = 0;
         for (i < 4) {
-            val c: u32 = plane.load(w, wd, ((oy + i / 2) * side + ox + i % 2)::usize);
-            if (layout.live(c, sn.live_mask, sn.live_lo, sn.live_hi) != 0) {
+            val at: usize = ((oy + i / 2) * side + ox + i % 2)::usize;
+            val c:  u32   = plane.load(w, wd, at);
+            var on: bool  = layout.live(c, sn.live_mask, sn.live_lo, sn.live_hi) != 0;
+            if (lv.n != 0 && !on) { on = lives_get(lv, at) != 0; }
+            if (on) {
                 l = l + 1;
                 g = g + layout.texel_age(c, sn.age_shift, sn.age_mask);
             }
@@ -2184,13 +2260,27 @@ fun note_span(t: *Tally, w: *u32, width: u32) {
     }
 }
 
+# count every cell of a chunk into a tally: its state layer's span, and its
+# live rule layers' spans (lives_of)
+pub fun count(t: *Tally, cells: plane.Plane, lv: *Lives) {
+    if (lv.n != 0) {
+        var i: usize = 0;
+        for (i < CELLS) {
+            note_with(t, plane.get(cells, i), lives_get(lv, i), (i & 63)::u32, (i >> 6)::u32);
+            i = i + 1;
+        }
+        ret;
+    }
+    # a word-wide layer named as such, so its cells are read a word each
+    if (cells.width == layer.WIDTH_MAX) { note_span(t, cells.w, layer.WIDTH_MAX); }
+    or                                  { note_span(t, cells.w, cells.width); }
+}
+
 # count a slot's live and warm cells into its census from its front cells
 pub fun recount(sp: *Space, s: usize) {
-    var t: Tally       = tally(sp.sense);
-    val c: plane.Plane = plane_of(sp, 0, s);
-    # a word-wide layer named as such, so its cells are read a word each
-    if (c.width == layer.WIDTH_MAX) { note_span(?t, c.w, layer.WIDTH_MAX); }
-    or                              { note_span(?t, c.w, c.width); }
+    var t:  Tally = tally(sp.sense);
+    var lv: Lives = lives_of(sp, s, false);
+    count(?t, plane_of(sp, 0, s), ?lv);
     tally_census(?t, ?sp.census[s * CENSUS], incarnation(sp, s));
     if (t.live != 0) { sp.census[s * CENSUS + 3] = halo(t.quads, span(sp)); }
     wake(sp, s);
