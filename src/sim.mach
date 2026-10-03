@@ -444,20 +444,39 @@ fun laid_for(s: *Sim, r: *rule.Rule) plane.Set {
 # cells as they stand and stepped with them, and while off it holds the
 # rule's own layers alone, so a run pays nothing for heat or age it does not
 # show. the tree keeps none, and the pool takes the view's choice up when the
-# world leaves it. call outside a frame, or in one before gpu frame has
-# recorded anything
+# world leaves it.
+#
+# where the GPU steps the world in a pool it made, its cells stay where they
+# are: the GPU makes the layer's shards and starts them from the state layer,
+# or drops them, in the next frame (gpu.in_place), and the host's staging
+# copy takes the layers up without a cell moving (space.restage). elsewhere
+# the host's cells are the world's, and move into the layers there. call outside a frame, or in one
+# before gpu frame has recorded anything
 # ---
 # s:   simulation, with no read or edit open
 # on:  the colour mode reads heat or age
-# ret: false when the GPU's cells could not be read or the allocator refused
-#      the layers, leaving the pool's layers as they were and the view's
-#      choice unmade
+# ret: false when the GPU's pool cannot take the layer within its memory,
+#      the GPU's cells could not be read or the allocator refused the layers,
+#      leaving the pool's layers as they were and the view's choice unmade
 pub fun set_views(s: *Sim, on: bool) bool {
     if (on == s.views) { ret true; }
     s.views = on;
     if (on_tree(s)) { ret true; }
     var lay: plane.Set = laid_for(s, ?s.rule);
     if (plane.same(space.layers(?s.space), ?lay)) { ret true; }
+    if (on_gpu(s) && gpu.in_place(s.gpu, ?lay)) {
+        if (!gpu.holds_layers(s.gpu, ?lay)) {
+            s.views = !on;
+            ret false;
+        }
+        val staged: err[allo.Error] = space.restage(?s.space, ?lay);
+        if (sel staged.err) {
+            s.views = !on;
+            ret false;
+        }
+        refit(s);
+        ret true;
+    }
     val synced: err[gfx.Error] = sync(s);
     if (sel synced.err) {
         s.views = !on;
@@ -5238,10 +5257,20 @@ test frame__a_host_refused_the_memory_leaves_the_pool_to_the_gpu_and_pauses {
     if (!t.gpu.withheld)                  { ret 8; }
     clear(?t.gpu);
     if (t.gpu.generation != gen || t.gpu.full) { ret 9; }
-    # with the memory back, the host takes the pool as the GPU kept it
+    # a colour mode's view layer comes and goes on the GPU's pool all the
+    # same, its cells staying there and the host taking the layers up without one
+    if (!set_views(?t.gpu, true) || space.layers(?t.gpu.space).n != 2)  { ret 12; }
+    if (!rig_frame(?t) || t.g.p.set.n != 2 || t.g.restart)              { ret 13; }
+    if (!set_views(?t.gpu, false) || space.layers(?t.gpu.space).n != 1) { ret 14; }
+    if (!rig_frame(?t) || t.g.p.set.n != 1)                             { ret 15; }
+    if (!set_views(?t.gpu, true) || !rig_frame(?t))                     { ret 16; }
+    # with the memory back, the host takes the pool as the GPU kept it, its
+    # view layer started from the cells as the CPU's starts at that generation
     t.gpu.space.max_slots = space.HOST_SLOTS;
-    if (!caught_up(?t)) { ret 10; }
-    if (t.gpu.withheld) { ret 11; }
+    for (t.cpu.generation < t.gpu.generation) { step(?t.cpu); }
+    if (!set_views(?t.cpu, true)) { ret 17; }
+    if (!caught_up(?t))           { ret 10; }
+    if (t.gpu.withheld)           { ret 11; }
     rig_close(?t);
     ret 0;
 }
