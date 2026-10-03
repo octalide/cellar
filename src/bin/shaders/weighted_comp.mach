@@ -108,8 +108,7 @@ var full: u32;
 val SHOWN_LAYER: u32 = 1;
 
 # the cell at (x, y) of a slot's frame, taken through the links where it lies
-# outside the window (cellar.layout), its slot NONE where no chunk holds it,
-# or PAST past a plane's dead edge
+# outside the window (cellar.layout), its slot NONE where no chunk holds it
 fun reach(slot: u32, x: i32, y: i32) pool.Spot {
     var sl: u32       = slot;
     var px: i32       = x;
@@ -125,10 +124,7 @@ fun reach(slot: u32, x: i32, y: i32) pool.Spot {
             at = pool.Spot{slot: sl, i: (py * layout.SIDE::i32 + px)::u32};
             h  = layout.HOPS;
         }
-        or (n == layout.NONE) {
-            if ((t & layout.LINK_EDGE) != 0) { at = pool.Spot{slot: layout.PAST, i: 0}; }
-            h = layout.HOPS;
-        }
+        or (n == layout.NONE) { h = layout.HOPS; }
         or {
             val nx: i32 = layout.hop_x(t, px, py);
             py = layout.hop_y(t, px, py);
@@ -226,6 +222,11 @@ fun comp_main() {
     # off the grid at zero
     val edge:   u32 = meta.table[base + layout.EDGE_AT];
     val seamed: u32 = layout.seamed(edge);
+    # a chunk whose block reaches the world's boundary reads a cell outside it
+    # as the form holds the edge, and holds its own cells outside it at zero
+    val dom_on: u32            = meta.base[layout.DOMAIN_ON_AT - layout.BASE_AT];
+    val dom:    *layout.Domain = meta.domain;
+    val dm:     pool.Dom       = pool.dom_of(dom, dom_on, slot);
 
     # the serial that produced the source. a stamp this step already wrote
     # may have replaced it, so a stamp of either serial counts as set then; a
@@ -256,7 +257,8 @@ fun comp_main() {
             }
             k = k + 1;
         }
-        if (seamed != 0) { busy = 1; }
+        if (seamed != 0)                       { busy = 1; }
+        if (dm.block != 0 && meta.strobe != 0) { busy = 1; }
         full = busy;
     }
     sy.workgroup_barrier();
@@ -322,8 +324,7 @@ fun comp_main() {
             for (c < hi) {
                 val a:  pool.Spot = reach(slot, c, y);
                 var on: u32       = 0;
-                if (a.slot == layout.PAST) { on = past; }
-                or (a.slot != layout.NONE) { on = pool.cell(sh, m, 0, src, a.slot, word.WIDTH, a.i); }
+                if (a.slot != layout.NONE) { on = pool.cell(sh, m, 0, src, a.slot, word.WIDTH, a.i); }
                 bits = bits | (on << (c - c0)::u32);
                 c    = c + 1;
             }
@@ -343,11 +344,16 @@ fun comp_main() {
             # the chunk, and each is one word of that chunk's row
             val cx: u32 = (k + 1) / 2;
             val n:  u32 = meta.table[base + cy * 3 + cx];
+            var w:  u32 = 0;
             if (n != layout.NONE) {
                 val ns: layout.Span = layer.span(sh, 0, src, layout.where(n, m), word.WIDTH);
-                val w:  u32         = ns.p.v[ns.at + yy::u32 * 2 + (k + 1) % 2];
-                bits = w & span((lo - c0)::u32, (hi - c0)::u32);
+                w = ns.p.v[ns.at + yy::u32 * 2 + (k + 1) % 2];
             }
+            if (past != 0 && dm.block != 0) {
+                val inside: u32 = pool.dom_bits(dom, dom_on, dm.block, cy * 3 + cx, n, yy::u32 * 2 + (k + 1) % 2);
+                w = (w & inside) | ~inside;
+            }
+            bits = w & span((lo - c0)::u32, (hi - c0)::u32);
         }
         tile.v[i] = bits;
         i         = i + 64;
@@ -460,7 +466,8 @@ fun comp_main() {
             c    = c + 1;
         }
     }
-    # cells off the grid are held at zero
+    # cells off the grid are held at zero, and outside the boundary, a word
+    # operation a run
     if (seamed != 0) {
         var c: u32 = 0;
         for (c < 8) {
@@ -468,6 +475,7 @@ fun comp_main() {
             c = c + 1;
         }
     }
+    if (dm.mask != 0) { next = next & ((pool.dom_word(dom, dm.mask, ly::u32 * 2 + x0 / 32) >> (x0 % 32)) & 0xff); }
 
     # the run's display channels follow its cells, and where the pool holds
     # none a live cell alone is warm

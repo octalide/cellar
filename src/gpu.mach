@@ -89,10 +89,14 @@
 # that stops every pass and step after it (mark_comp, gate_comp), and the host,
 # seeing it in a census, takes the pool, rewinds its count of the generations
 # to where the gate closed, makes room and reopens it. a bounded grid's seams
-# are the host's to link, so there the host allocates, as below, unless the
-# grid fits the pool whole: then every chunk of it was allocated when it was
-# set (cellar.space.cover), nothing is allocated or freed as it steps, and no
-# budget bounds the generations a frame records.
+# are the host's to link, and a boundary's chunks the host's to judge, so
+# there the host allocates, as below, unless the world fits the pool whole:
+# then every chunk of it was allocated when it was set (cellar.space.cover),
+# nothing is allocated or freed as it steps, and no budget bounds the
+# generations a frame records. a world with a boundary keeps its domain in a
+# buffer of its own, which the stages reach by the address the head holds
+# (layout.Domain) and the host keeps level with its own (sync_domain); a
+# world without one makes no such buffer, and its head says so.
 #
 # a chunk allocated empty is cleared on the GPU by a stage of its own rather
 # than uploaded, and each step stamps which chunks it left alive or warm, so the
@@ -959,6 +963,14 @@ fun pool_bytes(cap: usize) usize {
 # nops:     how many
 # ctl:      the status head's first words, as take read them
 # untaken:  why the last take that failed left the pool the GPU's
+# dom:      the world's boundary as the stages read it (layout.Domain), once
+#           a world had one
+# dom_room: words dom holds, 0 before it is made
+# dom_at:   its address
+# dom_on:   dom holds the boundary of the world the frame steps
+# dom_cap:  the slots dom's words a slot were laid out for
+# dom_most: the masks dom has room for
+# dom_set:  the host's count of boundaries set (space bound_at) dom holds
 pub rec Gpu {
     a:        *allo.Allocator;
     r:        *gfx.Renderer;
@@ -1103,6 +1115,13 @@ pub rec Gpu {
     nops:     usize;
     ctl:      [16]u32;
     untaken:  str;
+    dom:      gfx.StorageBuffer;
+    dom_room: usize;
+    dom_at:   u64;
+    dom_on:   bool;
+    dom_cap:  usize;
+    dom_most: usize;
+    dom_set:  u32;
 }
 
 # how long frames may take against the display's refresh interval
@@ -1374,6 +1393,12 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     g.pyrs     = vector.init[u32](a);
     g.edit_at  = vector.init[u32](a);
     g.room     = 0;
+    g.dom_room = 0;
+    g.dom_at   = 0;
+    g.dom_on   = false;
+    g.dom_cap  = 0;
+    g.dom_most = 0;
+    g.dom_set  = 0;
     g.cut      = false;
     g.span     = FIRST_SPAN;
     g.fixed    = false;
@@ -2158,7 +2183,8 @@ pub fun dnit(g: *Gpu) {
     vector.dnit[u32](?g.pyrs);
     vector.dnit[u32](?g.edit_at);
     vector.dnit[u32](?g.shifts);
-    if (g.room != 0) { gfx.storage_buffer_delete(g.d, ?g.edited); }
+    if (g.room != 0)     { gfx.storage_buffer_delete(g.d, ?g.edited); }
+    if (g.dom_room != 0) { gfx.storage_buffer_delete(g.d, ?g.dom); }
 }
 
 # note an edit, which a census recorded before it cannot free chunks around
@@ -3141,6 +3167,8 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
     }
     val e11: err[gfx.Error] = send(g, ?g.p.meta);
     if (sel e11.err) { ret e11; }
+    val ed: err[gfx.Error] = sync_domain(g, sp);
+    if (sel ed.err) { ret ed; }
 
     if (g.stepping) {
         # chunks allocated empty are cleared on the GPU, in both pools, the
@@ -3235,6 +3263,66 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
         }
     }
     ret err[gfx.Error].ok{};
+}
+
+# bring the stages' copy of the world's boundary level with the host's
+# (layout.Domain), where the GPU steps a world with one: whole when the host
+# set another boundary, its capacity changed or it made more masks than the
+# copy has room for, else the words and the mask of every slot whose entry
+# changed, which the host marks whenever it binds a slot. the copy is made
+# larger inside the frame, the old one freed once the frames reading it ran
+fun sync_domain(g: *Gpu, sp: *space.Space) err[gfx.Error] {
+    if (sp.bound == nil || !g.stepping) {
+        g.dom_on = false;
+        ret err[gfx.Error].ok{};
+    }
+    val masks: usize = sp.masks.len / space.MASK;
+    val slots: usize = sp.cap * space.DOM_WORDS;
+    val head:  usize = layout.DOM_HEAD::usize;
+    if (g.dom_on && g.dom_set == sp.bound_at && g.dom_cap == sp.cap && masks <= g.dom_most) {
+        var s: usize = 0;
+        for (s < sp.hi) {
+            if ((sp.dirty[s] & space.DIRTY_ENTRY) != 0) {
+                val d: *u32           = ?sp.dom[s * space.DOM_WORDS];
+                val e: err[gfx.Error] = queue(g, (head + s * space.DOM_WORDS) * 4, d::*u8, space.DOM_WORDS * 4);
+                if (sel e.err) { ret e; }
+                if (d[1] != 0) {
+                    val at: usize          = layout.mask_at((head + slots)::u32, d[1])::usize;
+                    val em: err[gfx.Error] = queue(g, at * 4, (?sp.masks.data[(d[1]::usize - 1) * space.MASK])::*u8, space.MASK * 4);
+                    if (sel em.err) { ret em; }
+                }
+            }
+            s = s + 1;
+        }
+        ret send(g, ?g.dom);
+    }
+    var most: usize = masks * 2;
+    if (most < 16) { most = 16; }
+    val words: usize = head + slots + most * space.MASK;
+    if (words > g.dom_room) {
+        if (g.dom_room != 0) { gfx.storage_buffer_delete(g.d, ?g.dom); }
+        g.dom_room = 0;
+        g.dom_on   = false;
+        val made: err[gfx.Error] = make_framed(g, true, words * 4, ?g.dom);
+        if (sel made.err) { ret made; }
+        val at: res[u64, gfx.Error] = gfx.storage_buffer_address(g.d, ?g.dom);
+        if (sel at.err) {
+            gfx.storage_buffer_delete(g.d, ?g.dom);
+            ret err[gfx.Error].err{at.err};
+        }
+        g.dom_room = words;
+        g.dom_at   = at.ok;
+    }
+    g.dom_cap  = sp.cap;
+    g.dom_most = (g.dom_room - head - slots) / space.MASK;
+    g.dom_set  = sp.bound_at;
+    var first: u32            = (head + slots)::u32;
+    var e:     err[gfx.Error] = queue(g, 0, (?first)::*u8, 4);
+    if (sel e.ok && sp.hi != 0)        { e = queue(g, head * 4, sp.dom::*u8, sp.hi * space.DOM_WORDS * 4); }
+    if (sel e.ok && sp.masks.len != 0) { e = queue(g, (head + slots) * 4, sp.masks.data::*u8, sp.masks.len * 4); }
+    if (sel e.err)                     { ret e; }
+    g.dom_on = true;
+    ret send(g, ?g.dom);
 }
 
 # fit the pool to the host's capacity, which shrank to the world it holds
@@ -3845,6 +3933,10 @@ fun fill_pool_words(g: *Gpu) {
     g.head[layout.SHARD_AT::usize]      = st.m;
     g.head[layout.LIT_AT::usize]        = g.lit;
     g.head[layout.FOLD_AT::usize]       = g.fold;
+    g.head[layout.DOMAIN_ON_AT::usize]  = 0;
+    g.head[layout.DOMAIN_AT::usize]     = (g.dom_at & 0xffffffff)::u32;
+    g.head[layout.DOMAIN_AT::usize + 1] = (g.dom_at >> 32)::u32;
+    if (g.dom_on) { g.head[layout.DOMAIN_ON_AT::usize] = 1; }
     g.head[layout.SHARDS_AT::usize]     = (st.at & 0xffffffff)::u32;
     g.head[layout.SHARDS_AT::usize + 1] = (st.at >> 32)::u32;
 }
@@ -3888,15 +3980,16 @@ fun plan_pass(g: *Gpu, free: bool, span: u32) {
     g.moved   = true;
 }
 
-# plan a gather of the active list ahead of the next generation, under rule r
-fun plan_gather(g: *Gpu, r: *rule.Rule) {
+# plan a gather of the active list ahead of the next generation, every chunk
+# along the boundary's edge listed where rim says the rule reads it live
+fun plan_gather(g: *Gpu, rim: bool) {
     val op: *Op = ?g.ops[g.nops];
     op.pass   = false;
     op.gather = true;
     op.now    = g.serial + 1;
     op.bits   = 0;
-    if (g.owns)         { op.bits = op.bits | layout.GATHER_GATED; }
-    if (rule.rimmed(r)) { op.bits = op.bits | layout.GATHER_RIM; }
+    if (g.owns) { op.bits = op.bits | layout.GATHER_GATED; }
+    if (rim)    { op.bits = op.bits | layout.GATHER_RIM; }
     g.nops = g.nops + 1;
 }
 
@@ -4091,7 +4184,7 @@ fun timed_ops(g: *Gpu, step: *gfx.Compute, bound: usize, tab: u32) err[gfx.Error
 # look:  the camera and colours for the draw
 # ret:   the generations completed, or why recording failed
 pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, look: *Look) res[usize, gfx.Error] {
-    val e14: err[gfx.Error] = flush(g, sp, false, g.stepping && !topology.bounded(?sp.grid));
+    val e14: err[gfx.Error] = flush(g, sp, false, g.stepping && !space.bounded(sp));
     if (sel e14.err) { ret res[usize, gfx.Error].err{e14.err}; }
     val ei: err[gfx.Error] = sync_ink(g, r, look);
     if (sel ei.err) { ret res[usize, gfx.Error].err{ei.err}; }
@@ -4176,7 +4269,7 @@ pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, 
                 g.passed  = space.ring(radius)::usize;
             }
             if (gather) {
-                plan_gather(g, r);
+                plan_gather(g, sp.rim);
                 g.listed   = true;
                 g.gathered = 0;
             }

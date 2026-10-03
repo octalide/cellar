@@ -113,6 +113,33 @@ fun word_at(sh: *layout.Shards, m: u32, c: u32, slot: u32, seamed: u32, x: i32, 
     ret v;
 }
 
+# 1 when the cell at (x, y) of a slot's frame, a cell or less outside it, lies
+# inside the world's boundary, whose block word for the slot is block
+fun inside(d: *layout.Domain, on: u32, block: u32, slot: u32, x: i32, y: i32) u32 {
+    var xx: i32 = x;
+    var yy: i32 = y;
+    var cx: u32 = 1;
+    var cy: u32 = 1;
+    if (xx < 0) {
+        xx = xx + layout.SIDE::i32;
+        cx = 0;
+    }
+    or (xx >= layout.SIDE::i32) {
+        xx = xx - layout.SIDE::i32;
+        cx = 2;
+    }
+    if (yy < 0) {
+        yy = yy + layout.SIDE::i32;
+        cy = 0;
+    }
+    or (yy >= layout.SIDE::i32) {
+        yy = yy - layout.SIDE::i32;
+        cy = 2;
+    }
+    val q: u32 = cy * 3 + cx;
+    ret pool.dom_in(d, on, block, q, meta.table[slot * layout.ENTRY + q], (yy * layout.SIDE::i32 + xx)::u32);
+}
+
 #[stage("compute")]
 #[workgroup(64, 1, 1)]
 fun comp_main() {
@@ -130,6 +157,12 @@ fun comp_main() {
     if (meta.table[base + layout.INCARNATION_AT] == 0) { ret; }
     val edge:   u32 = meta.table[base + layout.EDGE_AT];
     val seamed: u32 = layout.seamed(edge);
+    # a block reaching the world's boundary lets nothing through its edge: a
+    # neighbour outside it reads as the cell itself. a chunk across it holds
+    # its cells outside at zero
+    val dom_on: u32            = meta.base[layout.DOMAIN_ON_AT - layout.BASE_AT];
+    val dom:    *layout.Domain = meta.domain;
+    val dm:     pool.Dom       = pool.dom_of(dom, dom_on, slot);
 
     # the serial that produced the source, or this step's where a stamp this
     # step already wrote replaced it
@@ -235,11 +268,20 @@ fun comp_main() {
             e = word_at(sh, m, src, slot, seamed, x + 1, ly);
             s = word_at(sh, m, src, slot, seamed, x, ly + 1);
         }
+        if (dm.block != 0) {
+            if (inside(dom, dom_on, dm.block, slot, x, ly - 1) == 0) { n = c; }
+            if (inside(dom, dom_on, dm.block, slot, x - 1, ly) == 0) { w = c; }
+            if (inside(dom, dom_on, dm.block, slot, x + 1, ly) == 0) { e = c; }
+            if (inside(dom, dom_on, dm.block, slot, x, ly + 1) == 0) { s = c; }
+        }
         val sa:   u32 = word.a_of(n) + word.a_of(w) + word.a_of(e) + word.a_of(s);
         val sb:   u32 = word.b_of(n) + word.b_of(w) + word.b_of(e) + word.b_of(s);
         var next: u32 = word.next(c, sa, sb, du, dv, f, kill);
         if (seamed != 0 && layout.edge_side(edge, x, ly) != 4) { next = 0; }
-        if (next != 0)                                         { live = 1; }
+        if (dm.mask != 0) {
+            if (pool.dom_cell(dom, dm.mask, row + x::u32) == 0) { next = 0; }
+        }
+        if (next != 0) { live = 1; }
         acc  = acc | layer.place(word.WIDTH, row + x::u32, word.b_of(next));
         accu = accu | layer.place(word.WIDTH, row + x::u32, word.a_of(next));
         if (layer.ends(word.WIDTH, row + x::u32) != 0) {
