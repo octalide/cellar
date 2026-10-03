@@ -528,7 +528,7 @@ pub fun set_rule(s: *Sim, r: rule.Rule) bool {
     if (refusal(s, ?new) != nil) { ret false; }
     val same:   bool = rule.alike(?old, ?new);
     val regrid: bool = !topology.same(?old.grid, ?new.grid);
-    if (on_tree(s) && rule.caps(?new).no_tree != nil && !use_hashlife(s, false)) { ret false; }
+    if (on_tree(s) && rule.caps(?new).no_tree != nil && !move_hashlife(s, false)) { ret false; }
     if (on_tree(s)) {
         # the tree holds states, and only a state the new rule lacks changes
         val fewer: bool = rule.states(?new) < rule.states(?old);
@@ -665,10 +665,23 @@ fun fresh_words(s: *Sim, st: *u8, n: usize, out: *u32) {
 # r:   the rule
 # ret: the reason, for the person who asked for the rule
 pub fun refusal(s: *Sim, r: *rule.Rule) str {
-    if (s.gpu == nil || !s.gpu.stepping) { ret nil; }
     # a rule the tree runs stays off the GPU, where any other goes
     if (on_tree(s) && rule.caps(r).no_tree == nil) { ret nil; }
+    ret gpu_refusal(s, r);
+}
+
+# why the GPU stepping the pool cannot step a rule, or nil (the same render
+# thread rule as refusal)
+fun gpu_refusal(s: *Sim, r: *rule.Rule) str {
+    if (s.gpu == nil || !s.gpu.stepping) { ret nil; }
     ret gpu.refusal(s.gpu, r);
+}
+
+# why the world cannot leave the tree, or nil: the GPU that would step the pool
+# refuses the rule the world runs (the same render thread rule as refusal)
+pub fun leave_refusal(s: *Sim) str {
+    if (!on_tree(s)) { ret nil; }
+    ret gpu_refusal(s, ?s.rule);
 }
 
 # stop the team and release the pool and the tree
@@ -870,9 +883,15 @@ fun tree_to_pool(s: *Sim) bool {
 # s:   simulation, with no read or edit open
 # on:  hold the world in the tree
 # ret: false when the rule is one the tree cannot run, the table could not be
-#      made or filled, or the pool cannot hold the tree's world, leaving the
-#      world where it was
+#      made or filled, the GPU refuses the rule on leaving (leave_refusal), or
+#      the pool cannot hold the tree's world, leaving the world where it was
 pub fun use_hashlife(s: *Sim, on: bool) bool {
+    if (!on && leave_refusal(s) != nil) { ret false; }
+    ret move_hashlife(s, on);
+}
+
+# use_hashlife for a caller that has asked the GPU about the rule it leaves for
+fun move_hashlife(s: *Sim, on: bool) bool {
     if (on == on_tree(s)) { ret true; }
     val t: *hashlife.Tree = ?s.tree;
     if (on) {
@@ -1950,8 +1969,10 @@ pub fun place(s: *Sim, g: topology.Grid, dx: i64, dy: i64) Placed {
     val why: opt[str] = rule.refusal(?r);
     if (sel why.some)          { ret out; }
     if (refusal(s, ?r) != nil) { ret out; }
-    val moves: bool = dx != 0 || dy != 0;
-    if (on_tree(s) && (moves || rule.caps(?r).no_tree != nil) && !use_hashlife(s, false)) { ret out; }
+    val moves:  bool = dx != 0 || dy != 0;
+    val leaves: bool = on_tree(s) && (moves || rule.caps(?r).no_tree != nil);
+    if (leaves && gpu_refusal(s, ?r) != nil) { ret out; }
+    if (leaves && !move_hashlife(s, false))  { ret out; }
     if (on_tree(s)) {
         out.ok = set_rule(s, r);
         ret out;
@@ -6321,8 +6342,7 @@ test frame__a_bounded_grid_past_the_pools_ceiling_allocates_around_its_cells_on_
 }
 
 # seed a 10 by 10 square of the rule's ink at the origin
-#[testing]
-fun seed_ink_square(s: *Sim) {
+pub fun seed_ink_square(s: *Sim) {
     val ink: u32 = rule.ink(?s.rule);
     fill_begin(s);
     var y: i64 = 0;
@@ -6490,6 +6510,32 @@ test set_rule__refuses_a_family_the_stepping_gpu_cannot_bind {
     if (!rule.same(?s.rule, ?brain) || refusal(?s, ?brain) != nil) { ret 4; }
     s.gpu = nil;
     if (refusal(?s, ?life) != nil) { ret 5; }
+    dnit(?s);
+    ret 0;
+}
+
+test use_hashlife__refuses_leaving_the_tree_for_a_rule_the_gpu_cannot_step {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    Sim;
+    val made: err[allo.Error] = init(?s, ?a);
+    if (sel made.err)                                                  { ret 1; }
+    if (!set_rule(?s, rule.preset_rule(0)) || !use_hashlife(?s, true)) { ret 2; }
+    var g: gpu.Gpu;
+    g.stepping = true;
+    g.ready[0] = false;
+    g.ready[1] = true;
+    g.tried[0] = true;
+    g.tried[1] = true;
+    g.most     = 0;
+    s.gpu      = ?g;
+    if (leave_refusal(?s) == nil) { ret 3; }
+    if (use_hashlife(?s, false))  { ret 4; }
+    if (!on_tree(?s))             { ret 5; }
+    s.gpu = nil;
+    if (leave_refusal(?s) != nil) { ret 6; }
+    if (!use_hashlife(?s, false)) { ret 7; }
+    if (on_tree(?s))              { ret 8; }
     dnit(?s);
     ret 0;
 }

@@ -51,6 +51,7 @@ use cellar.desk;
 use cellar.device;
 use cellar.exec;
 use cellar.format;
+use cellar.formats;
 use cellar.gpu;
 use cellar.gui;
 use cellar.hud;
@@ -128,6 +129,7 @@ val ZOOM_STEP: f32 = 0.1;
 # bench_r:     the radius the measured rule reads, Life's weights widened to it, or
 #              the radius of the footprint world's kernel
 # bench_gps:   generations a second the measurement is capped at, 0 uncapped
+# bench_rule:  the rule every world of the measurement runs under, or nil for Life
 # engine:      the args.ENGINE_* the command line named
 # saved_tree:  HashLife was wanted by the settings, not the command line, so a
 #              world it cannot take stays on the pool
@@ -169,6 +171,7 @@ pub rec Game {
     bench_secs:  f64;
     bench_r:     usize;
     bench_gps:   usize;
+    bench_rule:  str;
     engine:      u8;
     saved_tree:  bool;
     want_tree:   bool;
@@ -301,8 +304,16 @@ pub fun on_init(ctx: *Context) {
 
     # the world is seeded once the GPU has set how far the pool may grow
     g.want_tree = false;
-    if (g.bench != args.BENCH_NONE) { bench_world(g); }
-    or                              { g.want_tree = start_world(?g.app, ?g.sim, g.open, g.capture != nil, engine); }
+    if (g.bench != args.BENCH_NONE) {
+        val why: str = bench_choose(g);
+        if (why != nil) {
+            print.eprintlnf("cellar: --rule {}: {}", g.bench_rule, why);
+            context_fail(ctx, 1);
+            ret;
+        }
+        bench_world(g);
+    }
+    or { g.want_tree = start_world(?g.app, ?g.sim, g.open, g.capture != nil, engine); }
 
     world.observe(?g.sim, ?g.shown);
     val spawned: err[thread.ThreadError] = runner.start(?g.runner, ?g.sim);
@@ -962,11 +973,36 @@ pub fun on_dnit(ctx: *Context) {
     app.dnit(?g.app);
 }
 
+# the grid the measured world runs on, as the suffix that names it, or nil
+fun bench_suffix(bench: u8) str {
+    if (bench == args.BENCH_TORUS) { ret "T512,512"; }
+    if (bench == args.BENCH_PLANE) { ret "P1024,512"; }
+    if (bench == args.BENCH_BOX)   { ret "T8192,8192"; }
+    ret nil;
+}
+
+# put the rule the command line chose on the world, or say why the measurement
+# cannot run under it
+# ---
+# ret: why not, or nil
+fun bench_choose(g: *Game) str {
+    if (g.bench_rule == nil)             { ret nil; }
+    if (g.bench == args.BENCH_FOOTPRINT) { ret "the footprint world runs the vote it measures"; }
+    val parsed: res[rule.Rule, str] = rule.parse(g.bench_rule);
+    if (sel parsed.err)                                                 { ret parsed.err; }
+    if (bench_suffix(g.bench) != nil && !rule.caps(?parsed.ok).bounded) { ret "the rule cannot run on a bounded grid"; }
+    if (!sim.set_rule(?g.sim, parsed.ok))                               { ret "the world could not take the rule"; }
+    ret nil;
+}
+
 # seed the measured world and frame it, running uncapped or at the speed asked
 #
 # a wider radius keeps Life's weights, so the world evolves as Life does while
 # each generation spreads by the wider radius, except in the footprint world,
-# whose kernel weighs its whole square so the step stage reads all of it
+# whose kernel weighs its whole square so the step stage reads all of it. a
+# continuous rule has no soup of live cells to run, so each world seeds what
+# the rule needs in its place: Orbium for Lenia, a square of ink for
+# reaction-diffusion
 fun bench_world(g: *Game) {
     val s: *sim.Sim = ?g.sim;
     if (g.bench == args.BENCH_FOOTPRINT) {
@@ -977,9 +1013,22 @@ fun bench_world(g: *Game) {
         weighted.set_radius(?k, g.bench_r);
         sim.set_rule(s, rule.make[weighted.Kernel](?weighted.FAMILY, k));
     }
-    if (g.bench == args.BENCH_PAUSE) {
+    if (g.bench == args.BENCH_PAUSE && g.bench_rule == nil) {
         val seeds: res[rule.Rule, str] = rule.parse("B2/S");
         if (sel seeds.ok) { sim.set_rule(s, seeds.ok); }
+    }
+    val suffix: str = bench_suffix(g.bench);
+    if (suffix != nil) { bench_grid(s, suffix); }
+    val family: str = rule.family_id(rule.family_of(?s.rule));
+    if (string.str_equals(family, "lenia")) {
+        formats.seed_orbium(s);
+        g.app.zoom = 900.0 / 64.0 / render.BASE_PPC;
+    }
+    or (string.str_equals(family, "reaction")) {
+        sim.seed_ink_square(s);
+        g.app.zoom = 900.0 / 512.0 / render.BASE_PPC;
+    }
+    or (g.bench == args.BENCH_PAUSE) {
         sim.randomize(s, sim.DEFAULT_DENSITY, 512);
         if (g.engine == args.ENGINE_HASHLIFE) { sim.use_hashlife(s, true); }
         g.app.zoom = 900.0 / 512.0 / render.BASE_PPC;
@@ -988,7 +1037,7 @@ fun bench_world(g: *Game) {
         sim.randomize(s, 1.0, FOOTPRINT_SIDE);
         g.app.zoom = 900.0 / FOOTPRINT_SIDE::f32 / render.BASE_PPC;
     }
-    or (g.bench == args.BENCH_DENSE) {
+    or (g.bench == args.BENCH_DENSE || g.bench == args.BENCH_TORUS) {
         sim.randomize(s, sim.DEFAULT_DENSITY, 512);
         g.app.zoom = 900.0 / 512.0 / render.BASE_PPC;
     }
@@ -996,18 +1045,11 @@ fun bench_world(g: *Game) {
         sim.seed_gun(s);
         g.app.zoom = 900.0 / 512.0 / render.BASE_PPC;
     }
-    or (g.bench == args.BENCH_TORUS) {
-        bench_grid(s, "T512,512");
-        sim.randomize(s, sim.DEFAULT_DENSITY, 512);
-        g.app.zoom = 900.0 / 512.0 / render.BASE_PPC;
-    }
     or (g.bench == args.BENCH_PLANE) {
-        bench_grid(s, "P1024,512");
         sim.seed_gun(s);
         g.app.zoom = 900.0 / 1024.0 / render.BASE_PPC;
     }
     or (g.bench == args.BENCH_BOX) {
-        bench_grid(s, "T8192,8192");
         sim.seed_glider_at(s, -1, -1);
         g.app.zoom = 900.0 / 512.0 / render.BASE_PPC;
     }
@@ -1060,12 +1102,25 @@ fun bench_grid(s: *sim.Sim, suffix: str) {
     sim.set_rule(s, r);
 }
 
+fun bench_engine(g: *Game) str {
+    if (world.hashlife(?g.shown)) { ret "hashlife"; }
+    if (!g.gpu.stepping)          { ret "cpu"; }
+    ret "gpu";
+}
+
 # count a measured frame, and report and stop once the time is up
 fun bench_frame(ctx: *Context, g: *Game) {
     val now: time.InstantClock = time.instant();
     if (sel now.err) { ret; }
     # the first frames seed the GPU and grow the pool, which is not the rate
     g.frames = g.frames + 1;
+    # a world that stopped on its own, full or at a ceiling, has no rate to report
+    if (g.bench != args.BENCH_PAUSE && !g.shown.running) {
+        print.printlnf("bench {} stopped on its own at generation {}: full {} ceiling {}, no rate", bench_engine(g), g.shown.generation,
+            g.shown.full, sim.tripped(?g.sim)::u64);
+        context_stop(ctx);
+        ret;
+    }
     if (g.frames <= WARMUP) { ret; }
     if (g.frames == WARMUP + 1) {
         g.started  = now.ok;
@@ -1077,13 +1132,18 @@ fun bench_frame(ctx: *Context, g: *Game) {
         ret;
     }
     # the generations a frame completed are counted at the pool it shows after them
-    val done: u64 = g.shown.generation - g.gen_seen;
+    # a closed gate voids generations off the count, so a frame can show fewer than the last
+    val done: i64 = g.shown.generation::i64 - g.gen_seen::i64;
     g.cell_gens = g.cell_gens + done::f64 * g.shown.chunks::f64 * space.CELLS::f64;
     g.gen_seen  = g.shown.generation;
     val secs: f64 = time.instant_sub(now.ok, g.started)::f64 / SECOND::f64;
     if (secs < g.bench_secs) { ret; }
-    val gens: f64 = (g.shown.generation - g.gen0)::f64;
+    val gens: f64 = (g.shown.generation::i64 - g.gen0::i64)::f64;
     # the clock started with the first measured frame, so the frames after it span the seconds
+    var gps: f64 = gens / secs;
+    var cps: f64 = g.cell_gens / secs;
+    if (gps < 0.0) { gps = 0.0; }
+    if (cps < 0.0) { cps = 0.0; }
     var spans: u64 = g.frames - WARMUP - 1;
     if (spans == 0) { spans = 1; }
     val frame: f64 = secs * 1000000.0 / spans::f64;
@@ -1096,8 +1156,8 @@ fun bench_frame(ctx: *Context, g: *Game) {
     # and into
     val bits: u64 = world.cell_bits(?g.shown);
     print.printlnf("bench {} radius {} chunks {} population {} gens/s {} step us {} cells/s {} frame us {} bits/cell {} pool bytes {}", engine,
-        rule.radius(?g.shown.rule)::u64, g.shown.chunks::u64, g.shown.population::u64, (gens / secs)::u64, step::u64,
-        (g.cell_gens / secs)::u64, frame::u64, bits, g.shown.pool.taken);
+        rule.radius(?g.shown.rule)::u64, g.shown.chunks::u64, g.shown.population::u64, gps::u64, step::u64,
+        cps::u64, frame::u64, bits, g.shown.pool.taken);
     context_stop(ctx);
 }
 
