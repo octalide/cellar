@@ -418,11 +418,12 @@ fun keys(ctx: *Context, g: *Game) {
     val in: *inp.Input = ?ctx.input;
     val a:  *app.App   = ?g.app;
     if (inp.key_pressed(in, inp.KEY_ESCAPE)) {
-        if (a.help != 0) { a.help = 0; }
-        or (a.sizing)    { bounds.cancel(a); }
-        or (a.picking)   { a.picking = false; }
-        or (a.selected)  { app.deselect(a); }
-        or               { context_stop(ctx); }
+        if (a.help != 0)     { a.help = 0; }
+        or (a.sizing)        { bounds.cancel(a); }
+        or (a.picking)       { a.picking = false; }
+        or (a.ncorners != 0) { a.ncorners = 0; }
+        or (a.selected)      { app.deselect(a); }
+        or                   { context_stop(ctx); }
         ret;
     }
     # a chord with ctrl acts on the selection, and never also as the bare key
@@ -636,16 +637,32 @@ fun edit_world(g: *Game, cam: render.Camera) {
 }
 
 # the wall tool under the pointer at cell (cx, cy): the brush draws a stroke
-# of walls as the pen draws cells, and a shape is dragged out from the press
-# and drawn as it is let go
+# of walls as the pen draws cells, a polygon takes a corner a press and is
+# drawn once a press lands on its first corner again, and any other shape is
+# dragged out from the press and drawn as it is let go
 fun walls(a: *app.App, h: *bint.Hit, cx: i64, cy: i64) {
     val v: u8 = app.wall_state(a);
+    if (a.wall_shape == app.WALL_POLYGON) {
+        a.wall_x = cx;
+        a.wall_y = cy;
+        if (!h.pressed) { ret; }
+        if (a.ncorners >= 3 && a.corners[0] == cx && a.corners[1] == cy) {
+            app.close_polygon(a);
+            ret;
+        }
+        if (a.ncorners < app.WALL_CORNERS) {
+            a.corners[a.ncorners * 2]     = cx;
+            a.corners[a.ncorners * 2 + 1] = cy;
+            a.ncorners                    = a.ncorners + 1;
+        }
+        ret;
+    }
     if (a.wall_shape == app.WALL_BRUSH) {
         if (!h.held) {
             a.stroke = false;
             ret;
         }
-        var w: command.Walls = command.Walls{shape: command.WALLS_LINE, x0: cx, y0: cy, x1: cx, y1: cy, v: v, joins: a.stroke};
+        var w: command.Walls = command.walls(command.WALLS_LINE, cx, cy, cx, cy, v, a.stroke);
         if (a.stroke) {
             w.x0 = a.last_x;
             w.y0 = a.last_y;
@@ -668,7 +685,58 @@ fun walls(a: *app.App, h: *bint.Hit, cx: i64, cy: i64) {
     a.walling = false;
     var shape: u8 = command.WALLS_RECT;
     if (a.wall_shape == app.WALL_ELLIPSE) { shape = command.WALLS_ELLIPSE; }
-    app.submit(a, command.Command.walls{command.Walls{shape: shape, x0: a.anchor_x, y0: a.anchor_y, x1: cx, y1: cy, v: v, joins: false}});
+    app.submit(a, command.Command.walls{command.walls(shape, a.anchor_x, a.anchor_y, cx, cy, v, false)});
+}
+
+# a cell of a wall shape being made, marked as the drag preview marks
+fun wall_mark(d: *paint.Paint, cam: render.Camera, x: i64, y: i64) {
+    val r: render.Span = render.span(cam, space.Box{x0: x, y0: y, x1: x + 1, y1: y + 1});
+    paint.rect(d, r.x0, r.y0, r.x1, r.y1, theme.WALL, 0.7);
+}
+
+# the edge of a polygon being clicked out from (x0, y0) to (x1, y1), a cell
+# marked along it at most every so many cells, so a long edge costs no more
+# than a short one
+fun wall_edge(d: *paint.Paint, cam: render.Camera, x0: i64, y0: i64, x1: i64, y1: i64) {
+    var dx: i64 = x1 - x0;
+    var dy: i64 = y1 - y0;
+    if (dx < 0) { dx = 0 - dx; }
+    if (dy < 0) { dy = 0 - dy; }
+    var n: i64 = dx;
+    if (dy > n) { n = dy; }
+    var step: i64 = 1;
+    if (n > 256) { step = n / 256; }
+    var i: i64 = 0;
+    for (i <= n) {
+        var x: i64 = x0;
+        var y: i64 = y0;
+        if (n != 0) {
+            x = x0 + (x1 - x0) * i / n;
+            y = y0 + (y1 - y0) * i / n;
+        }
+        wall_mark(d, cam, x, y);
+        i = i + step;
+    }
+}
+
+# the corners of a polygon being clicked out, its edges and the one to the
+# pointer
+fun wall_corners(g: *Game, d: *paint.Paint, cam: render.Camera) {
+    val a: *app.App = ?g.app;
+    if (a.tool != app.TOOL_WALL || a.wall_shape != app.WALL_POLYGON || a.ncorners == 0) { ret; }
+    var i: usize = 0;
+    for (i < a.ncorners) {
+        var x1: i64 = a.wall_x;
+        var y1: i64 = a.wall_y;
+        if (i + 1 < a.ncorners) {
+            x1 = a.corners[i * 2 + 2];
+            y1 = a.corners[i * 2 + 3];
+        }
+        wall_edge(d, cam, a.corners[i * 2], a.corners[i * 2 + 1], x1, y1);
+        i = i + 1;
+    }
+    val r: render.Span = render.span(cam, space.Box{x0: a.corners[0], y0: a.corners[1], x1: a.corners[0] + 1, y1: a.corners[1] + 1});
+    paint.frame(d, r.x0 - 2.0, r.y0 - 2.0, r.x1 + 2.0, r.y1 + 2.0, 1.0, theme.WALL_ON, 0.9);
 }
 
 # the box a wall shape being dragged out covers, as it would be drawn
@@ -957,6 +1025,7 @@ pub fun on_draw(ctx: *Context) {
     hover(g, ?d, cam);
     ghost(g, ?d, pt, cam);
     wall_drag(g, ?d, cam);
+    wall_corners(g, ?d, cam);
     val drew: err[gfx.Error] = gui.draw(?g.gui, ?pass);
     if (sel drew.err) { print.eprintlnf("could not draw the interface: {}", gfx.error_message(drew.err)); }
 
