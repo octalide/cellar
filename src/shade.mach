@@ -1,0 +1,179 @@
+# a region drawn over the world: the outside of the world's domain shaded and
+# its edge outlined, and a shape being drawn or a region being moved filled or
+# outlined in a colour of its own
+#
+# only the rows in view are walked, a run of rows holding the same spans as
+# one strip, and a strip is never less than a pixel tall, so a region costs
+# what the screen does however many rows it has. a run thinner than a pixel
+# is drawn as the row it starts on.
+
+use cellar.boundary;
+use cellar.paint;
+use cellar.render;
+use cellar.theme;
+use allo: std.allocator;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.types.error.err;
+use std.types.size.usize;
+
+# the outside of the domain, over whatever the colour mode drew there
+val OUTSIDE_ALPHA: f32 = 0.5;
+
+# what a region is drawn with
+# ---
+# r:   the region
+# dx:  columns it is drawn moved by
+# dy:  rows it is drawn moved by
+# tmp: spans worked out while drawing, kept by the caller between frames
+pub rec Draw {
+    r:   *boundary.Region;
+    dx:  i64;
+    dy:  i64;
+    tmp: *Vector[i64];
+}
+
+# the cells in view, half-open
+rec View {
+    x0:   i64;
+    y0:   i64;
+    x1:   i64;
+    y1:   i64;
+    rows: i64;
+}
+
+fun view(cam: render.Camera) View {
+    var v: View;
+    render.cell_at(cam, cam.x0, cam.y0, ?v.x0, ?v.y0);
+    render.cell_at(cam, cam.x0 + cam.sw, cam.y0 + cam.sh, ?v.x1, ?v.y1);
+    v.x1   = v.x1 + 1;
+    v.y1   = v.y1 + 1;
+    v.rows = 1;
+    if (cam.ppc < 1.0) { v.rows = (1.0 / cam.ppc)::i64; }
+    ret v;
+}
+
+fun clamp(v: i64, lo: i64, hi: i64) i64 {
+    if (v < lo) { ret lo; }
+    if (v > hi) { ret hi; }
+    ret v;
+}
+
+fun sx(cam: render.Camera, x: i64) f32 {
+    ret render.screen_x(cam, x::f64);
+}
+
+fun sy(cam: render.Camera, y: i64) f32 {
+    ret render.screen_y(cam, y::f64);
+}
+
+# the strip from row y: the spans it holds, n of them, and the row past it
+fun strip(d: *Draw, v: *View, y: i64, n: *usize, end: *i64) *i64 {
+    val ry: i64  = y - d.dy;
+    val xs: *i64 = boundary.row(d.r, ry, n);
+    var e:  i64  = boundary.same_until(d.r, ry) + d.dy;
+    if (e < y + v.rows) { e = y + v.rows; }
+    if (e > v.y1)       { e = v.y1; }
+    @end = e;
+    ret xs;
+}
+
+# fill a run of columns of a strip, clipped to the view
+fun run(p: *paint.Paint, cam: render.Camera, v: *View, x0: i64, x1: i64, y0: f32, y1: f32, hex: u32, alpha: f32) {
+    val a: i64 = clamp(x0, v.x0, v.x1);
+    val b: i64 = clamp(x1, v.x0, v.x1);
+    if (a < b) { paint.rect(p, sx(cam, a), y0, sx(cam, b), y1, hex, alpha); }
+}
+
+# shade everything in view the region does not hold
+pub fun outside(p: *paint.Paint, d: *Draw, cam: render.Camera) {
+    var v: View = view(cam);
+    var y: i64  = v.y0;
+    for (y < v.y1) {
+        var n:   usize = 0;
+        var end: i64   = 0;
+        val xs:  *i64  = strip(d, ?v, y, ?n, ?end);
+        val y0:  f32   = sy(cam, y);
+        val y1:  f32   = sy(cam, end);
+        var at:  i64   = v.x0;
+        var k:   usize = 0;
+        for (k < n) {
+            run(p, cam, ?v, at, xs[k * 2] + d.dx, y0, y1, theme.OUTSIDE, OUTSIDE_ALPHA);
+            at = xs[k * 2 + 1] + d.dx;
+            k  = k + 1;
+        }
+        run(p, cam, ?v, at, v.x1, y0, y1, theme.OUTSIDE, OUTSIDE_ALPHA);
+        y = end;
+    }
+}
+
+# fill the cells in view the region holds
+pub fun fill(p: *paint.Paint, d: *Draw, cam: render.Camera, hex: u32, alpha: f32) {
+    var v: View = view(cam);
+    var y: i64  = v.y0;
+    for (y < v.y1) {
+        var n:   usize = 0;
+        var end: i64   = 0;
+        val xs:  *i64  = strip(d, ?v, y, ?n, ?end);
+        var k:   usize = 0;
+        for (k < n) {
+            run(p, cam, ?v, xs[k * 2] + d.dx, xs[k * 2 + 1] + d.dx, sy(cam, y), sy(cam, end), hex, alpha);
+            k = k + 1;
+        }
+        y = end;
+    }
+}
+
+# outline the region's edge in view, a line t pixels thick centred on it
+#
+# a strip's sides are drawn down it, and its top where it differs from the
+# row above, so an edge that runs along a row is drawn once.
+pub fun outline(p: *paint.Paint, d: *Draw, cam: render.Camera, t: f32, hex: u32, alpha: f32) {
+    var v:    View = view(cam);
+    val h:    f32  = t / 2.0;
+    var y:    i64  = v.y0;
+    var none: [2]i64;
+    for (y < v.y1) {
+        var n:   usize = 0;
+        var end: i64   = 0;
+        val xs:  *i64  = strip(d, ?v, y, ?n, ?end);
+        val y0:  f32   = sy(cam, y);
+        val y1:  f32   = sy(cam, end);
+        var k:   usize = 0;
+        for (k < n * 2) {
+            val x: i64 = xs[k] + d.dx;
+            if (x >= v.x0 && x <= v.x1) { paint.rect(p, sx(cam, x) - h, y0 - h, sx(cam, x) + h, y1 + h, hex, alpha); }
+            k = k + 1;
+        }
+        var m:   usize = 0;
+        var up:  *i64  = boundary.row(d.r, y - 1 - d.dy, ?m);
+        var cur: *i64  = xs;
+        if (up == nil)  { up = ?none[0]; }
+        if (cur == nil) { cur = ?none[0]; }
+        # the top runs where one of the two rows holds a cell and the other not
+        var side: usize = 0;
+        for (side < 2) {
+            var e: err[allo.Error] = err[allo.Error].ok{};
+            if (side == 0) { e = boundary.merge(cur, n, up, m, boundary.SUBTRACT, d.tmp); }
+            or             { e = boundary.merge(up, m, cur, n, boundary.SUBTRACT, d.tmp); }
+            if (sel e.ok) {
+                var i: usize = 0;
+                for (i + 1 < d.tmp.len) {
+                    val a: i64 = clamp(d.tmp.data[i] + d.dx, v.x0, v.x1);
+                    val b: i64 = clamp(d.tmp.data[i + 1] + d.dx, v.x0, v.x1);
+                    if (a < b) { paint.rect(p, sx(cam, a) - h, y0 - h, sx(cam, b) + h, y0 + h, hex, alpha); }
+                    i = i + 2;
+                }
+            }
+            side = side + 1;
+        }
+        y = end;
+    }
+}
+
+# the world's domain: everything in view outside it shaded, and its edge
+# outlined
+pub fun domain(p: *paint.Paint, d: *Draw, cam: render.Camera) {
+    outside(p, d, cam);
+    outline(p, d, cam, 1.0, theme.TEXT_FAINT, 1.0);
+}

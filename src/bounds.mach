@@ -1,11 +1,17 @@
-# the world's bounds: the tool that drags them out and the controls that set
-# them by value
+# the world's bounds: the tool that draws its boundary or drags out a grid,
+# picks a region of the boundary to move, delete or clear, and the controls
+# that set a grid by value
 #
-# a box dragged in the world, or a grid's edges dragged to new places, becomes
-# the grid the world runs on, a plane unless another shape is chosen. the box
-# stays where it was drawn on screen: the command it makes translates the world
-# so the box is where the grid's notation centres it (cellar.exec). the shapes
-# are the grids cellar.topology runs, a Klein bottle twisted either way.
+# a shape drawn in the world (cellar.gesture) adds to, subtracts from or
+# intersects the world's boundary (cellar.domain), and a shape added to a
+# world without one becomes it. a rectangle is one of those shapes, and on a
+# world without a boundary it makes the plane the rule names, as a box for any
+# other grid does. a box dragged in the world, or a grid's edges dragged to
+# new places, becomes the grid the world runs on, a plane unless another
+# topology is chosen. the box stays where it was drawn on screen: the command
+# it makes translates the world so the box is where the grid's notation
+# centres it (cellar.exec). the topologies are the grids cellar.topology runs,
+# a Klein bottle twisted either way, and only a plane holds a drawn boundary.
 
 use blit;
 use bctx: blit.context;
@@ -13,19 +19,24 @@ use blay: blit.layout;
 use bov:  blit.overlay;
 use bw:   blit.widget;
 use cellar.app;
+use cellar.boundary;
 use cellar.command;
+use cellar.gesture;
 use cellar.hud;
 use cellar.look;
 use cellar.paint;
 use cellar.render;
+use cellar.shade;
 use cellar.space;
 use cellar.text;
 use cellar.theme;
 use cellar.topology;
 use cellar.world;
+use allo: std.allocator;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.error.err;
 use std.types.size.usize;
 use std.types.string.str;
 
@@ -171,18 +182,9 @@ fun max(a: i64, b: i64) i64 {
     ret b;
 }
 
-# use the tool: a press grabs the grid's edges near it or starts a new box,
-# a drag moves them, and the release asks for the bounds
-# ---
-# a:       application state
-# g:       the grid the world is on
-# cam:     the camera
-# scale:   the interface scale
-# mx:      the pointer's column on screen
-# my:      the pointer's row on screen
-# pressed: a press began on the world this frame
-# held:    the button is held
-pub fun tool(a: *app.App, g: *topology.Grid, cam: render.Camera, scale: f32, mx: f32, my: f32, pressed: bool, held: bool) {
+# drag a grid: a press grabs the grid's edges near it or starts a new box, a
+# drag moves them, and the release asks for the bounds
+fun sizing(a: *app.App, g: *topology.Grid, cam: render.Camera, scale: f32, mx: f32, my: f32, pressed: bool, held: bool) {
     var cx: i64 = 0;
     var cy: i64 = 0;
     render.cell_at(cam, mx, my, ?cx, ?cy);
@@ -215,13 +217,139 @@ pub fun tool(a: *app.App, g: *topology.Grid, cam: render.Camera, scale: f32, mx:
     ask(a, grid_of(shape_of(g), w, h), b.x0, b.y0);
 }
 
-# stop dragging the bounds, asking for nothing
-pub fun cancel(a: *app.App) {
-    a.sizing = false;
+# whether a press makes a grid rather than a boundary shape: a box for a grid
+# that wraps, a grab of a grid's edges, or a rectangle added to a world
+# without a boundary, which makes the plane
+fun grids(a: *app.App, g: *topology.Grid, cam: render.Camera, scale: f32, mx: f32, my: f32) bool {
+    if (a.shape.kind != gesture.RECT)                                      { ret false; }
+    if (a.grid_shape != SHAPE_PLANE)                                       { ret true; }
+    if (topology.bounded(g) && grabbed(g, cam, mx, my, GRAB * scale) != 0) { ret true; }
+    ret !a.dom_on && a.bound_op != boundary.SUBTRACT;
 }
 
-# the bounds being dragged, over the world, an unbounded axis across the screen
+# ask to combine the shape just drawn into the world's boundary
+fun drawn(a: *app.App) {
+    var c:      command.Domain  = command.Domain{op: command.DOMAIN_SHAPE, shape: boundary.init(a.alloc), how: a.bound_op, x: 0, y: 0, dx: 0, dy: 0};
+    val copied: err[allo.Error] = boundary.copy(?c.shape, ?a.shape.shape);
+    if (sel copied.err) {
+        boundary.dnit(?c.shape);
+        app.say(a, "out of memory");
+        ret;
+    }
+    app.submit(a, command.Command.domain{c});
+}
+
+# ask for an edit of the picked region
+fun ask_part(a: *app.App, op: u8, dx: i64, dy: i64) {
+    if (!a.part_on) { ret; }
+    app.submit(a, command.Command.domain{command.Domain{op: op, shape: boundary.init(a.alloc), how: boundary.ADD, x: a.part_x, y: a.part_y, dx: dx, dy: dy}});
+}
+
+# pick a region: a press on the picked one starts dragging it, a press
+# anywhere else picks the region there or none, and the release of a drag
+# asks to move it
+fun choose(a: *app.App, cam: render.Camera, mx: f32, my: f32, pressed: bool, held: bool) {
+    var cx: i64 = 0;
+    var cy: i64 = 0;
+    render.cell_at(cam, mx, my, ?cx, ?cy);
+    if (pressed) {
+        if (a.part_on && boundary.contains(?a.part, cx, cy)) {
+            a.moving   = true;
+            a.anchor_x = cx;
+            a.anchor_y = cy;
+            a.move_dx  = 0;
+            a.move_dy  = 0;
+        }
+        or { app.pick_part(a, cx, cy); }
+        ret;
+    }
+    if (!a.moving) { ret; }
+    a.move_dx = cx - a.anchor_x;
+    a.move_dy = cy - a.anchor_y;
+    if (held) { ret; }
+    a.moving = false;
+    if (a.move_dx != 0 || a.move_dy != 0) { ask_part(a, command.DOMAIN_MOVE, a.move_dx, a.move_dy); }
+    a.move_dx = 0;
+    a.move_dy = 0;
+}
+
+# use the tool: pick a region, drag a grid, or draw a boundary shape
+# ---
+# a:       application state
+# g:       the grid the world is on
+# cam:     the camera
+# scale:   the interface scale
+# mx:      the pointer's column on screen
+# my:      the pointer's row on screen
+# pressed: a press began on the world this frame
+# held:    the button is held
+pub fun tool(a: *app.App, g: *topology.Grid, cam: render.Camera, scale: f32, mx: f32, my: f32, pressed: bool, held: bool) {
+    if (a.sizing) {
+        sizing(a, g, cam, scale, mx, my, false, held);
+        ret;
+    }
+    if (a.choosing) {
+        choose(a, cam, mx, my, pressed, held);
+        ret;
+    }
+    if (pressed && !a.shape.active && grids(a, g, cam, scale, mx, my)) {
+        sizing(a, g, cam, scale, mx, my, true, held);
+        ret;
+    }
+    if (pressed && !a.shape.active && a.grid_shape != SHAPE_PLANE) {
+        app.say(a, "a grid that wraps is a rectangle: choose Plane to draw a boundary");
+        ret;
+    }
+    if (gesture.track(?a.shape, cam, scale, mx, my, pressed, held)) { drawn(a); }
+}
+
+# end a polygon being drawn, asking for it
+pub fun close(a: *app.App) {
+    if (gesture.close(?a.shape)) { drawn(a); }
+}
+
+# whether the tool is in the middle of something escape stops
+pub fun busy(a: *app.App) bool {
+    ret a.sizing || a.shape.active || a.moving;
+}
+
+# stop dragging the bounds, drawing a shape or moving a region, asking for nothing
+pub fun cancel(a: *app.App) {
+    a.sizing  = false;
+    a.moving  = false;
+    a.move_dx = 0;
+    a.move_dy = 0;
+    gesture.cancel(?a.shape);
+}
+
+# the world's domain, its outside shaded and its edge outlined, and the
+# region a region fill takes marked, under everything else drawn over the world
+pub fun domain(d: *paint.Paint, a: *app.App, cam: render.Camera) {
+    if (!a.dom_on) { ret; }
+    var w: shade.Draw = shade.Draw{r: ?a.domain, dx: 0, dy: 0, tmp: ?a.shade_tmp};
+    shade.domain(d, ?w, cam);
+    # the region a region fill takes, while that is what randomize fills
+    if (a.fill_target != app.FILL_REGION || boundary.empty(?a.fill_part)) { ret; }
+    w.r = ?a.fill_part;
+    shade.fill(d, ?w, cam, theme.CHOSEN, 0.12);
+    shade.outline(d, ?w, cam, 2.0, theme.CHOSEN, 0.95);
+}
+
+# what the tool is doing, over the world: the bounds being dragged, an
+# unbounded axis across the screen, the shape being drawn, and the picked
+# region where it is and where it is being dragged to
 pub fun overlay(d: *paint.Paint, a: *app.App, cam: render.Camera) {
+    gesture.overlay(d, ?a.shape, cam, ?a.shade_tmp);
+    if (a.part_on) {
+        var w: shade.Draw = shade.Draw{r: ?a.part, dx: 0, dy: 0, tmp: ?a.shade_tmp};
+        shade.outline(d, ?w, cam, 2.0, theme.ACCENT, 0.9);
+        if (a.moving) {
+            w.dx = a.move_dx;
+            w.dy = a.move_dy;
+            shade.fill(d, ?w, cam, theme.ACCENT, 0.2);
+            shade.outline(d, ?w, cam, 1.0, theme.ACCENT, 0.9);
+        }
+    }
     if (!a.sizing) { ret; }
     val r:  render.Span = render.span(cam, a.sized);
     var x0: f32         = r.x0;
@@ -325,7 +453,16 @@ pub fun section(ui: *bctx.Context, l: look.Look, a: *app.App, s: *world.Shown) {
             show_size(a, ?g);
         }
     }
-    if (on) {
+    if (a.dom_drawn) {
+        var d: [96]u8;
+        var o: usize = text.buf_str(?d[0], 0, "Drawn boundary, ");
+        o = text.buf_u64(?d[0], o, a.dom_parts::u64);
+        if (a.dom_parts == 1) { o = text.buf_str(?d[0], o, " region"); }
+        or                    { o = text.buf_str(?d[0], o, " regions"); }
+        d[o] = 0;
+        look.note(ui, l, ?d[0]);
+    }
+    or (on) {
         var d: [96]u8;
         var o: usize = text.buf_str(?d[0], 0, shape_name(a.grid_shape));
         o    = text.buf_str(?d[0], o, ", ");
@@ -350,15 +487,64 @@ pub fun section(ui: *bctx.Context, l: look.Look, a: *app.App, s: *world.Shown) {
         if (on) { ask_centred(a, grid_of(hit, g.w, g.h)); }
     }
 
+    shapes_section(ui, l, a);
+
     val ew:   u8 = bw.text_field(ui, "width", ?a.size_w, "Width in cells");
     val eh:   u8 = bw.text_field(ui, "height", ?a.size_h, "Height in cells");
     var acts: [2]str;
     acts[0] = "Set bounds";
     acts[1] = "Remove";
     var n: usize = 1;
-    if (on) { n = 2; }
+    if (on || a.dom_on) { n = 2; }
     val act: usize = bw.buttons(ui, ?acts[0], n);
     if (act == 0 || ((ew | eh) & blit.field.ENTERED) != 0) { set_typed(a); }
-    if (act == 1 && on)                                    { remove(a); }
-    look.note(ui, l, "The Bounds tool drags a box in the world, or the grid's edges");
+    if (act == 1 && (on || a.dom_on))                      { remove(a); }
+}
+
+# what a press draws and how it combines, the brush's size, and the picked
+# region's edits
+fun shapes_section(ui: *bctx.Context, l: look.Look, a: *app.App) {
+    look.heading(ui, l, "Boundary");
+    var kinds: [5]str;
+    kinds[0] = "Pick";
+    var k: usize = 0;
+    for (k < gesture.COUNT) {
+        kinds[k + 1] = gesture.name(k);
+        k            = k + 1;
+    }
+    var on: usize = a.shape.kind + 1;
+    if (a.choosing) { on = 0; }
+    val hit: usize = bw.button_grid(ui, ?kinds[0], gesture.COUNT + 1, 3, on);
+    if (hit <= gesture.COUNT && hit != on) {
+        cancel(a);
+        a.choosing = hit == 0;
+        if (hit > 0) { a.shape.kind = hit - 1; }
+    }
+    if (a.choosing) {
+        if (!a.part_on) { look.note(ui, l, "Click a region to pick it, then drag it to move it"); }
+        or {
+            look.note(ui, l, "Drag the region to move it and its cells");
+            var acts: [2]str;
+            acts[0] = "Delete region";
+            acts[1] = "Clear its cells";
+            val act: usize = bw.buttons(ui, ?acts[0], 2);
+            if (act == 0) { ask_part(a, command.DOMAIN_DELETE, 0, 0); }
+            if (act == 1) { ask_part(a, command.DOMAIN_CLEAR, 0, 0); }
+        }
+        ret;
+    }
+    var ops: [3]str;
+    ops[0] = "Add";
+    ops[1] = "Subtract";
+    ops[2] = "Intersect";
+    var op: usize = a.bound_op::usize;
+    if (bw.segmented(ui, ?ops[0], 3, ?op)) { a.bound_op = op::u32; }
+    if (a.shape.kind == gesture.FREEHAND) {
+        var rd: [24]u8;
+        val o:  usize = text.buf_u64(?rd[0], 0, a.shape.radius::u64);
+        rd[o] = 0;
+        bw.slider(ui, "Brush radius", ?rd[0], ?a.shape.radius, 0.0, gesture.RADIUS_MAX);
+    }
+    if (a.shape.kind == gesture.POLYGON) { look.note(ui, l, "Click each corner, then the first or enter to close it"); }
+    or                                   { look.note(ui, l, "Drag in the world to draw; a rectangle on a world without bounds makes its plane"); }
 }

@@ -141,8 +141,9 @@ dropped.
 | `Esc`                    | close the reference, deselect, or quit                           |
 
 Walls are cells with a fixed state that the live cells around them read but
-never change. The wall tool draws them with a brush, a rectangle or an
-ellipse, each wall dead or holding the pen's state: alive, or under Lenia and
+never change. The wall tool draws them with the same shapes the bounds tool
+draws a boundary with, a rectangle, an ellipse, a polygon or a freehand
+brush, each wall dead or holding the pen's state: alive, or under Lenia and
 reaction-diffusion a fixed value, a source or a sink. The eraser takes them
 away. Drawing, stamping, randomizing and the selection's operations leave
 them where they stand, and a clear removes them. They show in a stone colour

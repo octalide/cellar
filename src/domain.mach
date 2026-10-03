@@ -1,0 +1,224 @@
+# edits to the world's domain: a shape combined into its boundary, and one of
+# its regions moved, deleted or cleared of cells
+#
+# each is one change to the world (sim.set_bound shows the watch the world
+# whole first), so the journal keeps it as one step. a region is named by a
+# cell it holds, which stays its name whatever the regions around it are
+# numbered when the change applies.
+
+use cellar.boundary;
+use cellar.sim;
+use allo: std.allocator;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+fun refused(why: str) opt[str] {
+    ret opt[str].some{why};
+}
+
+val UNHELD: str = "the boundary could not be held";
+
+# whether a region was made
+fun made(e: err[allo.Error]) bool {
+    ret sel e.ok;
+}
+
+# combine a shape into the world's boundary
+#
+# a shape added to a world without a boundary becomes its boundary, since
+# every cell already belongs to it. any other is combined as sim.shape_bound
+# combines it.
+# ---
+# s:     simulation
+# shape: the shape's cells
+# op:    boundary.ADD, boundary.SUBTRACT or boundary.INTERSECT
+# ret:   why the world could not take it, the world then as it was
+pub fun combine(s: *sim.Sim, shape: *boundary.Region, op: u32) opt[str] {
+    if (sim.bound(s) == nil && op == boundary.ADD) { ret sim.set_bound(s, shape); }
+    ret sim.shape_bound(s, shape, op);
+}
+
+# the region of the world's boundary holding a cell
+# ---
+# out: receives the region
+# ret: why there is none
+fun part_at(s: *sim.Sim, x: i64, y: i64, out: *boundary.Region) opt[str] {
+    val b: *boundary.Region = sim.bound(s);
+    if (b == nil) { ret refused("the world has no boundary"); }
+    val at: res[usize, allo.Error] = boundary.region_at(b, x, y);
+    if (sel at.err)                  { ret refused(UNHELD); }
+    if (at.ok == boundary.NO_REGION) { ret refused("no region holds that cell"); }
+    val got: err[allo.Error] = boundary.region(b, at.ok, out);
+    if (sel got.err) { ret refused(UNHELD); }
+    ret opt[str].none{};
+}
+
+# take the region holding a cell out of the world's boundary, and the cells
+# in it with it
+# ---
+# s:   simulation
+# x:   the column of a cell the region holds
+# y:   its row
+# ret: why it could not be, the world then as it was
+pub fun delete(s: *sim.Sim, x: i64, y: i64) opt[str] {
+    var part: boundary.Region = boundary.init(s.space.a);
+    var rest: boundary.Region = boundary.init(s.space.a);
+    fin {
+        boundary.dnit(?part);
+        boundary.dnit(?rest);
+    }
+    val found: opt[str] = part_at(s, x, y, ?part);
+    if (sel found.some) { ret found; }
+    val ok: bool = made(boundary.copy(?rest, sim.bound(s))) && made(boundary.combine(?rest, ?part, boundary.SUBTRACT));
+    if (!ok) { ret refused(UNHELD); }
+    ret sim.set_bound(s, ?rest);
+}
+
+# kill every cell of the region holding a cell, keeping the region
+# ---
+# s:   simulation
+# x:   the column of a cell the region holds
+# y:   its row
+# ret: why it could not be
+pub fun clear(s: *sim.Sim, x: i64, y: i64) opt[str] {
+    var part: boundary.Region = boundary.init(s.space.a);
+    fin { boundary.dnit(?part); }
+    val found: opt[str] = part_at(s, x, y, ?part);
+    if (sel found.some)          { ret found; }
+    if (!sim.clear_in(s, ?part)) { ret refused("its cells could not be cleared"); }
+    ret opt[str].none{};
+}
+
+# the most cells a row of a region holds, across all of its spans
+fun widest(r: *boundary.Region) i64 {
+    var most: i64   = 0;
+    var i:    usize = 0;
+    for (i < r.bands.len) {
+        val b: *boundary.Band = ?r.bands.data[i];
+        var w: i64            = 0;
+        var k: usize          = 0;
+        for (k < b.n) {
+            w = w + r.xs.data[(b.at + k) * 2 + 1] - r.xs.data[(b.at + k) * 2];
+            k = k + 1;
+        }
+        if (w > most) { most = w; }
+        i = i + 1;
+    }
+    ret most;
+}
+
+# move the region holding a cell by (dx, dy), and the cells in it with it
+#
+# the boundary first takes the region where it goes as well as where it was,
+# so nothing is dropped while the cells move a row at a time, each row read
+# whole before it is written, the rows taken in the order that reads each
+# before the move writes over it. then the region leaves where it was.
+# ---
+# s:   simulation
+# x:   the column of a cell the region holds
+# y:   its row
+# dx:  columns it moves by
+# dy:  rows it moves by
+# ret: why it could not be, the world then as it was, unless its cells could
+#      not be read or written part way
+pub fun move(s: *sim.Sim, x: i64, y: i64, dx: i64, dy: i64) opt[str] {
+    if (dx == 0 && dy == 0) { ret opt[str].none{}; }
+    val a:    *allo.Allocator = s.space.a;
+    var part: boundary.Region = boundary.init(a);
+    var to:   boundary.Region = boundary.init(a);
+    var both: boundary.Region = boundary.init(a);
+    var rest: boundary.Region = boundary.init(a);
+    fin {
+        boundary.dnit(?part);
+        boundary.dnit(?to);
+        boundary.dnit(?both);
+        boundary.dnit(?rest);
+    }
+    val found: opt[str] = part_at(s, x, y, ?part);
+    if (sel found.some)          { ret found; }
+    if (!boundary.finite(?part)) { ret refused("a region without end cannot move"); }
+    # a world held as its complement holds no word a move could carry
+    if (sim.flipped(s))                   { ret refused("step once first: the world is held as its complement this generation"); }
+    if (!made(boundary.copy(?to, ?part))) { ret refused(UNHELD); }
+    boundary.translate(?to, dx, dy);
+    val held: bool = made(boundary.copy(?both, sim.bound(s))) && made(boundary.combine(?both, ?to, boundary.ADD))
+        && made(boundary.copy(?rest, sim.bound(s))) && made(boundary.combine(?rest, ?part, boundary.SUBTRACT))
+        && made(boundary.combine(?rest, ?to, boundary.ADD));
+    if (!held) { ret refused(UNHELD); }
+    val m:   usize                 = sim.word_len(s);
+    val n:   usize                 = widest(?part)::usize * m;
+    val buf: res[*u32, allo.Error] = allo.allocate[u32](a, n);
+    if (sel buf.err) { ret refused("the region is too wide to move its cells"); }
+    fin { allo.deallocate[u32](a, buf.ok, n); }
+    val grown: opt[str] = sim.set_bound(s, ?both);
+    if (sel grown.some) { ret grown; }
+    var pb: [4]i64;
+    boundary.bounds(?part, ?pb[0]);
+    var x0: i64 = pb[0];
+    var y0: i64 = pb[1];
+    var x1: i64 = pb[2];
+    var y1: i64 = pb[3];
+    if (dx < 0) { x0 = x0 + dx; }
+    or          { x1 = x1 + dx; }
+    if (dy < 0) { y0 = y0 + dy; }
+    or          { y1 = y1 + dy; }
+    var ok: bool = sim.read_begin(s, x0, y0, x1, y1);
+    if (ok) {
+        ok = sim.edit_begin(s, x0, y0, x1, y1);
+        if (ok) {
+            ok = rows(s, ?part, buf.ok, dx, dy);
+            if (!sim.edit_end(s)) { ok = false; }
+        }
+        sim.read_end(s);
+    }
+    if (!ok) { ret refused("its cells could not be moved"); }
+    ret sim.set_bound(s, ?rest);
+}
+
+# move each row of a region's cells by (dx, dy) in the open read and edit,
+# from the far end of the move back, so no row is written before it is read
+fun rows(s: *sim.Sim, part: *boundary.Region, buf: *u32, dx: i64, dy: i64) bool {
+    var pb: [4]i64;
+    boundary.bounds(part, ?pb[0]);
+    val m:    usize = sim.word_len(s);
+    var y:    i64   = pb[1];
+    var step: i64   = 1;
+    if (dy > 0) {
+        y    = pb[3] - 1;
+        step = -1;
+    }
+    var ok: bool = true;
+    for (ok && y >= pb[1] && y < pb[3]) {
+        var n:  usize = 0;
+        val xs: *i64  = boundary.row(part, y, ?n);
+        var at: usize = 0;
+        var k:  usize = 0;
+        for (ok && k < n) {
+            val w: usize = (xs[k * 2 + 1] - xs[k * 2])::usize;
+            ok = sim.read_words(s, xs[k * 2], y, w, ?buf[at * m]);
+            at = at + w;
+            k  = k + 1;
+        }
+        k = 0;
+        for (ok && k < n) {
+            ok = sim.edit_run(s, xs[k * 2], y, (xs[k * 2 + 1] - xs[k * 2])::usize, 0);
+            k  = k + 1;
+        }
+        at = 0;
+        k  = 0;
+        for (ok && k < n) {
+            val w: usize = (xs[k * 2 + 1] - xs[k * 2])::usize;
+            ok = sim.edit_words(s, xs[k * 2] + dx, y + dy, w, ?buf[at * m]);
+            at = at + w;
+            k  = k + 1;
+        }
+        y = y + step;
+    }
+    ret ok;
+}

@@ -52,6 +52,7 @@ use cellar.device;
 use cellar.exec;
 use cellar.format;
 use cellar.formats;
+use cellar.gesture;
 use cellar.gpu;
 use cellar.gui;
 use cellar.hud;
@@ -418,12 +419,12 @@ fun keys(ctx: *Context, g: *Game) {
     val in: *inp.Input = ?ctx.input;
     val a:  *app.App   = ?g.app;
     if (inp.key_pressed(in, inp.KEY_ESCAPE)) {
-        if (a.help != 0)     { a.help = 0; }
-        or (a.sizing)        { bounds.cancel(a); }
-        or (a.picking)       { a.picking = false; }
-        or (a.ncorners != 0) { a.ncorners = 0; }
-        or (a.selected)      { app.deselect(a); }
-        or                   { context_stop(ctx); }
+        if (a.help != 0)    { a.help = 0; }
+        or (bounds.busy(a)) { bounds.cancel(a); }
+        or (a.walls.active) { gesture.cancel(?a.walls); }
+        or (a.picking)      { a.picking = false; }
+        or (a.selected)     { app.deselect(a); }
+        or                  { context_stop(ctx); }
         ret;
     }
     # a chord with ctrl acts on the selection, and never also as the bare key
@@ -432,20 +433,24 @@ fun keys(ctx: *Context, g: *Game) {
     val del:   bool = inp.key_pressed(in, inp.KEY_DELETE);
     val z:     bool = inp.key_pressed(in, inp.KEY_Z);
     val redo:  bool = ctrl && ((z && shift) || inp.key_pressed(in, inp.KEY_Y));
-    if (inp.key_pressed(in, inp.KEY_SPACE))                                { app.submit(a, command.Command.toggle{}); }
-    if (inp.key_pressed(in, inp.KEY_S))                                    { app.submit(a, command.Command.step{}); }
-    if (inp.key_pressed(in, inp.KEY_BACKSPACE))                            { app.submit(a, command.Command.reset{}); }
-    if (inp.key_pressed(in, inp.KEY_C) && !ctrl)                           { app.submit(a, command.Command.clear{}); }
-    if (inp.key_pressed(in, inp.KEY_R) && !ctrl)                           { app.randomize(a); }
-    if (inp.key_pressed(in, inp.KEY_M))                                    { a.mode = (a.mode + 1) % app.MODE_COUNT; }
-    if (inp.key_pressed(in, inp.KEY_G))                                    { a.gutter = 1 - a.gutter; }
-    if (inp.key_pressed(in, inp.KEY_F))                                    { app.frame_area(a, ?g.shown.rule.grid, g.shown.regions.whole, g.shown.regions.chosen); }
-    if (inp.key_pressed(in, inp.KEY_D))                                    { a.tool = app.TOOL_DRAW; }
-    if (inp.key_pressed(in, inp.KEY_E))                                    { a.tool = app.TOOL_ERASE; }
-    if (inp.key_pressed(in, inp.KEY_T))                                    { a.tool = app.TOOL_STAMP; }
-    if (inp.key_pressed(in, inp.KEY_Q))                                    { app.step_ink(a, rule.states(?g.shown.rule), shift); }
-    if (inp.key_pressed(in, inp.KEY_V) && !ctrl)                           { a.tool = app.TOOL_SELECT; }
-    if (inp.key_pressed(in, inp.KEY_W))                                    { a.tool = app.TOOL_BOUNDS; }
+    if (inp.key_pressed(in, inp.KEY_SPACE))                              { app.submit(a, command.Command.toggle{}); }
+    if (inp.key_pressed(in, inp.KEY_S))                                  { app.submit(a, command.Command.step{}); }
+    if (inp.key_pressed(in, inp.KEY_BACKSPACE))                          { app.submit(a, command.Command.reset{}); }
+    if (inp.key_pressed(in, inp.KEY_C) && !ctrl)                         { app.submit(a, command.Command.clear{}); }
+    if (inp.key_pressed(in, inp.KEY_R) && !ctrl)                         { app.randomize(a); }
+    if (inp.key_pressed(in, inp.KEY_M))                                  { a.mode = (a.mode + 1) % app.MODE_COUNT; }
+    if (inp.key_pressed(in, inp.KEY_G))                                  { a.gutter = 1 - a.gutter; }
+    if (inp.key_pressed(in, inp.KEY_F))                                  { app.frame_area(a, ?g.shown.rule.grid, g.shown.regions.whole, g.shown.regions.chosen); }
+    if (inp.key_pressed(in, inp.KEY_D))                                  { a.tool = app.TOOL_DRAW; }
+    if (inp.key_pressed(in, inp.KEY_E))                                  { a.tool = app.TOOL_ERASE; }
+    if (inp.key_pressed(in, inp.KEY_T))                                  { a.tool = app.TOOL_STAMP; }
+    if (inp.key_pressed(in, inp.KEY_Q))                                  { app.step_ink(a, rule.states(?g.shown.rule), shift); }
+    if (inp.key_pressed(in, inp.KEY_V) && !ctrl)                         { a.tool = app.TOOL_SELECT; }
+    if (inp.key_pressed(in, inp.KEY_W))                                  { a.tool = app.TOOL_BOUNDS; }
+    if (inp.key_pressed(in, inp.KEY_ENTER) && a.tool == app.TOOL_BOUNDS) { bounds.close(a); }
+    if (inp.key_pressed(in, inp.KEY_ENTER) && a.tool == app.TOOL_WALL) {
+        if (gesture.close(?a.walls)) { app.draw_walls(a); }
+    }
     if (inp.key_pressed(in, inp.KEY_L))                                    { a.tool = app.TOOL_WALL; }
     if (inp.key_pressed(in, inp.KEY_V) && ctrl)                            { paste(ctx, a, shift); }
     if (z && !ctrl)                                                        { a.orient = pattern.orient_turn(a.orient); }
@@ -585,14 +590,20 @@ fun edit_world(g: *Game, cam: render.Camera) {
     val h: *bint.Hit = ?g.world;
     val a: *app.App  = ?g.app;
     # a drag of the bounds goes on wherever the pointer goes until released
-    if (a.tool == app.TOOL_BOUNDS || a.sizing) {
+    if (a.tool == app.TOOL_BOUNDS || bounds.busy(a)) {
         var gr: topology.Grid = g.shown.rule.grid;
         bounds.tool(a, ?gr, cam, app.scale(a.scale_idx), h.mx, h.my, h.pressed && over_world(g), h.held);
         ret;
     }
+    # the wall tool draws any gesture's shape, which goes on wherever the
+    # pointer goes until it is finished
+    if (a.tool == app.TOOL_WALL || a.walls.active) {
+        val pressed: bool = h.pressed && over_world(g) && !a.picking;
+        if (gesture.track(?a.walls, cam, app.scale(a.scale_idx), h.mx, h.my, pressed, h.held)) { app.draw_walls(a); }
+        if (a.tool == app.TOOL_WALL || a.walls.active)                                         { ret; }
+    }
     if (!over_world(g)) {
-        a.stroke  = false;
-        a.walling = false;
+        a.stroke = false;
         ret;
     }
     var cx: i64 = 0;
@@ -608,10 +619,6 @@ fun edit_world(g: *Game, cam: render.Camera) {
     }
     if (a.tool == app.TOOL_STAMP) {
         if (h.pressed) { arrange.stamp_active(a, cx, cy); }
-        ret;
-    }
-    if (a.tool == app.TOOL_WALL) {
-        walls(a, h, cx, cy);
         ret;
     }
     if (a.tool == app.TOOL_SELECT) {
@@ -636,134 +643,12 @@ fun edit_world(g: *Game, cam: render.Camera) {
     a.last_y = cy;
 }
 
-# the wall tool under the pointer at cell (cx, cy): the brush draws a stroke
-# of walls as the pen draws cells, a polygon takes a corner a press and is
-# drawn once a press lands on its first corner again, and any other shape is
-# dragged out from the press and drawn as it is let go
-fun walls(a: *app.App, h: *bint.Hit, cx: i64, cy: i64) {
-    val v: u8 = app.wall_state(a);
-    if (a.wall_shape == app.WALL_POLYGON) {
-        a.wall_x = cx;
-        a.wall_y = cy;
-        if (!h.pressed) { ret; }
-        if (a.ncorners >= 3 && a.corners[0] == cx && a.corners[1] == cy) {
-            app.close_polygon(a);
-            ret;
-        }
-        if (a.ncorners < app.WALL_CORNERS) {
-            a.corners[a.ncorners * 2]     = cx;
-            a.corners[a.ncorners * 2 + 1] = cy;
-            a.ncorners                    = a.ncorners + 1;
-        }
-        ret;
-    }
-    if (a.wall_shape == app.WALL_BRUSH) {
-        if (!h.held) {
-            a.stroke = false;
-            ret;
-        }
-        var w: command.Walls = command.walls(command.WALLS_LINE, cx, cy, cx, cy, v, a.stroke);
-        if (a.stroke) {
-            w.x0 = a.last_x;
-            w.y0 = a.last_y;
-        }
-        app.submit(a, command.Command.walls{w});
-        a.stroke = true;
-        a.last_x = cx;
-        a.last_y = cy;
-        ret;
-    }
-    if (h.pressed) {
-        a.walling  = true;
-        a.anchor_x = cx;
-        a.anchor_y = cy;
-    }
-    if (!a.walling) { ret; }
-    a.wall_x = cx;
-    a.wall_y = cy;
-    if (h.held) { ret; }
-    a.walling = false;
-    var shape: u8 = command.WALLS_RECT;
-    if (a.wall_shape == app.WALL_ELLIPSE) { shape = command.WALLS_ELLIPSE; }
-    app.submit(a, command.Command.walls{command.walls(shape, a.anchor_x, a.anchor_y, cx, cy, v, false)});
-}
-
-# a cell of a wall shape being made, marked as the drag preview marks
-fun wall_mark(d: *paint.Paint, cam: render.Camera, x: i64, y: i64) {
-    val r: render.Span = render.span(cam, space.Box{x0: x, y0: y, x1: x + 1, y1: y + 1});
-    paint.rect(d, r.x0, r.y0, r.x1, r.y1, theme.WALL, 0.7);
-}
-
-# the edge of a polygon being clicked out from (x0, y0) to (x1, y1), a cell
-# marked along it at most every so many cells, so a long edge costs no more
-# than a short one
-fun wall_edge(d: *paint.Paint, cam: render.Camera, x0: i64, y0: i64, x1: i64, y1: i64) {
-    var dx: i64 = x1 - x0;
-    var dy: i64 = y1 - y0;
-    if (dx < 0) { dx = 0 - dx; }
-    if (dy < 0) { dy = 0 - dy; }
-    var n: i64 = dx;
-    if (dy > n) { n = dy; }
-    var step: i64 = 1;
-    if (n > 256) { step = n / 256; }
-    var i: i64 = 0;
-    for (i <= n) {
-        var x: i64 = x0;
-        var y: i64 = y0;
-        if (n != 0) {
-            x = x0 + (x1 - x0) * i / n;
-            y = y0 + (y1 - y0) * i / n;
-        }
-        wall_mark(d, cam, x, y);
-        i = i + step;
-    }
-}
-
-# the corners of a polygon being clicked out, its edges and the one to the
-# pointer
-fun wall_corners(g: *Game, d: *paint.Paint, cam: render.Camera) {
-    val a: *app.App = ?g.app;
-    if (a.tool != app.TOOL_WALL || a.wall_shape != app.WALL_POLYGON || a.ncorners == 0) { ret; }
-    var i: usize = 0;
-    for (i < a.ncorners) {
-        var x1: i64 = a.wall_x;
-        var y1: i64 = a.wall_y;
-        if (i + 1 < a.ncorners) {
-            x1 = a.corners[i * 2 + 2];
-            y1 = a.corners[i * 2 + 3];
-        }
-        wall_edge(d, cam, a.corners[i * 2], a.corners[i * 2 + 1], x1, y1);
-        i = i + 1;
-    }
-    val r: render.Span = render.span(cam, space.Box{x0: a.corners[0], y0: a.corners[1], x1: a.corners[0] + 1, y1: a.corners[1] + 1});
-    paint.frame(d, r.x0 - 2.0, r.y0 - 2.0, r.x1 + 2.0, r.y1 + 2.0, 1.0, theme.WALL_ON, 0.9);
-}
-
-# the box a wall shape being dragged out covers, as it would be drawn
-fun wall_drag(g: *Game, d: *paint.Paint, cam: render.Camera) {
-    val a: *app.App = ?g.app;
-    if (a.tool != app.TOOL_WALL || !a.walling) { ret; }
-    var b: space.Box = space.Box{x0: a.anchor_x, y0: a.anchor_y, x1: a.wall_x, y1: a.wall_y};
-    if (b.x1 < b.x0) {
-        b.x0 = a.wall_x;
-        b.x1 = a.anchor_x;
-    }
-    if (b.y1 < b.y0) {
-        b.y0 = a.wall_y;
-        b.y1 = a.anchor_y;
-    }
-    b.x1 = b.x1 + 1;
-    b.y1 = b.y1 + 1;
-    val r: render.Span = render.span(cam, b);
-    paint.rect(d, r.x0, r.y0, r.x1, r.y1, theme.WALL, 0.25);
-    paint.frame(d, r.x0 - 1.0, r.y0 - 1.0, r.x1 + 1.0, r.y1 + 1.0, 1.0, theme.WALL, 0.9);
-}
-
-# a bounded grid's edge as a thin line, and the space off it as the plain
-# backdrop: off the grid is dead, on a frame drawn inverted too
+# a wrapping grid's edge as a thin line, and the space off it as the plain
+# backdrop: off the grid is dead, on a frame drawn inverted too. a plane is a
+# boundary, drawn as the world's domain is (bounds.domain)
 fun grid_edge(g: *Game, d: *paint.Paint, cam: render.Camera) {
     var gr: topology.Grid = g.shown.rule.grid;
-    if (!topology.bounded(?gr)) { ret; }
+    if (!topology.bounded(?gr) || gr.shape == topology.PLANE) { ret; }
     # an unbounded axis runs past the port
     var x0: f32 = cam.x0 - 2.0;
     var x1: f32 = cam.x0 + cam.sw + 2.0;
@@ -1019,13 +904,13 @@ pub fun on_draw(ctx: *Context) {
     # the world's overlays, then the interface over everything
     var d: paint.Paint = paint.Paint{pass: ?pass, srgb: g.srgb};
     grid_edge(g, ?d, cam);
+    bounds.domain(?d, a, cam);
     outline(g, ?d, cam);
     hud.selection(?d, a, cam, sc);
     bounds.overlay(?d, a, cam);
     hover(g, ?d, cam);
     ghost(g, ?d, pt, cam);
-    wall_drag(g, ?d, cam);
-    wall_corners(g, ?d, cam);
+    gesture.overlay(?d, ?a.walls, cam, ?a.shade_tmp);
     val drew: err[gfx.Error] = gui.draw(?g.gui, ?pass);
     if (sel drew.err) { print.eprintlnf("could not draw the interface: {}", gfx.error_message(drew.err)); }
 

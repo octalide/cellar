@@ -4,12 +4,14 @@
 # the colours, the panels and what they show, and the messages it flashes.
 
 use blit;
+use cellar.boundary;
 use cellar.brush;
 use cellar.ceiling;
 use cellar.command;
 use cellar.device;
 use cellar.fill;
 use cellar.format;
+use cellar.gesture;
 use cellar.identify;
 use cellar.identify.worker;
 use cellar.journal;
@@ -28,7 +30,6 @@ use cellar.topology;
 use allo: std.allocator;
 use std.collections.vector;
 use std.collections.vector.Vector;
-use mem: std.memory;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -77,25 +78,12 @@ pub val TOOL_ERASE: usize = 1;
 pub val TOOL_STAMP: usize = 2;
 # drag out a rectangle to operate on
 pub val TOOL_SELECT: usize = 3;
-# drag out the world's bounds, or the edges of the grid it is on
+# draw the world's boundary, or a grid's bounds, and act on its regions
 pub val TOOL_BOUNDS: usize = 4;
-# draw walls, with the brush or a shape (WALL_*)
+# draw walls, with any of the gestures (cellar.gesture)
 pub val TOOL_WALL: usize = 5;
 # number of tools
 pub val TOOL_COUNT: usize = 6;
-
-# the wall tool draws a stroke of walls along the pointer
-pub val WALL_BRUSH: usize = 0;
-# a rectangle dragged out
-pub val WALL_RECT: usize = 1;
-# the ellipse inscribed in a rectangle dragged out
-pub val WALL_ELLIPSE: usize = 2;
-# a polygon clicked out a corner at a time, closed on its first corner
-pub val WALL_POLYGON: usize = 3;
-# number of wall shapes
-pub val WALL_SHAPES: usize = 4;
-# the most corners a polygon clicked out holds
-pub val WALL_CORNERS: usize = 64;
 
 # a wall drawn holds no live state
 pub val WALL_DEAD: usize = 0;
@@ -196,13 +184,8 @@ pub val ZOOM_TREE_MIN: f32 = 0.000000000001;
 # dragging:     the selection is being dragged out
 # anchor_x:     the cell the drag started on
 # anchor_y:     the cell the drag started on
-# wall_shape:   what the wall tool draws (WALL_BRUSH, WALL_RECT, WALL_ELLIPSE)
 # wall_kind:    what a wall drawn holds (WALL_DEAD, WALL_INK)
-# walling:      a wall shape is being dragged out from the anchor
-# wall_x:       the cell the drag or the polygon has reached
-# wall_y:       the cell the drag or the polygon has reached
-# corners:      the polygon's corners clicked so far, column then row each
-# ncorners:     how many
+# walls:        the shape the wall tool is drawing (cellar.gesture)
 # sizing:       the bounds are being dragged
 # edges:        the grid's edges the drag moves (cellar.bounds), 0 for a new box
 # sized:        the bounds as dragged so far, half-open
@@ -213,6 +196,28 @@ pub val ZOOM_TREE_MIN: f32 = 0.000000000001;
 # size_h:       the bounds section's height
 # size_h_buf:   its text
 # sized_grid:   the grid the size fields last showed
+# domain:       the world's boundary as last seen (cellar.exec), which the
+#               bounds tool and the draw read
+# dom_on:       the world has a boundary, which domain holds
+# dom_drawn:    it was drawn, rather than the plane the rule names
+# dom_seen:     the change to the boundary domain was copied at (sim.bound_revision)
+# dom_parts:    regions it holds
+# shape:        the shape the bounds tool is drawing (cellar.gesture)
+# choosing:     a press of the bounds tool picks a region rather than drawing
+# bound_op:     how a drawn shape combines with the boundary (boundary.ADD,
+#               SUBTRACT or INTERSECT)
+# part_on:      a region of the boundary is picked
+# part_x:       the column of a cell it holds
+# part_y:       its row
+# part:         the region, as last seen
+# moving:       the picked region is being dragged
+# move_dx:      columns it is dragged by so far
+# move_dy:      rows it is dragged by so far
+# shade_tmp:    spans the draw of a region works out (cellar.shade)
+# fill_on:      a region is chosen for a region fill, which fill_part holds
+# fill_x:       the column of the cell that chose it
+# fill_y:       its row
+# fill_part:    the region, as the boundary was last seen
 # alloc:        allocator behind the patterns and the queue, once attach has run
 # queue:        edits to the world, applied at the start of the next frame
 # start:        the world reset returns to, once attach has run
@@ -287,13 +292,8 @@ pub rec App {
     dragging:     bool;
     anchor_x:     i64;
     anchor_y:     i64;
-    wall_shape:   usize;
     wall_kind:    usize;
-    walling:      bool;
-    wall_x:       i64;
-    wall_y:       i64;
-    corners:      [WALL_CORNERS * 2]i64;
-    ncorners:     usize;
+    walls:        gesture.Gesture;
     sizing:       bool;
     edges:        u8;
     sized:        space.Box;
@@ -303,6 +303,26 @@ pub rec App {
     size_h:       blit.field.Field;
     size_h_buf:   [SIZE_DIGITS + 1]u8;
     sized_grid:   topology.Grid;
+    domain:       boundary.Region;
+    dom_on:       bool;
+    dom_drawn:    bool;
+    dom_seen:     u64;
+    dom_parts:    usize;
+    shape:        gesture.Gesture;
+    choosing:     bool;
+    bound_op:     u32;
+    part_on:      bool;
+    part_x:       i64;
+    part_y:       i64;
+    part:         boundary.Region;
+    moving:       bool;
+    move_dx:      i64;
+    move_dy:      i64;
+    shade_tmp:    Vector[i64];
+    fill_on:      bool;
+    fill_x:       i64;
+    fill_y:       i64;
+    fill_part:    boundary.Region;
     alloc:        *allo.Allocator;
     queue:        command.Queue;
     start:        snapshot.Snapshot;
@@ -552,6 +572,14 @@ pub fun attach(a: *App, alloc: *allo.Allocator) err[format.Error] {
     a.clip       = vector.init[u8](alloc);
     a.clip_ready = false;
     a.layout     = vector.init[u8](alloc);
+    a.domain     = boundary.init(alloc);
+    a.part       = boundary.init(alloc);
+    a.shade_tmp  = vector.init[i64](alloc);
+    a.fill_part  = boundary.init(alloc);
+    gesture.init(?a.shape, alloc);
+    gesture.init(?a.walls, alloc);
+    a.walls.kind   = gesture.FREEHAND;
+    a.walls.radius = 0.0;
     val l: err[format.Error] = library.init(?a.library, alloc);
     if (sel l.err) { ret l; }
     val p: err[allo.Error] = pattern.init(?a.picked, alloc, 0, 0, "");
@@ -576,6 +604,12 @@ pub fun dnit(a: *App) {
     journal.dnit(?a.log);
     vector.dnit[u8](?a.clip);
     vector.dnit[u8](?a.layout);
+    boundary.dnit(?a.domain);
+    boundary.dnit(?a.part);
+    vector.dnit[i64](?a.shade_tmp);
+    boundary.dnit(?a.fill_part);
+    gesture.dnit(?a.shape);
+    gesture.dnit(?a.walls);
     worker.cancel(?a.identifier);
 }
 
@@ -651,22 +685,17 @@ pub fun submit(a: *App, c: command.Command) {
     }
 }
 
-# draw the polygon of walls whose corners have been clicked out, holding the
-# wall tool's state, and start the next afresh
-pub fun close_polygon(a: *App) {
-    val n: usize = a.ncorners;
-    a.ncorners = 0;
-    if (n < 3) { ret; }
-    var w: command.Walls = command.walls(command.WALLS_POLYGON, 0, 0, 0, 0, wall_state(a), false);
-    w.pts = vector.init[i64](a.alloc);
-    val room: res[usize, allo.Error] = vector.reserve[i64](?w.pts, n * 2);
-    if (sel room.err) {
+# draw the walls of the shape the wall tool's gesture just finished, holding
+# the wall tool's state, as one change
+pub fun draw_walls(a: *App) {
+    var r:      boundary.Region = boundary.init(a.alloc);
+    val copied: err[allo.Error] = boundary.copy(?r, ?a.walls.shape);
+    if (sel copied.err) {
+        boundary.dnit(?r);
         say(a, "out of memory");
         ret;
     }
-    mem.copy[i64](w.pts.data, ?a.corners[0], n * 2);
-    w.pts.len = n * 2;
-    submit(a, command.Command.walls{w});
+    submit(a, command.Command.walls{command.Walls{shape: r, v: wall_state(a)}});
 }
 
 # a file command's copy of a path, saying so when there is no memory for it
@@ -750,6 +779,75 @@ pub fun select(a: *App, x0: i64, y0: i64, x1: i64, y1: i64) {
 pub fun deselect(a: *App) {
     a.selected = false;
     a.dragging = false;
+}
+
+# pick the region of the boundary holding a cell, as the boundary was last
+# seen, or none where no region holds it
+# ---
+# ret: whether a region holds the cell
+pub fun pick_part(a: *App, x: i64, y: i64) bool {
+    a.part_on = false;
+    a.moving  = false;
+    boundary.clear(?a.part);
+    if (!a.dom_on) { ret false; }
+    val at: res[usize, allo.Error] = boundary.region_at(?a.domain, x, y);
+    if (!sel at.ok)                  { ret false; }
+    if (at.ok == boundary.NO_REGION) { ret false; }
+    val got: err[allo.Error] = boundary.region(?a.domain, at.ok, ?a.part);
+    if (sel got.err) { ret false; }
+    a.part_on = true;
+    a.part_x  = x;
+    a.part_y  = y;
+    ret true;
+}
+
+# take up the world's boundary as it now stands, once it has changed since
+# last seen, keeping the picked region picked where a region still holds its
+# cell
+# ---
+# a:       application state, attached
+# changes: the boundary's changes so far (sim.bound_revision)
+# b:       the boundary, or nil for none
+# drawn:   it was drawn, rather than the plane the rule names
+pub fun see_domain(a: *App, changes: u64, b: *boundary.Region, drawn: bool) {
+    if (changes == a.dom_seen) { ret; }
+    a.dom_seen  = changes;
+    a.dom_on    = false;
+    a.dom_drawn = false;
+    a.dom_parts = 0;
+    boundary.clear(?a.domain);
+    if (b != nil) {
+        val copied: err[allo.Error] = boundary.copy(?a.domain, b);
+        a.dom_on    = sel copied.ok;
+        a.dom_drawn = a.dom_on && drawn;
+    }
+    if (a.dom_on) {
+        val n: res[usize, allo.Error] = boundary.count(?a.domain);
+        if (sel n.ok) { a.dom_parts = n.ok; }
+    }
+    if (a.part_on) { pick_part(a, a.part_x, a.part_y); }
+    see_fill(a, a.fill_on, a.fill_x, a.fill_y, true);
+}
+
+# take up the cell that chooses the region a region fill takes, finding the
+# region in the boundary as last seen when the cell or the boundary changed
+# ---
+# a:     application state, attached
+# on:    a cell is chosen
+# x:     its column
+# y:     its row
+# again: the boundary changed, so the region is found again
+pub fun see_fill(a: *App, on: bool, x: i64, y: i64, again: bool) {
+    if (!again && on == a.fill_on && x == a.fill_x && y == a.fill_y) { ret; }
+    a.fill_on = on;
+    a.fill_x  = x;
+    a.fill_y  = y;
+    boundary.clear(?a.fill_part);
+    if (!on || !a.dom_on) { ret; }
+    val at: res[usize, allo.Error] = boundary.region_at(?a.domain, x, y);
+    if (!sel at.ok)                  { ret; }
+    if (at.ok == boundary.NO_REGION) { ret; }
+    boundary.region(?a.domain, at.ok, ?a.fill_part);
 }
 
 # ask for an operation on the selection, when there is one
@@ -853,18 +951,36 @@ pub fun init(a: *App) {
     a.selected   = false;
     a.dragging   = false;
     a.sizing     = false;
-    a.wall_shape = WALL_BRUSH;
     a.wall_kind  = WALL_DEAD;
-    a.walling    = false;
-    a.wall_x     = 0;
-    a.wall_y     = 0;
-    a.ncorners   = 0;
     a.edges      = 0;
     a.grid_shape = 0;
     blit.field.init(?a.size_w, ?a.size_w_buf[0], SIZE_DIGITS + 1, 0, digit);
     blit.field.init(?a.size_h, ?a.size_h_buf[0], SIZE_DIGITS + 1, 0, digit);
     a.sized_grid = topology.open();
-    a.alloc      = nil;
+    a.domain     = boundary.init(nil);
+    a.dom_on     = false;
+    a.dom_drawn  = false;
+    a.dom_seen   = 0;
+    a.dom_parts  = 0;
+    gesture.init(?a.shape, nil);
+    gesture.init(?a.walls, nil);
+    a.walls.kind   = gesture.FREEHAND;
+    a.walls.radius = 0.0;
+    a.choosing     = false;
+    a.bound_op     = boundary.ADD;
+    a.part_on      = false;
+    a.part_x       = 0;
+    a.part_y       = 0;
+    a.part         = boundary.init(nil);
+    a.moving       = false;
+    a.move_dx      = 0;
+    a.move_dy      = 0;
+    a.shade_tmp    = vector.init[i64](nil);
+    a.fill_on      = false;
+    a.fill_x       = 0;
+    a.fill_y       = 0;
+    a.fill_part    = boundary.init(nil);
+    a.alloc        = nil;
     worker.init(?a.identifier);
     a.id_limits     = identify.limits();
     a.identified[0] = 0;
