@@ -70,12 +70,35 @@ pub val SHARD_AT: u32 = 18;
 # the word of the value a fresh live cell holds in the set's shown layer
 # (cellar.rule lit), which a shown layer the pool takes up starts from
 pub val LIT_AT: u32 = 19;
+# the word of the rows a dispatch folds along y (row): the device's most
+# workgroups along y, which every stage finds its row by
+pub val FOLD_AT: u32 = 20;
 # the words of the shard table's address, past the base words (Meta)
 pub val SHARDS_AT: u32 = 24;
 # a neighbour that does not exist
 pub val NONE: u32 = 0xffffffff;
 # a position past a plane's dead edge, as a step stage's reach finds it
 pub val PAST: u32 = 0xfffffffe;
+
+# the row of workgroups a stage's workgroup lies in, where its dispatch folds
+# rows past fold along y onto z, fold rows a step along z (cellar.gpu rows). a
+# dispatch's last step along z may run past the rows it covers, so a stage
+# bounds the row before it reads anything the row names
+pub fun row(y: u32, z: u32, fold: u32) u32 {
+    ret y + z * fold;
+}
+
+# the workgroups along y of a dispatch folded as row folds it, covering rows
+# up to row r: what a stage that lists rows raises indirect arguments' y to
+pub fun fold_y(r: u32, fold: u32) u32 {
+    if (r < fold) { ret r + 1; }
+    ret fold;
+}
+
+# the workgroups along z of a dispatch covering rows up to row r, as fold_y
+pub fun fold_z(r: u32, fold: u32) u32 {
+    ret r / fold + 1;
+}
 
 # storage buffers every step stage binds: the meta buffer and the flags, at
 # bindings 0 and 1. the cells it reaches by address (Shards)
@@ -463,7 +486,7 @@ pub fun edge_side(e: u32, x: i32, y: i32) u32 {
 # slot is free, a link word per neighbour slot, and the edge word. sense
 # holds the running rule's, and gen, strobe and base lie at GEN_AT, STROBE_AT
 # and BASE_AT. base's words are the first entry of a step's dispatch, then
-# the words at WIDTH_AT, SET_AT, WIDTHS_AT, CAP_AT, SHARD_AT and LIT_AT, and shards,
+# the words at WIDTH_AT, SET_AT, WIDTHS_AT, CAP_AT, SHARD_AT, LIT_AT and FOLD_AT, and shards,
 # at SHARDS_AT, is the address of the shard table. a stage's storage block
 # has at most 16 fields, so these are gathered rather than one each
 pub rec Meta {
@@ -479,21 +502,34 @@ pub rec Meta {
     table:  [WORDS]u32;
 }
 
-# the slots a stage works on, named by the host
+# the slots the clear stage empties, n of them, named by the host or listed by
+# the settle stage
 pub rec List {
+    n: u32;
     v: [WORDS]u32;
 }
 
+# the words of a list buffer for cap slots
+pub fun list_words(cap: u32) u32 {
+    ret 1 + cap;
+}
+
 # the indirect arguments the steps over the active list are dispatched from,
-# whose second is the list's length, and the gather's header bits in the
-# fourth, then per slot of the pool's capacity two words, each the serial of
+# folded to cover its length (row), the gather's header bits, and the list's
+# length, then per slot of the pool's capacity two words, each the serial of
 # the last step that left a live cell and a warm one, then the active list:
 # the slots the steps until the next gather may change (gather_comp), from
 # list_at of the capacity on (CAP_AT)
 pub rec Flags {
-    args: [4]u32;
+    args: [3]u32;
+    bits: u32;
+    n:    u32;
+    pad:  [3]u32;
     v:    [WORDS]u32;
 }
+
+# words of a flags buffer ahead of its stamps
+pub val FLAGS_HEAD: u32 = 8;
 
 # the word of the flags buffer where the list's arguments start
 pub val FLAGS_ARGS: u32 = 0;
@@ -506,7 +542,7 @@ pub fun list_at(cap: u32) u32 {
 
 # the words of a flags buffer for cap slots
 pub fun flags_words(cap: u32) u32 {
-    ret 4 + cap * 3;
+    ret FLAGS_HEAD + cap * 3;
 }
 
 # the gather's header bits: the GPU owns the pool, so a closed gate (Status)
@@ -588,8 +624,9 @@ pub val CTL_PASS:  u32 = 9;
 pub val CTL_NOW:   u32 = 10;
 pub val CTL_GENS:  u32 = 11;
 pub val CTL_SPAN:  u32 = 13;
-# the indirect arguments of the settle stage, one workgroup per 64 slots
-# claimed, and of the clear stage, one per settled slot, three words each
+# the indirect arguments of the settle stage, a row of one workgroup per 64
+# slots claimed, and of the clear stage, a row per settled slot, three words
+# each, folded (row)
 pub val ARGS_SETTLE: u32 = 16;
 pub val ARGS_CLEAR:  u32 = 19;
 # census words per slot: the packed count, the extent, and the coordinates
@@ -659,6 +696,29 @@ test link__takes_a_position_through_every_transform_and_back {
     if (edge(0, 64, 0, 64, 0) != EDGE_WHOLE)                                                { ret 5; }
     if (edge_side(e, 13, 0) != 3 || edge_side(e, 14, 49) != 4 || edge_side(e, 20, 50) != 7) { ret 6; }
     if (edge_side(e, 64, -1) != 2)                                                          { ret 7; }
+    ret 0;
+}
+
+test fold__covers_every_row_and_runs_past_the_last_by_less_than_a_fold {
+    val folds: [3]u32 = [3]u32{1, 7, 65535};
+    val rows:  [5]u32 = [5]u32{0, 6, 7, 65535, 200000};
+    var i:     u32    = 0;
+    for (i < 3) {
+        var j: u32 = 0;
+        for (j < 5) {
+            val f: u32 = folds[i];
+            val r: u32 = rows[j];
+            val y: u32 = fold_y(r, f);
+            val z: u32 = fold_z(r, f);
+            # the last workgroup's row is at or past r, and every row below it
+            # is some workgroup's: y holds a whole fold wherever z steps
+            val top: u32 = row(y - 1, z - 1, f);
+            if (y > f || top < r || top - r >= f) { ret 1; }
+            if (z > 1 && y != f)                  { ret 2; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
     ret 0;
 }
 
