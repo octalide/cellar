@@ -265,6 +265,7 @@ pub rec Watch {
 # unsettled:  the CPU's last step reached the pool's ceiling before every
 #             live chunk had its halo, so the next settles the pool first
 # held:       a test's hold on the pool's ceiling in slots, 0 for none
+# pool:       the memory the pool takes and may take (pool_memory)
 # withheld:   the GPU keeps a pool the host could not take back, so the run
 #             paused and what needed the host's pool was refused, until a take
 #             next succeeds
@@ -301,6 +302,7 @@ pub rec Sim {
     full:       bool;
     unsettled:  bool;
     held:       usize;
+    pool:       PoolMemory;
     withheld:   bool;
     generation: u64;
     running:    u8;
@@ -358,6 +360,7 @@ pub fun init(s: *Sim, a: *allo.Allocator) err[allo.Error] {
     s.full       = false;
     s.unsettled  = false;
     s.held       = 0;
+    s.pool       = PoolMemory{taken: 0, bound: 0, heap: 0, share: 0};
     s.withheld   = false;
     s.generation = 0;
     s.running    = 0;
@@ -669,20 +672,54 @@ pub fun attach(s: *Sim, g: *gpu.Gpu) {
 # ---
 # s: simulation
 pub fun refit(s: *Sim) {
-    val set: *plane.Set = space.layers(?s.space);
-    val on:  bool       = s.ceil.on[ceiling.POOL];
-    val lim: u64        = ceiling.raw(?s.ceil, ceiling.POOL);
-    var n:   usize      = space.HOST_SLOTS;
-    if (on && lim != 0) {
-        val fit: u64 = lim / space.slot_bytes(?s.space)::u64;
-        if (fit < n::u64) { n = fit::usize; }
-    }
+    val set:  *plane.Set = space.layers(?s.space);
+    val on:   bool       = s.ceil.on[ceiling.POOL];
+    val lim:  u64        = ceiling.raw(?s.ceil, ceiling.POOL);
+    val host: u64        = space.slot_bytes(?s.space)::u64;
+    var n:    usize      = space.HOST_SLOTS;
+    if (on && lim != 0 && lim / host < n::u64) { n = (lim / host)::usize; }
+    s.pool = PoolMemory{taken: 0, bound: n::u64 * host, heap: 0, share: 0};
     if (s.gpu != nil) {
-        val dev: usize = gpu.fit(s.gpu, set, gpu.memory_limit(s.gpu, on, lim));
-        if (on_gpu(s) || dev < n) { n = dev; }
+        val bound: u64   = gpu.memory_limit(s.gpu, on, lim);
+        val dev:   usize = gpu.fit(s.gpu, set, bound);
+        s.pool.heap  = gpu.heap(s.gpu);
+        s.pool.share = gpu.memory_limit(s.gpu, true, 0);
+        if (on_gpu(s) || dev < n) {
+            n            = dev;
+            s.pool.bound = bound;
+        }
     }
     if (s.held != 0 && s.held < n) { n = s.held; }
     space.set_ceiling(?s.space, n);
+    note_pool(s);
+}
+
+# what the pool takes now: on the device while a GPU steps the world, else on
+# the host
+fun note_pool(s: *Sim) {
+    if (on_gpu(s)) { s.pool.taken = gpu.pool_bytes_of(s.gpu); }
+    or             { s.pool.taken = (s.space.cap * space.slot_bytes(?s.space))::u64; }
+}
+
+# the memory the pool takes and may take, in bytes, as the interface shows it
+# ---
+# taken: what it takes now
+# bound: the most it may take under its ceiling, where the device or the
+#        host holds it
+# heap:  the device's largest local heap, 0 without a GPU or where it says
+#        nothing
+# share: what the ceiling's default leaves it on the device (cellar.gpu
+#        memory_limit), 0 without a GPU
+pub rec PoolMemory {
+    taken: u64;
+    bound: u64;
+    heap:  u64;
+    share: u64;
+}
+
+# the memory the pool takes and may take, as the last refit and step found it
+pub fun pool_memory(s: *Sim) PoolMemory {
+    ret s.pool;
 }
 
 # hold the pool's ceiling to slots, below what refit fits it to, so a test can
@@ -1000,6 +1037,7 @@ pub fun commit(s: *Sim) {
         trip(s, ceiling.POOL);
     }
     s.generation = s.generation + 1;
+    note_pool(s);
     val pop: u64 = population(s)::u64;
     history.add(?s.history, s.generation, pop);
     check(s, pop, took(s.began));
@@ -1195,6 +1233,7 @@ pub fun collect(s: *Sim) {
         ret;
     }
     rewind(s);
+    note_pool(s);
     if (!got.fits)  { overflow(s); }
     if (!got.fresh) { ret; }
     # every census older than the last clear is refused, so it is never more

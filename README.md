@@ -269,9 +269,11 @@ The other worlds run Life with its eight weights widened to the radius, one by
 default, so a wider radius costs its spread but reads the same eight cells.
 
 The line reads `bench <engine> radius <r> chunks <n> population <n> gens/s <n>
-step us <n> cells/s <n> frame us <n>`: chunks and population as the run ended,
-generations a second, the time a generation took on average, the cells of the
-chunks the pool held stepped a second, and the time a frame took on average.
+step us <n> cells/s <n> frame us <n> bits/cell <n> pool bytes <n>`: chunks and
+population as the run ended, generations a second, the time a generation took
+on average, the cells of the chunks the pool held stepped a second, the time a
+frame took on average, the bits a cell takes in the pool, and the bytes the
+pool took, on the GPU where it steps.
 
 `cellar --bench <gpu|cpu> pause [seconds]` runs Seeds from a soup, pauses it
 after each run of that long and resumes it, and prints how long each pause took
