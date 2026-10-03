@@ -77,6 +77,17 @@
 # the world at the last completed generation, owing no commit. the GPU's generations are
 # recorded by the frame, between whose ranges nothing is under way to cancel.
 #
+# walls are cells of the world with a fixed state or value (cellar.layer
+# WALL): a step leaves them as they are and their neighbours read them as any
+# cell. the pool takes up the wall layer when a world first takes a wall
+# (hold_walls) and lets it go once the world holds none (let_walls), so a world
+# that never held one pays nothing. an edit says what its writes do to walls
+# (EDIT_CELLS, EDIT_WALLS, EDIT_ERASE): a cell edit and a fill leave them as
+# they stand, a wall edit makes its cells walls holding the word it writes, and
+# an erase takes them away. a clear, a load or the restore of a world without
+# walls takes them away with the rest, a randomize keeps them, and the journal
+# and snapshots keep them with the cells. the tree runs no walls (no_tree).
+#
 # the world is unbounded unless the rule names a bounded grid
 # (cellar.topology) or the world has a boundary (cellar.boundary), and then a
 # cell written off the grid or outside the boundary is dropped, as Golly clips
@@ -122,6 +133,8 @@ use std.chrono.duration.SECOND;
 use std.chrono.time;
 use std.collections.set;
 use std.collections.set.Set;
+use std.collections.vector;
+use std.collections.vector.Vector;
 use mem: std.memory;
 use std.print;
 use std.rand;
@@ -174,23 +187,36 @@ pub rec Caps {
     pool: bool;
 }
 
+# what an edit's writes do to walls (edit_begin_as)
+# ---
+# EDIT_CELLS: a cell that is a wall keeps its word and stays one
+# EDIT_WALLS: every cell written becomes a wall holding the word written
+# EDIT_ERASE: every cell written stops being a wall
+pub val EDIT_CELLS: u8 = 0;
+pub val EDIT_WALLS: u8 = 1;
+pub val EDIT_ERASE: u8 = 2;
+
 # the bounds of an open edit, in cells, half-open
 # ---
-# open:   between edit_begin and edit_end
-# sparse: the area is small, so cells are written singly rather than by chunk
-# lost:   a cell was dropped because the pool or the tree was full
-# x0:     first column
-# y0:     first row
-# x1:     column after the last
-# y1:     row after the last
+# open:    between edit_begin and edit_end
+# sparse:  the area is small, so cells are written singly rather than by chunk
+# mode:    what its writes do to walls (EDIT_CELLS, EDIT_WALLS, EDIT_ERASE)
+# chunked: a chunk was written whole, its walls with it (edit_chunk)
+# lost:    a cell was dropped because the pool or the tree was full
+# x0:      first column
+# y0:      first row
+# x1:      column after the last
+# y1:      row after the last
 pub rec Edit {
-    open:   bool;
-    sparse: bool;
-    lost:   bool;
-    x0:     i64;
-    y0:     i64;
-    x1:     i64;
-    y1:     i64;
+    open:    bool;
+    sparse:  bool;
+    mode:    u8;
+    chunked: bool;
+    lost:    bool;
+    x0:      i64;
+    y0:      i64;
+    x1:      i64;
+    y1:      i64;
 }
 
 # the bounds of an open read, in cells, half-open
@@ -406,6 +432,7 @@ pub fun init(s: *Sim, a: *allo.Allocator) err[allo.Error] {
     s.space.sense = rule.sense(?s.rule);
     s.space.lit   = rule.lit(?s.rule);
     s.space.reach = rule.radius(?s.rule);
+    s.space.flips = rule.caps(?s.rule).b0;
     hashlife.set_rule(?s.tree, s.rule);
     s.rng        = rand.init();
     s.gpu        = nil;
@@ -491,8 +518,57 @@ fun kept(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64, whole: bool, current: bool
 # view layer its family keeps heat and age in while the view's colour mode
 # reads them (cellar.layer)
 fun laid_for(s: *Sim, r: *rule.Rule) plane.Set {
-    if (s.views) { ret rule.viewed(r); }
-    ret rule.layers(r);
+    var set: plane.Set = rule.layers(r);
+    if (s.views)  { set = rule.viewed(r); }
+    if (walls(s)) { plane.add_wall(?set); }
+    ret set;
+}
+
+# whether the world holds walls, so the pool holds the wall layer
+pub fun walls(s: *Sim) bool {
+    ret !on_tree(s) && space.walls_on(?s.space);
+}
+
+# take up the wall layer, so the world may take walls, as one change: the
+# world leaves the tree, which runs none (no_tree), and the cells move into
+# the layers with it, pulled from the GPU first. a world that holds it
+# already is left as it is. call outside a frame, or in one before gpu frame
+# has recorded anything, with no edit or read open
+# ---
+# s:   simulation
+# ret: why the world cannot take walls, the world then as it was: it could not
+#      leave the tree, the GPU's cells could not be read, or the pool could not
+#      take the layer
+pub fun hold_walls(s: *Sim) opt[str] {
+    if (walls(s))                               { ret opt[str].none{}; }
+    if (on_tree(s) && !move_hashlife(s, false)) { ret opt[str].some{"HashLife cannot run walls, and the world is too large for the chunk pool"}; }
+    ret relay_walls(s, true, true);
+}
+
+# let the wall layer go once the world holds no wall, as hold_walls takes it up
+fun let_walls(s: *Sim) {
+    if (!walls(s) || space.any_walls(?s.space)) { ret; }
+    relay_walls(s, false, true);
+}
+
+# move the world's cells into its layers with or without the wall layer,
+# pulling them from the GPU first with pull, where the host's are not the
+# world's already
+fun relay_walls(s: *Sim, on: bool, pull: bool) opt[str] {
+    var lay: plane.Set = rule.layers(?s.rule);
+    if (s.views) { lay = rule.viewed(?s.rule); }
+    if (on)      { plane.add_wall(?lay); }
+    if (pull) {
+        val unread: opt[str] = synced_why(s, sync(s));
+        if (sel unread.some) { ret unread; }
+    }
+    val laid: opt[str] = relay(s, ?lay, nil, nil);
+    if (sel laid.some) { ret laid; }
+    val sp: *space.Space = ?s.space;
+    if (on_gpu(s)) { gpu.forget_writes(s.gpu, 0, sp.hi); }
+    # the cells are as they were, and the pool's layers took them whole
+    pool_settle(s);
+    ret opt[str].none{};
 }
 
 # hold the view layers a colour mode reads, or let them go: while on, the pool
@@ -635,8 +711,10 @@ pub fun cell_bits(s: *Sim) u64 {
     var bits: u64   = 0;
     var k:    usize = 0;
     for (k < set.n) {
-        bits = bits + 2 * set.at[k].width::u64;
-        k    = k + 1;
+        # a static layer's cells are one (cellar.layer WALL)
+        if (space.static_layer(?set, k)) { bits = bits + set.at[k].width::u64; }
+        or                               { bits = bits + 2 * set.at[k].width::u64; }
+        k = k + 1;
     }
     ret bits;
 }
@@ -689,6 +767,7 @@ pub fun set_rule(s: *Sim, r: rule.Rule) opt[str] {
         s.space.sense = rule.sense(?s.rule);
         s.space.lit   = rule.lit(?s.rule);
         s.space.reach = rule.radius(?s.rule);
+        s.space.flips = rule.caps(?s.rule).b0;
         hashlife.set_rule(?s.tree, r);
         touched(s);
         if (fewer && !hashlife.limit_states(?s.tree, rule.states(?new))) { overflow(s); }
@@ -721,6 +800,7 @@ pub fun set_rule(s: *Sim, r: rule.Rule) opt[str] {
     }
     s.rule        = r;
     s.space.reach = rule.radius(?s.rule);
+    s.space.flips = rule.caps(?s.rule).b0;
     if (rule.caps(?new).no_tree == nil) { hashlife.set_rule(?s.tree, r); }
     if (same && !regrid && !relaid) {
         rim(s);
@@ -739,13 +819,16 @@ pub fun set_rule(s: *Sim, r: rule.Rule) opt[str] {
     }
     # the live cells changed, so the census and the chunks around them follow
     fill_end(s);
+    # a grid's edge may have taken the last walls with the cells off it
+    if (regrid) { let_walls(s); }
     ret opt[str].none{};
 }
 
 # whether the pool keeps the chunks along the boundary's edge: the rule's
 # step reads it live on some generation (rule.Caps b0)
 fun rim(s: *Sim) {
-    s.space.rim = s.bounded && rule.caps(?s.rule).b0;
+    s.space.rim   = s.bounded && rule.caps(?s.rule).b0;
+    s.space.flips = rule.caps(?s.rule).b0;
 }
 
 # put the pool on the grid the rule names: a plane is the boundary of its
@@ -863,6 +946,8 @@ pub fun set_bound(s: *Sim, r: *boundary.Region) opt[str] {
         sl = sl + 1;
     }
     fill_end(s);
+    # the walls outside it went with the cells there
+    let_walls(s);
     ret opt[str].none{};
 }
 
@@ -1239,7 +1324,7 @@ rec Seed {
 fun seed_chunk(ctx: *u8, cx: i64, cy: i64, cells: *u8) {
     val sd: *Seed = ctx::*Seed;
     fresh_words(sd.s, cells, space.CELLS, sd.w);
-    if (!fill_chunk(sd.s, cx, cy, sd.w)) { sd.lost = true; }
+    if (!fill_chunk(sd.s, cx, cy, sd.w, nil)) { sd.lost = true; }
 }
 
 # seed the tree's live chunks into the emptied pool and settle it
@@ -1270,11 +1355,13 @@ pub fun use_hashlife(s: *Sim, on: bool) bool {
 }
 
 # why the tree cannot hold the world, or nil: its rule's reason (rule.Caps
-# no_tree), or a boundary, which the tree's unbounded plane has no room for
+# no_tree), a boundary, which the tree's unbounded plane has no room for, or
+# walls, which it has no layer for
 pub fun no_tree(s: *Sim) str {
     val why: str = rule.caps(?s.rule).no_tree;
     if (why != nil) { ret why; }
     if (s.bounded)  { ret "a drawn boundary"; }
+    if (walls(s))   { ret "walls"; }
     ret nil;
 }
 
@@ -2060,6 +2147,12 @@ fun rewind(s: *Sim) {
 # ---
 # s: simulation
 pub fun clear(s: *Sim) {
+    clear_world(s, false);
+}
+
+# empty the world as clear does, keeping the wall layer where keep says so,
+# for a caller that puts the walls back (randomize_shape)
+fun clear_world(s: *Sim, keep: bool) {
     if (wanted(s, 0, 0, 0, 0, true)) {
         val synced: err[gfx.Error] = sync(s);
         kept(s, 0, 0, 0, 0, true, sel synced.ok);
@@ -2082,6 +2175,13 @@ pub fun clear(s: *Sim) {
     val sp: *space.Space = ?s.space;
     val to: usize        = gpu.fitted(sp.hi, gpu.MOST_SLOTS);
     if (to < sp.cap) { space.shrink(sp, to); }
+    # an empty world holds no wall, and its layer goes with the walls, nothing
+    # to read back
+    if (!keep && walls(s)) {
+        var lay: plane.Set = rule.layers(?s.rule);
+        if (s.views) { lay = rule.viewed(?s.rule); }
+        relay(s, ?lay, nil, nil);
+    }
     note_pool(s);
 }
 
@@ -2095,7 +2195,7 @@ fun tree_chunk(s: *Sim, x: i64, y: i64, make: bool) *u8 {
     ret hashlife.chunk(?s.tree, space.chunk_of(x), space.chunk_of(y), make);
 }
 
-# seed a cell of a state, between fill_begin and fill_end
+# seed a cell of a state, between fill_begin and fill_end, unless it is a wall
 # ---
 # s:     simulation
 # x:     column
@@ -2113,6 +2213,8 @@ pub fun fill_cell(s: *Sim, x: i64, y: i64, state: u32) bool {
     }
     val sl: u32 = space.alloc(?s.space, space.chunk_of(x), space.chunk_of(y));
     if (sl == space.NONE) { ret false; }
+    # a fill never writes over a wall
+    if (walls(s) && space.wall_at(?s.space, sl::usize, space.local_of(y) * 64 + space.local_of(x))) { ret true; }
     var w: [layer.LAYERS_MAX]u32;
     rule.fresh(?s.rule, state, ?w[0]);
     space.put_word(?s.space, sl::usize, space.local_of(y) * 64 + space.local_of(x), ?w[0]);
@@ -2126,8 +2228,11 @@ pub fun fill_cell(s: *Sim, x: i64, y: i64, state: u32) bool {
 # cx:    chunk column
 # cy:    chunk row
 # cells: space.CELLS words, row-major (word_len)
+# wl:    the chunk's walls, a bit a cell as the wall layer holds them
+#        (layout.MASK words), or nil for none; a world that holds walls
+#        (hold_walls) takes them
 # ret:   false when the pool or the tree is full
-pub fun fill_chunk(s: *Sim, cx: i64, cy: i64, cells: *u32) bool {
+pub fun fill_chunk(s: *Sim, cx: i64, cy: i64, cells: *u32, wl: *u32) bool {
     if (!space.on_grid(?s.space, cx, cy)) { ret true; }
     if (on_tree(s)) {
         val p: *u8   = hashlife.chunk(?s.tree, cx, cy, true);
@@ -2144,9 +2249,20 @@ pub fun fill_chunk(s: *Sim, cx: i64, cy: i64, cells: *u32) bool {
     val sl: u32 = space.alloc(?s.space, cx, cy);
     if (sl == space.NONE) { ret false; }
     space.put_words(?s.space, sl::usize, 0, space.CELLS, cells);
+    put_chunk_walls(s, sl::usize, wl);
     space.touch(?s.space, sl::usize);
     space.mask(?s.space, sl::usize);
     ret true;
+}
+
+# make a slot's walls those of a chunk's wall span (layout.MASK words), or
+# none for nil, where the world holds walls
+fun put_chunk_walls(s: *Sim, sl: usize, wl: *u32) {
+    if (!walls(s)) { ret; }
+    val p: plane.Plane = space.walls_of(?s.space, sl);
+    if (wl == nil) { plane.clear(p); }
+    or             { mem.copy[u32](p.w, wl, space.MASK); }
+    space.mark_walls(?s.space, sl);
 }
 
 # count what the pool was seeded with and surround every live chunk
@@ -2230,8 +2346,51 @@ pub fun region_view(s: *Sim) Regions {
     ret s.regions;
 }
 
+# the coordinates and images (space.get_image) of every walled chunk, read
+# back from the GPU first, for a change that empties the world and keeps its
+# walls (randomize_shape)
+# ---
+# ret: false when the cells could not be read or held, the walls then lost
+fun keep_walls(s: *Sim, at: *Vector[i64], img: *Vector[u32]) bool {
+    val synced: err[gfx.Error] = sync(s);
+    if (sel synced.err) { ret false; }
+    val sp: *space.Space = ?s.space;
+    val n:  usize        = space.image_words(sp);
+    var sl: usize        = 0;
+    for (sl < sp.hi) {
+        if (space.used(sp, sl) && space.walled(sp, sl)) {
+            vector.push[i64](at, space.slot_x(sp, sl));
+            val p: res[usize, allo.Error] = vector.push[i64](at, space.slot_y(sp, sl));
+            val r: res[usize, allo.Error] = vector.reserve[u32](img, n);
+            if (sel p.err || sel r.err) { ret false; }
+            space.get_image(sp, sl, ?img.data[img.len]);
+            img.len = img.len + n;
+        }
+        sl = sl + 1;
+    }
+    ret true;
+}
+
+# put the walls keep_walls kept back into the emptied world, which holds the
+# wall layer
+fun put_walls_back(s: *Sim, at: *Vector[i64], img: *Vector[u32]) {
+    val sp: *space.Space = ?s.space;
+    val n:  usize        = space.image_words(sp);
+    var i:  usize        = 0;
+    for (i * 2 < at.len) {
+        val sl: u32 = space.alloc(sp, at.data[i * 2], at.data[i * 2 + 1]);
+        if (sl != space.NONE) {
+            space.put_image_walls(sp, sl::usize, ?img.data[i * n]);
+            space.touch(sp, sl::usize);
+        }
+        or { overflow(s); }
+        i = i + 1;
+    }
+}
+
 # replace the world with a random soup over a shape, resetting the count. cells
-# off the world's grid or boundary are never filled
+# off the world's grid or boundary are never filled, and the world's walls
+# stand where they are, the soup filling around them
 # ---
 # s:   simulation
 # f:   what to fill
@@ -2261,7 +2420,16 @@ pub fun randomize_shape(s: *Sim, f: *fill.Fill) bool {
     var thresh: i64       = (f.density * 1000.0)::i64;
     if (thresh < 0)    { thresh = 0; }
     if (thresh > 1000) { thresh = 1000; }
-    fill_begin(s);
+    # the soup replaces the cells and leaves the walls where they stand
+    var kept_at:  Vector[i64] = vector.init[i64](s.space.a);
+    var kept_img: Vector[u32] = vector.init[u32](s.space.a);
+    fin {
+        vector.dnit[i64](?kept_at);
+        vector.dnit[u32](?kept_img);
+    }
+    val walled: bool = walls(s) && keep_walls(s, ?kept_at, ?kept_img);
+    clear_world(s, walled);
+    if (walled) { put_walls_back(s, ?kept_at, ?kept_img); }
     var y: i64 = b.y0;
     for (y < b.y1) {
         var x: i64 = b.x0;
@@ -2345,9 +2513,10 @@ pub fun capture(s: *Sim, sn: *snapshot.Snapshot) bool {
     ret sel copied.ok;
 }
 
-# what a list of chunks by their words hands each one: its column and row and
-# its space.CELLS words, row-major (word_len), which last until the next call
-pub def Words: fun(*u8, i64, i64, *u32);
+# what a list of chunks by their words hands each one: its column and row,
+# its space.CELLS words, row-major (word_len), and its walls (layout.MASK
+# words) or nil where it holds none, which last until the next call
+pub def Words: fun(*u8, i64, i64, *u32, *u32);
 
 # the world being listed by words
 # ---
@@ -2365,11 +2534,12 @@ rec ByWords {
 fun tree_words(ctx: *u8, cx: i64, cy: i64, cells: *u8) {
     val bw: *ByWords = ctx::*ByWords;
     fresh_words(bw.s, cells, space.CELLS, bw.w);
-    bw.f(bw.ctx, cx, cy, bw.w);
+    bw.f(bw.ctx, cx, cy, bw.w, nil);
 }
 
-# hand f every chunk in a box of chunks that holds a word but 0, as the host
-# holds its words or the tree its states, written as the rule's words
+# hand f every chunk in a box of chunks that holds a word but 0 or a wall, as
+# the host holds its words and walls or the tree its states, written as the
+# rule's words
 #
 # the host's cells are the staging copy on the GPU, current only after sync or
 # for the chunks an open edit or read pulled. f must not change the world.
@@ -2398,11 +2568,14 @@ pub fun chunks_in(s: *Sim, b: space.Box, f: Words, ctx: *u8) {
     var sl:  usize        = 0;
     for (sl < top) {
         if (space.used(sp, sl)) {
-            val cx: i64 = space.slot_x(sp, sl);
-            val cy: i64 = space.slot_y(sp, sl);
-            if (cx >= b.x0 && cx < b.x1 && cy >= b.y0 && cy < b.y1 && space.holds_word(sp, sl)) {
+            val cx: i64  = space.slot_x(sp, sl);
+            val cy: i64  = space.slot_y(sp, sl);
+            val wl: bool = space.walls_on(sp) && space.walled(sp, sl);
+            if (cx >= b.x0 && cx < b.x1 && cy >= b.y0 && cy < b.y1 && (wl || space.holds_word(sp, sl))) {
                 space.get_words(sp, sl, 0, space.CELLS, w);
-                f(ctx, cx, cy, w);
+                var at: *u32 = nil;
+                if (wl) { at = space.walls_of(sp, sl).w; }
+                f(ctx, cx, cy, w, at);
             }
         }
         sl = sl + 1;
@@ -2436,16 +2609,23 @@ pub fun restore(s: *Sim, sn: *snapshot.Snapshot) bool {
     }
     or {
         fill_begin(s);
+        # a copy of walls goes back into a world holding the wall layer, which
+        # the clear let go, so nothing is read back
+        if (sn.walled) {
+            val held: opt[str] = relay_walls(s, true, false);
+            if (sel held.some) { ok = false; }
+        }
         val w: *u32 = buffer(s, space.CELLS);
         if (w == nil) { ok = false; }
         var i: usize = 0;
         for (i < sn.n && ok) {
             snapshot.words_of(sn, i, w);
-            ok = fill_chunk(s, sn.at[i * 2], sn.at[i * 2 + 1], w);
+            ok = fill_chunk(s, sn.at[i * 2], sn.at[i * 2 + 1], w, snapshot.walls_of(sn, i));
             i  = i + 1;
         }
         unbuffer(s, w, space.CELLS);
         if (!fill_end(s)) { ok = false; }
+        let_walls(s);
     }
     if (!ok) { overflow(s); }
     s.generation = sn.generation;
@@ -2510,18 +2690,26 @@ pub fun place(s: *Sim, g: topology.Grid, dx: i64, dy: i64) Placed {
     fill_begin(s);
     val sp: *space.Space = ?s.space;
     var ok: bool         = true;
-    var i:  usize        = 0;
-    val c:  *u32         = buffer(s, space.CELLS);
-    val m:  usize        = word_len(s);
+    # the walls move with the world, into a wall layer the clear let go
+    if (was.walled) {
+        val held: opt[str] = relay_walls(s, true, false);
+        if (sel held.some) { ok = false; }
+    }
+    var i: usize = 0;
+    val c: *u32  = buffer(s, space.CELLS);
+    val m: usize = word_len(s);
     if (c == nil) { ok = false; }
     for (ok && i < was.n) {
         snapshot.words_of(?was, i, c);
+        val wl: *u32  = snapshot.walls_of(?was, i);
         val x0: i64   = was.at[i * 2] * space.SIDE + dx;
         val y0: i64   = was.at[i * 2 + 1] * space.SIDE + dy;
         var k:  usize = 0;
         for (ok && k < space.CELLS) {
-            val w: *u32 = ?c[k * m];
-            if (!blank(w, m)) {
+            val w:    *u32 = ?c[k * m];
+            var wall: bool = false;
+            if (wl != nil) { wall = ((wl[k / 32] >> (k % 32)::u32) & 1) != 0; }
+            if (!blank(w, m) || wall) {
                 val x: i64 = x0 + (k % 64)::i64;
                 val y: i64 = y0 + (k / 64)::i64;
                 if (!space.holds(sp, x, y)) {
@@ -2532,6 +2720,7 @@ pub fun place(s: *Sim, g: topology.Grid, dx: i64, dy: i64) Placed {
                     if (sl == space.NONE) { ok = false; }
                     or {
                         space.put_word(sp, sl::usize, space.local_of(y) * 64 + space.local_of(x), w);
+                        if (wall) { space.put_walls(sp, sl::usize, space.local_of(y) * 64 + space.local_of(x), 1, true); }
                         space.touch(sp, sl::usize);
                     }
                 }
@@ -2542,6 +2731,7 @@ pub fun place(s: *Sim, g: topology.Grid, dx: i64, dy: i64) Placed {
     }
     unbuffer(s, c, space.CELLS);
     val settled: bool = fill_end(s);
+    let_walls(s);
     if (!ok) { overflow(s); }
     s.generation = gen;
     out.ok       = ok && settled;
@@ -2798,7 +2988,23 @@ pub fun reaches(x0: i64, y0: i64, x1: i64, y1: i64) bool {
 # ret: false when an edit is already open, the area passes the world's reach,
 #      the GPU keeps the pool (own), or the GPU's cells could not be read
 pub fun edit_begin(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64) bool {
+    ret edit_begin_as(s, x0, y0, x1, y1, EDIT_CELLS);
+}
+
+# open a bulk edit as edit_begin does, whose writes do mode to walls
+#
+# a wall edit takes the wall layer up first (hold_walls). while the GPU steps a
+# world that holds walls every edit pulls its chunks, small ones too, so the
+# host's walls there are the world's when the edit reads and writes them.
+# ---
+# mode: EDIT_CELLS, EDIT_WALLS or EDIT_ERASE
+# ret:  false as edit_begin, or when a wall edit's world could not take walls
+pub fun edit_begin_as(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64, mode: u8) bool {
     if (s.edit.open || !reaches(x0, y0, x1, y1)) { ret false; }
+    if (mode == EDIT_WALLS) {
+        val held: opt[str] = hold_walls(s);
+        if (sel held.some) { ret false; }
+    }
     val e: *Edit = ?s.edit;
     e.x0 = x0;
     e.y0 = y0;
@@ -2808,9 +3014,12 @@ pub fun edit_begin(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64) bool {
         e.x1 = x0;
         e.y1 = y0;
     }
-    e.lost   = false;
-    e.sparse = e.x1 - e.x0 <= SPARSE_CELLS::i64 && e.y1 - e.y0 <= SPARSE_CELLS::i64
+    e.mode    = mode;
+    e.chunked = false;
+    e.lost    = false;
+    e.sparse  = e.x1 - e.x0 <= SPARSE_CELLS::i64 && e.y1 - e.y0 <= SPARSE_CELLS::i64
         && (e.x1 - e.x0) * (e.y1 - e.y0) <= SPARSE_CELLS::i64;
+    if (walls(s) && on_gpu(s))  { e.sparse = false; }
     if (!on_tree(s) && !own(s)) { ret false; }
     val watch: bool = e.x1 > e.x0 && wanted(s, e.x0, e.y0, e.x1, e.y1, false);
     if (on_tree(s)) {
@@ -2842,7 +3051,7 @@ fun put_sparse(s: *Sim, x: i64, y: i64, c: *u32) bool {
     val cx:   i64  = space.chunk_of(x);
     val cy:   i64  = space.chunk_of(y);
     var sl:   u32  = space.find(sp, cx, cy);
-    val none: bool = blank(c, word_len(s));
+    val none: bool = blank(c, word_len(s)) && s.edit.mode != EDIT_WALLS;
     if (sl == space.NONE) {
         if (none) { ret true; }
         sl = space.alloc(sp, cx, cy);
@@ -2850,8 +3059,8 @@ fun put_sparse(s: *Sim, x: i64, y: i64, c: *u32) bool {
     }
     val slot: usize = sl::usize;
     val i:    usize = space.local_of(y) * 64 + space.local_of(x);
-    space.put_word(sp, slot, i, c);
-    if (!none) { space.surround(sp, slot); }
+    if (!put_cells(s, slot, i, 1, c)) { ret true; }
+    if (!none)                        { space.surround(sp, slot); }
     # the GPU's copy takes the cell alone while it steps, and the chunk whole
     # while it only draws
     if (on_gpu(s)) { gpu.note_write(s.gpu, sp, slot, i); }
@@ -2919,9 +3128,35 @@ fun editing(s: *Sim, x: i64, y: i64, n: usize) bool {
     ret e.open && y >= e.y0 && y < e.y1 && x >= e.x0 && x + n::i64 <= e.x1;
 }
 
+# write word c to n cells of slot sl from cell i, all in one row, as the open
+# edit's mode says: a cell edit passes each wall by, a wall edit makes every
+# cell a wall, and an erase makes none of them one
+# ---
+# ret: whether any cell was written
+fun put_cells(s: *Sim, sl: usize, i: usize, n: usize, c: *u32) bool {
+    val sp:   *space.Space = ?s.space;
+    val mode: u8           = s.edit.mode;
+    if (mode == EDIT_CELLS && walls(s) && space.walled(sp, sl)) {
+        var any: bool  = false;
+        var k:   usize = 0;
+        for (k < n) {
+            if (!space.wall_at(sp, sl, i + k)) {
+                space.put_word(sp, sl, i + k, c);
+                any = true;
+            }
+            k = k + 1;
+        }
+        ret any;
+    }
+    space.fill_words(sp, sl, i, n, c);
+    if (mode == EDIT_WALLS)             { space.put_walls(sp, sl, i, n, true); }
+    if (mode == EDIT_ERASE && walls(s)) { space.put_walls(sp, sl, i, n, false); }
+    ret true;
+}
+
 # write word c, which holds state v, to n cells of a row inside the open edit
 fun put_run(s: *Sim, x: i64, y: i64, n: usize, c: *u32, v: u8) bool {
-    val none: bool  = blank(c, word_len(s));
+    val none: bool  = blank(c, word_len(s)) && s.edit.mode != EDIT_WALLS;
     val e:    *Edit = ?s.edit;
     var ok:   bool  = true;
     var at:   i64   = x;
@@ -2953,7 +3188,7 @@ fun put_run(s: *Sim, x: i64, y: i64, n: usize, c: *u32, v: u8) bool {
                 var sl: u32 = space.find(?s.space, space.chunk_of(a), space.chunk_of(y));
                 if (sl == space.NONE && !none) { sl = space.alloc(?s.space, space.chunk_of(a), space.chunk_of(y)); }
                 if (sl != space.NONE) {
-                    space.fill_words(?s.space, sl::usize, space.local_of(y) * 64 + space.local_of(a), (b - a)::usize, c);
+                    put_cells(s, sl::usize, space.local_of(y) * 64 + space.local_of(a), (b - a)::usize, c);
                     space.touch(?s.space, sl::usize);
                 }
                 or (!none) { ok = false; }
@@ -2967,7 +3202,8 @@ fun put_run(s: *Sim, x: i64, y: i64, n: usize, c: *u32, v: u8) bool {
     ret ok;
 }
 
-# write a whole chunk's cells in the open edit, as they are given
+# write a whole chunk's cells in the open edit, as they are given, its walls
+# with them whatever the edit's mode
 #
 # the edit must not be a small one and must cover the chunk whole.
 # ---
@@ -2976,9 +3212,12 @@ fun put_run(s: *Sim, x: i64, y: i64, n: usize, c: *u32, v: u8) bool {
 # cy:    chunk row
 # cells: space.CELLS words, row-major (word_len), or nil to kill every cell
 #        of the chunk
-# ret:   false when no such edit is open, the chunk lies outside it, or the
-#        pool was full
-pub fun edit_chunk(s: *Sim, cx: i64, cy: i64, cells: *u32) bool {
+# wl:    the chunk's walls (layout.MASK words), or nil for none; a world
+#        taking any must hold walls (hold_walls)
+# ret:   false when no such edit is open, the chunk lies outside it, the
+#        world holds no walls for wl, or the pool was full
+pub fun edit_chunk(s: *Sim, cx: i64, cy: i64, cells: *u32, wl: *u32) bool {
+    if (wl != nil && !walls(s) && !on_tree(s)) { ret false; }
     val e: *Edit = ?s.edit;
     if (!e.open || (e.sparse && !on_tree(s)))                                                                             { ret false; }
     if (cx * space.SIDE < e.x0 || cy * space.SIDE < e.y0 || (cx + 1) * space.SIDE > e.x1 || (cy + 1) * space.SIDE > e.y1) { ret false; }
@@ -3005,7 +3244,7 @@ pub fun edit_chunk(s: *Sim, cx: i64, cy: i64, cells: *u32) bool {
     if (!space.on_grid(sp, cx, cy)) { ret true; }
     var sl: u32 = space.find(sp, cx, cy);
     if (sl == space.NONE) {
-        if (cells == nil) { ret true; }
+        if (cells == nil && wl == nil) { ret true; }
         sl = space.alloc(sp, cx, cy);
         if (sl == space.NONE) {
             e.lost = true;
@@ -3016,6 +3255,8 @@ pub fun edit_chunk(s: *Sim, cx: i64, cy: i64, cells: *u32) bool {
     mem.zero[u32](?none[0], layer.LAYERS_MAX::usize);
     if (cells == nil) { space.fill_words(sp, sl::usize, 0, space.CELLS, ?none[0]); }
     or                { space.put_words(sp, sl::usize, 0, space.CELLS, cells); }
+    put_chunk_walls(s, sl::usize, wl);
+    s.edit.chunked = true;
     space.touch(sp, sl::usize);
     # nothing lands off the grid or outside the boundary
     if (space.bounded(sp)) { space.mask(sp, sl::usize); }
@@ -3116,6 +3357,7 @@ pub fun edit_end(s: *Sim) bool {
         }
         if (s.gpu != nil)          { gpu.note_edit(s.gpu); }
         if (e.lost && !s.withheld) { overflow(s); }
+        unwalled(s);
         ret !e.lost;
     }
     var sl: usize = 0;
@@ -3126,7 +3368,14 @@ pub fun edit_end(s: *Sim) bool {
     ok = space.settle(sp, sp.census, sp.hi, false);
     if (s.gpu != nil)                   { gpu.note_edit(s.gpu); }
     if ((!ok || e.lost) && !s.withheld) { overflow(s); }
+    unwalled(s);
     ret ok && !e.lost;
+}
+
+# let the wall layer go after an edit that may have taken the last wall away
+fun unwalled(s: *Sim) {
+    if (s.edit.mode == EDIT_ERASE || s.edit.chunked) { let_walls(s); }
+    s.edit.mode = EDIT_CELLS;
 }
 
 # kill every cell outside a rectangle
@@ -3325,9 +3574,48 @@ pub fun load_chunks(s: *Sim) usize {
 # y: row
 # v: state, below the rule's states
 pub fun paint(s: *Sim, x: i64, y: i64, v: u8) {
-    if (!edit_begin(s, x, y, x + 1, y + 1)) { ret; }
+    paint_as(s, x, y, v, EDIT_CELLS);
+}
+
+# set one cell to a state as one edit whose writes do mode to walls
+# (edit_begin_as)
+pub fun paint_as(s: *Sim, x: i64, y: i64, v: u8, mode: u8) {
+    if (!edit_begin_as(s, x, y, x + 1, y + 1, mode)) { ret; }
     edit_set(s, x, y, v);
     edit_end(s);
+}
+
+# set every cell of a region that ends to a state as one edit, whose writes
+# do mode to walls (edit_begin_as): walls of the region drawn with the wall
+# tool's shapes (cellar.boundary rect, ellipse)
+# ---
+# s:    simulation
+# r:    the region, finite
+# v:    the state of the world, below the rule's states
+# mode: EDIT_CELLS, EDIT_WALLS or EDIT_ERASE
+# ret:  why it was not written: the world could not take walls, or the edit
+#       could not be made
+pub fun paint_region(s: *Sim, r: *boundary.Region, v: u8, mode: u8) opt[str] {
+    var b: [4]i64;
+    if (!boundary.finite(r) || !boundary.bounds(r, ?b[0])) { ret opt[str].none{}; }
+    if (mode == EDIT_WALLS) {
+        val held: opt[str] = hold_walls(s);
+        if (sel held.some) { ret held; }
+    }
+    if (!edit_begin_as(s, b[0], b[1], b[2], b[3], mode)) { ret opt[str].some{"the edit could not be made"}; }
+    var y: i64 = b[1];
+    for (y < b[3]) {
+        var n:  usize = 0;
+        val xs: *i64  = boundary.row(r, y, ?n);
+        var k:  usize = 0;
+        for (k < n) {
+            edit_run(s, xs[k * 2], y, (xs[k * 2 + 1] - xs[k * 2])::usize, v);
+            k = k + 1;
+        }
+        y = y + 1;
+    }
+    if (!edit_end(s)) { ret opt[str].some{"the pool could not hold them"}; }
+    ret opt[str].none{};
 }
 
 # the sensed value (cellar.layer) of the cell at (x, y): its value in the
@@ -3361,6 +3649,16 @@ pub fun word_at(s: *Sim, x: i64, y: i64, out: *u32) {
     }
     val sl: u32 = space.find(?s.space, space.chunk_of(x), space.chunk_of(y));
     if (sl != space.NONE) { space.get_word(?s.space, sl::usize, space.local_of(y) * 64 + space.local_of(x), out); }
+}
+
+# whether the cell at (x, y) of the world is a wall, from the host's cells
+#
+# on the GPU this is the staging copy, current only after sync.
+pub fun wall_at(s: *Sim, x: i64, y: i64) bool {
+    if (!walls(s)) { ret false; }
+    val sl: u32 = space.find(?s.space, space.chunk_of(x), space.chunk_of(y));
+    if (sl == space.NONE) { ret false; }
+    ret space.wall_at(?s.space, sl::usize, space.local_of(y) * 64 + space.local_of(x));
 }
 
 # whether the cell at (x, y) of the world is live, from the host's cells or the tree
@@ -4792,6 +5090,10 @@ fun same_world(a: *Sim, b: *Sim) bool {
                             ret false;
                         }
                         k = k + 1;
+                    }
+                    if (wall_at(x, cx, cy) != wall_at(y, cx, cy)) {
+                        print.eprintlnf("cells differ at ({}, {}) as walls", cx, cy);
+                        ret false;
                     }
                     # and its display channels, where a shown layer keeps them
                     if (slack == 0 && cell(x, cx, cy) != cell(y, cx, cy)) {
@@ -7933,5 +8235,238 @@ test place__translates_the_world_onto_each_grid_on_both_engines {
         rig_close(?t);
         k = k + 1;
     }
+    ret 0;
+}
+
+# the state a value wall holds under a rule: half way up its states, a
+# source of half strength under a continuous rule, its ink under any other
+#[testing]
+fun wall_value(r: *rule.Rule) u8 {
+    if (rule.caps(r).continuous) { ret (rule.states(r) / 2)::u8; }
+    ret rule.ink(r)::u8;
+}
+
+# walls of every kind as the wall tool draws them, over a soup: a ring of
+# dead walls two cells thick round the box (-40, -40) to (40, 40), a line of
+# walls holding the rule's ink across it, and an ellipse of walls holding
+# wall_value, the soup inside and the walls laid over it
+#[testing]
+fun seed_walls(s: *Sim) {
+    val ink: u32 = rule.ink(?s.rule);
+    s.rng = rand.seed(7, 5, 3, 1);
+    fill_begin(s);
+    var y: i64 = -38;
+    for (y < 38) {
+        var x: i64 = -38;
+        for (x < 38) {
+            if (rand.range(?s.rng, 0, 1000) < 350) { fill_cell(s, x, y, ink); }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    fill_end(s);
+    var r:     boundary.Region = boundary.init(s.space.a);
+    var inner: boundary.Region = boundary.init(s.space.a);
+    boundary.rect(?r, -40, -40, 40, 40);
+    boundary.rect(?inner, -38, -38, 38, 38);
+    boundary.combine(?r, ?inner, boundary.SUBTRACT);
+    paint_region(s, ?r, 0, EDIT_WALLS);
+    boundary.rect(?r, -30, 0, 30, 1);
+    paint_region(s, ?r, ink::u8, EDIT_WALLS);
+    boundary.ellipse(?r, -20, 10, 0, 30);
+    paint_region(s, ?r, wall_value(?s.rule), EDIT_WALLS);
+    boundary.dnit(?r);
+    boundary.dnit(?inner);
+}
+
+# whether the walls seed_walls drew stand as drawn: each a wall holding its
+# state, as an edit sees it whatever the parity
+#[testing]
+fun walls_stand(s: *Sim) bool {
+    var want: [layer.LAYERS_MAX]u32;
+    var got:  [layer.LAYERS_MAX]u32;
+    var y:    i64 = -40;
+    for (y < 40) {
+        var x: i64 = -40;
+        for (x < 40) {
+            var v:  u32  = 0;
+            var on: bool = x < -38 || x >= 38 || y < -38 || y >= 38;
+            if (!on && y == 0 && x >= -30 && x < 30) {
+                v  = rule.ink(?s.rule);
+                on = true;
+            }
+            or (!on && x >= -20 && x < 0 && y >= 10 && y < 30) {
+                var r: boundary.Region = boundary.init(s.space.a);
+                boundary.ellipse(?r, -20, 10, 0, 30);
+                if (boundary.contains(?r, x, y)) {
+                    v  = wall_value(?s.rule)::u32;
+                    on = true;
+                }
+                boundary.dnit(?r);
+            }
+            if (on) {
+                if (!wall_at(s, x, y)) {
+                    print.eprintlnf("({}, {}) is no wall", x, y);
+                    ret false;
+                }
+                # a world held as its complement is read through it
+                rule.fresh(?s.rule, v, ?want[0]);
+                if (alive(s, x, y) != space.live_word(?s.space, ?want[0])) {
+                    print.eprintlnf("the wall at ({}, {}) is not as drawn", x, y);
+                    ret false;
+                }
+                if (!flipped(s)) {
+                    word_at(s, x, y, ?got[0]);
+                    if (!mem.equal[u32](?want[0], ?got[0], word_len(s))) {
+                        print.eprintlnf("the wall at ({}, {}) holds another word", x, y);
+                        ret false;
+                    }
+                }
+            }
+            or (wall_at(s, x, y)) {
+                print.eprintlnf("({}, {}) is a wall", x, y);
+                ret false;
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    ret true;
+}
+
+test frame__walls_of_every_kind_step_on_the_gpu_as_on_the_cpu {
+    # Life, a rule whose background flips, generations, a wide kernel,
+    # non-totalistic rules, lenia, whose walls are sources, and
+    # reaction-diffusion, whose walls are sources of both fields
+    val strings: [7]str = [7]str{"B3/S23", "B0123/S123", "345/2/4", "R5,C0,M1,S34..58,B34..45,NM", "B2-a/S12",
+        "R=13,T=10,b=[1],m=0.15,s=0.015,kn=1,gn=1", "F=0.029,k=0.057"};
+    var k: usize = 0;
+    for (k < 7) {
+        var t:    Rig;
+        val code: i32 = rig_open(?t, rule_named(strings[k]), seed_walls);
+        if (code != 0)                        { ret code; }
+        if (!walls(?t.cpu) || !walls(?t.gpu)) { ret 1; }
+        if (!walls_stand(?t.cpu))             { ret 2; }
+        # an odd generation, then an even one
+        val steps: [2]u64 = [2]u64{39, 1};
+        var i:     usize  = 0;
+        for (i < 2) {
+            rig_step(?t, steps[i]);
+            if (!rig_same(?t)) {
+                print.eprintlnf("{} differs between the engines at generation {}", strings[k], t.cpu.generation);
+                ret 10 + k::i32;
+            }
+            if (population(?t.cpu) != population(?t.gpu)) { ret 20 + k::i32; }
+            if (!walls_stand(?t.cpu)) {
+                print.eprintlnf("{}'s walls moved on the CPU by generation {}", strings[k], t.cpu.generation);
+                ret 30 + k::i32;
+            }
+            if (t.on && !walls_stand(?t.gpu)) {
+                print.eprintlnf("{}'s walls moved on the GPU by generation {}", strings[k], t.gpu.generation);
+                ret 40 + k::i32;
+            }
+            i = i + 1;
+        }
+        rig_close(?t);
+        k = k + 1;
+    }
+    ret 0;
+}
+
+test step__a_wall_holds_its_state_and_its_neighbours_read_it {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    Sim;
+    val made: err[allo.Error] = init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    val bits: u64 = cell_bits(?s);
+    # a world that never held a wall has no wall layer, and HashLife runs it
+    if (walls(?s) || no_tree(?s) != nil) { ret 2; }
+    # a live wall of three in a row births the cells above and below its
+    # middle, as a blinker would, and stays as it is
+    if (!edit_begin_as(?s, 0, 0, 3, 1, EDIT_WALLS)) { ret 3; }
+    edit_run(?s, 0, 0, 3, 1);
+    edit_end(?s);
+    # a blinker whose birth above it lands on a dead wall
+    paint(?s, 20, 0, 1);
+    paint(?s, 21, 0, 1);
+    paint(?s, 22, 0, 1);
+    paint_as(?s, 21, -1, 0, EDIT_WALLS);
+    if (!walls(?s) || cell_bits(?s) != bits + layer.WALL_WIDTH::u64)    { ret 4; }
+    if (no_tree(?s) == nil || !string.str_equals(no_tree(?s), "walls")) { ret 5; }
+    if (use_hashlife(?s, true))                                         { ret 5; }
+    step(?s);
+    if (!alive(?s, 0, 0) || !alive(?s, 1, 0) || !alive(?s, 2, 0))       { ret 6; }
+    if (!alive(?s, 1, -1) || !alive(?s, 1, 1))                          { ret 7; }
+    if (alive(?s, 21, -1) || !wall_at(?s, 21, -1) || !alive(?s, 21, 1)) { ret 8; }
+    var n: usize = 0;
+    for (n < 9) {
+        step(?s);
+        n = n + 1;
+    }
+    if (!alive(?s, 0, 0) || !alive(?s, 1, 0) || !alive(?s, 2, 0) || !wall_at(?s, 1, 0)) { ret 9; }
+    if (alive(?s, 21, -1) || !wall_at(?s, 21, -1))                                      { ret 10; }
+    # a painted cell passes a wall by, and the eraser takes it away
+    paint(?s, 21, -1, 1);
+    if (alive(?s, 21, -1) || !wall_at(?s, 21, -1)) { ret 11; }
+    paint_as(?s, 21, -1, 0, EDIT_ERASE);
+    if (wall_at(?s, 21, -1) || !walls(?s)) { ret 12; }
+    # the last wall gone takes the layer with it
+    if (!edit_begin_as(?s, 0, 0, 3, 1, EDIT_ERASE)) { ret 13; }
+    edit_run(?s, 0, 0, 3, 0);
+    edit_end(?s);
+    if (walls(?s) || cell_bits(?s) != bits || no_tree(?s) != nil) { ret 14; }
+    # and a clear takes them all
+    paint_as(?s, 5, 5, 1, EDIT_WALLS);
+    if (!walls(?s)) { ret 15; }
+    clear(?s);
+    if (walls(?s) || cell_bits(?s) != bits) { ret 16; }
+    dnit(?s);
+    ret 0;
+}
+
+test randomize__a_fill_of_any_shape_leaves_the_walls_where_they_stand {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    Sim;
+    val made: err[allo.Error] = init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    # a boundary of two regions, for the grid and the region fills
+    var left:  boundary.Region = boundary.init(?a);
+    var right: boundary.Region = boundary.init(?a);
+    boundary.rect(?left, -64, -64, 0, 64);
+    boundary.rect(?right, 10, -64, 64, 64);
+    boundary.combine(?left, ?right, boundary.ADD);
+    val set: opt[str] = set_bound(?s, ?left);
+    boundary.dnit(?left);
+    boundary.dnit(?right);
+    if (sel set.some) { ret 2; }
+    choose_region(?s, 20, 0);
+    # dead walls across both regions
+    var r: boundary.Region = boundary.init(?a);
+    boundary.rect(?r, -40, -2, 40, 2);
+    val drawn: opt[str] = paint_region(?s, ?r, 0, EDIT_WALLS);
+    if (sel drawn.some) { ret 3; }
+    boundary.dnit(?r);
+    var fills: [4]fill.Fill;
+    fills[0] = fill.square(0, 0, 128, 1.0);
+    fills[1] = fill.circle(0, 0, 128, 1.0);
+    fills[2] = fill.Fill{shape: fill.Shape.grid{}, density: 1.0};
+    fills[3] = fill.Fill{shape: fill.Shape.region{}, density: 1.0};
+    var k: usize = 0;
+    for (k < 4) {
+        if (!randomize_shape(?s, ?fills[k])) { ret 10 + k::i32; }
+        if (!walls(?s))                      { ret 20 + k::i32; }
+        var x: i64 = -40;
+        for (x < 40) {
+            val inside: bool = space.holds(?s.space, x, 0);
+            if (inside && (!wall_at(?s, x, 0) || alive(?s, x, 0))) { ret 30 + k::i32; }
+            x = x + 1;
+        }
+        # the fill took the cells beside the walls
+        if (!alive(?s, 20, 5)) { ret 40 + k::i32; }
+        k = k + 1;
+    }
+    dnit(?s);
     ret 0;
 }

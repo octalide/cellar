@@ -29,8 +29,13 @@
 # no domain at all.
 #
 # a chunk's cells are stored in layers (cellar.layer), the set the running
-# rule declares and any the view keeps, each holding every slot's span at its
-# width. the pool reads a cell's state through the family's sense
+# rule declares, the wall layer while the world holds walls and any the view
+# keeps, each holding every slot's span at its width. the wall layer is
+# static: its back cells are its front cells, the same array, so a swap moves
+# nothing and a step that leaves a wall cell as it stands needs no copy of
+# it. a wall cell's word is held as the step found it (hold_walls), a slot's
+# entry says whether its chunk holds a wall (layout.WALLED), and a chunk that
+# does is never freed. the pool reads a cell's state through the family's sense
 # (cellar.layout.Sense) and its live rule layers (cellar.layer), and
 # everything outside it reads and writes cells
 # through the planes and exact values below, never knowing a cell's width.
@@ -216,6 +221,7 @@ pub tag Follow: u8 {
 # live:      slots in use
 # table:     the page table, cap * ENTRY words
 # set:       the layers the cells are stored in
+# fam:       set without its wall layer, the layers the rule family steps
 # spans:     words of a slot's span of each layer, as set gives them
 # fronts:    each layer's front cells, cap spans of it (cellar.layer)
 # backs:     each layer's back cells, cap spans of it, or nil when the GPU
@@ -248,6 +254,9 @@ pub tag Follow: u8 {
 # grid:      the grid the world runs on
 # rim:       every chunk along the boundary's edge is kept, for a rule whose
 #            step reads the edge live (see keep_rim)
+# flips:     the running rule's background flips each generation, so a wall
+#            cell's held word flips with it and every walled chunk steps
+#            (hold_walls)
 # whole:     every chunk of the world is held and stays, so nothing is
 #            allocated or freed while the world steps (cover)
 # awake:     on a pool held whole, the slots whose cells or back cells may hold
@@ -283,6 +292,7 @@ pub rec Space {
     live:      usize;
     table:     *u32;
     set:       plane.Set;
+    fam:       plane.Set;
     spans:     [layer.LAYERS_MAX]usize;
     fronts:    [layer.LAYERS_MAX]*u32;
     backs:     [layer.LAYERS_MAX]*u32;
@@ -306,6 +316,7 @@ pub rec Space {
     wide:      bool;
     grid:      topology.Grid;
     rim:       bool;
+    flips:     bool;
     whole:     bool;
     awake:     *u32;
     nawake:    usize;
@@ -683,6 +694,7 @@ fun span_of(sp: *Space, k: usize) usize {
 # take a set as the pool's layers, and each layer's span with it
 fun take_set(sp: *Space, set: *plane.Set) {
     sp.set = @set;
+    sp.fam = plane.without_wall(set);
     var k: usize = 0;
     for (k < set.n) {
         sp.spans[k] = plane.span_words(set.at[k].width);
@@ -890,16 +902,127 @@ fun holds_cell(sp: *Space, s: usize, i: usize) bool {
     ret false;
 }
 
+# the pool's layer that layer k of the set the rule family steps (fam) is:
+# the same place, or one past where the wall layer sits before it
+#[inline]
+pub fun fam_layer(sp: *Space, k: usize) usize {
+    val w: opt[usize] = plane.wall(?sp.set);
+    if (sel w.some) {
+        if (k >= w.some) { ret k + 1; }
+    }
+    ret k;
+}
+
+# the layers the rule family steps: the pool's, its wall layer left out
+pub fun fam_set(sp: *Space) *plane.Set {
+    ret ?sp.fam;
+}
+
+# whether the pool holds the wall layer (cellar.layer WALL)
+pub fun walls_on(sp: *Space) bool {
+    ret plane.walled(?sp.set);
+}
+
+# slot s's span of the wall layer, a bit a cell set where the cell is a wall;
+# the pool must hold the wall layer
+pub fun walls_of(sp: *Space, s: usize) plane.Plane {
+    val w: opt[usize] = plane.wall(?sp.set);
+    if (sel w.none) { ret plane.at(nil, layer.WALL_WIDTH); }
+    ret plane_of(sp, w.some, s);
+}
+
+# whether slot s's chunk holds a wall, as its entry says (layout.WALLED)
+#[inline]
+pub fun walled(sp: *Space, s: usize) bool {
+    ret layout.walled(sp.table[s * ENTRY + layout.EDGE_AT::usize]) != 0;
+}
+
+# whether cell i of slot s is a wall
+pub fun wall_at(sp: *Space, s: usize, i: usize) bool {
+    if (!walled(sp, s)) { ret false; }
+    ret plane.get(walls_of(sp, s), i) != 0;
+}
+
+# make n cells of slot s from cell i walls, or not, leaving their words as
+# they are; the pool must hold the wall layer
+pub fun put_walls(sp: *Space, s: usize, i: usize, n: usize, on: bool) {
+    var v: u32 = 0;
+    if (on) { v = 1; }
+    plane.fill(walls_of(sp, s), i, n, v);
+    mark_walls(sp, s);
+}
+
+# bring slot s's walled bit level with its wall layer, its entry marked dirty
+# where the bit changed
+pub fun mark_walls(sp: *Space, s: usize) {
+    var on: u32 = 0;
+    if (walls_on(sp) && plane.any(walls_of(sp, s))) { on = layout.WALLED; }
+    val e: *u32 = ?sp.table[s * ENTRY + layout.EDGE_AT::usize];
+    if ((@e & layout.WALLED) == on) { ret; }
+    @e          = (@e & ~layout.WALLED) | on;
+    sp.dirty[s] = sp.dirty[s] | DIRTY_ENTRY;
+}
+
+# whether any chunk of the pool holds a wall, as the entries say
+pub fun any_walls(sp: *Space) bool {
+    var s: usize = 0;
+    for (s < sp.hi) {
+        if (used(sp, s) && walled(sp, s)) { ret true; }
+        s = s + 1;
+    }
+    ret false;
+}
+
+# hold the walls of slot s through a step: each wall cell's value in each of
+# the word's layers is written into the back cells as the front holds it, or
+# as its complement where the background flips (flips), as an edit at the
+# next generation would write the same world. the view layers are the
+# family's to step, and the wall layer, static, stays as it is
+# ---
+# ret: whether the chunk holds a wall, so its back cells changed and want
+#      counting again
+pub fun hold_walls(sp: *Space, s: usize) bool {
+    if (!walls_on(sp) || !walled(sp, s)) { ret false; }
+    val wl: *u32  = walls_of(sp, s).w;
+    var k:  usize = 0;
+    for (k < plane.exact(?sp.set)) {
+        val wd: u32  = sp.set.at[k].width;
+        val f:  *u32 = plane_of(sp, k, s).w;
+        val b:  *u32 = back_of(sp, k, s).w;
+        if (wd == 1) {
+            var flip: u32 = 0;
+            if (sp.flips) { flip = 0xffffffff; }
+            var j: usize = 0;
+            for (j < MASK) {
+                b[j] = (b[j] & ~wl[j]) | ((f[j] ^ flip) & wl[j]);
+                j    = j + 1;
+            }
+        }
+        or {
+            var flip: u32 = 0;
+            if (sp.flips) { flip = layer.mask(wd); }
+            var i: usize = 0;
+            for (i < CELLS) {
+                if (((wl[i / 32] >> (i % 32)::u32) & 1) != 0) { plane.store(b, wd, i, plane.load(f, wd, i) ^ flip); }
+                i = i + 1;
+            }
+        }
+        k = k + 1;
+    }
+    ret true;
+}
+
 # words of a chunk's image under the pool's layers (plane.image_words)
 pub fun image_words(sp: *Space) usize {
     ret plane.image_words(?sp.set);
 }
 
-# copy slot s's image, its state and rule layers' spans in order, into out
+# copy slot s's image, its state and rule layers' spans in order and its wall
+# layer's where the pool holds one (plane.image_words), into out
 pub fun get_image(sp: *Space, s: usize, out: *u32) {
     var at: usize = 0;
     var k:  usize = 0;
-    for (k < plane.exact(?sp.set)) {
+    for (k < image_layers(sp)) {
         mem.copy[u32](?out[at], plane_of(sp, k, s).w, span_of(sp, k));
         at = at + span_of(sp, k);
         k  = k + 1;
@@ -913,16 +1036,44 @@ pub fun start_shown(sp: *Space, s: usize) {
 }
 
 # write an image under the pool's layers into slot s's state and rule
-# layers, as put_word does a cell
+# layers, and its wall layer where the pool holds one, as put_word does a
+# cell
 pub fun put_image(sp: *Space, s: usize, img: *u32) {
     var at: usize = 0;
     var k:  usize = 0;
-    for (k < plane.exact(?sp.set)) {
+    for (k < image_layers(sp)) {
         mem.copy[u32](plane_of(sp, k, s).w, ?img[at], span_of(sp, k));
         at = at + span_of(sp, k);
         k  = k + 1;
     }
     restart(sp, s, 0, CELLS);
+    mark_walls(sp, s);
+}
+
+# the layers an image holds, from layer 0: the word's, and the wall layer
+# where the pool holds one, which follows them
+fun image_layers(sp: *Space) usize {
+    var n: usize = plane.exact(?sp.set);
+    if (plane.walled(?sp.set)) { n = n + 1; }
+    ret n;
+}
+
+# write the walls of an image under the pool's layers (get_image) into slot
+# s: each wall cell's word and the wall layer, every other cell left as it
+# is; the pool must hold the wall layer
+pub fun put_image_walls(sp: *Space, s: usize, img: *u32) {
+    val wl: *u32  = ?img[image_words(sp) - MASK];
+    var w:  [layer.LAYERS_MAX]u32;
+    var i:  usize = 0;
+    for (i < CELLS) {
+        if (((wl[i / 32] >> (i % 32)::u32) & 1) != 0) {
+            image_word(?sp.set, img, i, ?w[0]);
+            put_word(sp, s, i, ?w[0]);
+        }
+        i = i + 1;
+    }
+    mem.copy[u32](walls_of(sp, s).w, wl, MASK);
+    mark_walls(sp, s);
 }
 
 # the word of cell i of an image under a set, into out
@@ -1058,7 +1209,7 @@ fun make_layers(a: *allo.Allocator, set: *plane.Set, cap: usize, stepped: bool, 
         val n: usize = cap * plane.span_words(set.at[k].width);
         fronts[k] = zwords(a, n);
         backs[k]  = nil;
-        if (stepped)                                          { backs[k] = zwords(a, n); }
+        if (stepped)                                          { backs[k] = back_for(a, set, k, fronts[k], n); }
         if (fronts[k] == nil || (stepped && backs[k] == nil)) { ok = false; }
         k = k + 1;
     }
@@ -1066,13 +1217,28 @@ fun make_layers(a: *allo.Allocator, set: *plane.Set, cap: usize, stepped: bool, 
     ret ok;
 }
 
+# whether layer k of a set is static, one cells whose back is its front
+# (cellar.layer WALL)
+#[inline]
+pub fun static_layer(set: *plane.Set, k: usize) bool {
+    ret set.at[k].role == layer.WALL;
+}
+
+# the back cells of layer k of a set whose front cells, n words, are front:
+# the front itself for a static layer, else n words zeroed, or nil when the
+# allocator refused them
+fun back_for(a: *allo.Allocator, set: *plane.Set, k: usize, front: *u32, n: usize) *u32 {
+    if (static_layer(set, k)) { ret front; }
+    ret zwords(a, n);
+}
+
 # free every layer of a set made for cap slots
 fun drop_layers(a: *allo.Allocator, set: *plane.Set, cap: usize, fronts: **u32, backs: **u32) {
     var k: usize = 0;
     for (k < set.n) {
         val n: usize = cap * plane.span_words(set.at[k].width);
-        if (fronts[k] != nil) { allo.deallocate[u32](a, fronts[k], n); }
-        if (backs[k] != nil)  { allo.deallocate[u32](a, backs[k], n); }
+        if (fronts[k] != nil)                         { allo.deallocate[u32](a, fronts[k], n); }
+        if (backs[k] != nil && backs[k] != fronts[k]) { allo.deallocate[u32](a, backs[k], n); }
         fronts[k] = nil;
         backs[k]  = nil;
         k         = k + 1;
@@ -1136,7 +1302,7 @@ fun alloc_arrays(sp: *Space, cap: usize) err[allo.Error] {
         var k: usize = 0;
         for (k < sp.set.n) {
             mem.copy[u32](fronts[k], sp.fronts[k], sp.hi * span_of(sp, k));
-            if (backs[k] != nil) { mem.copy[u32](backs[k], sp.backs[k], sp.hi * span_of(sp, k)); }
+            if (backs[k] != nil && backs[k] != fronts[k]) { mem.copy[u32](backs[k], sp.backs[k], sp.hi * span_of(sp, k)); }
             k = k + 1;
         }
         if (pyr) { mem.copy[u32](mips, sp.mips, sp.hi * MIP); }
@@ -1225,6 +1391,7 @@ pub fun init(sp: *Space, a: *allo.Allocator, stepped: bool) err[allo.Error] {
     sp.wide     = false;
     sp.grid     = topology.open();
     sp.rim      = false;
+    sp.flips    = false;
     sp.whole    = false;
     sp.nawake   = 0;
     sp.ndue     = 0;
@@ -1256,8 +1423,8 @@ pub def Remap: fun(*u8, *u32, *u32);
 # store the pool's cells in another set of layers, every cell's word turned
 # into its word under it
 #
-# a view layer of the new set keeps its cells where the old set held one of
-# the same name and width, and starts at zero otherwise. the back cells start
+# a view layer or the wall layer of the new set keeps its cells where the old
+# set held one of the same name, role and width, and starts at zero otherwise. the back cells start
 # at zero, as a pool's do. every slot in use is touched once anything moved.
 # ---
 # sp:  the pool
@@ -1322,7 +1489,8 @@ pub fun relayer(sp: *Space, set: *plane.Set, map: Remap, ctx: *u8) err[allo.Erro
             for (!same && k < set.n) {
                 val kept: opt[usize] = plane.find(?old, set.at[k].name);
                 if (sel kept.some) {
-                    if (old.at[kept.some].role == layer.VIEW && old.at[kept.some].width == set.at[k].width) {
+                    val role: u32 = old.at[kept.some].role;
+                    if ((role == layer.VIEW || role == layer.WALL) && role == set.at[k].role && old.at[kept.some].width == set.at[k].width) {
                         mem.copy[u32](plane_of(sp, k, s).w, ?was[kept.some][s * plane.span_words(set.at[k].width)], span_of(sp, k));
                     }
                 }
@@ -1385,7 +1553,7 @@ pub fun slot_bytes(sp: *Space) usize {
     var k: usize = 0;
     for (k < sp.set.n) {
         var b: usize = plane.span_words(sp.set.at[k].width) * 4;
-        if (sp.stepped) { b = b * 2; }
+        if (sp.stepped && !static_layer(?sp.set, k)) { b = b * 2; }
         n = n + b;
         k = k + 1;
     }
@@ -1469,15 +1637,15 @@ pub fun restage(sp: *Space, set: *plane.Set) err[allo.Error] {
             val n: usize = sp.cap * plane.span_words(set.at[k].width);
             fronts[k] = zwords(sp.a, n);
             backs[k]  = nil;
-            if (sp.stepped) { backs[k] = zwords(sp.a, n); }
+            if (sp.stepped) { backs[k] = back_for(sp.a, set, k, fronts[k], n); }
             made[k] = true;
             if (fronts[k] == nil || (sp.stepped && backs[k] == nil)) {
                 var j: usize = m;
                 for (j <= k) {
                     if (made[j]) {
                         val w: usize = sp.cap * plane.span_words(set.at[j].width);
-                        if (fronts[j] != nil) { allo.deallocate[u32](sp.a, fronts[j], w); }
-                        if (backs[j] != nil)  { allo.deallocate[u32](sp.a, backs[j], w); }
+                        if (fronts[j] != nil)                         { allo.deallocate[u32](sp.a, fronts[j], w); }
+                        if (backs[j] != nil && backs[j] != fronts[j]) { allo.deallocate[u32](sp.a, backs[j], w); }
                     }
                     j = j + 1;
                 }
@@ -1490,8 +1658,8 @@ pub fun restage(sp: *Space, set: *plane.Set) err[allo.Error] {
     for (k < old.n) {
         if (k >= set.n || made[k]) {
             val n: usize = sp.cap * plane.span_words(old.at[k].width);
-            if (sp.fronts[k] != nil) { allo.deallocate[u32](sp.a, sp.fronts[k], n); }
-            if (sp.backs[k] != nil)  { allo.deallocate[u32](sp.a, sp.backs[k], n); }
+            if (sp.fronts[k] != nil)                               { allo.deallocate[u32](sp.a, sp.fronts[k], n); }
+            if (sp.backs[k] != nil && sp.backs[k] != sp.fronts[k]) { allo.deallocate[u32](sp.a, sp.backs[k], n); }
         }
         k = k + 1;
     }
@@ -1548,7 +1716,7 @@ pub fun set_stepped(sp: *Space, stepped: bool) err[allo.Error] {
     var k: usize = 0;
     if (!stepped) {
         for (k < sp.set.n) {
-            allo.deallocate[u32](sp.a, sp.backs[k], sp.cap * span_of(sp, k));
+            if (sp.backs[k] != sp.fronts[k]) { allo.deallocate[u32](sp.a, sp.backs[k], sp.cap * span_of(sp, k)); }
             sp.backs[k] = nil;
             k           = k + 1;
         }
@@ -1557,11 +1725,11 @@ pub fun set_stepped(sp: *Space, stepped: bool) err[allo.Error] {
     }
     var backs: [layer.LAYERS_MAX]*u32;
     for (k < sp.set.n) {
-        backs[k] = zwords(sp.a, sp.cap * span_of(sp, k));
+        backs[k] = back_for(sp.a, ?sp.set, k, sp.fronts[k], sp.cap * span_of(sp, k));
         if (backs[k] == nil) {
             var j: usize = 0;
             for (j < k) {
-                allo.deallocate[u32](sp.a, backs[j], sp.cap * span_of(sp, j));
+                if (backs[j] != sp.fronts[j]) { allo.deallocate[u32](sp.a, backs[j], sp.cap * span_of(sp, j)); }
                 j = j + 1;
             }
             ret err[allo.Error].err{allo.Error.exhausted{}};
@@ -1983,7 +2151,7 @@ fun link(sp: *Space, s: usize) {
         }
         k = k + 1;
     }
-    e[layout.EDGE_AT::usize] = topology.edge_word(?sp.grid, cx, cy);
+    e[layout.EDGE_AT::usize] = topology.edge_word(?sp.grid, cx, cy) | (e[layout.EDGE_AT::usize] & layout.WALLED);
     sp.dirty[s]              = sp.dirty[s] | DIRTY_ENTRY;
 }
 
@@ -2036,6 +2204,7 @@ pub fun mask(sp: *Space, s: usize) {
         }
         i = i + 1;
     }
+    mark_walls(sp, s);
 }
 
 # put the world on a grid: the chunks off it are freed, every other chunk is
@@ -2235,7 +2404,7 @@ fun quiet(sp: *Space, s: usize) {
     mem.zero[u32](?sp.before[s * CENSUS], CENSUS);
     var k: usize = 0;
     for (sp.stepped && k < sp.set.n) {
-        plane.clear(back_of(sp, k, s));
+        if (!static_layer(?sp.set, k)) { plane.clear(back_of(sp, k, s)); }
         k = k + 1;
     }
     if (sp.mips_back != nil) { mem.zero[u32](?sp.mips_back[s * MIP], MIP); }
@@ -2433,7 +2602,7 @@ fun move_slot(sp: *Space, s: usize, d: usize) {
     for (k < sp.set.n) {
         val w: usize = span_of(sp, k);
         mem.copy[u32](?sp.fronts[k][d * w], ?sp.fronts[k][s * w], w);
-        if (sp.backs[k] != nil) { mem.copy[u32](?sp.backs[k][d * w], ?sp.backs[k][s * w], w); }
+        if (sp.backs[k] != nil && sp.backs[k] != sp.fronts[k]) { mem.copy[u32](?sp.backs[k][d * w], ?sp.backs[k][s * w], w); }
         k = k + 1;
     }
     if (sp.mips != nil) {
@@ -2645,8 +2814,8 @@ fun ask(sp: *Space, s: usize) {
 }
 
 # the slots the CPU's next step of a pool held whole steps, into due: every
-# awake one, the chunks the halo of each live one asks for, and the rim where
-# it is kept. every other slot holds zeros in both cells and nothing near it
+# awake one, the chunks the halo of each live one asks for, the rim where it
+# is kept, and every walled chunk where the background flips. every other slot holds zeros in both cells and nothing near it
 # lives, so its step would write the zeros its back cells hold already
 pub fun plan(sp: *Space) {
     var i: usize = 0;
@@ -2663,6 +2832,12 @@ pub fun plan(sp: *Space) {
         i = i + 1;
     }
     keep_rim(sp);
+    # a wall held as a flipping background's complement changes every step
+    var t: usize = 0;
+    for (sp.flips && walls_on(sp) && t < sp.hi) {
+        if (used(sp, t) && walled(sp, t)) { ask(sp, t); }
+        t = t + 1;
+    }
 }
 
 # after the CPU's step of a pool held whole, keep awake only the slots it
@@ -2918,7 +3093,7 @@ pub fun settle(sp: *Space, census: *u32, n: usize, frees: bool) bool {
         val had: usize = sp.nfree;
         s = 0;
         for (s < n && s < sp.hi) {
-            if (current(sp, c, n, s) && c[s * CENSUS] == 0 && c[s * CENSUS + 1] == 0 && sp.asked[s] == 0) {
+            if (current(sp, c, n, s) && c[s * CENSUS] == 0 && c[s * CENSUS + 1] == 0 && sp.asked[s] == 0 && !walled(sp, s)) {
                 release(sp, s);
             }
             s = s + 1;
