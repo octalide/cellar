@@ -68,13 +68,18 @@ Lenia rules are Bert Chan's continuous automata: a cell holds a value from 0
 to 1 and moves each generation by the growth of a smooth kernel's weighted sum
 around it. A rule is Chakazul's parameters as his Lenia writes them,
 `R=13,T=10,b=[1],m=0.15,s=0.015,kn=1,gn=1` for Orbium. R is the kernel's
-radius, up to 32. T is the generations to a unit of time. b holds the peaks of
+radius, up to 64. T is the generations to a unit of time. b holds the peaks of
 the kernel's rings. m and s are the growth's centre and width. kn and gn name
 the kernel core and growth function, numbered as his are. Cells are drawn by
 value on his colour map. Chakazul's patterns are Golly multi-state RLE of
 their values in 255ths, so they open as RLE files. RLE and the other pattern
 formats keep the 255ths, and a format with fewer states refuses the rule.
-RLW, cellar's own pattern format, and a world file keep every value exactly. Lenia runs on the CPU and the GPU, not on HashLife.
+RLW, cellar's own pattern format, and a world file keep every value exactly.
+Built-in: the rules of Orbium (`R=13,T=10,b=[1],m=0.15,s=0.015`), Gyrorbium
+(`m=0.156,s=0.0224`), Scutium (`m=0.29,s=0.045`) and Hydrogeminium
+(`R=18,T=10,b=[1/2,1,2/3],m=0.26,s=0.036`), and the pattern library's Lenia
+category holds creatures that live under them and others. Lenia runs on the
+CPU and the GPU, not on HashLife.
 
 Reaction-diffusion rules are Gray-Scott's model: a cell holds two
 concentrations, u and v, that diffuse and react, v feeding on u at u v^2,
@@ -87,7 +92,8 @@ u = 1 - i/15 and v = j/15, so a pattern needs 256 states, as multi-state RLE
 holds, and a format with fewer refuses the rule. RLW and a world file keep
 every value exactly. The pen paints u = 1, v = 1, which starts a pattern from a
 stroke. Cells are drawn by v. Built-in: Gray-Scott spots (`F=0.03,k=0.062`),
-stripes (`F=0.029,k=0.057`) and mitosis (`F=0.0367,k=0.0649`). Reaction-diffusion
+stripes (`F=0.029,k=0.057`) and mitosis (`F=0.0367,k=0.0649`), each with a
+seed in the pattern library's Gray-Scott category. Reaction-diffusion
 runs on the CPU and the GPU, not on HashLife.
 
 Any rule runs on a bounded grid named after it as Golly writes one:
@@ -150,8 +156,9 @@ at the sides, grouped by purpose:
   2^k generations and a generation to go straight to, the panels menu, and the
   settings and the key reference
 - **patterns**: a library of about three hundred classic patterns (still
-  lifes, oscillators, spaceships, guns, puffers, methuselahs and growth) to
-  browse by category or search by name, a custom pattern drawn in place, and a
+  lifes, oscillators, spaceships, guns, puffers, methuselahs and growth), Lenia
+  creatures and reaction-diffusion seeds to browse by category or search by
+  name, a custom pattern drawn in place, and a
   preview of the selected one. The library's sources are listed in
   [res/patterns](res/patterns/README.md)
 - **files**: named saves of the world and the custom pattern, a list of every
