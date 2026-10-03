@@ -23,10 +23,13 @@ use btext:  blit.text;
 use btoast: blit.toast;
 use bw:     blit.widget;
 use cellar.app;
+use cellar.ceiling;
+use cellar.command;
 use cellar.look;
 use cellar.paint;
 use cellar.render;
 use rules: cellar.rule;
+use cellar.sim;
 use cellar.space;
 use cellar.text;
 use cellar.theme;
@@ -140,7 +143,7 @@ pub fun readout(ui: *bctx.Context, l: look.Look, a: *app.App, s: *world.Shown, p
     # the fields flow into rows no wider than the world's port leaves, the
     # least important last. one wider than a row on its own is cut to it
     val lh:   f32       = bctx.line_height(ui);
-    val room: f32       = maxf(pt.w - bctx.px(ui, HUD_MARGIN) * 2.0 - bctx.px(ui, look.READOUT_PAD) * 2.0, 0.0);
+    val room: f32       = maxf(pt.w - bctx.px(ui, HUD_MARGIN) * 2.0 - bctx.px(ui, look.READOUT_PAD_X) * 2.0, 0.0);
     var fo:   blay.Flow = bw.flow(ui);
     fo.gap     = bctx.px(ui, 14.0);
     fo.row_gap = bctx.px(ui, 4.0);
@@ -382,6 +385,57 @@ pub fun toast(ui: *bctx.Context, m: *Messages, a: *app.App, pt: render.Port) {
     btoast.show_in(ui, "toast", ?m.stack, area(pt), bov.BOTTOM);
 }
 
+# the pool's memory a run paused at its ceiling is offered: twice what it may
+# take now, no more than the device holds, or none once it may take all of
+# that
+# ---
+# p:   the memory the pool takes and may take
+# ret: the limit offered in MiB, 0 for none
+pub fun pool_raise(p: sim.PoolMemory) u64 {
+    val now:  u64 = (p.bound + 1048575) / 1048576;
+    var next: u64 = now * 2;
+    if (p.heap != 0 && next > p.heap / 1048576) { next = p.heap / 1048576; }
+    if (next <= now)                            { ret 0; }
+    ret next;
+}
+
+# while the run is paused at the pool's ceiling, a button over the world that
+# raises it (pool_raise) and runs on
+# ---
+# ui: the interface
+# l:  cellar's look
+# a:  application state
+# s:  the world as shown
+# pt: the world's viewport
+pub fun pool_offer(ui: *bctx.Context, l: look.Look, a: *app.App, s: *world.Shown, pt: render.Port) {
+    if (world.paused_at(s) != ceiling.POOL) { ret; }
+    val next: u64 = pool_raise(world.pool(s));
+    if (next == 0) { ret; }
+    var lb: [80]u8;
+    var o:  usize = text.buf_str(?lb[0], 0, "Raise the pool to ");
+    o     = text.buf_grouped(?lb[0], o, next);
+    o     = text.buf_str(?lb[0], o, " MiB and run on###pool_raise");
+    lb[o] = 0;
+    var ov: bov.Overlay = bov.on_rect(area(pt), bov.TOP, bov.TOP);
+    ov.dy   = bctx.px(ui, HUD_MARGIN);
+    ov.band = band.BASE;
+    bstyle.push_class(ui, l.hud);
+    val shown: bov.Shown = bov.begin(ui, "pool_offer", ov);
+    val pd:    f32       = bctx.px(ui, 6.0);
+    val w:     f32       = bctx.text_width(ui, ?lb[0]) + pd * 4.0;
+    val h:     f32       = bctx.line_height(ui) + pd * 2.0;
+    val r:     bctx.Area = bw.place(ui, blay.fixed(w), blay.fixed(h), w, h);
+    if (bw.button_at(ui, ?lb[0], r.x0, r.y0, r.x1, r.y1, false)) {
+        var c: ceiling.Ceilings = world.ceilings(s);
+        c.on[ceiling.POOL]    = true;
+        c.limit[ceiling.POOL] = next;
+        app.submit(a, command.Command.ceilings{c});
+        app.submit(a, command.Command.toggle{});
+    }
+    bov.end(ui, shown);
+    bstyle.pop(ui);
+}
+
 # the key reference, over everything; a click anywhere closes it
 # ---
 # ui: the interface
@@ -546,5 +600,15 @@ test toast__a_message_replaces_the_last_and_a_held_one_waits_for_the_next {
     if (sel freed.err) { ret 1; }
     val dropped: err[allo.Error] = messages_dnit(?tp.m);
     if (sel dropped.err) { ret 1; }
+    ret 0;
+}
+
+test pool_raise__doubles_the_pool_until_the_device_holds_no_more {
+    val mib: u64 = 1048576;
+    if (pool_raise(sim.PoolMemory{taken: 0, bound: 1000 * mib, heap: 8192 * mib, share: 0}) != 2000) { ret 1; }
+    if (pool_raise(sim.PoolMemory{taken: 0, bound: 6144 * mib, heap: 8192 * mib, share: 0}) != 8192) { ret 2; }
+    if (pool_raise(sim.PoolMemory{taken: 0, bound: 8192 * mib, heap: 8192 * mib, share: 0}) != 0)    { ret 3; }
+    # a host's pool, with no device to hold it to, doubles
+    if (pool_raise(sim.PoolMemory{taken: 0, bound: 600 * mib, heap: 0, share: 0}) != 1200) { ret 4; }
     ret 0;
 }

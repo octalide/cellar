@@ -3,14 +3,13 @@
 #
 # a cell is its values in the family's two layers, v in the state layer and
 # 1 - u in the rule layer word.U, each read and written at the width the
-# family declares (word.WIDTH, cellar.layer), the state layer bound at
-# bindings 0 and 1 and the U layer at its own (cellar.layer binding). an
+# family declares (word.WIDTH, cellar.layer), both reached by address. an
 # invocation builds the words of each layer its run of cells fills before it
 # writes them.
 #
 # an invocation is a run of 8 cells in a row, and 8 workgroups of 64 cover a
-# chunk; workgroup y names the chunk's slot through the active list
-# (cellar.layout.Flags). a cell's four orthogonal neighbours are read straight
+# chunk; the workgroup's row (cellar.layout row) names the chunk's slot
+# through the active list (cellar.layout.Flags). a cell's four orthogonal neighbours are read straight
 # from the source pool through the chunk's page-table entry, and through its
 # links on a seamed chunk, so a chunk that does not exist, or a position past a
 # plane's dead edge, reads as the background, zero in both. the step is the
@@ -22,56 +21,49 @@
 # one that also held none the step before already holds them in both pools
 # and is skipped.
 
+use cellar.bin.shaders.pool;
 use cellar.layer;
 use cellar.layout;
 use cellar.layout.Flags;
-use cellar.layout.Layer;
 use cellar.layout.Meta;
 use cellar.rules.reaction.word;
 
 #[storage(1, 0, "readonly")]
-var src:   Layer;
-#[storage(1, 1)]
-var dst:   Layer;
-#[storage(1, 2, "readonly")]
 var meta:  Meta;
-#[storage(1, 3)]
+#[storage(1, 1)]
 var flags: Flags;
-#[storage(1, 4, "readonly")]
-var srcu:  Layer;
-#[storage(1, 5)]
-var dstu:  Layer;
 
-$if (layout.STEP_BINDINGS != 4 || word.U != 1 || word.WIDTH != 16) {
-    $error("the U layer's bindings are not the contract's (cellar.layer binding), or a word does not hold two cells");
+$if (word.WIDTH != 16) {
+    $error("a word does not hold two cells");
 }
 
 #[builtin("global_invocation")]
 var gid: u32x3;
 
-# the source's pair of the cell at address a (cellar.layer), its U layer's
-# value and its state layer's
-fun cell_of(a: u32) u32 {
-    val b: u32 = layer.read(src.v[layer.addr_word(word.WIDTH, a)], word.WIDTH, a);
-    val u: u32 = layer.read(srcu.v[layer.addr_word(word.WIDTH, a)], word.WIDTH, a);
+# the pair of cell i of a slot in the source cells c (cellar.layer), its U
+# layer's value and its state layer's, the shards named by sh under the
+# pool's geometry m
+fun cell_of(sh: *layout.Shards, m: u32, c: u32, slot: u32, i: u32) u32 {
+    val b: u32 = pool.cell(sh, m, 0, c, slot, word.WIDTH, i);
+    val u: u32 = pool.cell(sh, m, word.U, c, slot, word.WIDTH, i);
     ret word.cell(u, b);
 }
 
-# the address (cellar.layer) of the cell at (x, y) of a slot's frame, taken
-# through the links where it lies outside the window (cellar.layout), or NONE
-# where no chunk holds it or past a plane's dead edge
-fun reach(slot: u32, x: i32, y: i32) u32 {
-    var sl: u32 = slot;
-    var px: i32 = x;
-    var py: i32 = y;
-    var at: u32 = layout.NONE;
-    var h:  u32 = 0;
+# the cell at (x, y) of a slot's frame, taken through the links where it lies
+# outside the window (cellar.layout), its slot NONE where no chunk holds it or
+# past a plane's dead edge
+fun reach(slot: u32, x: i32, y: i32) pool.Spot {
+    var sl: u32       = slot;
+    var px: i32       = x;
+    var py: i32       = y;
+    var at: pool.Spot = pool.Spot{slot: layout.NONE, i: 0};
+    var h:  u32       = 0;
     for (h <= layout.HOPS) {
         val b: u32 = sl * layout.ENTRY;
         val k: u32 = layout.edge_side(meta.table[b + layout.EDGE_AT], px, py);
         val n: u32 = meta.table[b + k];
         if (k == 4) {
-            at = layer.addr(sl, (py * layout.SIDE::i32 + px)::u32);
+            at = pool.Spot{slot: sl, i: (py * layout.SIDE::i32 + px)::u32};
             h  = layout.HOPS;
         }
         or (n == layout.NONE) { h = layout.HOPS; }
@@ -87,10 +79,10 @@ fun reach(slot: u32, x: i32, y: i32) u32 {
     ret at;
 }
 
-# the pair of the cell at (x, y) of a slot's frame, within a chunk of it, zero
-# where no chunk holds it
-fun word_at(slot: u32, seamed: u32, x: i32, y: i32) u32 {
-    var at: u32 = layout.NONE;
+# the pair of the cell at (x, y) of a slot's frame in the source cells c,
+# within a chunk of it, zero where no chunk holds it
+fun word_at(sh: *layout.Shards, m: u32, c: u32, slot: u32, seamed: u32, x: i32, y: i32) u32 {
+    var at: pool.Spot = pool.Spot{slot: layout.NONE, i: 0};
     if (seamed != 0) { at = reach(slot, x, y); }
     or {
         var xx: i32 = x;
@@ -114,24 +106,25 @@ fun word_at(slot: u32, seamed: u32, x: i32, y: i32) u32 {
             cy = 2;
         }
         val n: u32 = meta.table[slot * layout.ENTRY + cy * 3 + cx];
-        if (n != layout.NONE) { at = layer.addr(n, (yy * layout.SIDE::i32 + xx)::u32); }
+        if (n != layout.NONE) { at = pool.Spot{slot: n, i: (yy * layout.SIDE::i32 + xx)::u32}; }
     }
-    if (at == layout.NONE) { ret 0; }
-    ret cell_of(at);
+    var v: u32 = 0;
+    if (at.slot != layout.NONE) { v = cell_of(sh, m, c, at.slot, at.i); }
+    ret v;
 }
 
 #[stage("compute")]
 #[workgroup(64, 1, 1)]
 fun comp_main() {
-    # workgroup y names an entry of the active list past the dispatch's base,
-    # and a dispatch may run past the list's end
-    val entry: u32 = gid[1] + meta.base[0];
-    if (entry >= flags.args[1]) { ret; }
-    val slot: u32 = flags.list[entry];
+    # the workgroup's row names an entry of the active list past the
+    # dispatch's base, and a dispatch may run past the list's end
+    val entry: u32 = layout.row(gid[1], gid[2], meta.base[layout.FOLD_AT - layout.BASE_AT]) + meta.base[0];
+    if (entry >= flags.n) { ret; }
+    val slot: u32 = flags.v[layout.list_at(meta.base[layout.CAP_AT - layout.BASE_AT]) + entry];
     val ly:   i32 = (gid[0] / 8)::i32;
     val x0:   i32 = (gid[0] % 8)::i32 * 8;
     val base: u32 = slot * layout.ENTRY;
-    val row:  u32 = layer.addr(slot, (ly * layout.SIDE::i32)::u32);
+    val row:  u32 = (ly * layout.SIDE::i32)::u32;
     var acc:  u32 = 0;
     var accu: u32 = 0;
     if (meta.table[base + layout.INCARNATION_AT] == 0) { ret; }
@@ -153,7 +146,15 @@ fun comp_main() {
         k = k + 1;
     }
     if (seamed != 0) { busy = 1; }
-    var x: i32 = x0;
+    # the source cells are the last step's, the destination this one's
+    # (cellar.layer)
+    val sh:    *layout.Shards = meta.shards;
+    val m:     u32            = meta.base[layout.SHARD_AT - layout.BASE_AT];
+    val src:   u32            = last & 1;
+    val place: layout.Where   = layout.where(slot, m);
+    val dst:   layout.Span    = layer.span(sh, 0, now & 1, place, word.WIDTH);
+    val dstu:  layout.Span    = layer.span(sh, word.U, now & 1, place, word.WIDTH);
+    var x:     i32            = x0;
     if (busy == 0) {
         val warm: u32 = flags.v[slot * 2 + 1];
         if (warm != last && warm != now) {
@@ -161,9 +162,9 @@ fun comp_main() {
             # destination already holds them
             if (warm != last - 1) { ret; }
             for (x < x0 + 8) {
-                dst.v[layer.addr_word(word.WIDTH, row + x::u32)]  = 0;
-                dstu.v[layer.addr_word(word.WIDTH, row + x::u32)] = 0;
-                x                                                 = x + 1;
+                dst.p.v[dst.at + layer.cell_word(word.WIDTH, row + x::u32)]   = 0;
+                dstu.p.v[dstu.at + layer.cell_word(word.WIDTH, row + x::u32)] = 0;
+                x                                                             = x + 1;
             }
             ret;
         }
@@ -196,9 +197,12 @@ fun comp_main() {
                 var bv: u32 = 0;
                 var bu: u32 = 0;
                 if (nb != layout.NONE) {
-                    val at: u32 = layer.addr_word(word.WIDTH, layer.addr(nb, yy::u32 * layout.SIDE + x0::u32)) + j;
-                    bv = src.v[at];
-                    bu = srcu.v[at];
+                    val nat: layout.Where = layout.where(nb, m);
+                    val sv:  layout.Span  = layer.span(sh, 0, src, nat, word.WIDTH);
+                    val su:  layout.Span  = layer.span(sh, word.U, src, nat, word.WIDTH);
+                    val at:  u32          = layer.cell_word(word.WIDTH, yy::u32 * layout.SIDE + x0::u32) + j;
+                    bv = sv.p.v[sv.at + at];
+                    bu = su.p.v[su.at + at];
                 }
                 # a word holds two cells, the first in its low bits
                 rows[r * 8 + j * 2]     = word.cell(bu & layer.mask(word.WIDTH), bv & layer.mask(word.WIDTH));
@@ -219,17 +223,17 @@ fun comp_main() {
             c = rows[8 + i];
             n = rows[i];
             s = rows[16 + i];
-            if (i == 0) { w = word_at(slot, seamed, x - 1, ly); }
+            if (i == 0) { w = word_at(sh, m, src, slot, seamed, x - 1, ly); }
             or          { w = rows[7 + i]; }
-            if (i == 7) { e = word_at(slot, seamed, x + 1, ly); }
+            if (i == 7) { e = word_at(sh, m, src, slot, seamed, x + 1, ly); }
             or          { e = rows[9 + i]; }
         }
         or {
-            c = cell_of(row + x::u32);
-            n = word_at(slot, seamed, x, ly - 1);
-            w = word_at(slot, seamed, x - 1, ly);
-            e = word_at(slot, seamed, x + 1, ly);
-            s = word_at(slot, seamed, x, ly + 1);
+            c = cell_of(sh, m, src, slot, row + x::u32);
+            n = word_at(sh, m, src, slot, seamed, x, ly - 1);
+            w = word_at(sh, m, src, slot, seamed, x - 1, ly);
+            e = word_at(sh, m, src, slot, seamed, x + 1, ly);
+            s = word_at(sh, m, src, slot, seamed, x, ly + 1);
         }
         val sa:   u32 = word.a_of(n) + word.a_of(w) + word.a_of(e) + word.a_of(s);
         val sb:   u32 = word.b_of(n) + word.b_of(w) + word.b_of(e) + word.b_of(s);
@@ -239,10 +243,10 @@ fun comp_main() {
         acc  = acc | layer.place(word.WIDTH, row + x::u32, word.b_of(next));
         accu = accu | layer.place(word.WIDTH, row + x::u32, word.a_of(next));
         if (layer.ends(word.WIDTH, row + x::u32) != 0) {
-            dst.v[layer.addr_word(word.WIDTH, row + x::u32)]  = acc;
-            dstu.v[layer.addr_word(word.WIDTH, row + x::u32)] = accu;
-            acc                                               = 0;
-            accu                                              = 0;
+            dst.p.v[dst.at + layer.cell_word(word.WIDTH, row + x::u32)]   = acc;
+            dstu.p.v[dstu.at + layer.cell_word(word.WIDTH, row + x::u32)] = accu;
+            acc                                                           = 0;
+            accu                                                          = 0;
         }
         x = x + 1;
     }

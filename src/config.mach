@@ -20,7 +20,10 @@
 # version 3 added the selection line, version 4 the rule line, version 5 the
 # engine line, version 6 the ceilings line and version 7 the layout. version
 # 8 keeps the layout as one dock space around the world, where version 7 kept
-# a dock space at either side, so a version 7 layout is not read.
+# a dock space at either side, so a version 7 layout is not read. version 9
+# keeps the pool's ceiling in MiB of memory, where versions 6 to 8 kept it in
+# chunks, which are read as the memory they stand for
+# (cellar.ceiling pool_of_chunks).
 #
 # the engine line is "<engine> <exponent>" after the rule line: the engine
 # chosen, cpu, gpu or hashlife, and HashLife's step exponent. a file without it
@@ -67,8 +70,8 @@ use std.types.size.usize;
 use std.types.string;
 use std.types.string.str;
 
-# settings-format version written; versions 1 to 7 are still read
-val VERSION: u64 = 8;
+# settings-format version written; versions 1 to 8 are still read
+val VERSION: u64 = 9;
 # the last version that kept the rule as a weighted kernel's integers
 val KERNEL_INTS: usize = 3;
 # the first version with the selection line
@@ -79,6 +82,8 @@ val ENGINE_LINE: usize = 5;
 val CEILING_LINE: usize = 6;
 # the first version with the layout this version reads
 val LAYOUT: usize = 8;
+# the first version keeping the pool's ceiling in MiB
+val POOL_MIB: usize = 9;
 # the first line's retired slots, between the panel flag and the scale
 val RETIRED: usize = 5;
 
@@ -367,7 +372,7 @@ pub fun load(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) err[persi
             for (at < full && data.data[at] != '\n') { at = at + 1; }
             if (at < full) {
                 var c: ceiling.Ceilings = sim.ceilings(s);
-                read_ceilings(?data, at + 1, ?c);
+                read_ceilings(?data, at + 1, ?c, version);
                 sim.set_ceilings(s, c);
             }
         }
@@ -438,10 +443,11 @@ fun read_engine(b: *Vector[u8], at: usize, ap: *app.App, s: *sim.Sim) {
 
 # read the ceilings line, an on flag and a limit per ceiling, into c
 # ---
-# b:  the file
-# at: where the line starts
-# c:  the ceilings, each one the line holds replaced
-fun read_ceilings(b: *Vector[u8], at: usize, c: *ceiling.Ceilings) {
+# b:       the file
+# at:      where the line starts
+# c:       the ceilings, each one the line holds replaced
+# version: the file's, before POOL_MIB keeping the pool's in chunks
+fun read_ceilings(b: *Vector[u8], at: usize, c: *ceiling.Ceilings, version: usize) {
     val full: usize = b.len;
     var end:  usize = at;
     for (end < full && b.data[end] != '\n') { end = end + 1; }
@@ -453,7 +459,8 @@ fun read_ceilings(b: *Vector[u8], at: usize, c: *ceiling.Ceilings) {
         val limit: usize = read_uint(b, ?p);
         c.on[k]    = bit(on) != 0;
         c.limit[k] = limit::u64;
-        k          = k + 1;
+        if (k == ceiling.POOL && version < POOL_MIB) { c.limit[k] = ceiling.pool_of_chunks(c.on[k], limit::u64); }
+        k = k + 1;
     }
     b.len = full;
 }
@@ -486,7 +493,7 @@ pub fun load_ceilings(a: *allo.Allocator, path: str, c: *ceiling.Ceilings) err[p
             if (data.data[at] == '\n') { lines = lines + 1; }
             at = at + 1;
         }
-        if (lines == 4) { read_ceilings(?data, at, c); }
+        if (lines == 4) { read_ceilings(?data, at, c, version); }
     }
     vector.dnit[u8](?data);
     ret err[persist.Error].ok{};
@@ -880,6 +887,25 @@ test load__reads_every_version {
     if (!loads_ok(?a, ?ap, ?s, path)) { ret 74; }
     got = sim.ceilings(?s);
     if (got.limit[ceiling.POPULATION] != 12345) { ret 75; }
+
+    # version 9 keeps the pool's ceiling in MiB, and an older file's chunks
+    # are read as the memory they stand for
+    c                     = sim.ceilings(?s);
+    c.limit[ceiling.POOL] = 1000;
+    sim.set_ceilings(?s, c);
+    if (!saves_ok(?a, ?ap, ?s, path))                                                 { ret 81; }
+    if (!loads_ok(?a, ?ap, ?s, path) || sim.ceilings(?s).limit[ceiling.POOL] != 1000) { ret 82; }
+    val rr: res[Vector[u8], fs.FsError] = fs.read_bytes(?a, path);
+    if (sel rr.err) { ret 83; }
+    var old: Vector[u8] = rr.ok;
+    if (old.data[0] != '9' || old.data[1] != ' ') { ret 83; }
+    old.data[0] = '8';
+    val w8: err[fs.FsError] = fs.write_bytes(path, old.data, old.len, persist.FILE_MODE);
+    vector.dnit[u8](?old);
+    if (sel w8.err)                                                                 { ret 84; }
+    if (!loads_ok(?a, ?ap, ?s, path) || sim.ceilings(?s).limit[ceiling.POOL] != 22) { ret 85; }
+    c.limit[ceiling.POOL] = 0;
+    sim.set_ceilings(?s, c);
 
     # version 8 keeps the layout after the ceilings, and an older file has none
     val doc: str = "[window.12]\nx = 4.0\n\n[docked.12]\nnode = 3\n";

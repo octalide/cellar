@@ -215,8 +215,9 @@ fun slow_device(ui: *bctx.Context, l: look.Look, a: *app.App) {
 pub fun stats_page(ui: *bctx.Context, l: look.Look, a: *app.App, s: *world.Shown) {
     graph(ui, l, s);
 
-    var labels: [8]str;
-    var values: [8]str;
+    var labels: [9]str;
+    var values: [9]str;
+    var pool:   [80]u8;
     var gen:    [32]u8;
     var pop:    [32]u8;
     var box:    [64]u8;
@@ -260,8 +261,16 @@ pub fun stats_page(ui: *bctx.Context, l: look.Look, a: *app.App, s: *world.Shown
     values[6] = world.rule_string(s, ?rb[0]);
     labels[7] = "device";
     values[7] = device_name(a);
+    # what the pool takes, of what its ceiling lets it take
+    val pm: sim.PoolMemory = world.pool(s);
+    o         = text.buf_mib(?pool[0], 0, pm.taken);
+    o         = text.buf_str(?pool[0], o, " of ");
+    o         = text.buf_mib(?pool[0], o, pm.bound);
+    pool[o]   = 0;
+    labels[8] = "pool";
+    values[8] = ?pool[0];
     pairs(ui, l, ?labels[0], ?values[0], 6, 2);
-    pairs(ui, l, ?labels[6], ?values[6], 2, 1);
+    pairs(ui, l, ?labels[6], ?values[6], 3, 1);
     slow_device(ui, l, a);
     if (world.full(s)) { look.line(ui, l.small, world.full_reason(s), theme.WARN); }
 
@@ -271,7 +280,8 @@ pub fun stats_page(ui: *bctx.Context, l: look.Look, a: *app.App, s: *world.Shown
 }
 
 # the ceilings a run pauses at, each switched on or off, its limit dragged along
-# 1, 2 and 5 times the powers of ten
+# 1, 2 and 5 times the powers of ten. the pool's runs to the device's memory,
+# and below its first notch leaves the pool the device's share
 fun ceilings(ui: *bctx.Context, l: look.Look, a: *app.App, s: *world.Shown) {
     look.heading(ui, l, "Pause a run that passes");
     var c:       ceiling.Ceilings = world.ceilings(s);
@@ -286,14 +296,32 @@ fun ceilings(ui: *bctx.Context, l: look.Look, a: *app.App, s: *world.Shown) {
             changed = true;
         }
         if (c.on[k]) {
-            var rd: [48]u8;
-            var o:  usize = text.buf_grouped(?rd[0], 0, c.limit[k]);
-            o     = text.buf_str(?rd[0], o, " ");
-            o     = text.buf_str(?rd[0], o, ceiling.unit(k));
+            var rd: [64]u8;
+            var o:  usize = 0;
+            var lo: usize = ceiling.notch_lo(k);
+            var hi: usize = ceiling.notch_hi(k);
+            var v:  f32   = ceiling.notch_of(c.limit[k])::f32;
+            if (k == ceiling.POOL) {
+                val pm: sim.PoolMemory = world.pool(s);
+                if (pm.heap != 0) { hi = ceiling.notch_of(pm.heap / 1048576); }
+                # a notch below the first is the device's share
+                lo = lo - 1;
+                if (c.limit[k] == 0) {
+                    v = lo::f32;
+                    o = text.buf_str(?rd[0], 0, "auto, ");
+                    o = text.buf_mib(?rd[0], o, pm.share);
+                }
+            }
+            if (o == 0) {
+                o = text.buf_grouped(?rd[0], 0, c.limit[k]);
+                o = text.buf_str(?rd[0], o, " ");
+                o = text.buf_str(?rd[0], o, ceiling.unit(k));
+            }
             rd[o] = 0;
-            var v: f32 = ceiling.notch_of(c.limit[k])::f32;
-            if (bw.slider(ui, "Limit", ?rd[0], ?v, ceiling.notch_lo(k)::f32, ceiling.notch_hi(k)::f32)) {
-                val n: u64 = ceiling.notch((v + 0.5)::usize);
+            if (bw.slider(ui, "Limit", ?rd[0], ?v, lo::f32, hi::f32)) {
+                val at: usize = (v + 0.5)::usize;
+                var n:  u64   = ceiling.notch(at);
+                if (k == ceiling.POOL && at <= lo) { n = 0; }
                 if (n != c.limit[k]) {
                     c.limit[k] = n;
                     changed    = true;

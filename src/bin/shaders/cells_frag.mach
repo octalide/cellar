@@ -7,8 +7,9 @@
 # in its rule palette's colour for the cell's heat, which is the state's place
 # in the palette. a cell is its sensed value, its value in the pool's state
 # layer with its value in the shown layer above it, each read at the width the
-# meta head holds (cellar.layer), and what is live and where the heat and age
-# channels lie in it, the rule family's sense in the meta head says.
+# meta head holds (cellar.layer) at the front, by address, and what is live
+# and where the heat and age channels lie in it, the rule family's sense in
+# the meta head says.
 #
 # at a pixel per cell or more a pixel shows the cell under its centre, and with
 # grid lines on and cells large enough, the last pixel of each cell shows the
@@ -52,22 +53,15 @@ rec View {
     pal:     [768]f32x4;
 }
 
+use cellar.bin.shaders.pool;
 use cellar.layer;
 use cellar.layout;
-use cellar.layout.Layer;
 use cellar.layout.Meta;
-use cellar.layout.Mip;
 
 #[storage(1, 0, "readonly")]
-var cells: Layer;
+var meta: Meta;
 #[storage(1, 1, "readonly")]
-var meta:  Meta;
-#[storage(1, 2, "readonly")]
-var view:  View;
-#[storage(1, 3, "readonly")]
-var mip:   Mip;
-#[storage(1, 4, "readonly")]
-var shown: Layer;
+var view: View;
 
 #[builtin("frag_coord")]
 var frag: f32x4;
@@ -98,14 +92,20 @@ fun div_down(a: i32, b: i32) i32 {
     ret q;
 }
 
+# where a slot lies in the shards
+fun place(slot: u32) layout.Where {
+    ret layout.where(slot, meta.base[layout.SHARD_AT - layout.BASE_AT]);
+}
+
 # the sensed value of cell i of a slot, at the widths the meta head holds
-# (cellar.layer)
+# (cellar.layer), at the front
 fun cell(slot: u32, i: u32) u32 {
-    val w:  u32 = meta.base[layout.WIDTH_AT - layout.BASE_AT];
-    val hw: u32 = layer.live_width(meta.base[layout.LIVE_AT - layout.BASE_AT], layer.SHOWN_SLOT);
-    val v:  u32 = layer.read(cells.v[layer.cell_at(w, slot, i)], w, i);
-    if (hw == 0) { ret v; }
-    ret layer.sensed(v, layer.read(shown.v[layer.cell_at(hw, slot, i)], hw, i), w);
+    val w:     u32          = meta.base[layout.WIDTH_AT - layout.BASE_AT];
+    val front: u32          = meta.serial & 1;
+    val at:    layout.Where = place(slot);
+    val s:     layout.Span  = layer.span(meta.shards, 0, front, at, w);
+    val v:     u32          = layer.read(s.p.v[s.at + layer.cell_word(w, i)], w, i);
+    ret pool.sensed(meta.shards, meta.base[layout.SET_AT - layout.BASE_AT], meta.base[layout.WIDTHS_AT - layout.BASE_AT], front, at, v, w, i);
 }
 
 # the share of the live colour for cells this dense
@@ -150,20 +150,20 @@ fun sample() f32x4 {
         val share: f32 = (c & layout.SUMMARY_LIVE)::f32 / layout.SUMMARY_LIVE::f32;
         ret summed(share, (c >> layout.SUMMARY_HEAT) & layout.HEAT_CAP, 0);
     }
-    val heat: u32 = layout.texel_heat(c, meta.heat_shift, meta.heat_mask);
+    val heat: u32 = layout.texel_heat(c, meta.sense.heat_shift, meta.sense.heat_mask);
 
     var col: f32x4 = view.back;
     if (flipped() != 0) {
-        if (layout.live(c, meta.live_mask, meta.live_lo, meta.live_hi) == 0) { col = view.solid; }
+        if (layout.live(c, meta.sense.live_mask, meta.sense.live_lo, meta.sense.live_hi) == 0) { col = view.solid; }
     }
     or (view.mode == 1) {
         if (heat != 0) { col = view.pal[heat]; }
     }
-    or (layout.live(c, meta.live_mask, meta.live_lo, meta.live_hi) != 0) {
+    or (layout.live(c, meta.sense.live_mask, meta.sense.live_lo, meta.sense.live_hi) != 0) {
         col = view.solid;
         if (view.ink != 0) { col = view.pal[512 + heat]; }
         # the palette runs over the first 255 generations and holds after
-        if (view.mode == 2) { col = view.pal[256 + layout.texel_age(c, meta.age_shift, meta.age_mask)]; }
+        if (view.mode == 2) { col = view.pal[256 + layout.texel_age(c, meta.sense.age_shift, meta.sense.age_mask)]; }
     }
     if (view.gutter != 0 && view.ppc >= 4.0) {
         val fx: f32 = (in_local[0] - lx::f32) * view.ppc;
@@ -232,11 +232,14 @@ fun coverage() f32x4 {
                         var t: u32 = 0;
                         if (l == 0) {
                             val c: u32 = cell(n, (ly * side + lx)::u32);
-                            val a: u32 = layout.live(c, meta.live_mask, meta.live_lo, meta.live_hi);
-                            t = layout.texel(a, layout.texel_heat(c, meta.heat_shift, meta.heat_mask),
-                                a * layout.texel_age(c, meta.age_shift, meta.age_mask));
+                            val a: u32 = layout.live(c, meta.sense.live_mask, meta.sense.live_lo, meta.sense.live_hi);
+                            t = layout.texel(a, layout.texel_heat(c, meta.sense.heat_shift, meta.sense.heat_mask),
+                                a * layout.texel_age(c, meta.sense.age_shift, meta.sense.age_mask));
                         }
-                        or { t = mip.v[n * layout.MIP + at + (ly * side + lx)::u32]; }
+                        or {
+                            val m: layout.Span = layout.mip_span(meta.shards, place(n));
+                            t = m.p.v[m.at + at + (ly * side + lx)::u32];
+                        }
                         val tl: u32 = t & layout.TEXEL_LIVE;
                         val th: u32 = (t >> layout.TEXEL_HEAT) & layout.HEAT_CAP;
                         live = live + tl;

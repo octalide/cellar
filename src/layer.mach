@@ -20,12 +20,16 @@
 #          declared by the family with a name and a width. a rule's own data
 #          may declare one, as a rule table read from a file would, since a
 #          set is data and not code: a layer added changes no layout
-#   view   a layer the view keeps for a colour mode, trails, heat or age. it
-#          exists only while the view's colour mode uses it: made from the
+#   view   a layer the view keeps for a colour mode, trails, heat or age,
+#          declared by a family whose state layer is too narrow to hold its
+#          display channels (cellar.rule viewed). it exists only while the
+#          view's colour mode uses it (cellar.sim set_views): made from the
 #          state as it stands when the mode turns on, stepped with the world
-#          while it lasts, and freed when the mode turns off. it is never
-#          saved, copied, journaled or written by an edit, since the state
-#          gives it again
+#          while it lasts, and freed when the mode turns off. the family's
+#          step advances it where the set it steps holds it and passes it by
+#          where it does not, so a run that shows neither pays for neither.
+#          it is never saved, copied, journaled or written by an edit, since
+#          the state gives it again
 #
 # the state and rule layers are a cell's word, its exact value: a value for
 # each of them, in the set's order, each at its layer's width. a word is what
@@ -72,25 +76,23 @@
 # cells lie in one row, so a step that works a word at a time steps 32 / width
 # cells at once.
 #
-# where a span lies is the store's to say and no one else's. today a layer is
-# one buffer holding every slot's span in slot order (span_at). a store that
-# spreads a layer over several buffers names the buffer and offset of a slot's
-# span instead, since a span never straddles two, and nothing above it changes:
-# no code finds a span but span_at, the host's store and the stages through it.
+# where a span lies is the store's to say and no one else's. the host holds a
+# layer as one array of every slot's span in slot order (span_at). the GPU
+# holds each layer's two cells in shards, buffers each holding a run of slots'
+# spans, and names a slot's shard and the word its span starts at there
+# (span), from the slot alone (cellar.layout shard_of), so a span never
+# straddles two shards and a pool grows without moving one.
 #
-# until the stages reach the pool by device address, a step stage binds each
-# layer of its set as a source and a destination buffer: the state layer at
-# bindings 0 and 1, ahead of the meta and flags buffers (cellar.layout), and
-# layer k of the rest two by two after those and the family's rule buffer
-# (binding). the shared stages read the state layer alone, at the width the
-# meta head holds (cellar.layout.WIDTH_AT), and the stages that judge a cell
-# live, the census, the mark and the reduce, bind its live rule layers' source
-# buffers too, at LIVE_BINDING on, in the variant built for a rule whose family
-# declares any. the meta head names their widths (cellar.layout.LIVE_AT), at
-# most LIVE_MAX of them, so a rule with more live rule layers runs on the CPU.
-# the census and the reduce read a cell's sensed value: the same variant binds
-# its shown layer at SHOWN_BINDING, whose width the meta head's live word names
-# at SHOWN_SLOT, and the draw binds it past its own four (cellar.gpu draw).
+# the stages reach every layer by device address through the shard table the
+# meta head names (cellar.layout.Shards), so a stage binds no layer and a set
+# holds as many as LAYERS_MAX whatever the device binds. the meta head names
+# the set's layers and their widths (cellar.layout SET_AT and WIDTHS_AT,
+# set_word and widths_add): the shared stages read the state layer at its
+# width, the stages that judge a cell live, the census, the mark and the
+# reduce, read every live rule layer too, and the census, the reduce and the
+# draw read a cell's sensed value through the shown layer. a layer's cells c,
+# 0 or 1, hold the generation a step of serial s left where c is s's low bit,
+# so a stage finds the front from the serial it reads.
 
 use cellar.layout;
 
@@ -99,15 +101,9 @@ pub val WIDTH_MAX: u32 = 32;
 # the most layers a set holds, of every role
 pub val LAYERS_MAX: u32 = 8;
 
-# the most live rule layers a stage that judges a cell live binds, and the
-# binding of the first, past the four the census, mark and reduce stages bind
-pub val LIVE_MAX:     u32 = 3;
-pub val LIVE_BINDING: u32 = 4;
-# the binding of the shown layer's source buffer in the census's and the
-# reduce's variant that binds the live rule layers, past them, and its place in
-# the meta head's live word (live_add), past theirs
-pub val SHOWN_BINDING: u32 = LIVE_BINDING + LIVE_MAX;
-pub val SHOWN_SLOT:    u32 = 7;
+$if (LAYERS_MAX != layout.SHARD_LAYERS) {
+    $error("the shard table names another number of layers than a set holds");
+}
 
 # the roles a layer can have
 pub val STATE: u32 = 0;
@@ -165,19 +161,12 @@ pub fun cell_at(width: u32, slot: u32, i: u32) u32 {
     ret span_at(width, slot) + cell_word(width, i);
 }
 
-# a cell's address, its slot's cells then its own: it names a cell whatever
-# the width of the layer it is read in (addr_word)
+# where a slot's span of layer k's cells c, 0 or 1, at a width lies in the
+# shards the table sh names, the slot found by cellar.layout where under the
+# pool's geometry (cellar.layout SHARD_AT)
 #[inline]
-pub fun addr(slot: u32, i: u32) u32 {
-    ret slot * layout.CELLS + i;
-}
-
-# the word of a layer held as one buffer holding the cell at address a; read,
-# write, place and ends take an address as they take a cell of a slot
-#[inline]
-pub fun addr_word(width: u32, a: u32) u32 {
-    if (width == WIDTH_MAX) { ret a; }
-    ret cell_at(width, a / layout.CELLS, a % layout.CELLS);
+pub fun span(sh: *layout.Shards, k: u32, c: u32, at: layout.Where, width: u32) layout.Span {
+    ret layout.Span{p: sh.v[layout.cells_entry(k, c, at.shard)], at: at.index * span_words(width)};
 }
 
 # cells a word holds
@@ -216,21 +205,49 @@ pub fun ends(width: u32, i: u32) u32 {
     ret 0;
 }
 
-# the meta head's live word (cellar.layout.LIVE_AT) with live rule layer j
-# of a width added, four bits a layer from the low bits: the width's log2 plus
-# one, so 0 names no layer
-pub fun live_add(code: u32, j: u32, width: u32) u32 {
+# the meta head's widths word (cellar.layout.WIDTHS_AT) with layer k's width
+# added, four bits a layer from the low bits: the width's log2 plus one, so 0
+# names no layer
+pub fun widths_add(code: u32, k: u32, width: u32) u32 {
     var c: u32 = 1;
     for ((1 << (c - 1)) < width) { c = c + 1; }
-    ret code | (c << (j * 4));
+    ret code | (c << (k * 4));
 }
 
-# the width of live rule layer j a live word names, 0 for none
+# the width of layer k a widths word names, 0 for none
 #[inline]
-pub fun live_width(code: u32, j: u32) u32 {
-    val c: u32 = (code >> (j * 4)) & 0xf;
+pub fun width_in(code: u32, k: u32) u32 {
+    val c: u32 = (code >> (k * 4)) & 0xf;
     if (c == 0) { ret 0; }
     ret 1 << (c - 1);
+}
+
+# the meta head's set word (cellar.layout.SET_AT): the set's n layers in the
+# low four bits, its shown layer above them, 0 for none since the state layer
+# is never shown, and a bit per live rule layer from SET_LIVE, by layer
+pub fun set_word(n: u32, shown: u32, lives: u32) u32 {
+    ret n | (shown << 4) | (lives << SET_LIVE);
+}
+
+# where the set word's live bits start
+pub val SET_LIVE: u32 = 8;
+
+# the layers a set word names
+#[inline]
+pub fun set_layers(w: u32) u32 {
+    ret w & 0xf;
+}
+
+# the shown layer a set word names, 0 for none
+#[inline]
+pub fun set_shown(w: u32) u32 {
+    ret (w >> 4) & 0xf;
+}
+
+# the live rule layers a set word names, a bit a layer by its place in the set
+#[inline]
+pub fun set_lives(w: u32) u32 {
+    ret w >> SET_LIVE;
 }
 
 # a cell's sensed value: its state layer's value v, with its shown layer's
@@ -240,22 +257,6 @@ pub fun live_width(code: u32, j: u32) u32 {
 pub fun sensed(v: u32, h: u32, width: u32) u32 {
     if (width >= WIDTH_MAX) { ret v; }
     ret v | (h << width);
-}
-
-# the binding of layer k's source buffer in a step stage, its destination's
-# the one after: the state layer's at 0, any other's past the fixed bindings
-# and the rule buffer a family with one binds
-# ---
-# k:     the layer
-# table: 1 when the family binds a rule buffer, else 0
-pub fun binding(k: u32, table: u32) u32 {
-    if (k == 0) { ret 0; }
-    ret layout.STEP_BINDINGS + table + (k - 1) * 2;
-}
-
-# the storage buffers a step stage binds for a set of n layers
-pub fun bindings(n: u32, table: u32) u32 {
-    ret layout.STEP_BINDINGS + table + (n - 1) * 2;
 }
 
 test address__packs_every_width_low_bit_first_a_row_to_a_word {
@@ -283,20 +284,16 @@ test address__packs_every_width_low_bit_first_a_row_to_a_word {
         if ((put & ~(mask(width) << cell_shift(width, j))) != (all & ~(mask(width) << cell_shift(width, j)))) { ret 7; }
         if (place(width, j, v) != (v << cell_shift(width, j)))                                                { ret 8; }
         if (ends(width, j) != 1 || (width < WIDTH_MAX && ends(width, 0) != 0))                                { ret 9; }
-        # an address names a slot's cell in every width
-        val a: u32 = addr(5, 77);
-        if (addr_word(width, a) != cell_at(width, 5, 77) || read(0xffffffff, width, a) != mask(width)) { ret 14; }
         width = width * 2;
     }
-    if (valid(0) != 0 || valid(3) != 0 || valid(64) != 0)                                                         { ret 10; }
-    if (binding(0, 1) != 0 || binding(1, 0) != layout.STEP_BINDINGS || binding(2, 1) != layout.STEP_BINDINGS + 3) { ret 12; }
-    if (bindings(1, 1) != layout.STEP_BINDINGS + 1)                                                               { ret 13; }
-    # a live word names each live rule layer's width, and nothing past them
-    val code: u32 = live_add(live_add(0, 0, 16), 1, 1);
-    if (live_width(code, 0) != 16 || live_width(code, 1) != 1 || live_width(code, 2) != 0) { ret 15; }
-    if (live_width(live_add(0, LIVE_MAX - 1, 32), LIVE_MAX - 1) != 32)                     { ret 16; }
-    # and the shown layer's in its own place, past them
-    if (live_width(live_add(code, SHOWN_SLOT, 16), SHOWN_SLOT) != 16 || live_width(code, SHOWN_SLOT) != 0) { ret 17; }
-    if (sensed(1, 0x1ff, 1) != 0x3ff || sensed(0xabc, 7, WIDTH_MAX) != 0xabc)                              { ret 18; }
+    if (valid(0) != 0 || valid(3) != 0 || valid(64) != 0) { ret 10; }
+    # a widths word names each layer's width, and nothing past them
+    val code: u32 = widths_add(widths_add(0, 0, 16), 1, 1);
+    if (width_in(code, 0) != 16 || width_in(code, 1) != 1 || width_in(code, 2) != 0) { ret 15; }
+    if (width_in(widths_add(0, LAYERS_MAX - 1, 32), LAYERS_MAX - 1) != 32)           { ret 16; }
+    # a set word names its layers, its shown layer and its live ones
+    val sw: u32 = set_word(4, 3, 0x6);
+    if (set_layers(sw) != 4 || set_shown(sw) != 3 || set_lives(sw) != 0x6 || set_shown(set_word(1, 0, 0)) != 0) { ret 17; }
+    if (sensed(1, 0x1ff, 1) != 0x3ff || sensed(0xabc, 7, WIDTH_MAX) != 0xabc)                                   { ret 18; }
     ret 0;
 }

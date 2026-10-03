@@ -1,14 +1,20 @@
 # the ceilings a run pauses at, which keep a runaway world from eating the machine
 #
-# each ceiling bounds one measure of the world: its population, the chunks of
-# the pool in use, the memory HashLife's nodes take, and how long a step took.
+# each ceiling bounds one measure of the world: its population, the memory
+# the pool takes, the memory HashLife's nodes take, and how long a step took.
 # each is on or off with a limit in its own unit, and a measure is compared in
-# its raw form (cells, chunks, bytes, nanoseconds) against the limit times the
+# its raw form (cells, bytes, bytes, nanoseconds) against the limit times the
 # unit's scale, so a ceiling added later is a row of the tables below.
 #
 # the simulation checks them once a step completes (cellar.sim) and pauses a
 # run that crossed one. resuming carries the run past that ceiling, which then
 # stays quiet until its measure falls back under it.
+#
+# the pool's ceiling is a bound rather than a check: the pool is sized to it
+# (cellar.sim refit), on the device where a GPU holds it, so a world that
+# would outgrow it pauses as it reaches it, and only a higher limit carries
+# the run past. its limit 0 leaves the bound to a share of the device's
+# memory (cellar.gpu memory_limit), and the ceiling off to all of it.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -19,7 +25,7 @@ use std.types.string.str_equals;
 
 # live cells
 pub val POPULATION: usize = 0;
-# chunks of the pool in use
+# memory the pool takes, in MiB, 0 for a share of the device's
 pub val POOL: usize = 1;
 # memory HashLife's nodes take, in MiB
 pub val MEMORY: usize = 2;
@@ -38,14 +44,15 @@ pub rec Ceilings {
 }
 
 # the ceilings a fresh install runs with: the pool and HashLife's memory are
-# held well inside what the machine has, and the population and step time are
+# held well inside what the machine has, the pool's to the share of the
+# device's memory its limit 0 leaves it, and the population and step time are
 # left to the user
 pub fun defaults() Ceilings {
     var c: Ceilings;
     c.on[POPULATION]    = false;
     c.limit[POPULATION] = 100000000;
     c.on[POOL]          = true;
-    c.limit[POOL]       = 20000;
+    c.limit[POOL]       = 0;
     c.on[MEMORY]        = true;
     c.limit[MEMORY]     = 500;
     c.on[STEP]          = false;
@@ -56,7 +63,7 @@ pub fun defaults() Ceilings {
 # what a ceiling bounds, for a message
 pub fun name(k: usize) str {
     if (k == POPULATION) { ret "the population"; }
-    if (k == POOL)       { ret "the chunk pool"; }
+    if (k == POOL)       { ret "the pool's memory"; }
     if (k == MEMORY)     { ret "HashLife's memory"; }
     ret "a step's time";
 }
@@ -64,7 +71,7 @@ pub fun name(k: usize) str {
 # a ceiling's short label, for the panel
 pub fun label(k: usize) str {
     if (k == POPULATION) { ret "Population"; }
-    if (k == POOL)       { ret "Chunks"; }
+    if (k == POOL)       { ret "Pool memory"; }
     if (k == MEMORY)     { ret "HashLife memory"; }
     ret "Step time";
 }
@@ -72,7 +79,7 @@ pub fun label(k: usize) str {
 # the unit a ceiling's limit is in
 pub fun unit(k: usize) str {
     if (k == POPULATION) { ret "cells"; }
-    if (k == POOL)       { ret "chunks"; }
+    if (k == POOL)       { ret "MiB"; }
     if (k == MEMORY)     { ret "MiB"; }
     ret "ms";
 }
@@ -80,7 +87,7 @@ pub fun unit(k: usize) str {
 # the `cellar run` option that sets a ceiling
 pub fun flag(k: usize) str {
     if (k == POPULATION) { ret "--max-population"; }
-    if (k == POOL)       { ret "--max-chunks"; }
+    if (k == POOL)       { ret "--max-pool-memory"; }
     if (k == MEMORY)     { ret "--max-memory"; }
     ret "--max-step-ms";
 }
@@ -97,8 +104,8 @@ pub fun of_flag(s: str) usize {
 
 # the raw measure one unit of a ceiling's limit stands for
 fun scale(k: usize) u64 {
-    if (k == MEMORY) { ret 1048576; }
-    if (k == STEP)   { ret 1000000; }
+    if (k == MEMORY || k == POOL) { ret 1048576; }
+    if (k == STEP)                { ret 1000000; }
     ret 1;
 }
 
@@ -143,7 +150,7 @@ pub fun notch_lo(k: usize) usize {
 
 pub fun notch_hi(k: usize) usize {
     if (k == POPULATION) { ret notch_of(1000000000000); }
-    if (k == POOL)       { ret notch_of(50000); }
+    if (k == POOL)       { ret notch_of(1000000); }
     if (k == MEMORY)     { ret notch_of(100000); }
     ret notch_of(100000);
 }
@@ -154,6 +161,28 @@ test notch__runs_one_two_five_and_finds_its_way_back {
     var c: Ceilings = defaults();
     if (over(?c, POPULATION, 0xffffffffffffffff))                                { ret 3; }
     if (!over(?c, MEMORY, 500 * 1048576 + 1) || over(?c, MEMORY, 500 * 1048576)) { ret 4; }
-    if (of_flag("--max-chunks") != POOL || of_flag("--max") != COUNT)            { ret 5; }
+    if (of_flag("--max-pool-memory") != POOL || of_flag("--max") != COUNT)       { ret 5; }
+    ret 0;
+}
+
+# a pool ceiling saved in chunks, before the pool's ceiling was its memory,
+# as the MiB it stands for: the device memory a chunk of the default rule,
+# Life, takes, its 1-bit state and 16-bit shown layers in both cells, its
+# pyramid and its share of the pool's own buffers (cellar.gpu slot_bytes,
+# pool_bytes), rounded up. the old default, never changed, stands for none,
+# so the pool takes the device's share as a fresh install's does
+pub fun pool_of_chunks(on: bool, chunks: u64) u64 {
+    if (on && chunks == OLD_POOL) { ret 0; }
+    ret (chunks * CHUNK_BYTES + 1048575) / 1048576;
+}
+
+# the default the pool's ceiling had in chunks
+val OLD_POOL: u64 = 20000;
+# bytes a chunk of Life takes on the device
+val CHUNK_BYTES: u64 = 22944;
+
+test pool_of_chunks__keeps_a_chosen_limit_and_drops_the_old_default {
+    if (pool_of_chunks(true, 20000) != 0 || pool_of_chunks(false, 20000) != 438) { ret 1; }
+    if (pool_of_chunks(true, 1000) != 22 || pool_of_chunks(true, 0) != 0)        { ret 2; }
     ret 0;
 }

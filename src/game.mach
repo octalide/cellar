@@ -51,10 +51,10 @@ use cellar.desk;
 use cellar.device;
 use cellar.exec;
 use cellar.format;
+use cellar.formats;
 use cellar.gpu;
 use cellar.gui;
 use cellar.hud;
-use cellar.layer.plane;
 use cellar.paint;
 use cellar.panel;
 use cellar.paths;
@@ -129,6 +129,8 @@ val ZOOM_STEP: f32 = 0.1;
 # bench_r:     the radius the measured rule reads, Life's weights widened to it, or
 #              the radius of the footprint world's kernel
 # bench_gps:   generations a second the measurement is capped at, 0 uncapped
+# bench_rule:  the rule every world of the measurement runs under, or nil for Life
+# bench_mode:  the colour mode the measurement draws in, a render.MODE_*
 # engine:      the args.ENGINE_* the command line named
 # saved_tree:  HashLife was wanted by the settings, not the command line, so a
 #              world it cannot take stays on the pool
@@ -170,6 +172,8 @@ pub rec Game {
     bench_secs:  f64;
     bench_r:     usize;
     bench_gps:   usize;
+    bench_rule:  str;
+    bench_mode:  u8;
     engine:      u8;
     saved_tree:  bool;
     want_tree:   bool;
@@ -251,7 +255,7 @@ pub fun on_init(ctx: *Context) {
         if (sel loaded.err) { print.eprintlnf("settings ignored: {}", persist.error_message(loaded.err)); }
     }
 
-    val rr: err[gfx.Error] = gfx.renderer_init(?g.renderer, ?ctx.window);
+    val rr: err[gfx.Error] = gpu.renderer_init(?g.renderer, ?ctx.window);
     if (sel rr.err) {
         print.eprintlnf("could not start the renderer: {}", gfx.error_message(rr.err));
         context_fail(ctx, 1);
@@ -279,10 +283,6 @@ pub fun on_init(ctx: *Context) {
     var heat: [1024]f32;
     var age:  [1024]f32;
     render.palettes(?heat[0], ?age[0], g.srgb);
-    # a bounded grid the settings put the world on was held whole to the host's
-    # ceiling, which the device's may lie below
-    val slots: usize = gpu.ceiling(gfx.renderer_limits(?g.renderer));
-    if (slots != 0) { space.limit(?g.sim.space, slots); }
     val gr: err[gfx.Error] = gpu.init(?g.gpu, ?g.a, ?g.renderer, g.sim.space.cap, ?heat[0], ?age[0]);
     if (sel gr.err) {
         print.eprintlnf("could not set up the world on the GPU: {}", gfx.error_message(gr.err));
@@ -306,8 +306,16 @@ pub fun on_init(ctx: *Context) {
 
     # the world is seeded once the GPU has set how far the pool may grow
     g.want_tree = false;
-    if (g.bench != args.BENCH_NONE) { bench_world(g); }
-    or                              { g.want_tree = start_world(?g.app, ?g.sim, g.open, g.capture != nil, engine); }
+    if (g.bench != args.BENCH_NONE) {
+        val why: str = bench_choose(g);
+        if (why != nil) {
+            print.eprintlnf("cellar: --rule {}: {}", g.bench_rule, why);
+            context_fail(ctx, 1);
+            ret;
+        }
+        bench_world(g);
+    }
+    or { g.want_tree = start_world(?g.app, ?g.sim, g.open, g.capture != nil, engine); }
 
     world.observe(?g.sim, ?g.shown);
     val spawned: err[thread.ThreadError] = runner.start(?g.runner, ?g.sim);
@@ -751,12 +759,23 @@ pub fun on_draw(ctx: *Context) {
     # the frame holds the world only when the thread is not stepping it, or
     # between steps when commands wait, and releases it before drawing
     runner.pace(?g.runner, a.uncapped != 0, a.speed::f64);
-    val held: bool = runner.take(?g.runner, a.queue.items.len != 0 || g.want_tree);
+    # a colour mode that reads heat or age has the pool hold the view layer
+    # they lie in, and one that does not lets it go (sim.set_views)
+    val views: bool = a.mode != render.MODE_SOLID::usize;
+    val held:  bool = runner.take(?g.runner, a.queue.items.len != 0 || g.want_tree || world.views(?g.shown) != views);
     if (held) {
         # the world's edits and file actions run first: a save reads the GPU's
         # cells back, which is only valid before the frame records anything
         var deps: exec.Deps = exec.Deps{a: ?g.a};
         exec.run(a, ?g.sim, ?deps);
+        # a file just opened may have set the mode
+        val want: bool = a.mode != render.MODE_SOLID::usize;
+        if (!sim.set_views(?g.sim, want)) {
+            # the pool keeps its layers, and the colour mode follows them
+            if (want) { a.mode = render.MODE_SOLID::usize; }
+            or        { a.mode = render.MODE_HEAT::usize; }
+            app.say(a, "the pool could not change its layers for the colour mode");
+        }
         if (g.want_tree) {
             g.want_tree = false;
             if (!sim.on_tree(?g.sim) && g.saved_tree) {
@@ -805,6 +824,7 @@ pub fun on_draw(ctx: *Context) {
         val stepped: i32 = hud.position(bu, g.gui.look, seen, pt, over_world(g), g.world.mx, g.world.my);
         if (stepped != 0) { zoom_step(a, stepped > 0); }
         hud.toast(bu, ?g.msgs, a, pt);
+        hud.pool_offer(bu, g.gui.look, a, ?g.shown, pt);
         hud.help(bu, a, sw, sh);
         val notches: f32 = gui.notches(?g.gui);
         if (notches != 0.0 && over_world(g)) { zoom_at(a, pt, g.world.mx, g.world.my, notches); }
@@ -955,11 +975,36 @@ pub fun on_dnit(ctx: *Context) {
     app.dnit(?g.app);
 }
 
+# the grid the measured world runs on, as the suffix that names it, or nil
+fun bench_suffix(bench: u8) str {
+    if (bench == args.BENCH_TORUS) { ret "T512,512"; }
+    if (bench == args.BENCH_PLANE) { ret "P1024,512"; }
+    if (bench == args.BENCH_BOX)   { ret "T8192,8192"; }
+    ret nil;
+}
+
+# put the rule the command line chose on the world, or say why the measurement
+# cannot run under it
+# ---
+# ret: why not, or nil
+fun bench_choose(g: *Game) str {
+    if (g.bench_rule == nil)             { ret nil; }
+    if (g.bench == args.BENCH_FOOTPRINT) { ret "the footprint world runs the vote it measures"; }
+    val parsed: res[rule.Rule, str] = rule.parse(g.bench_rule);
+    if (sel parsed.err)                                                 { ret parsed.err; }
+    if (bench_suffix(g.bench) != nil && !rule.caps(?parsed.ok).bounded) { ret "the rule cannot run on a bounded grid"; }
+    if (!sim.set_rule(?g.sim, parsed.ok))                               { ret "the world could not take the rule"; }
+    ret nil;
+}
+
 # seed the measured world and frame it, running uncapped or at the speed asked
 #
 # a wider radius keeps Life's weights, so the world evolves as Life does while
 # each generation spreads by the wider radius, except in the footprint world,
-# whose kernel weighs its whole square so the step stage reads all of it
+# whose kernel weighs its whole square so the step stage reads all of it. a
+# continuous rule has no soup of live cells to run, so each world seeds what
+# the rule needs in its place: Orbium for Lenia, a square of ink for
+# reaction-diffusion
 fun bench_world(g: *Game) {
     val s: *sim.Sim = ?g.sim;
     if (g.bench == args.BENCH_FOOTPRINT) {
@@ -970,9 +1015,22 @@ fun bench_world(g: *Game) {
         weighted.set_radius(?k, g.bench_r);
         sim.set_rule(s, rule.make[weighted.Kernel](?weighted.FAMILY, k));
     }
-    if (g.bench == args.BENCH_PAUSE) {
+    if (g.bench == args.BENCH_PAUSE && g.bench_rule == nil) {
         val seeds: res[rule.Rule, str] = rule.parse("B2/S");
         if (sel seeds.ok) { sim.set_rule(s, seeds.ok); }
+    }
+    val suffix: str = bench_suffix(g.bench);
+    if (suffix != nil) { bench_grid(s, suffix); }
+    val family: str = rule.family_id(rule.family_of(?s.rule));
+    if (string.str_equals(family, "lenia")) {
+        formats.seed_orbium(s);
+        g.app.zoom = 900.0 / 64.0 / render.BASE_PPC;
+    }
+    or (string.str_equals(family, "reaction")) {
+        sim.seed_ink_square(s);
+        g.app.zoom = 900.0 / 512.0 / render.BASE_PPC;
+    }
+    or (g.bench == args.BENCH_PAUSE) {
         sim.randomize(s, sim.DEFAULT_DENSITY, 512);
         if (g.engine == args.ENGINE_HASHLIFE) { sim.use_hashlife(s, true); }
         g.app.zoom = 900.0 / 512.0 / render.BASE_PPC;
@@ -981,7 +1039,7 @@ fun bench_world(g: *Game) {
         sim.randomize(s, 1.0, FOOTPRINT_SIDE);
         g.app.zoom = 900.0 / FOOTPRINT_SIDE::f32 / render.BASE_PPC;
     }
-    or (g.bench == args.BENCH_DENSE) {
+    or (g.bench == args.BENCH_DENSE || g.bench == args.BENCH_TORUS) {
         sim.randomize(s, sim.DEFAULT_DENSITY, 512);
         g.app.zoom = 900.0 / 512.0 / render.BASE_PPC;
     }
@@ -989,18 +1047,11 @@ fun bench_world(g: *Game) {
         sim.seed_gun(s);
         g.app.zoom = 900.0 / 512.0 / render.BASE_PPC;
     }
-    or (g.bench == args.BENCH_TORUS) {
-        bench_grid(s, "T512,512");
-        sim.randomize(s, sim.DEFAULT_DENSITY, 512);
-        g.app.zoom = 900.0 / 512.0 / render.BASE_PPC;
-    }
     or (g.bench == args.BENCH_PLANE) {
-        bench_grid(s, "P1024,512");
         sim.seed_gun(s);
         g.app.zoom = 900.0 / 1024.0 / render.BASE_PPC;
     }
     or (g.bench == args.BENCH_BOX) {
-        bench_grid(s, "T8192,8192");
         sim.seed_glider_at(s, -1, -1);
         g.app.zoom = 900.0 / 512.0 / render.BASE_PPC;
     }
@@ -1031,6 +1082,7 @@ fun bench_world(g: *Game) {
     }
     g.app.panel = 0;
     g.app.refit = false;
+    g.app.mode  = g.bench_mode::usize;
     # the pauses are timed on a run played as a person plays it, so the
     # journal holds the world from where the run began, not from the first pause
     if (g.bench == args.BENCH_PAUSE) { app.submit(?g.app, command.Command.toggle{}); }
@@ -1053,12 +1105,25 @@ fun bench_grid(s: *sim.Sim, suffix: str) {
     sim.set_rule(s, r);
 }
 
+fun bench_engine(g: *Game) str {
+    if (world.hashlife(?g.shown)) { ret "hashlife"; }
+    if (!g.gpu.stepping)          { ret "cpu"; }
+    ret "gpu";
+}
+
 # count a measured frame, and report and stop once the time is up
 fun bench_frame(ctx: *Context, g: *Game) {
     val now: time.InstantClock = time.instant();
     if (sel now.err) { ret; }
     # the first frames seed the GPU and grow the pool, which is not the rate
     g.frames = g.frames + 1;
+    # a world that stopped on its own, full or at a ceiling, has no rate to report
+    if (g.bench != args.BENCH_PAUSE && !g.shown.running) {
+        print.printlnf("bench {} stopped on its own at generation {}: full {} ceiling {}, no rate", bench_engine(g), g.shown.generation,
+            g.shown.full, sim.tripped(?g.sim)::u64);
+        context_stop(ctx);
+        ret;
+    }
     if (g.frames <= WARMUP) { ret; }
     if (g.frames == WARMUP + 1) {
         g.started  = now.ok;
@@ -1070,13 +1135,18 @@ fun bench_frame(ctx: *Context, g: *Game) {
         ret;
     }
     # the generations a frame completed are counted at the pool it shows after them
-    val done: u64 = g.shown.generation - g.gen_seen;
+    # a closed gate voids generations off the count, so a frame can show fewer than the last
+    val done: i64 = g.shown.generation::i64 - g.gen_seen::i64;
     g.cell_gens = g.cell_gens + done::f64 * g.shown.chunks::f64 * space.CELLS::f64;
     g.gen_seen  = g.shown.generation;
     val secs: f64 = time.instant_sub(now.ok, g.started)::f64 / SECOND::f64;
     if (secs < g.bench_secs) { ret; }
-    val gens: f64 = (g.shown.generation - g.gen0)::f64;
+    val gens: f64 = (g.shown.generation::i64 - g.gen0::i64)::f64;
     # the clock started with the first measured frame, so the frames after it span the seconds
+    var gps: f64 = gens / secs;
+    var cps: f64 = g.cell_gens / secs;
+    if (gps < 0.0) { gps = 0.0; }
+    if (cps < 0.0) { cps = 0.0; }
     var spans: u64 = g.frames - WARMUP - 1;
     if (spans == 0) { spans = 1; }
     val frame: f64 = secs * 1000000.0 / spans::f64;
@@ -1087,16 +1157,10 @@ fun bench_frame(ctx: *Context, g: *Game) {
     if (world.hashlife(?g.shown)) { engine = "hashlife"; }
     # the pool's memory a cell, its layers' widths in the cells stepped from
     # and into
-    var set:  plane.Set = rule.layers(?g.shown.rule);
-    var bits: u64       = 0;
-    var k:    usize     = 0;
-    for (k < set.n) {
-        bits = bits + 2 * set.at[k].width::u64;
-        k    = k + 1;
-    }
-    print.printlnf("bench {} radius {} chunks {} population {} gens/s {} step us {} cells/s {} frame us {} bits/cell {}", engine,
-        rule.radius(?g.shown.rule)::u64, g.shown.chunks::u64, g.shown.population::u64, (gens / secs)::u64, step::u64,
-        (g.cell_gens / secs)::u64, frame::u64, bits);
+    val bits: u64 = world.cell_bits(?g.shown);
+    print.printlnf("bench {} radius {} chunks {} population {} gens/s {} step us {} cells/s {} frame us {} bits/cell {} pool bytes {}", engine,
+        rule.radius(?g.shown.rule)::u64, g.shown.chunks::u64, g.shown.population::u64, gps::u64, step::u64,
+        cps::u64, frame::u64, bits, g.shown.pool.taken);
     context_stop(ctx);
 }
 

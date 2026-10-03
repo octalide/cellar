@@ -1,9 +1,11 @@
 # the pool on the GPU: stepped by a compute stage and drawn from where it lies
 #
-# each layer of the cells (cellar.layer) lives in two storage buffers stepped
-# back and forth, and the page table and the rule in a third, laid out as
-# cellar.space keeps them, so the host's pool is mirrored rather than
-# translated. the layers are the host's: a pool whose layers change, under a
+# each layer of the cells (cellar.layer) lives in two cells stepped back and
+# forth, and the coverage pyramids beside them, each in shards the stages
+# reach by device address (cellar.layout), and the page table and the rule in
+# the meta buffer, laid out as cellar.space keeps them, so the host's pool is
+# mirrored rather than translated. the shards are a store's (Store), which a
+# growth only adds to, so nothing the pool holds moves as it grows. the layers are the host's: a pool whose layers change, under a
 # rule that stores its cells otherwise, is made again in the next frame and
 # filled from the host's cells, which are current whenever the layers change.
 # the host's cells are a staging copy: whole chunks it filled or allocated,
@@ -95,16 +97,18 @@
 # what the last census found the list held.
 #
 # below a pixel per cell the draw reads each chunk's coverage pyramid
-# (cellar.layout.Mip), which a reduce stage builds after the frame's last
+# (cellar.layout MIP), which a reduce stage builds after the frame's last
 # generation, skipping the chunks the steps left cold.
 #
 # a rule family whose rule does not fit its window of the meta head keeps it
-# in a rule buffer of its own (see cellar.rule), bound after the four buffers
+# in a rule buffer of its own (see cellar.rule), bound after the two buffers
 # every step binds. it is packed and uploaded, in order with the frame's
 # dispatches, only when the rule it holds is not the one running, and made
 # larger, waiting for the device, only when a rule needs more words than it
 # holds. a family whose stage binds more storage buffers than the device's
-# dispatches can is not built, and its rules cannot be stepped here (steps).
+# dispatches can is not built, and its rules cannot be stepped here. a family
+# registered once the stages were built has its stage built on the render
+# thread the first time a rule of it is asked for or stepped (prepare).
 #
 # where the compute stages cannot be built, the CPU steps and this only draws,
 # uploading the chunks in view whose cells changed since they were last sent,
@@ -116,6 +120,7 @@
 
 use gfx: boom.graphics;
 use gm:  boom.math;
+use boom.window;
 use cellar.layer;
 use cellar.layer.plane;
 use cellar.layout;
@@ -139,6 +144,7 @@ use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
+use std.types.string;
 use std.types.string.str;
 
 #[embed("{artifact.stage-clear_comp.out}")]
@@ -165,22 +171,14 @@ val WIPE_SPV:   [_]u8;
 val SEED_SPV:   [_]u8;
 #[embed("{artifact.stage-gather_comp.out}")]
 val GATHER_SPV: [_]u8;
+#[embed("{artifact.stage-start_comp.out}")]
+val START_SPV:  [_]u8;
 #[embed("{artifact.stage-edit_comp.out}")]
 val EDIT_SPV:   [_]u8;
 #[embed("{artifact.stage-cells_vert.out}")]
 val VERT_SPV:   [_]u8;
 #[embed("{artifact.stage-cells_frag.out}")]
 val FRAG_SPV:   [_]u8;
-
-# the census's, the reduce's and the mark's variants that bind the live rule
-# layers (cellar.layer LIVE_BINDING), and the census's and the reduce's the
-# shown layer past them (cellar.layer SHOWN_BINDING)
-#[embed("{artifact.stage-census_live_comp.out}")]
-val CENSUS_LIVE_SPV: [_]u8;
-#[embed("{artifact.stage-reduce_live_comp.out}")]
-val REDUCE_LIVE_SPV: [_]u8;
-#[embed("{artifact.stage-mark_live_comp.out}")]
-val MARK_LIVE_SPV:   [_]u8;
 
 # words of the meta buffer ahead of the page table: the shared words and the rule
 pub val HEAD: usize = layout.HEAD::usize;
@@ -195,37 +193,30 @@ pub val MIP: usize = layout.MIP::usize;
 pub val SHADES: usize = 256;
 
 # storage binding sets a frame keeps for the dispatches and draws besides its
-# generations', for a pool of n layers: a clear and an edit a layer, a growth a
-# layer in each of the two pools, the carry, the seeding's two, the gate, the
-# census, the reduction and the draw
-fun frame_sets(n: usize) usize {
-    ret 4 * n + 7;
-}
+# generations': the clear, the edit, the growth's carry of the stamps and of
+# the page table, the seeding's two, the gate, the census, the reduction and
+# the draw, and the start of a shown layer taken up. the stages reach every
+# layer by address, so none of these is one a layer
+val FRAME_SETS: usize = 11;
 
-# dispatches one frame's generations may record for a pool of n layers, its
-# steps, its passes and its gathers, in the storage binding sets the frame has
-# left besides frame_sets
-fun max_calls(n: usize) usize {
-    ret gfx.MAX_STORAGE_SETS - frame_sets(n);
-}
-
-# the most dispatches a frame's generations may record, a pool of one layer's
-# (max_calls), which also bounds the generations it records
+# the most dispatches a frame's generations may record, its steps, its passes
+# and its gathers, in the storage binding sets the frame has left besides
+# FRAME_SETS, which also bounds the generations it records
 pub val MAX_STEPS: usize = 245;
 
-# dispatches a pass records for a pool of n layers, the mark, the settle and a
-# clear a layer, and one more for the first of a frame, which frees
-fun pass_calls(n: usize) usize {
-    ret 2 + n;
-}
+# dispatches a pass records, the mark, the settle and the clear, and one more
+# for the first of a frame, which frees
+val PASS_CALLS: usize = 3;
 
 # the span a frame starts with, before a frame has been measured
 val FIRST_SPAN: usize = 4096;
 # the least a span shrinks to
 val MIN_SPAN: usize = 64;
+# the most slots a pool's shards hold, at the largest geometry
+pub val MOST_SLOTS: usize = ((layout.SHARDS_MAX + layout.SHARD_LOG - layout.SHARD_LOG_MAX) << layout.SHARD_LOG_MAX)::usize;
 # the most a span grows to: every generation a frame may record of the largest
 # pool
-pub val MAX_SPAN: usize = layout.MAX_SLOTS::usize * MAX_STEPS;
+pub val MAX_SPAN: usize = MOST_SLOTS * MAX_STEPS;
 # the share of the refresh interval a frame's stepping may take on the GPU,
 # STEP_SHARE over SHARE_OF, the rest left to the draw, the census and the
 # compositor
@@ -351,7 +342,6 @@ rec Snap {
 # free:   the pass frees, as the frame's first does
 # tail:   the step covers the list from lo to its end, whatever its length,
 #         rather than n entries
-# src:    the cells the step reads, or the pass marks from
 # lo:     a step's first entry of the list
 # n:      a step's entries, when it is no tail
 # now:    a step's serial, for a pass the serial of the step that left the
@@ -365,7 +355,6 @@ rec Op {
     gather: bool;
     free:   bool;
     tail:   bool;
-    src:    usize;
     lo:     u32;
     n:      u32;
     now:    u32;
@@ -388,7 +377,304 @@ rec Write {
     v:    u32;
 }
 
-# the buffers sized to the pool's capacity
+# the shards a pool's cells and pyramids lie in (cellar.layout): each
+# layer's two cells' and the pyramids' shards, each a storage buffer, and the
+# shard table naming their addresses, which the stages reach them through
+#
+# a store holds every slot below the first shard it has not made, and grows
+# by making shards, so a pool that grows keeps its store and moves no cell. a
+# pool made for other layers gets a store of its own.
+# ---
+# set:   the layers it holds
+# m:     its geometry, the log2 of its largest shard's slots (cellar.layout
+#        SHARD_AT)
+# n:     shards made of every layer's cells and of the pyramids
+# cells: shard j of layer k's cells c, at layout.cells_entry(k, c, j)
+# mip:   shard j of the pyramids
+# table: the shard table (cellar.layout.Shards)
+# at:    its address
+# addrs: the shard table as it is written, an address an entry
+# made:  the table was made
+rec Store {
+    set:   plane.Set;
+    m:     u32;
+    n:     usize;
+    cells: [STORE_CELLS]gfx.StorageBuffer;
+    mip:   [SHARDS]gfx.StorageBuffer;
+    table: gfx.StorageBuffer;
+    at:    u64;
+    addrs: [layout.SHARD_TABLE]u64;
+    made:  bool;
+}
+
+# shards of a store's pyramids, and of all its cells
+val SHARDS:      usize = layout.SHARDS_MAX::usize;
+val STORE_CELLS: usize = (layout.SHARD_LAYERS * 2 * layout.SHARDS_MAX)::usize;
+
+# the most bytes a shard of the widest layer or of the pyramids takes, which
+# sets a store's geometry where the device allows that much: small enough
+# that a pool's last growth wastes little of its memory, large enough that a
+# pool of tens of gigabytes stays well inside SHARDS_MAX shards
+val SHARD_BYTES: u64 = 268435456;
+
+# the geometry for a set's store on a device that allocates at most most bytes
+# at once, zero for no limit: the largest shard of the widest of its state
+# and rule layers and the pyramids no larger than SHARD_BYTES or most. its
+# view layers come and go on the store as it stands (store_views), so they
+# have no say in it
+fun geometry(set: *plane.Set, most: u64) u32 {
+    var widest: u64   = (MIP * 4)::u64;
+    var k:      usize = 0;
+    for (k < plane.exact(set)) {
+        val b: u64 = (plane.span_words(set.at[k].width) * 4)::u64;
+        if (b > widest) { widest = b; }
+        k = k + 1;
+    }
+    var cap: u64 = SHARD_BYTES;
+    if (most != 0 && most < cap) { cap = most; }
+    var m: u32 = layout.SHARD_LOG;
+    for (m < layout.SHARD_LOG_MAX && (widest << (m + 1)::u64) <= cap) { m = m + 1; }
+    ret m;
+}
+
+# slots a store holds
+fun store_slots(st: *Store) usize {
+    ret layout.shard_start(st.n::u32, st.m)::usize;
+}
+
+# slots shard j of a store holds
+fun shard_slots(st: *Store, j: usize) usize {
+    ret (layout.shard_start((j + 1)::u32, st.m) - layout.shard_start(j::u32, st.m))::usize;
+}
+
+# make a store holding no slot for a set, its shard table made inside the
+# frame when framed
+fun store_make(g: *Gpu, st: *Store, set: *plane.Set, framed: bool) err[gfx.Error] {
+    st.set  = @set;
+    st.m    = geometry(set, gfx.renderer_limits(g.r).max_memory_allocation_size);
+    st.n    = 0;
+    st.made = false;
+    mem.zero[u64](?st.addrs[0], layout.SHARD_TABLE::usize);
+    val e: err[gfx.Error] = make_framed(g, framed, layout.SHARD_TABLE::usize * 8, ?st.table);
+    if (sel e.err) { ret e; }
+    val at: res[u64, gfx.Error] = gfx.storage_buffer_address(g.d, ?st.table);
+    if (sel at.err) {
+        gfx.storage_buffer_delete(g.d, ?st.table);
+        ret err[gfx.Error].err{at.err};
+    }
+    st.at   = at.ok;
+    st.made = true;
+    ret err[gfx.Error].ok{};
+}
+
+# make shards until a store holds cap slots, inside the frame when framed, and
+# write their addresses into its shard table. a shard refused leaves the
+# store holding the shards made before it
+fun store_reach(g: *Gpu, st: *Store, cap: usize, framed: bool) err[gfx.Error] {
+    val from: usize = st.n;
+    for (store_slots(st) < cap) {
+        if (st.n >= SHARDS) { ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.overrun{(cap * slot_bytes(?st.set))::u64}}}; }
+        val j:     usize          = st.n;
+        val slots: usize          = shard_slots(st, j);
+        val e:     err[gfx.Error] = make_shard(g, st, j, slots, framed);
+        if (sel e.err) { ret e; }
+        st.n = j + 1;
+    }
+    if (st.n == from) { ret err[gfx.Error].ok{}; }
+    # the entries of the shards just made, every layer's and the pyramids'
+    var k: usize = 0;
+    for (k <= layer.LAYERS_MAX::usize) {
+        var at: usize = layout.cells_entry(k::u32, 0, from::u32)::usize * 8;
+        var n:  usize = (layout.SHARDS_MAX::usize + st.n - from) * 8;
+        if (k == layer.LAYERS_MAX::usize) {
+            at = layout.mip_entry(from::u32)::usize * 8;
+            n  = (st.n - from) * 8;
+        }
+        or (k >= st.set.n) { n = 0; }
+        if (n != 0) {
+            val e: err[gfx.Error] = write_framed(g, framed, ?st.table, at, (?st.addrs[at / 8])::*u8, n);
+            if (sel e.err) { ret e; }
+        }
+        k = k + 1;
+    }
+    ret err[gfx.Error].ok{};
+}
+
+# make shard j of every layer's two cells and of the pyramids, slots long,
+# noting their addresses, each made undone if one is refused
+fun make_shard(g: *Gpu, st: *Store, j: usize, slots: usize, framed: bool) err[gfx.Error] {
+    var made: usize = 0;
+    val n:    usize = st.set.n * 2 + 1;
+    for (made < n) {
+        var b:   *gfx.StorageBuffer = ?st.mip[j];
+        var len: usize              = slots * MIP * 4;
+        var e:   usize              = layout.mip_entry(j::u32)::usize;
+        if (made < st.set.n * 2) {
+            val k: usize = made / 2;
+            b   = ?st.cells[layout.cells_entry(k::u32, (made % 2)::u32, j::u32)::usize];
+            len = slots * plane.span_words(st.set.at[k].width) * 4;
+            e   = layout.cells_entry(k::u32, (made % 2)::u32, j::u32)::usize;
+        }
+        val mk: err[gfx.Error] = make_framed(g, framed, len, b);
+        if (sel mk.err) {
+            drop_shard(g, st, j, made);
+            ret mk;
+        }
+        val at: res[u64, gfx.Error] = gfx.storage_buffer_address(g.d, b);
+        if (sel at.err) {
+            gfx.storage_buffer_delete(g.d, b);
+            drop_shard(g, st, j, made);
+            ret err[gfx.Error].err{at.err};
+        }
+        st.addrs[e] = at.ok;
+        made        = made + 1;
+    }
+    ret err[gfx.Error].ok{};
+}
+
+# delete the first n buffers of shard j, in make_shard's order
+fun drop_shard(g: *Gpu, st: *Store, j: usize, n: usize) {
+    var i: usize = 0;
+    for (i < n) {
+        if (i < st.set.n * 2) { gfx.storage_buffer_delete(g.d, ?st.cells[layout.cells_entry((i / 2)::u32, (i % 2)::u32, j::u32)::usize]); }
+        or                    { gfx.storage_buffer_delete(g.d, ?st.mip[j]); }
+        i = i + 1;
+    }
+}
+
+# whether two sets differ in their view layers alone, and one's view layers
+# are where the other's begin, so a store of either takes the other's by
+# making or deleting the shards of the layers past them (store_views)
+fun views_nest(a: *plane.Set, b: *plane.Set) bool {
+    if (!plane.same_words(a, b) || plane.exact(a) != plane.exact(b)) { ret false; }
+    var k: usize = plane.exact(a);
+    for (k < a.n && k < b.n) {
+        if (a.at[k].width != b.at[k].width || !string.str_equals(a.at[k].name, b.at[k].name)) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# give a store a set's layers whose view layers nest with its own
+# (views_nest), inside the frame, under its geometry as it stands: a view
+# layer past the store's has shards made for every shard the store holds,
+# uninitialised, and one past the set's has its shards deleted, each written
+# into the shard table. no other layer's shard moves. a shard refused, or
+# past what the device allocates at once, leaves the store as it was
+fun store_views(g: *Gpu, st: *Store, set: *plane.Set) err[gfx.Error] {
+    val most: u64   = gfx.renderer_limits(g.r).max_memory_allocation_size;
+    val from: usize = st.set.n;
+    var made: usize = 0;
+    var k:    usize = from;
+    for (k < set.n) {
+        var j: usize = 0;
+        for (j < st.n * 2) {
+            val len: usize              = shard_slots(st, j / 2) * plane.span_words(set.at[k].width) * 4;
+            val e:   usize              = layout.cells_entry(k::u32, (j % 2)::u32, (j / 2)::u32)::usize;
+            val b:   *gfx.StorageBuffer = ?st.cells[e];
+            var mk:  err[gfx.Error]     = err[gfx.Error].ok{};
+            if (most != 0 && len::u64 > most) { mk = err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.overrun{len::u64}}}; }
+            or                                { mk = make_framed(g, true, len, b); }
+            if (sel mk.err) {
+                drop_cells(g, st, from, made);
+                ret mk;
+            }
+            val at: res[u64, gfx.Error] = gfx.storage_buffer_address(g.d, b);
+            if (sel at.err) {
+                gfx.storage_buffer_delete(g.d, b);
+                drop_cells(g, st, from, made);
+                ret err[gfx.Error].err{at.err};
+            }
+            st.addrs[e] = at.ok;
+            made        = made + 1;
+            j           = j + 1;
+        }
+        k = k + 1;
+    }
+    k = set.n;
+    for (k < st.set.n) {
+        drop_cells(g, st, k, st.n * 2);
+        val at: usize = layout.cells_entry(k::u32, 0, 0)::usize;
+        mem.zero[u64](?st.addrs[at], layout.SHARDS_MAX::usize * 2);
+        k = k + 1;
+    }
+    # the entries of every layer made or let go
+    k = from;
+    if (set.n < from) { k = set.n; }
+    for (k < from || k < set.n) {
+        val at: usize          = layout.cells_entry(k::u32, 0, 0)::usize * 8;
+        val e:  err[gfx.Error] = write_framed(g, true, ?st.table, at, (?st.addrs[at / 8])::*u8, layout.SHARDS_MAX::usize * 2 * 8);
+        if (sel e.err) { ret e; }
+        k = k + 1;
+    }
+    st.set = @set;
+    ret err[gfx.Error].ok{};
+}
+
+# delete the first n of the shards of layers from k on, both cells of each of
+# a layer's shards in turn, as store_views makes them
+fun drop_cells(g: *Gpu, st: *Store, k: usize, n: usize) {
+    var i: usize = 0;
+    for (i < n) {
+        val l: usize = k + i / (st.n * 2);
+        val j: usize = i % (st.n * 2);
+        gfx.storage_buffer_delete(g.d, ?st.cells[layout.cells_entry(l::u32, (j % 2)::u32, (j / 2)::u32)::usize]);
+        i = i + 1;
+    }
+}
+
+# delete every shard of a store and its table
+fun store_drop(g: *Gpu, st: *Store) {
+    if (!st.made) { ret; }
+    var j: usize = 0;
+    for (j < st.n) {
+        drop_shard(g, st, j, st.set.n * 2 + 1);
+        j = j + 1;
+    }
+    gfx.storage_buffer_delete(g.d, ?st.table);
+    st.n    = 0;
+    st.made = false;
+}
+
+# a run of a buffer: the bytes from off on
+rec Piece {
+    b:   *gfx.StorageBuffer;
+    off: usize;
+}
+
+# where slot s's span of layer k's cells c lies in a store
+fun cells_at(st: *Store, k: usize, c: usize, s: usize) Piece {
+    val at: layout.Where = layout.where(s::u32, st.m);
+    ret Piece{b: ?st.cells[layout.cells_entry(k::u32, c::u32, at.shard)::usize], off: at.index::usize * plane.span_words(st.set.at[k].width) * 4};
+}
+
+# where slot s's pyramid lies in a store
+fun mip_at(st: *Store, s: usize) Piece {
+    val at: layout.Where = layout.where(s::u32, st.m);
+    ret Piece{b: ?st.mip[at.shard], off: at.index::usize * MIP * 4};
+}
+
+# slots of a run of run from s that lie in s's shard
+fun in_shard(st: *Store, s: usize, run: usize) usize {
+    val j:   u32   = layout.shard_of(s::u32, st.m);
+    val end: usize = layout.shard_start(j + 1, st.m)::usize;
+    if (s + run > end) { ret end - s; }
+    ret run;
+}
+
+# bytes a slot takes in a store for a set: every layer's two cells and its
+# pyramid
+fun slot_bytes(set: *plane.Set) usize {
+    var n: usize = MIP * 4;
+    var k: usize = 0;
+    for (k < set.n) {
+        n = n + plane.span_words(set.at[k].width) * 8;
+        k = k + 1;
+    }
+    ret n;
+}
+
+# the buffers sized to the pool's capacity, beside the store its cells lie in
 #
 # the device is the render thread's. it alone creates and deletes these
 # buffers, reads them back and records and submits work on them, since boom
@@ -405,14 +691,13 @@ rec Write {
 # (take) only then.
 # ---
 # set:    the layers the cells are stored in
-# cells:  each layer's two cell pools stepped between, layer k's at k * 2
-#         and k * 2 + 1 (cells_of)
+# store:  which of the GPU side's stores its cells and pyramids lie in
 # meta:   the rule and the page table
-# flags:  per slot the serials of the last step that left it alive and warm,
-#         then the active list the steps are dispatched over
+# flags:  the active list's arguments, per slot the serials of the last step
+#         that left it alive and warm, then the active list the steps are
+#         dispatched over
 # list:   the slots the clear stage empties
-# mip:    every slot's coverage pyramid
-# status: the census stage's output
+# status: the census stage's output and the GPU's allocator
 # rb:     the census readback
 # got:    where a landed census is copied
 # landed: the landed census unpacked to space.CENSUS words per slot
@@ -422,11 +707,10 @@ rec Write {
 # cap:    slots the buffers hold
 rec Pool {
     set:    plane.Set;
-    cells:  [layer.LAYERS_MAX * 2]gfx.StorageBuffer;
+    store:  usize;
     meta:   gfx.StorageBuffer;
     flags:  gfx.StorageBuffer;
     list:   gfx.StorageBuffer;
-    mip:    gfx.StorageBuffer;
     status: gfx.StorageBuffer;
     rb:     gfx.Readback;
     got:    *u32;
@@ -435,18 +719,9 @@ rec Pool {
     cap:    usize;
 }
 
-# pool c, 0 or 1, of a pool's layer k
-fun cells_of(p: *Pool, k: usize, c: usize) *gfx.StorageBuffer {
-    ret ?p.cells[k * 2 + c];
-}
-
-# pool c of a pool's shown layer (cellar.layer), which the census, the
-# reduction and the draw bind beside its state layer, or its state layer's
-# where it has none, which they then never read
-fun shown_cells(p: *Pool, c: usize) *gfx.StorageBuffer {
-    val k: opt[usize] = plane.shown(?p.set);
-    if (sel k.none) { ret cells_of(p, 0, c); }
-    ret cells_of(p, k.some, c);
+# the store a pool's cells lie in
+fun store_of(g: *Gpu, p: *Pool) *Store {
+    ret ?g.stores[p.store];
 }
 
 # the bytes of a slot's span of a pool's layer k
@@ -454,9 +729,11 @@ fun span_bytes(p: *Pool, k: usize) usize {
     ret plane.span_words(p.set.at[k].width) * 4;
 }
 
-# the byte where a slot's span of a pool's layer k starts in its buffers
-fun span_offset(p: *Pool, k: usize, s: usize) usize {
-    ret layer.span_at(p.set.at[k].width, s::u32)::usize * 4;
+# bytes of the buffers sized to a pool of cap slots, besides its store
+fun pool_bytes(cap: usize) usize {
+    val words: usize = HEAD + cap * space.ENTRY + layout.flags_words(cap::u32)::usize + layout.list_words(cap::u32)::usize
+        + layout.STATUS_HEAD::usize + layout.status_words(cap::u32)::usize;
+    ret words * 4;
 }
 
 # the GPU's side of the world
@@ -464,7 +741,11 @@ fun span_offset(p: *Pool, k: usize, s: usize) usize {
 # a:        allocator for host buffers
 # r:        the renderer
 # d:        its device
-# slots:    the most slots the device's storage buffers hold, the pool's ceiling
+# slots:    the pool's ceiling for the layers it was last fitted to (fit)
+# bound:    the most bytes the pool may take, its memory limit, 0 for as much
+#           as the device holds
+# stores:   the stores the pool's cells lie in, the current pool's and one a
+#           growth into other layers makes beside it
 # p:        the buffers sized to the pool
 # next:     the buffers a growth made room in, swapped in by the next frame
 # reserved: next holds buffers
@@ -474,7 +755,11 @@ fun span_offset(p: *Pool, k: usize, s: usize) usize {
 # view:     the look and the palettes
 # steps:    each rule family's step stage
 # ready:    which families' step stages were built
+# tried:    which families' step stages were asked for, built or not, so a
+#           family registered once the stages were built is built on first use
 # most:     the storage buffers the device's dispatches bind
+# fold:     the rows a dispatch folds along y (dispatch_rows): the device's
+#           most workgroups along y, which the head holds for the stages
 # table:    the running family's rule buffer, once one needed it
 # words:    words table holds, 0 before it is made
 # tabled:   table holds the rule in shown
@@ -489,6 +774,12 @@ fun span_offset(p: *Pool, k: usize, s: usize) usize {
 # carry:    the stage that carries the page table and the allocator's words
 #           into larger buffers while the GPU owns the pool
 # edit:     the stage that writes painted cells into a layer narrower than a word
+# start:    the stage that starts a shown layer the pool took up from its state
+#           layer
+# restart:  the pool took up a shown layer this frame, which start fills once
+#           the frame's edits are in
+# lit:      the value a fresh live cell holds in the shown layer, the host
+#           pool's, which the head holds for start
 # edited:   the edits it reads, made larger as a frame paints more
 # room:     the edits edited holds
 # edit_at:  the frame's edits of a layer, as edited holds them
@@ -530,6 +821,7 @@ fun span_offset(p: *Pool, k: usize, s: usize) usize {
 # sent:     slots whose layers the frame's upload of the CPU's chunks sends
 # stamped:  slots whose stamps to set current this frame
 # batch:    the writes of one buffer a frame records as one copy (send)
+# split:    a batch's writes into one shard (send_mip)
 # keys:     painted cells ordered by cell, then by when they were painted
 # stamp:    the current serial, twice for every slot a run of stamps covers
 # pyrs:     pyramids built in the frame, staged for upload
@@ -562,9 +854,6 @@ fun span_offset(p: *Pool, k: usize, s: usize) usize {
 # head:     the meta header staged for upload
 # built:    a pyramid built on the host, staged for upload
 # mark:     a pass's stage that asks for halos and claims slots
-# lives:    the census's, the reduce's and the mark's variants that bind the
-#           live rule layers (cellar.layer LIVE_BINDING), in that order
-# lived:    lives were built, the device's dispatches binding enough
 # free:     a pass's stage that frees what nothing asked for
 # settle:   a pass's stage that keeps one twin and links it in
 # gate:     the stage that zeroes the frame's steps while the gate is closed
@@ -606,6 +895,8 @@ pub rec Gpu {
     r:        *gfx.Renderer;
     d:        *gfx.Device;
     slots:    usize;
+    bound:    u64;
+    stores:   [2]Store;
     p:        Pool;
     next:     Pool;
     reserved: bool;
@@ -614,7 +905,9 @@ pub rec Gpu {
     view:     gfx.StorageBuffer;
     steps:    [rule.FAMILIES_MAX]gfx.Compute;
     ready:    [rule.FAMILIES_MAX]bool;
+    tried:    [rule.FAMILIES_MAX]bool;
     most:     usize;
+    fold:     u32;
     table:    gfx.StorageBuffer;
     words:    usize;
     tabled:   bool;
@@ -628,6 +921,9 @@ pub rec Gpu {
     grow:     gfx.Compute;
     carry:    gfx.Compute;
     edit:     gfx.Compute;
+    start:    gfx.Compute;
+    restart:  bool;
+    lit:      u32;
     edited:   gfx.StorageBuffer;
     room:     usize;
     edit_at:  Vector[u32];
@@ -666,6 +962,7 @@ pub rec Gpu {
     sent:     Vector[u32];
     stamped:  Vector[u32];
     batch:    Vector[gfx.BufferWrite];
+    split:    Vector[gfx.BufferWrite];
     keys:     Vector[u64];
     stamp:    Vector[u32];
     pyrs:     Vector[u32];
@@ -691,11 +988,9 @@ pub rec Gpu {
     counted:  bool;
     cursor:   usize;
     send_ps:  u64;
-    head:     [128]u32;
+    head:     [layout.HEAD]u32;
     built:    [layout.MIP]u32;
     mark:     gfx.Compute;
-    lives:    [LIVES]gfx.Compute;
-    lived:    bool;
     free:     gfx.Compute;
     settle:   gfx.Compute;
     gate:     gfx.Compute;
@@ -779,35 +1074,42 @@ fun make(d: *gfx.Device, size: usize, out: *gfx.StorageBuffer) err[gfx.Error] {
     ret err[gfx.Error].ok{};
 }
 
-# n, or fewer: the most slots a buffer of words words holds, with head words
-# ahead of them and per words a slot
-fun fit(n: usize, words: usize, head: usize, per: usize) usize {
-    if (words < head) { ret 0; }
-    val m: usize = (words - head) / per;
-    if (m < n) { ret m; }
-    ret n;
+# whether a pool of cap slots of a set's layers fits a device whose bound
+# buffers hold words words, in limit bytes, 0 for no limit: the meta, status
+# and flags buffers are bound whole, and the store and they take the memory
+fun fits(cap: usize, words: usize, set: *plane.Set, limit: u64) bool {
+    if (HEAD + cap * space.ENTRY > words)                                         { ret false; }
+    if (layout.flags_words(cap::u32)::usize > words)                              { ret false; }
+    if (layout.STATUS_HEAD::usize + layout.status_words(cap::u32)::usize > words) { ret false; }
+    ret limit == 0 || (cap * slot_bytes(set) + pool_bytes(cap))::u64 <= limit;
 }
 
-# the most slots a pool may hold on a device with these limits
+# the most slots a pool of a set's layers may hold on a device with these
+# limits, taking at most limit bytes, 0 for no limit of its own
 #
-# every storage buffer make_pool creates is bound whole, so each must fit the
-# device's storage buffer range, and the tightest sets the ceiling, which is
-# a layer's cells at their widest, a 32-bit layer's span a slot. the status
-# and flags buffers are the same size for every pool, and a device too small
-# for them holds none. the stages' arrays are declared for layout.MAX_SLOTS,
-# which caps it on a device that allows more.
+# the cells and the pyramids lie in at most SHARDS_MAX shards under the set's
+# geometry, the buffers bound whole must fit the device's storage buffer range
+# and the words a stage declares (layout.WORDS), and the store and those
+# buffers together take no more than the limit. the ceiling is a whole number
+# of shards, since a store grows a shard at a time.
 # ---
-# l:   the device's limits
-# ret: the ceiling, zero when the limits were never read
-pub fun ceiling(l: gfx.Limits) usize {
-    val words: usize = l.max_storage_buffer_range / 4;
-    var n:     usize = layout.MAX_SLOTS::usize;
-    # the cells, the pyramids, the meta, the status and flags, and the list
-    n = fit(n, words, 0, plane.span_words(layer.WIDTH_MAX));
-    n = fit(n, words, 0, MIP);
-    n = fit(n, words, HEAD, space.ENTRY);
-    if (words < layout.STATUS_WORDS::usize || words < layout.FLAGS_WORDS::usize) { ret 0; }
-    n = fit(n, words, 0, 1);
+# l:     the device's limits
+# set:   the layers
+# limit: the most bytes, 0 for none
+# ret:   the ceiling, zero when the limits were never read or not even the
+#        first shard fits
+pub fun ceiling(l: gfx.Limits, set: *plane.Set, limit: u64) usize {
+    var words: usize = l.max_storage_buffer_range / 4;
+    if (words > layout.WORDS::usize) { words = layout.WORDS::usize; }
+    val m: u32   = geometry(set, l.max_memory_allocation_size);
+    var k: u32   = 0;
+    var n: usize = 0;
+    for (k < layout.SHARDS_MAX) {
+        val cap: usize = layout.shard_start(k + 1, m)::usize;
+        if (!fits(cap, words, set, limit)) { ret n; }
+        n = cap;
+        k = k + 1;
+    }
     ret n;
 }
 
@@ -821,6 +1123,13 @@ fun forget_censuses(g: *Gpu) {
     }
 }
 
+# write len bytes from src into a buffer at off, in order with the frame's
+# work when framed, else outside one, which waits for the device
+fun write_framed(g: *Gpu, framed: bool, b: *gfx.StorageBuffer, off: usize, src: *u8, len: usize) err[gfx.Error] {
+    if (framed) { ret gfx.renderer_buffer_update(g.r, b, off, src, len); }
+    ret gfx.storage_buffer_upload(g.d, b, off, src, len);
+}
+
 # a pool's buffer, made inside the frame when framed so nothing waits for the
 # device, else outside one, which drains the queue
 fun make_framed(g: *Gpu, framed: bool, size: usize, out: *gfx.StorageBuffer) err[gfx.Error] {
@@ -832,107 +1141,79 @@ fun make_framed(g: *Gpu, framed: bool, size: usize, out: *gfx.StorageBuffer) err
 }
 
 # the buffers sized for cap slots and a set of layers, into pp, made inside
-# the frame when framed
-fun make_pool(g: *Gpu, pp: *Pool, cap: usize, framed: bool, set: *plane.Set) err[gfx.Error] {
+# the frame when framed, beside store st, which already holds cap slots of
+# those layers
+fun make_pool(g: *Gpu, pp: *Pool, cap: usize, framed: bool, set: *plane.Set, st: usize) err[gfx.Error] {
     pp.got    = nil;
     pp.landed = nil;
     pp.held   = nil;
     pp.cap    = 0;
     pp.set    = @set;
-    # each layer's two pools, then the rest, each made undone if one is refused
+    pp.store  = st;
+    # the bound buffers in order, each made undone if one after it is refused
     var made: usize = 0;
-    for (made < set.n * 2) {
-        val e: err[gfx.Error] = make_framed(g, framed, cap * span_bytes(pp, made / 2), ?pp.cells[made]);
+    for (made < 4) {
+        var size: usize = (HEAD + cap * space.ENTRY) * 4;
+        if (made == 1) { size = (layout.STATUS_HEAD::usize + layout.status_words(cap::u32)::usize) * 4; }
+        or (made == 2) { size = layout.flags_words(cap::u32)::usize * 4; }
+        or (made == 3) { size = layout.list_words(cap::u32)::usize * 4; }
+        val e: err[gfx.Error] = make_framed(g, framed, size, bound_of(pp, made));
         if (sel e.err) {
-            drop_cells(g, pp, made);
+            drop_bound(g, pp, made);
             ret e;
         }
         made = made + 1;
     }
-    val e3: err[gfx.Error] = make_framed(g, framed, (HEAD + cap * space.ENTRY) * 4, ?pp.meta);
-    if (sel e3.err) {
-        drop_cells(g, pp, made);
-        ret e3;
-    }
-    val e4: err[gfx.Error] = make_framed(g, framed, layout.STATUS_WORDS::usize * 4, ?pp.status);
-    if (sel e4.err) {
-        drop_cells(g, pp, made);
-        gfx.storage_buffer_delete(g.d, ?pp.meta);
-        ret e4;
-    }
     val e5: err[gfx.Error] = gfx.readback(?pp.rb, g.d, status_bytes(cap));
     if (sel e5.err) {
-        drop_cells(g, pp, made);
-        gfx.storage_buffer_delete(g.d, ?pp.meta);
-        gfx.storage_buffer_delete(g.d, ?pp.status);
+        drop_bound(g, pp, made);
         ret e5;
     }
-    val e5f: err[gfx.Error] = make_framed(g, framed, layout.FLAGS_WORDS::usize * 4, ?pp.flags);
-    if (sel e5f.err) {
-        gfx.readback_delete(?pp.rb, g.d);
-        drop_cells(g, pp, made);
-        gfx.storage_buffer_delete(g.d, ?pp.meta);
-        gfx.storage_buffer_delete(g.d, ?pp.status);
-        ret e5f;
-    }
-    val e5l: err[gfx.Error] = make_framed(g, framed, cap * 4, ?pp.list);
-    if (sel e5l.err) {
-        gfx.storage_buffer_delete(g.d, ?pp.flags);
-        gfx.readback_delete(?pp.rb, g.d);
-        drop_cells(g, pp, made);
-        gfx.storage_buffer_delete(g.d, ?pp.meta);
-        gfx.storage_buffer_delete(g.d, ?pp.status);
-        ret e5l;
-    }
-    val e5m: err[gfx.Error] = make_framed(g, framed, cap * MIP * 4, ?pp.mip);
-    if (sel e5m.err) {
-        gfx.storage_buffer_delete(g.d, ?pp.list);
-        gfx.storage_buffer_delete(g.d, ?pp.flags);
-        gfx.readback_delete(?pp.rb, g.d);
-        drop_cells(g, pp, made);
-        gfx.storage_buffer_delete(g.d, ?pp.meta);
-        gfx.storage_buffer_delete(g.d, ?pp.status);
-        ret e5m;
-    }
+    pp.cap = cap;
     val rg: res[*u32, allo.Error] = allo.allocate[u32](g.a, status_bytes(cap) / 4);
     if (sel rg.err) {
         drop_pool(g, pp);
-        ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.empty{}}};
+        ret err[gfx.Error].err{gfx.Error.alloc{rg.err}};
     }
     pp.got = rg.ok;
     val ru: res[*u32, allo.Error] = allo.zallocate[u32](g.a, cap * space.CENSUS);
     if (sel ru.err) {
         drop_pool(g, pp);
-        ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.empty{}}};
+        ret err[gfx.Error].err{gfx.Error.alloc{ru.err}};
     }
     pp.landed = ru.ok;
     val rh: res[*u8, allo.Error] = allo.zallocate[u8](g.a, cap);
     if (sel rh.err) {
         drop_pool(g, pp);
-        ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.empty{}}};
+        ret err[gfx.Error].err{gfx.Error.alloc{rh.err}};
     }
     pp.held = rh.ok;
-    pp.cap  = cap;
     ret err[gfx.Error].ok{};
 }
 
-# delete the first n of a pool's cell buffers
-fun drop_cells(g: *Gpu, p: *Pool, n: usize) {
-    var i: usize = n;
-    for (i > 0) {
-        i = i - 1;
-        gfx.storage_buffer_delete(g.d, ?p.cells[i]);
+# a pool's bound buffer i, in make_pool's order: the meta, the status, the
+# flags and the list
+fun bound_of(p: *Pool, i: usize) *gfx.StorageBuffer {
+    if (i == 0) { ret ?p.meta; }
+    if (i == 1) { ret ?p.status; }
+    if (i == 2) { ret ?p.flags; }
+    ret ?p.list;
+}
+
+# delete the first n of a pool's bound buffers
+fun drop_bound(g: *Gpu, p: *Pool, n: usize) {
+    var i: usize = 0;
+    for (i < n) {
+        gfx.storage_buffer_delete(g.d, bound_of(p, i));
+        i = i + 1;
     }
 }
 
+# delete a pool's buffers, leaving its store to whichever pool still holds it
 fun drop_pool(g: *Gpu, p: *Pool) {
-    gfx.storage_buffer_delete(g.d, ?p.mip);
-    gfx.storage_buffer_delete(g.d, ?p.list);
-    gfx.storage_buffer_delete(g.d, ?p.flags);
+    if (p.cap == 0) { ret; }
     gfx.readback_delete(?p.rb, g.d);
-    gfx.storage_buffer_delete(g.d, ?p.status);
-    gfx.storage_buffer_delete(g.d, ?p.meta);
-    drop_cells(g, p, p.set.n * 2);
+    drop_bound(g, p, 4);
     if (p.got != nil)    { allo.deallocate[u32](g.a, p.got, status_bytes(p.cap) / 4); }
     if (p.landed != nil) { allo.deallocate[u32](g.a, p.landed, p.cap * space.CENSUS); }
     if (p.held != nil)   { allo.deallocate[u8](g.a, p.held, p.cap); }
@@ -940,6 +1221,16 @@ fun drop_pool(g: *Gpu, p: *Pool) {
     p.landed = nil;
     p.held   = nil;
     p.cap    = 0;
+}
+
+# delete the pool a growth replaced, once the frame copying out of it has
+# run, which deleting waits for, and its store where the pool now in use
+# keeps another
+fun drop_old(g: *Gpu) {
+    if (!g.retired) { ret; }
+    drop_pool(g, ?g.old);
+    if (g.old.store != g.p.store && !(g.reserved && g.next.store == g.old.store)) { store_drop(g, ?g.stores[g.old.store]); }
+    g.retired = false;
 }
 
 # build the stages and buffers on a renderer
@@ -959,17 +1250,19 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     g.a        = a;
     g.r        = r;
     g.d        = gfx.renderer_device(r);
-    g.slots    = ceiling(gfx.renderer_limits(r));
+    g.fold     = gfx.renderer_limits(r).max_compute_work_group_count[1];
+    g.bound    = 0;
     g.p.got    = nil;
     g.p.landed = nil;
     g.p.held   = nil;
     g.p.cap    = 0;
     g.owed     = 0;
     g.reserved = false;
+    g.restart  = false;
+    g.lit      = 0;
     mem.zero[u8]((?g.drawn)::*u8, $size_of(layout.Sense));
     g.retired  = false;
     g.hi       = 0;
-    g.front    = 0;
     g.id       = 0;
     g.spread   = 0;
     g.gens     = 0;
@@ -994,6 +1287,7 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     g.sent     = vector.init[u32](a);
     g.stamped  = vector.init[u32](a);
     g.batch    = vector.init[gfx.BufferWrite](a);
+    g.split    = vector.init[gfx.BufferWrite](a);
     g.keys     = vector.init[u64](a);
     g.stamp    = vector.init[u32](a);
     g.pyrs     = vector.init[u32](a);
@@ -1054,11 +1348,8 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
 
     g.stepping = false;
     if (build_steps(g)) {
-        if (build_stages(g)) {
-            g.stepping = true;
-            build_lives(g);
-        }
-        or { drop_steps(g, rule.FAMILIES_MAX); }
+        if (build_stages(g)) { g.stepping = true; }
+        or                   { drop_steps(g, rule.FAMILIES_MAX); }
     }
     if (g.stepping) { hold_clocks(g); }
 
@@ -1067,13 +1358,141 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     val e8: err[gfx.Error] = gfx.storage_buffer_upload(g.d, ?g.view, LOOK * 4, heat::*u8, SHADES * 16);
     if (sel e8.err) { ret e8; }
     val e9: err[gfx.Error] = gfx.storage_buffer_upload(g.d, ?g.view, (LOOK + SHADES * 4) * 4, age::*u8, SHADES * 16);
-    if (sel e9.err)    { ret e9; }
-    if (cap > g.slots) { ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.overrun{(cap * plane.span_words(layer.WIDTH_MAX) * 4)::u64}}}; }
+    if (sel e9.err) { ret e9; }
     forget_censuses(g);
     # a 32-bit state layer until the host's pool names its own, which the
     # first flush takes up
     var set: plane.Set = plane.state("cells", layer.WIDTH_MAX);
-    ret make_pool(g, ?g.p, cap, false, ?set);
+    g.slots = ceiling(gfx.renderer_limits(r), ?set, 0);
+    if (cap > g.slots) { ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.overrun{(cap * slot_bytes(?set))::u64}}}; }
+    g.stores[0].made = false;
+    g.stores[1].made = false;
+    val es: err[gfx.Error] = store_make(g, ?g.stores[0], ?set, false);
+    if (sel es.err) { ret es; }
+    val er: err[gfx.Error] = store_reach(g, ?g.stores[0], cap, false);
+    if (sel er.err) { ret er; }
+    ret make_pool(g, ?g.p, cap, false, ?set, 0);
+}
+
+# fit the pool's ceiling to a set of layers and a memory limit: the most slots
+# a pool of those layers may hold on the device in at most limit bytes, 0 for
+# as much as the device holds, which owe holds a growth to
+# ---
+# g:     the GPU side
+# set:   the layers the host's pool holds
+# limit: the most bytes, 0 for none
+# ret:   the ceiling
+pub fun fit(g: *Gpu, set: *plane.Set, limit: u64) usize {
+    g.bound = limit;
+    g.slots = ceiling(gfx.renderer_limits(g.r), set, limit);
+    ret g.slots;
+}
+
+# whether the pool in use could hold its cells in a set's layers as it
+# stands, every shard its store holds made for them, within the memory and
+# the limits its ceiling was fitted to (fit), so the host may take the set up
+# while the GPU steps the world. the store's geometry leaves view layers out
+# (geometry), so a view layer wider than the rest must also fit the device's
+# largest allocation in the largest shard the store may grow
+pub fun holds_layers(g: *Gpu, set: *plane.Set) bool {
+    val st: *Store = store_of(g, ?g.p);
+    if (g.p.cap == 0 || !st.made) { ret true; }
+    val l:    gfx.Limits = gfx.renderer_limits(g.r);
+    val most: u64        = l.max_memory_allocation_size;
+    var k:    usize      = plane.exact(set);
+    for (k < set.n) {
+        val len: u64 = ((1::usize << st.m::usize) * plane.span_words(set.at[k].width) * 4)::u64;
+        if (most != 0 && len > most) { ret false; }
+        k = k + 1;
+    }
+    ret ceiling(l, set, g.bound) >= store_slots(st);
+}
+
+# whether the next frame takes a set up in place (review): the GPU steps the
+# world in a pool it made, the set differs from the pool's in view layers
+# alone, and no growth waits to move the world into a store of other layers.
+# else the host's cells must be the world's before the set is taken up, and
+# the next frame uploads them whole
+pub fun in_place(g: *Gpu, set: *plane.Set) bool {
+    if (!g.stepping || g.p.cap == 0 || !views_nest(?g.p.set, set)) { ret false; }
+    if (g.reserved && g.next.store != g.p.store)                   { ret false; }
+    val st: *Store = store_of(g, ?g.p);
+    ret st.made && plane.same(?st.set, ?g.p.set);
+}
+
+# the share of the device's memory a pool takes when its ceiling leaves it to
+# the device: three quarters of a discrete GPU's own memory, which leaves the
+# rest to the swapchain, the compositor and other programs drawing on it, and
+# a quarter where device memory is the host's RAM, which the system, the
+# host's staging copy of the pool and every other program share
+val HEAP_DISCRETE: u64 = 3;
+val HEAP_UNIFIED:  u64 = 1;
+val HEAP_OF:       u64 = 4;
+
+# the most bytes the pool may take on the device under its memory ceiling:
+# limit bytes, 0 for the device's share (HEAP_DISCRETE, HEAP_UNIFIED), or
+# all of its memory where the ceiling is off, and never more than the device's
+# largest local heap, nor more than the pool takes now and what the device's
+# budget leaves this process where it reports one
+# ---
+# g:     the GPU side
+# on:    the ceiling is on
+# limit: its limit in bytes, 0 for the device's share
+# ret:   the bytes, 0 where the device says nothing of its memory
+pub fun memory_limit(g: *Gpu, on: bool, limit: u64) u64 {
+    val l:    gfx.Limits = gfx.renderer_limits(g.r);
+    val heap: u64        = l.device_local_heap_size;
+    var n:    u64        = heap;
+    if (on && limit != 0) { n = limit; }
+    or (on) {
+        var share: u64 = HEAP_DISCRETE;
+        if (l.unified_memory) { share = HEAP_UNIFIED; }
+        n = heap / HEAP_OF * share;
+    }
+    if (heap != 0 && n > heap) { n = heap; }
+    val b: opt[gfx.MemoryBudget] = gfx.renderer_memory_budget(g.r);
+    if (sel b.some) {
+        var free: u64 = 0;
+        if (b.some.budget > b.some.usage) { free = b.some.budget - b.some.usage; }
+        val most: u64 = pool_bytes_of(g) + free;
+        if (n == 0 || n > most) { n = most; }
+    }
+    ret n;
+}
+
+# the bytes the device's largest local heap holds, 0 where it says nothing
+pub fun heap(g: *Gpu) u64 {
+    ret gfx.renderer_limits(g.r).device_local_heap_size;
+}
+
+# the bytes the pool takes on the device: its store's shards and the buffers
+# sized to its capacity
+pub fun pool_bytes_of(g: *Gpu) u64 {
+    if (g.p.cap == 0) { ret 0; }
+    val st: *Store = store_of(g, ?g.p);
+    ret (store_slots(st) * slot_bytes(?st.set) + pool_bytes(g.p.cap))::u64;
+}
+
+# which of a layer's two cells holds the generation the last step left, the
+# front: the low bit of its serial (cellar.layer)
+fun front(g: *Gpu) usize {
+    ret (g.serial & 1)::usize;
+}
+
+# what cellar requires of the device it draws on: Vulkan 1.2 with buffer
+# device addresses, which every stage reaches the pool through
+# (cellar.layout). a device without them is refused when the renderer starts
+pub fun requirements() gfx.Requirements {
+    var q: gfx.Requirements = gfx.requirements_none();
+    q.api_version           = (1 << 22) | (2 << 12);
+    q.buffer_device_address = true;
+    ret q;
+}
+
+# start a renderer on a window, on a device that meets cellar's requirements
+# (requirements), presenting in step with the display
+pub fun renderer_init(r: *gfx.Renderer, w: *window.Window) err[gfx.Error] {
+    ret gfx.renderer_init_requiring(r, w, gfx.PresentMode.vsync{}, requirements());
 }
 
 # the shared compute stages, in the order build_stages makes them
@@ -1138,13 +1557,18 @@ fun stage_of(g: *Gpu, i: usize, spv: **u8, len: *usize) *gfx.Compute {
         @len = $length_of(CARRY_SPV);
         ret ?g.carry;
     }
+    if (i == 12) {
+        @spv = ?START_SPV[0];
+        @len = $length_of(START_SPV);
+        ret ?g.start;
+    }
     @spv = ?EDIT_SPV[0];
     @len = $length_of(EDIT_SPV);
     ret ?g.edit;
 }
 
 # the shared compute stages
-val STAGES: usize = 13;
+val STAGES: usize = 14;
 
 # hold the clocks a frame's stepping is timed by, all of them or none, none on
 # a device whose queue writes no timestamps, which leaves the frame time to
@@ -1202,143 +1626,40 @@ fun drop_stages(g: *Gpu, n: usize) {
     }
 }
 
-# the variants of the stages that judge a cell live, the census, the reduce
-# and the mark, that bind the live rule layers
-val LIVES: usize = 3;
-
-# the variant i of LIVES, as build_lives makes them
-fun live_of(g: *Gpu, i: usize, spv: **u8, len: *usize) *gfx.Compute {
-    if (i == 0) {
-        @spv = ?CENSUS_LIVE_SPV[0];
-        @len = $length_of(CENSUS_LIVE_SPV);
-    }
-    or (i == 1) {
-        @spv = ?REDUCE_LIVE_SPV[0];
-        @len = $length_of(REDUCE_LIVE_SPV);
-    }
-    or {
-        @spv = ?MARK_LIVE_SPV[0];
-        @len = $length_of(MARK_LIVE_SPV);
-    }
-    ret ?g.lives[i];
-}
-
-# build the variants that bind the live rule layers and the shown layer, all
-# of them or none, where the device's dispatches bind them all. without them
-# the GPU steps no rule whose family declares a live rule layer or a shown
-# layer (refusal)
-fun build_lives(g: *Gpu) {
-    g.lived = false;
-    if ((layer.SHOWN_BINDING + 1)::usize > g.most) { ret; }
-    var i: usize = 0;
-    for (i < LIVES) {
-        var spv: *u8            = nil;
-        var len: usize          = 0;
-        val c:   *gfx.Compute   = live_of(g, i, ?spv, ?len);
-        val e:   err[gfx.Error] = gfx.compute(c, g.d, spv, len);
-        if (sel e.err) {
-            drop_some_lives(g, i);
-            ret;
-        }
-        i = i + 1;
-    }
-    g.lived = true;
-}
-
-# delete the variants that bind the live rule layers, where they were built
-fun drop_lives(g: *Gpu) {
-    if (g.lived) { drop_some_lives(g, LIVES); }
-    g.lived = false;
-}
-
-# delete the first n variants that bind the live rule layers
-fun drop_some_lives(g: *Gpu, n: usize) {
-    var spv: *u8   = nil;
-    var len: usize = 0;
-    var i:   usize = 0;
-    for (i < n) {
-        gfx.compute_delete(live_of(g, i, ?spv, ?len), g.d);
-        i = i + 1;
-    }
-}
-
-# whether the pool's layers are read through the variants that bind the
-# layers beside the state layer: they have a live rule layer or a shown layer
-fun layered(g: *Gpu) bool {
-    ret g.lived && (plane.lives(?g.p.set) != 0 || plane.shown_width(?g.p.set) != 0);
-}
-
-# the stage that judges a cell live to dispatch for the pool's layers: the
-# plain one, or for layers with a live rule layer or a shown layer its
-# variant i of LIVES
-fun judge(g: *Gpu, plain: *gfx.Compute, i: usize) *gfx.Compute {
-    if (layered(g)) { ret ?g.lives[i]; }
-    ret plain;
-}
-
-# bind the pool's live rule layers' cells c, front or back, past a stage's
-# four fixed bindings, as the variant judge picks reads them (cellar.layer
-# LIVE_BINDING), every binding past the last live one the state layer's
-# ---
-# bufs: the stage's buffers, room for LIVE_BINDING + LIVE_MAX
-# ret:  the buffers the stage binds
-fun bind_lives(g: *Gpu, bufs: **gfx.StorageBuffer, c: usize) usize {
-    val first: usize = layer.LIVE_BINDING::usize;
-    if (!layered(g)) { ret first; }
-    var j: usize = 0;
-    var k: usize = 1;
-    for (k < plane.exact(?g.p.set) && j < layer.LIVE_MAX::usize) {
-        if (g.p.set.at[k].live) {
-            bufs[first + j] = cells_of(?g.p, k, c);
-            j               = j + 1;
-        }
-        k = k + 1;
-    }
-    for (j < layer.LIVE_MAX::usize) {
-        bufs[first + j] = cells_of(?g.p, 0, c);
-        j               = j + 1;
-    }
-    ret first + layer.LIVE_MAX::usize;
-}
-
-# bind the pool's shown layer's cells c past the live rule layers bind_lives
-# bound, as the census's and the reduce's variant reads it (cellar.layer
-# SHOWN_BINDING), the state layer's where it has none
-# ---
-# bufs: the stage's buffers, room for SHOWN_BINDING + 1
-# n:    the buffers bind_lives bound
-# ret:  the buffers the stage binds
-fun bind_shown(g: *Gpu, bufs: **gfx.StorageBuffer, n: usize, c: usize) usize {
-    if (!layered(g)) { ret n; }
-    bufs[layer.SHOWN_BINDING::usize] = shown_cells(?g.p, c);
-    ret layer.SHOWN_BINDING::usize + 1;
-}
-
-# build the step stage of every rule family that has one and whose bindings
-# the device's dispatches hold, all of those or none. a family registered
-# later has none built, and the CPU steps it
+# build the step stage of every rule family registered so far that has one
+# and whose bindings the device's dispatches hold, all of those or none. a
+# family registered later is built on first use (prepare)
 fun build_steps(g: *Gpu) bool {
-    val most: usize = gfx.renderer_limits(g.r).max_dispatch_bindings;
-    g.most = most;
+    g.most = gfx.renderer_limits(g.r).max_dispatch_bindings;
     var i: usize = 0;
     for (i < rule.FAMILIES_MAX) {
         g.ready[i] = false;
+        g.tried[i] = false;
         i          = i + 1;
     }
     i = 0;
     for (i < rule.families()) {
-        var len: usize = 0;
-        val spv: *u8   = rule.stage(i, ?len);
-        if (spv != nil && rule.bindings(i) <= most) {
-            val sc: err[gfx.Error] = gfx.compute(?g.steps[i], g.d, spv, len);
-            if (sel sc.err) {
-                drop_steps(g, i);
-                ret false;
-            }
-            g.ready[i] = true;
+        if (!build_step(g, i)) {
+            drop_steps(g, i);
+            ret false;
         }
         i = i + 1;
     }
+    ret true;
+}
+
+# build family f's step stage where it has one and the device's dispatches
+# hold its bindings, noting it was tried either way, so it is never tried again
+# ---
+# ret: false when the device refused to build it
+fun build_step(g: *Gpu, f: usize) bool {
+    g.tried[f] = true;
+    var len: usize = 0;
+    val spv: *u8   = rule.stage(f, ?len);
+    if (spv == nil || rule.bindings(f) > g.most) { ret true; }
+    val sc: err[gfx.Error] = gfx.compute(?g.steps[f], g.d, spv, len);
+    if (sel sc.err) { ret false; }
+    g.ready[f] = true;
     ret true;
 }
 
@@ -1352,30 +1673,32 @@ fun drop_steps(g: *Gpu, n: usize) {
     }
 }
 
-# whether the GPU steps rules of family f
-pub fun steps(g: *Gpu, f: usize) bool {
-    ret g.stepping && g.ready[f];
+# whether the GPU steps rules of family f, building its stage first when it
+# was registered after the stages were built and no rule of it was asked of
+# the GPU since. it creates a pipeline, so only the render thread, the
+# device's owner, may call it
+pub fun prepare(g: *Gpu, f: usize) bool {
+    if (!g.stepping) { ret false; }
+    if (!g.tried[f]) { build_step(g, f); }
+    ret g.ready[f];
 }
 
 # why the GPU cannot step a rule, or nil when it can or does not step: its
-# family has no stage built, or its family's stage, or the layers the rule
-# stores its cells in, bind more storage buffers than the device's
-# dispatches can
+# family has no stage, the device refused to build it, or its family's stage
+# binds more storage buffers than the device's dispatches can. a family
+# registered after the stages were built has its stage built here, the first
+# time one of its rules is asked for (prepare), so only the render thread may
+# call it
 pub fun refusal(g: *Gpu, r: *rule.Rule) str {
     if (!g.stepping) { ret nil; }
-    val f:   usize     = rule.family_of(r);
-    var set: plane.Set = rule.layers(r);
-    var tab: u32       = 0;
-    if (rule.table(f)) { tab = 1; }
+    val f:   usize = rule.family_of(r);
     var len: usize = 0;
     if (rule.stage(f, ?len) == nil) { ret "this rule's family has no GPU stage, so it cannot run while the GPU steps the world"; }
-    # the census, the reduce and the mark read every live rule layer, and the
-    # census and the reduce the shown layer
-    val lives: usize = plane.lives(?set);
-    if ((lives != 0 || plane.shown_width(?set) != 0) && (!g.lived || lives > layer.LIVE_MAX::usize)) { ret "this GPU's compute stages bind too few storage buffers for the layers this rule's cells are read by, so it cannot run while it steps the world"; }
-    # a family's stage was built only where its state layer's bindings fit
-    if (g.ready[f] && (set.n == 1 || layer.bindings(set.n::u32, tab)::usize <= g.most)) { ret nil; }
-    ret "this GPU's compute stages bind too few storage buffers for the rule buffer and layers this rule needs, so it cannot run while it steps the world";
+    # a family's stage reaches every layer by address, however many the
+    # rule's cells take, so only its own bindings can keep it from being built
+    if (prepare(g, f))              { ret nil; }
+    if (rule.bindings(f) <= g.most) { ret "this GPU could not build this rule's family's stage, so it cannot run while it steps the world"; }
+    ret "this GPU's compute stages bind too few storage buffers for the rule buffer this rule needs, so it cannot run while it steps the world";
 }
 
 # add a write to the batch the next send records
@@ -1509,6 +1832,7 @@ fun fill_shades(pal: *f32) {
 # ret: false when the device refused the buffers
 pub fun reserve(g: *Gpu, cap: usize) bool {
     if (cap <= g.p.cap || (g.reserved && cap <= g.next.cap)) { ret true; }
+    if (cap > g.slots)                                       { ret false; }
     var set: *plane.Set = ?g.p.set;
     if (g.sp != nil) { set = space.layers(g.sp); }
     ret make_next(g, cap, false, set);
@@ -1530,17 +1854,43 @@ pub fun owe(g: *Gpu, cap: usize) bool {
 }
 
 # make the buffers a growth to cap slots, or a change of layers, moves the
-# world into, inside the frame when framed
+# world into, inside the frame when framed: a growth's cells go on lying in
+# the pool's store, which makes the shards it lacks, and other layers' in a
+# store of their own
 fun make_next(g: *Gpu, cap: usize, framed: bool, set: *plane.Set) bool {
     # nothing has been recorded into a pool made since the last frame
-    if (g.reserved) {
-        drop_pool(g, ?g.next);
-        g.reserved = false;
+    drop_next(g);
+    var st: usize = g.p.store;
+    if (!plane.same_shape(?g.stores[st].set, set)) {
+        st = 1 - g.p.store;
+        # the pool a growth replaced may still hold the other store, and
+        # deleting it waits for the frame that last read it
+        if (g.retired && g.old.store == st) { drop_old(g); }
+        if (g.stores[st].made)              { store_drop(g, ?g.stores[st]); }
+        val e: err[gfx.Error] = store_make(g, ?g.stores[st], set, framed);
+        if (sel e.err) { ret false; }
     }
-    val made: err[gfx.Error] = make_pool(g, ?g.next, cap, framed, set);
-    if (sel made.err) { ret false; }
+    val r: err[gfx.Error] = store_reach(g, ?g.stores[st], cap, framed);
+    if (sel r.err) {
+        if (st != g.p.store) { store_drop(g, ?g.stores[st]); }
+        ret false;
+    }
+    val made: err[gfx.Error] = make_pool(g, ?g.next, cap, framed, set, st);
+    if (sel made.err) {
+        if (st != g.p.store) { store_drop(g, ?g.stores[st]); }
+        ret false;
+    }
     g.reserved = true;
     ret true;
+}
+
+# delete the buffers a growth made that no frame has moved the world into,
+# and their store where the pool in use keeps another
+fun drop_next(g: *Gpu) {
+    if (!g.reserved) { ret; }
+    drop_pool(g, ?g.next);
+    if (g.next.store != g.p.store) { store_drop(g, ?g.stores[g.next.store]); }
+    g.reserved = false;
 }
 
 # have the GPU side mirror the host's pool, which then makes room through
@@ -1559,7 +1909,6 @@ pub fun forgo_compute(g: *Gpu) {
     if (!g.stepping) { ret; }
     drop_steps(g, rule.FAMILIES_MAX);
     drop_stages(g, STAGES);
-    drop_lives(g);
     g.stepping = false;
 }
 
@@ -1569,6 +1918,8 @@ pub fun dnit(g: *Gpu) {
     if (g.retired)  { drop_pool(g, ?g.old); }
     if (g.reserved) { drop_pool(g, ?g.next); }
     drop_pool(g, ?g.p);
+    store_drop(g, ?g.stores[0]);
+    store_drop(g, ?g.stores[1]);
     gfx.storage_buffer_delete(g.d, ?g.view);
     gfx.shader_delete(?g.draw, g.d);
     if (g.words != 0) { gfx.storage_buffer_delete(g.d, ?g.table); }
@@ -1576,7 +1927,6 @@ pub fun dnit(g: *Gpu) {
     if (g.stepping) {
         drop_steps(g, rule.FAMILIES_MAX);
         drop_stages(g, STAGES);
-        drop_lives(g);
     }
     if (g.clocked) { drop_clocks(g, TIMERS); }
     vector.dnit[Write](?g.writes);
@@ -1584,6 +1934,7 @@ pub fun dnit(g: *Gpu) {
     vector.dnit[u32](?g.sent);
     vector.dnit[u32](?g.stamped);
     vector.dnit[gfx.BufferWrite](?g.batch);
+    vector.dnit[gfx.BufferWrite](?g.split);
     vector.dnit[u64](?g.keys);
     vector.dnit[u32](?g.stamp);
     vector.dnit[u32](?g.pyrs);
@@ -1637,6 +1988,13 @@ pub fun note_write(g: *Gpu, sp: *space.Space, s: usize, i: usize) {
 pub fun fix_span(g: *Gpu, slots: usize) {
     g.span  = slots;
     g.fixed = true;
+}
+
+# fold every dispatch's rows past rows along y onto z, as a device whose most
+# workgroups along y is rows would, so a test folds them with a small pool
+#[testing]
+pub fun fix_fold(g: *Gpu, rows: u32) {
+    g.fold = rows;
 }
 
 # hold the span at a share of what the next generation is estimated to step,
@@ -1886,7 +2244,7 @@ pub fun collect(g: *Gpu, sp: *space.Space) Landed {
     }
     if (snap.owned) {
         val gate: bool = g.p.got[layout.CTL_GATE::usize] != 0;
-        if (g.p.got[layout.CTL_TOMBS::usize] > layout.HASH / 8) { g.rehash = true; }
+        if (g.p.got[layout.CTL_TOMBS::usize] > layout.buckets(g.p.cap::u32) / 8) { g.rehash = true; }
         # a census taken while the gate was closed read cells no step since
         # has touched, so it is no count of the world
         if (gate) {
@@ -1986,7 +2344,6 @@ pub fun take(g: *Gpu, sp: *space.Space) bool {
         g.gens    = g.gens - v;
         g.serial  = ((g.serial::u64 + 0x100000000 - (v & 0xffffffff)) & 0xffffffff)::u32;
         g.rewound = g.rewound + v;
-        if ((v & 1) != 0) { g.front = 1 - g.front; }
         g.going   = false;
         g.counted = false;
         g.listed  = false;
@@ -2133,16 +2490,40 @@ pub fun forget_writes(g: *Gpu, lo: usize, n: usize) {
 }
 
 # read every layer of the GPU's front cells of a run of slots into the host's
-# staging cells, which the GPU's layers must match, as every flush leaves them
+# staging cells, which the GPU's layers must match, as every flush leaves them.
+# view layers the host took up in place (in_place) and the next flush has not
+# yet made are read as that flush starts them: the layers both hold are read,
+# and a shown layer the GPU lacks starts from the state layer just read
 fun read_run(g: *Gpu, sp: *space.Space, s: usize, run: usize) err[gfx.Error] {
-    # layers changed since the last flush leave every slot's staging newer
-    if (!plane.same_shape(?g.p.set, space.layers(sp))) { ret err[gfx.Error].ok{}; }
-    var k: usize = 0;
-    for (k < g.p.set.n) {
-        val e: err[gfx.Error] = gfx.storage_buffer_read(g.d, cells_of(?g.p, k, g.front), span_offset(?g.p, k, s),
-            space.span_run(sp, k, s)::*u8, run * span_bytes(?g.p, k));
-        if (sel e.err) { ret e; }
+    val set:  *plane.Set = space.layers(sp);
+    val nest: bool       = views_nest(?g.p.set, set);
+    # layers changed otherwise since the last flush leave every slot's
+    # staging newer
+    if (!plane.same_shape(?g.p.set, set) && !nest) { ret err[gfx.Error].ok{}; }
+    var both: usize = g.p.set.n;
+    if (nest && set.n < both) { both = set.n; }
+    # a run read a shard at a time, since no span straddles two
+    val st: *Store = store_of(g, ?g.p);
+    var k:  usize  = 0;
+    for (k < both) {
+        var at: usize = s;
+        for (at < s + run) {
+            val n:  usize          = in_shard(st, at, s + run - at);
+            val pc: Piece          = cells_at(st, k, front(g), at);
+            val e:  err[gfx.Error] = gfx.storage_buffer_read(g.d, pc.b, pc.off, space.span_run(sp, k, at)::*u8, n * span_bytes(?g.p, k));
+            if (sel e.err) { ret e; }
+            at = at + n;
+        }
         k = k + 1;
+    }
+    val now: opt[usize] = plane.shown(set);
+    val was: opt[usize] = plane.shown(?g.p.set);
+    if (nest && (sel now.some) && (sel was.none)) {
+        var t: usize = s;
+        for (t < s + run) {
+            space.start_shown(sp, t);
+            t = t + 1;
+        }
     }
     ret err[gfx.Error].ok{};
 }
@@ -2152,88 +2533,137 @@ fun refilled(sp: *space.Space, s: usize) bool {
     ret (sp.dirty[s] & space.DIRTY_CELLS) != 0 && space.used(sp, s);
 }
 
-# batch the words of a word-wide layer l holding painted cells, as the host's
-# cells hold them now, once each, and none in a chunk going up whole (filled),
-# whose cells the host has written since. a layer narrower than a word has its
-# painted cells written on the GPU instead (edit_painted)
-fun queue_painted(g: *Gpu, sp: *space.Space, filled: bool, l: usize) err[gfx.Error] {
+# a key ordering painted cells by slot, then by a place inside it below 2^12,
+# then by when they were painted, the write's index below 2^28, which slots
+# below 2^24 hold (MOST_SLOTS)
+fun paint_key(slot: u32, at: u32, i: usize) u64 {
+    ret (slot::u64 << 40) | (at::u64 << 28) | i::u64;
+}
+
+# the slot and the place a paint_key names, without its write
+fun paint_cell(k: u64) u64 {
+    ret k >> 28;
+}
+
+# the keys of the painted cells of layer l, by the word of its span each lies
+# in when word, else by the cell, none in a chunk going up whole (filled),
+# sorted, in keys
+fun paint_keys(g: *Gpu, sp: *space.Space, filled: bool, l: usize, word: bool) err[gfx.Error] {
     vector.clear[u64](?g.keys);
-    val width: u32 = g.p.set.at[l].width;
-    if (width < layer.WIDTH_MAX) { ret err[gfx.Error].ok{}; }
-    var i: usize = 0;
+    val width: u32   = g.p.set.at[l].width;
+    var i:     usize = 0;
     for (i < g.writes.len) {
         val w: *Write = ?g.writes.data[i];
         if (w.k::usize == l && (!filled || !refilled(sp, w.slot::usize))) {
-            val pushed: res[usize, allo.Error] = vector.push[u64](?g.keys, (layer.cell_at(width, w.slot, w.i)::u64 << 32) | i::u64);
+            var at: u32 = w.i;
+            if (word) { at = layer.cell_word(width, w.i); }
+            val pushed: res[usize, allo.Error] = vector.push[u64](?g.keys, paint_key(w.slot, at, i));
             if (sel pushed.err) { ret err[gfx.Error].err{gfx.Error.alloc{pushed.err}}; }
         }
         i = i + 1;
     }
     sort.sort[u64](g.keys.data, g.keys.len);
-    i = 0;
-    for (i < g.keys.len) {
-        val k: u64 = g.keys.data[i];
-        if (i + 1 < g.keys.len && (g.keys.data[i + 1] >> 32) == (k >> 32)) {
-            i = i + 1;
-            cnt;
+    ret err[gfx.Error].ok{};
+}
+
+# upload layer l's front cells of the chunks the host filled, where filled
+# says they go up, and the words of its painted cells when it is word-wide,
+# as the host's cells hold them now, once each and none in a chunk going up
+# whole: a batch a shard, since a span lies in one shard. a layer narrower
+# than a word has its painted cells written on the GPU instead (edits_of)
+fun upload_layer(g: *Gpu, sp: *space.Space, filled: bool, chunks: usize, top: usize, l: usize) err[gfx.Error] {
+    val st:    *Store = store_of(g, ?g.p);
+    val width: u32    = g.p.set.at[l].width;
+    val wide:  bool   = width >= layer.WIDTH_MAX;
+    var keyed: usize  = 0;
+    if (wide) {
+        val ek: err[gfx.Error] = paint_keys(g, sp, filled, l, true);
+        if (sel ek.err) { ret ek; }
+        keyed = g.keys.len;
+    }
+    var j: usize = 0;
+    var q: usize = 0;
+    for (j < st.n) {
+        val lo: usize = layout.shard_start(j::u32, st.m)::usize;
+        var hi: usize = layout.shard_start((j + 1)::u32, st.m)::usize;
+        if (hi > top) { hi = top; }
+        var s: usize = lo;
+        for (filled && chunks != 0 && s < hi) {
+            if (!refilled(sp, s)) {
+                s = s + 1;
+                cnt;
+            }
+            var run: usize = 1;
+            for (s + run < hi && refilled(sp, s + run)) { run = run + 1; }
+            val pc:  Piece          = cells_at(st, l, front(g), s);
+            val e12: err[gfx.Error] = queue(g, pc.off, space.span_run(sp, l, s)::*u8, run * span_bytes(?g.p, l));
+            if (sel e12.err) { ret e12; }
+            var k: usize = 0;
+            for (g.stepping && l == 0 && k < run) {
+                vector.push[u32](?g.stamped, (s + k)::u32);
+                k = k + 1;
+            }
+            s = s + run;
         }
-        val w:  *Write         = ?g.writes.data[(k & 0xffffffff)::usize];
-        val at: *u32           = ?space.plane_of(sp, l, w.slot::usize).w[layer.cell_word(width, w.i)::usize];
-        val e:  err[gfx.Error] = queue(g, (k >> 32)::usize * 4, at::*u8, 4);
-        if (sel e.err) { ret e; }
-        i = i + 1;
+        # the painted words of the shard, a cell's last write alone
+        for (q < keyed && (g.keys.data[q] >> 40)::usize < lo + shard_slots(st, j)) {
+            val k: u64 = g.keys.data[q];
+            q = q + 1;
+            if (q < keyed && paint_cell(g.keys.data[q]) == paint_cell(k)) { cnt; }
+            val w:  *Write         = ?g.writes.data[(k & 0xfffffff)::usize];
+            val wd: usize          = layer.cell_word(width, w.i)::usize;
+            val at: *u32           = ?space.plane_of(sp, l, w.slot::usize).w[wd];
+            val pc: Piece          = cells_at(st, l, front(g), w.slot::usize);
+            val e:  err[gfx.Error] = queue(g, pc.off + wd * 4, at::*u8, 4);
+            if (sel e.err) { ret e; }
+        }
+        val e14: err[gfx.Error] = send(g, ?st.cells[layout.cells_entry(l::u32, front(g)::u32, j::u32)::usize]);
+        if (sel e14.err) { ret e14; }
+        j = j + 1;
     }
     ret err[gfx.Error].ok{};
 }
 
-# write the painted cells of a layer l narrower than a word into the GPU's
-# front, none in a chunk going up whole (filled): each cell's last edit goes up
-# as the bits it takes in its word and its value in them, and the edit stage
-# writes them there with atomics, so the word's other cells stay as the GPU
-# holds them and the host need not pull them first (cellar.sim edit_begin)
-fun edit_painted(g: *Gpu, sp: *space.Space, filled: bool, l: usize) err[gfx.Error] {
+# add the painted cells of a layer l narrower than a word to the frame's
+# edits, none in a chunk going up whole (filled): each cell's last edit as the
+# bits it takes in its word and its value in them, which the edit stage
+# writes into the front with atomics, so the word's other cells stay as the
+# GPU holds them and the host need not pull them first (cellar.sim edit_begin)
+fun edits_of(g: *Gpu, sp: *space.Space, filled: bool, l: usize) err[gfx.Error] {
     val width: u32 = g.p.set.at[l].width;
     if (width >= layer.WIDTH_MAX || !g.stepping) { ret err[gfx.Error].ok{}; }
-    vector.clear[u64](?g.keys);
-    var i: usize = 0;
-    for (i < g.writes.len) {
-        val w: *Write = ?g.writes.data[i];
-        if (w.k::usize == l && (!filled || !refilled(sp, w.slot::usize))) {
-            val pushed: res[usize, allo.Error] = vector.push[u64](?g.keys, (layer.addr(w.slot, w.i)::u64 << 32) | i::u64);
-            if (sel pushed.err) { ret err[gfx.Error].err{gfx.Error.alloc{pushed.err}}; }
-        }
-        i = i + 1;
-    }
+    val ek: err[gfx.Error] = paint_keys(g, sp, filled, l, false);
+    if (sel ek.err)      { ret ek; }
     if (g.keys.len == 0) { ret err[gfx.Error].ok{}; }
-    sort.sort[u64](g.keys.data, g.keys.len);
-    vector.clear[u32](?g.edit_at);
-    val room: res[usize, allo.Error] = vector.ensure[u32](?g.edit_at, 4 + g.keys.len * 3);
+    val room: res[usize, allo.Error] = vector.ensure[u32](?g.edit_at, g.edit_at.len + g.keys.len * 4);
     if (sel room.err) { ret err[gfx.Error].err{gfx.Error.alloc{room.err}}; }
-    g.edit_at.len = 4;
-    var n: u32 = 0;
-    i = 0;
+    var i: usize = 0;
     for (i < g.keys.len) {
         val k: u64 = g.keys.data[i];
+        i = i + 1;
         # a cell's last edit alone
-        if (i + 1 < g.keys.len && (g.keys.data[i + 1] >> 32) == (k >> 32)) {
-            i = i + 1;
-            cnt;
-        }
-        val w:  *Write = ?g.writes.data[(k & 0xffffffff)::usize];
-        val a:  u32    = (k >> 32)::u32;
+        if (i < g.keys.len && paint_cell(g.keys.data[i]) == paint_cell(k)) { cnt; }
+        val w:  *Write = ?g.writes.data[(k & 0xfffffff)::usize];
         val sh: u32    = layer.cell_shift(width, w.i);
-        g.edit_at.data[g.edit_at.len]     = layer.addr_word(width, a);
-        g.edit_at.data[g.edit_at.len + 1] = layer.mask(width) << sh;
-        g.edit_at.data[g.edit_at.len + 2] = (w.v & layer.mask(width)) << sh;
-        g.edit_at.len                     = g.edit_at.len + 3;
-        n                                 = n + 1;
-        i                                 = i + 1;
+        val at: usize  = g.edit_at.len;
+        g.edit_at.data[at]     = w.slot;
+        g.edit_at.data[at + 1] = (l::u32 << layout.EDIT_LAYER) | layer.cell_word(width, w.i);
+        g.edit_at.data[at + 2] = layer.mask(width) << sh;
+        g.edit_at.data[at + 3] = (w.v & layer.mask(width)) << sh;
+        g.edit_at.len          = at + 4;
     }
-    g.edit_at.data[0] = n;
-    g.edit_at.data[1] = 0;
+    ret err[gfx.Error].ok{};
+}
+
+# write the frame's edits into the front on the GPU, one dispatch for every
+# layer's, the edits' buffer grown inside the frame as the rule buffer is
+fun edit_painted(g: *Gpu) err[gfx.Error] {
+    val n: usize = (g.edit_at.len - 4) / 4;
+    if (n == 0) { ret err[gfx.Error].ok{}; }
+    g.edit_at.data[0] = n::u32;
+    g.edit_at.data[1] = front(g)::u32;
     g.edit_at.data[2] = 0;
     g.edit_at.data[3] = 0;
-    # the edits' buffer grows inside the frame, as the rule buffer does
     if (g.edit_at.len > g.room) {
         if (g.room != 0) { gfx.storage_buffer_delete(g.d, ?g.edited); }
         g.room = 0;
@@ -2246,9 +2676,9 @@ fun edit_painted(g: *Gpu, sp: *space.Space, filled: bool, l: usize) err[gfx.Erro
     val eu: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.edited, 0, g.edit_at.data::*u8, g.edit_at.len * 4);
     if (sel eu.err) { ret eu; }
     var eb: [2]*gfx.StorageBuffer;
-    eb[0] = cells_of(?g.p, l, g.front);
+    eb[0] = ?g.p.meta;
     eb[1] = ?g.edited;
-    ret gfx.renderer_dispatch(g.r, ?g.edit, ?eb[0], 2, (n + 63) / 64, 1, 1);
+    ret dispatch_each(g, ?g.edit, ?eb[0], 2, n);
 }
 
 # batch the stamps that mark the slots in stamped alive and warm as of the
@@ -2271,7 +2701,8 @@ fun queue_stamps(g: *Gpu) err[gfx.Error] {
             if (g.stamped.data[i] == lo + run::u32) { run = run + 1; }
             i = i + 1;
         }
-        val e: err[gfx.Error] = queue(g, lo::usize * 8, g.stamp.data::*u8, run * 8);
+        # a slot's stamps lie past the flags buffer's head (cellar.layout.Flags)
+        val e: err[gfx.Error] = queue(g, (layout.FLAGS_HEAD::usize + lo::usize * 2) * 4, g.stamp.data::*u8, run * 8);
         if (sel e.err) { ret e; }
     }
     ret err[gfx.Error].ok{};
@@ -2285,10 +2716,7 @@ fun queue_stamps(g: *Gpu) err[gfx.Error] {
 fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
     # buffers a growth replaced are freed once the frame that copied out of
     # them has run, which deleting waits for
-    if (g.retired) {
-        drop_pool(g, ?g.old);
-        g.retired = false;
-    }
+    drop_old(g);
     # the GPU owned the pool before this frame, so its page table is the one
     # a growth carries
     var held: bool = g.owns;
@@ -2309,9 +2737,12 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
         sp.wide  = false;
         g.listed = false;
     }
+    g.lit = sp.lit;
+    val ev: err[gfx.Error] = review(g, sp);
+    if (sel ev.err) { ret ev; }
     val owed: usize = atomic.exchange(?g.owed, 0)::usize;
     if (owed > g.p.cap && !(g.reserved && owed <= g.next.cap) && !make_next(g, owed, true, space.layers(sp))) {
-        ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.overrun{(owed * plane.span_words(layer.WIDTH_MAX) * 4)::u64}}};
+        ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.overrun{(owed * slot_bytes(space.layers(sp)))::u64}}};
     }
     # buffers made for other layers than the host's are made again for them,
     # at the capacity they were to have, and filled from the host's cells
@@ -2319,10 +2750,13 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
     if (g.reserved) { aim = ?g.next; }
     val relaid: bool = !plane.same_shape(?aim.set, space.layers(sp));
     if (relaid && !make_next(g, aim.cap, true, space.layers(sp))) {
-        ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.overrun{(aim.cap * plane.span_words(layer.WIDTH_MAX) * 4)::u64}}};
+        ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.overrun{(aim.cap * slot_bytes(space.layers(sp)))::u64}}};
     }
     val grew: bool = g.reserved;
-    if (grew && relaid) {
+    # a growth made in another store than the pool's, as a pool made for
+    # other layers is, holds none of the world's cells
+    val moved: bool = grew && g.next.store != g.p.store;
+    if (grew && (relaid || moved)) {
         # the host's cells and page table are the world's, and go up whole
         g.old      = g.p;
         g.retired  = true;
@@ -2339,31 +2773,21 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
         if (g.owns) { g.reseed = true; }
     }
     or (grew) {
-        # the world moves into the larger buffers reserve made
+        # the world goes on in the store, which made the shards the growth
+        # needs, and its stamps move into the larger buffers reserve made
         g.old      = g.p;
         g.retired  = true;
         g.p        = g.next;
         g.reserved = false;
         g.est      = UNKNOWN;
         forget_censuses(g);
-        # a gate closed in a frame no census has shown yet voided steps the
-        # front was turned for, so while the GPU owned the pool either cells may
-        # hold the world, and both go
-        var pools: usize = 1;
-        if (held) { pools = 2; }
-        # a dispatch a layer, its workgroups along x covering a slot's span
-        var k: usize = 0;
-        for (g.hi != 0 && g.stepping && k < pools * g.p.set.n) {
-            val c:  usize = (g.front + k % pools) % 2;
-            val l:  usize = k / pools;
-            var gb: [4]*gfx.StorageBuffer;
-            gb[0] = cells_of(?g.old, l, c);
-            gb[1] = cells_of(?g.p, l, c);
-            gb[2] = ?g.old.flags;
-            gb[3] = ?g.p.flags;
-            val eg: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.grow, ?gb[0], 4, (span_bytes(?g.p, l) / 256)::u32, g.hi::u32, 1);
+        if (g.hi != 0 && g.stepping) {
+            var gb: [3]*gfx.StorageBuffer;
+            gb[0] = ?g.old.flags;
+            gb[1] = ?g.p.flags;
+            gb[2] = ?g.old.meta;
+            val eg: err[gfx.Error] = dispatch_each(g, ?g.grow, ?gb[0], 3, g.hi);
             if (sel eg.err) { ret eg; }
-            k = k + 1;
         }
         if (held) {
             # the GPU carries its own page table, which the host's may lag, and
@@ -2374,7 +2798,7 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
             cb[1] = ?g.p.meta;
             cb[2] = ?g.old.status;
             cb[3] = ?g.p.status;
-            val ec: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.carry, ?cb[0], 4, 1, g.old.cap::u32, 1);
+            val ec: err[gfx.Error] = dispatch_rows(g, ?g.carry, ?cb[0], 4, 1, g.old.cap);
             if (sel ec.err) { ret ec; }
             g.rehash = true;
         }
@@ -2388,6 +2812,11 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
             if (g.owns) { g.reseed = true; }
         }
     }
+
+    # the stages this frame records find the pool's shards and capacity in the
+    # meta head, which the pool just swapped in may not hold yet
+    val ew: err[gfx.Error] = write_pool_words(g);
+    if (sel ew.err) { ret ew; }
 
     # the GPU's top may lie past the host's capacity, which did not grow with it
     var top: usize = sp.hi;
@@ -2431,8 +2860,10 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
     if (sel e11.err) { ret e11; }
 
     if (g.stepping) {
-        # chunks allocated empty are cleared on the GPU, in both pools
+        # chunks allocated empty are cleared on the GPU, in both pools, the
+        # list's length ahead of them (layout.List)
         vector.clear[u32](?g.zeros);
+        vector.push[u32](?g.zeros, 0);
         s = 0;
         for (s < top) {
             if ((sp.dirty[s] & (space.DIRTY_ZERO | space.DIRTY_CELLS)) == space.DIRTY_ZERO && space.used(sp, s)) {
@@ -2440,54 +2871,42 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
             }
             s = s + 1;
         }
-        if (g.zeros.len != 0) {
+        val zeros: usize = g.zeros.len - 1;
+        if (zeros != 0) {
+            g.zeros.data[0] = zeros::u32;
             val el: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.list, 0, g.zeros.data::*u8, g.zeros.len * 4);
             if (sel el.err) { ret el; }
-            # a dispatch a layer, its workgroups along x covering a slot's span
-            var k: usize = 0;
-            for (k < g.p.set.n) {
-                var zb: [4]*gfx.StorageBuffer;
-                zb[0] = cells_of(?g.p, k, 0);
-                zb[1] = cells_of(?g.p, k, 1);
-                zb[2] = ?g.p.list;
-                zb[3] = ?g.p.flags;
-                val ez: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.clear, ?zb[0], 4, (span_bytes(?g.p, k) / 256)::u32, g.zeros.len::u32, 1);
-                if (sel ez.err) { ret ez; }
-                k = k + 1;
-            }
+            # workgroups along x covering the widest span, a row a slot
+            var zb: [3]*gfx.StorageBuffer;
+            zb[0] = ?g.p.meta;
+            zb[1] = ?g.p.list;
+            zb[2] = ?g.p.flags;
+            val ez: err[gfx.Error] = dispatch_rows(g, ?g.clear, ?zb[0], 3, clear_groups(?g.p), zeros);
+            if (sel ez.err) { ret ez; }
         }
     }
 
     # chunks the host filled are uploaded, where the GPU steps or with whole,
     # and stamped so they step in full. painted cells go up after the clear,
     # which may have emptied the chunk they lie in
-    val filled: bool  = g.stepping || whole;
-    var l:      usize = 0;
+    val filled: bool = g.stepping || whole;
+    vector.clear[u32](?g.edit_at);
+    val er: res[usize, allo.Error] = vector.ensure[u32](?g.edit_at, 4);
+    if (sel er.err) { ret err[gfx.Error].err{gfx.Error.alloc{er.err}}; }
+    g.edit_at.len = 4;
+    var l: usize = 0;
     for (l < g.p.set.n) {
-        s = 0;
-        for (filled && chunks != 0 && s < top) {
-            if (!refilled(sp, s)) {
-                s = s + 1;
-                cnt;
-            }
-            var run: usize = 1;
-            for (s + run < top && refilled(sp, s + run)) { run = run + 1; }
-            val e12: err[gfx.Error] = queue(g, span_offset(?g.p, l, s), space.span_run(sp, l, s)::*u8, run * span_bytes(?g.p, l));
-            if (sel e12.err) { ret e12; }
-            var k: usize = 0;
-            for (g.stepping && l == 0 && k < run) {
-                vector.push[u32](?g.stamped, (s + k)::u32);
-                k = k + 1;
-            }
-            s = s + run;
-        }
-        val e13: err[gfx.Error] = queue_painted(g, sp, filled, l);
+        val e13: err[gfx.Error] = upload_layer(g, sp, filled, chunks, top, l);
         if (sel e13.err) { ret e13; }
-        val e14: err[gfx.Error] = send(g, cells_of(?g.p, l, g.front));
-        if (sel e14.err) { ret e14; }
-        val e15: err[gfx.Error] = edit_painted(g, sp, filled, l);
+        val e15: err[gfx.Error] = edits_of(g, sp, filled, l);
         if (sel e15.err) { ret e15; }
         l = l + 1;
+    }
+    val e16: err[gfx.Error] = edit_painted(g);
+    if (sel e16.err) { ret e16; }
+    if (g.restart) {
+        val es: err[gfx.Error] = start_shown(g, sp);
+        if (sel es.err) { ret es; }
     }
     vector.clear[Write](?g.writes);
     if (g.stepping) {
@@ -2530,6 +2949,56 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
     ret err[gfx.Error].ok{};
 }
 
+# take up the host's view layers in place, where the GPU steps the world and
+# the host's layers differ from its own in view layers alone (views_nest):
+# the store makes or deletes those layers' shards and keeps every other
+# (store_views), so no cell moves and the host's staging copy, which took
+# them up without a cell (space.restage), sends none. a shown layer taken up
+# is started from the state layer once the frame's edits are in (start_shown).
+# a generation part way through starts over, since its finished ranges wrote
+# no shown layer or one now gone. other layers than the host's are left to
+# the relayout that makes them again from the host's cells
+fun review(g: *Gpu, sp: *space.Space) err[gfx.Error] {
+    val set: *plane.Set = space.layers(sp);
+    if (plane.same(?g.p.set, set) || !in_place(g, set)) { ret err[gfx.Error].ok{}; }
+    val st:    *Store         = store_of(g, ?g.p);
+    val now:   opt[usize]     = plane.shown(set);
+    val was:   opt[usize]     = plane.shown(?g.p.set);
+    val shown: bool           = (sel now.some) && (sel was.none);
+    val e:     err[gfx.Error] = store_views(g, st, set);
+    if (sel e.err) { ret e; }
+    g.p.set = @set;
+    if (g.reserved) { g.next.set = @set; }
+    if (shown)      { g.restart = true; }
+    g.going   = false;
+    g.counted = false;
+    ret err[gfx.Error].ok{};
+}
+
+# start the shown layer the pool just took up from its state layer, in both
+# cells of every slot below the GPU's top or the host's, under the rule's
+# sense and lit value as the host holds them (start_comp)
+fun start_shown(g: *Gpu, sp: *space.Space) err[gfx.Error] {
+    g.restart = false;
+    var top: usize = sp.hi;
+    if (g.hi > top)            { top = g.hi; }
+    if (g.owns && g.top > top) { top = g.top; }
+    if (top > g.p.cap)         { top = g.p.cap; }
+    if (top == 0)              { ret err[gfx.Error].ok{}; }
+    val k: opt[usize] = plane.shown(?g.p.set);
+    if (sel k.none) { ret err[gfx.Error].ok{}; }
+    # the head's sense and pool words, which the stage reads, as the host
+    # holds them now, ahead of the frame's own head
+    val es: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.meta, 3 * 4, (?sp.sense)::*u8, $size_of(layout.Sense));
+    if (sel es.err) { ret es; }
+    val ew: err[gfx.Error] = write_pool_words(g);
+    if (sel ew.err) { ret ew; }
+    var mb: [1]*gfx.StorageBuffer;
+    mb[0] = ?g.p.meta;
+    val words: usize = plane.span_words(g.p.set.at[k.some].width);
+    ret dispatch_rows(g, ?g.start, ?mb[0], 1, ((words + 63) / 64)::u32, top);
+}
+
 # hand the pool the host changed back to the GPU: the gate reopened, the
 # incarnations going on from the host's, the top and the capacity written, and
 # the hash and the free bits seeded from the page table just uploaded. the next
@@ -2548,22 +3017,21 @@ fun hand_back(g: *Gpu, sp: *space.Space) err[gfx.Error] {
 }
 
 # seed the GPU's hash and free bits from its page table again, for the top
-# and the capacity written ahead of it, which also clears the tombstones out of
-# the hash
+# written ahead of it and the capacity the meta head holds, which also clears
+# the tombstones out of the hash
 fun rehash(g: *Gpu) err[gfx.Error] {
-    var w: [2]u32;
-    w[0] = g.top::u32;
-    w[1] = g.p.cap::u32;
-    val et: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.status, layout.CTL_TOP::usize * 4, (?w[0])::*u8, 8);
+    val top: u32            = g.top::u32;
+    val et:  err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.status, layout.CTL_TOP::usize * 4, (?top)::*u8, 4);
     if (sel et.err) { ret et; }
-    var wb: [1]*gfx.StorageBuffer;
-    wb[0] = ?g.p.status;
-    val ew: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.wipe, ?wb[0], 1, layout.HASH / 64, 1, 1);
+    var wb: [2]*gfx.StorageBuffer;
+    wb[0] = ?g.p.meta;
+    wb[1] = ?g.p.status;
+    val ew: err[gfx.Error] = dispatch_each(g, ?g.wipe, ?wb[0], 2, layout.buckets(g.p.cap::u32)::usize);
     if (sel ew.err) { ret ew; }
     var sb: [2]*gfx.StorageBuffer;
     sb[0] = ?g.p.meta;
     sb[1] = ?g.p.status;
-    val es: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.seed, ?sb[0], 2, ((g.p.cap + 63) / 64)::u32, 1, 1);
+    val es: err[gfx.Error] = dispatch_each(g, ?g.seed, ?sb[0], 2, g.p.cap);
     if (sel es.err) { ret es; }
     g.rehash = false;
     ret err[gfx.Error].ok{};
@@ -2688,7 +3156,7 @@ fun upload_view(g: *Gpu, sp: *space.Space, look: *Look) err[gfx.Error] {
             }
             i = i + 1;
         }
-        e = send(g, ?g.p.mip);
+        e = send_mip(g);
     }
     or {
         e = send_drawn(g, sp);
@@ -2706,20 +3174,58 @@ fun upload_view(g: *Gpu, sp: *space.Space, look: *Look) err[gfx.Error] {
     ret e;
 }
 
-# send the layers the draw reads of the slots in sent, each layer as one batch
+# send the batched pyramids, each written at its slot's pyramid as if the
+# pyramids were one buffer, a batch a shard
+fun send_mip(g: *Gpu) err[gfx.Error] {
+    val st: *Store = store_of(g, ?g.p);
+    var j:  usize  = 0;
+    for (j < st.n) {
+        vector.clear[gfx.BufferWrite](?g.split);
+        var i: usize = 0;
+        for (i < g.batch.len) {
+            val w:  gfx.BufferWrite = g.batch.data[i];
+            val sl: usize           = w.offset / (MIP * 4);
+            if (layout.shard_of(sl::u32, st.m)::usize == j) {
+                val pushed: res[usize, allo.Error] = vector.push[gfx.BufferWrite](?g.split, gfx.BufferWrite{offset: mip_at(st, sl).off, src: w.src, len: w.len});
+                if (sel pushed.err) {
+                    vector.clear[gfx.BufferWrite](?g.batch);
+                    ret err[gfx.Error].err{gfx.Error.alloc{pushed.err}};
+                }
+            }
+            i = i + 1;
+        }
+        if (g.split.len != 0) {
+            val e: err[gfx.Error] = gfx.renderer_buffer_update_batch(g.r, ?st.mip[j], g.split.data, g.split.len);
+            if (sel e.err) {
+                vector.clear[gfx.BufferWrite](?g.batch);
+                ret e;
+            }
+        }
+        j = j + 1;
+    }
+    vector.clear[gfx.BufferWrite](?g.batch);
+    ret err[gfx.Error].ok{};
+}
+
+# send the layers the draw reads of the slots in sent, a batch a layer's shard
 fun send_drawn(g: *Gpu, sp: *space.Space) err[gfx.Error] {
-    var k: usize = 0;
+    val st: *Store = store_of(g, ?g.p);
+    var k:  usize  = 0;
     for (k < g.p.set.n) {
-        if (k == 0 || g.p.set.at[k].role == layer.VIEW) {
+        var j: usize = 0;
+        for ((k == 0 || g.p.set.at[k].role == layer.VIEW) && j < st.n) {
             var i: usize = 0;
             for (i < g.sent.len) {
-                val sl: usize          = g.sent.data[i]::usize;
-                val eq: err[gfx.Error] = queue(g, span_offset(?g.p, k, sl), space.span_run(sp, k, sl)::*u8, span_bytes(?g.p, k));
-                if (sel eq.err) { ret eq; }
+                val sl: usize = g.sent.data[i]::usize;
+                if (layout.shard_of(sl::u32, st.m)::usize == j) {
+                    val eq: err[gfx.Error] = queue(g, cells_at(st, k, front(g), sl).off, space.span_run(sp, k, sl)::*u8, span_bytes(?g.p, k));
+                    if (sel eq.err) { ret eq; }
+                }
                 i = i + 1;
             }
-            val es: err[gfx.Error] = send(g, cells_of(?g.p, k, g.front));
+            val es: err[gfx.Error] = send(g, ?st.cells[layout.cells_entry(k::u32, front(g)::u32, j::u32)::usize]);
             if (sel es.err) { ret es; }
+            j = j + 1;
         }
         k = k + 1;
     }
@@ -2734,7 +3240,8 @@ pub fun pyramids_hold(g: *Gpu, sp: *space.Space) bool {
     var s:   usize = 0;
     for (s < g.hi && s < sp.hi) {
         if (space.used(sp, s) && sp.dirty[s] == 0) {
-            val e: err[gfx.Error] = gfx.storage_buffer_read(g.d, ?g.p.mip, s * MIP * 4, (?got[0])::*u8, MIP * 4);
+            val pc: Piece          = mip_at(store_of(g, ?g.p), s);
+            val e:  err[gfx.Error] = gfx.storage_buffer_read(g.d, pc.b, pc.off, (?got[0])::*u8, MIP * 4);
             if (sel e.err) { ret false; }
             var lv: space.Lives = space.lives_of(sp, s, false);
             space.pyramid(space.plane_of(sp, 0, s), sp.sense, ?lv, ?g.built[0]);
@@ -2753,7 +3260,8 @@ pub fun pyramids_hold(g: *Gpu, sp: *space.Space) bool {
 # plane.span_words words; call outside a frame
 #[testing]
 pub fun read_front(g: *Gpu, k: usize, s: usize, out: *u32) bool {
-    val e: err[gfx.Error] = gfx.storage_buffer_read(g.d, cells_of(?g.p, k, g.front), span_offset(?g.p, k, s), out::*u8, span_bytes(?g.p, k));
+    val pc: Piece          = cells_at(store_of(g, ?g.p), k, front(g), s);
+    val e:  err[gfx.Error] = gfx.storage_buffer_read(g.d, pc.b, pc.off, out::*u8, span_bytes(?g.p, k));
     ret sel e.ok;
 }
 
@@ -2779,23 +3287,50 @@ fun write_head(g: *Gpu, r: *rule.Rule, gen: u64) {
     # the frame's first step, of serial g.serial + 1, reads generation gen
     g.head[layout.GEN_AT::usize] = (((gen & 0xffffffff) + 0x200000000 - g.serial::u64 - 1) & 0xffffffff)::u32;
     if (rule.caps(r).b0) { g.head[layout.STROBE_AT::usize] = 1; }
-    # the shared stages read the pool's state layer at its width
-    g.head[layout.WIDTH_AT::usize] = g.p.set.at[0].width;
-    # and its live rule layers at theirs, and its shown layer at its own
-    var live: u32   = 0;
-    var j:    u32   = 0;
-    var k:    usize = 1;
-    for (k < plane.exact(?g.p.set) && j < layer.LIVE_MAX) {
-        if (g.p.set.at[k].live) {
-            live = layer.live_add(live, j, g.p.set.at[k].width);
-            j    = j + 1;
-        }
+    fill_pool_words(g);
+    rule.pack(r, ?g.head[layout.SHARED]);
+}
+
+# the first and the last of the head's words that say where the pool lies and
+# what its layers are, past the step's first entry: the set, the widths, the
+# capacity, the geometry and the shard table's address (cellar.layout)
+val POOL_AT:  usize = layout.WIDTH_AT::usize;
+val POOL_END: usize = layout.SHARDS_AT::usize + 2;
+
+# stage the head's pool words for the pool in use: the state layer's width,
+# which the shared stages read it at, every layer's width, the shown layer
+# and the live rule layers, which the stages that judge a cell live read
+# (cellar.layer set_word), the capacity, the geometry, and the shard table's
+# address, low word first
+fun fill_pool_words(g: *Gpu) {
+    val st:     *Store = store_of(g, ?g.p);
+    var widths: u32    = 0;
+    var lives:  u32    = 0;
+    var k:      usize  = 0;
+    for (k < g.p.set.n) {
+        widths = layer.widths_add(widths, k::u32, g.p.set.at[k].width);
+        if (k != 0 && k < plane.exact(?g.p.set) && g.p.set.at[k].live) { lives = lives | (1 << k::u32); }
         k = k + 1;
     }
-    val shown: u32 = plane.shown_width(?g.p.set);
-    if (shown != 0) { live = layer.live_add(live, layer.SHOWN_SLOT, shown); }
-    g.head[layout.LIVE_AT::usize] = live;
-    rule.pack(r, ?g.head[layout.SHARED]);
+    var shown: u32        = 0;
+    val sk:    opt[usize] = plane.shown(?g.p.set);
+    if (sel sk.some) { shown = sk.some::u32; }
+    g.head[layout.WIDTH_AT::usize]      = g.p.set.at[0].width;
+    g.head[layout.SET_AT::usize]        = layer.set_word(g.p.set.n::u32, shown, lives);
+    g.head[layout.WIDTHS_AT::usize]     = widths;
+    g.head[layout.CAP_AT::usize]        = g.p.cap::u32;
+    g.head[layout.SHARD_AT::usize]      = st.m;
+    g.head[layout.LIT_AT::usize]        = g.lit;
+    g.head[layout.FOLD_AT::usize]       = g.fold;
+    g.head[layout.SHARDS_AT::usize]     = (st.at & 0xffffffff)::u32;
+    g.head[layout.SHARDS_AT::usize + 1] = (st.at >> 32)::u32;
+}
+
+# write the head's pool words into the meta buffer of the pool in use, in
+# order with the frame's work, so the stages a flush records read them
+fun write_pool_words(g: *Gpu) err[gfx.Error] {
+    fill_pool_words(g);
+    ret gfx.renderer_buffer_update(g.r, ?g.p.meta, POOL_AT * 4, (?g.head[POOL_AT])::*u8, (POOL_END - POOL_AT) * 4);
 }
 
 # plan a step of the generation going over the list from entry lo: n entries,
@@ -2807,7 +3342,6 @@ fun plan_step(g: *Gpu, lo: usize, n: usize, tail: bool) {
     op.gather = false;
     op.free   = false;
     op.tail   = tail;
-    op.src    = g.front;
     op.lo     = lo::u32;
     op.n      = n::u32;
     op.now    = g.serial + 1;
@@ -2823,7 +3357,6 @@ fun plan_pass(g: *Gpu, free: bool, span: u32) {
     op.pass   = true;
     op.gather = false;
     op.free   = free;
-    op.src    = g.front;
     op.now    = g.serial;
     op.id     = g.pass;
     op.gens   = (g.gens & 0xffffffff)::u32;
@@ -2852,32 +3385,28 @@ fun record_step(g: *Gpu, step: *gfx.Compute, bound: usize, tab: u32, op: *Op) er
     if (sel es.err) { ret es; }
     val eb: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.meta, layout.BASE_AT::usize * 4, (?op.lo)::*u8, 4);
     if (sel eb.err) { ret eb; }
-    # every layer's source and destination where its stage binds them
-    # (cellar.layer binding), after a rule buffer it binds
-    var bufs: [layer.LAYERS_MAX * 2 + 3]*gfx.StorageBuffer;
-    bufs[2]                           = ?g.p.meta;
-    bufs[3]                           = ?g.p.flags;
+    # the meta and flags buffers, then a rule buffer the family binds; the
+    # stage reaches every layer by address, the cells the serial names
+    # (cellar.layer)
+    var bufs: [3]*gfx.StorageBuffer;
+    bufs[0]                           = ?g.p.meta;
+    bufs[1]                           = ?g.p.flags;
     bufs[layout.TABLE_BINDING::usize] = ?g.table;
-    var k: usize = 0;
-    for (k < g.p.set.n) {
-        val at: usize = layer.binding(k::u32, tab)::usize;
-        bufs[at]     = cells_of(?g.p, k, op.src);
-        bufs[at + 1] = cells_of(?g.p, k, 1 - op.src);
-        k            = k + 1;
-    }
     if (op.tail) { ret gfx.renderer_dispatch_indirect(g.r, step, ?bufs[0], bound, ?g.p.flags, layout.FLAGS_ARGS::usize * 4); }
-    ret gfx.renderer_dispatch(g.r, step, ?bufs[0], bound, 8, op.n, 1);
+    ret dispatch_rows(g, step, ?bufs[0], bound, 8, op.n::usize);
 }
 
-# record a planned gather: the list emptied and its header bits set, the meta
-# serial the next step's, then a slot an invocation below the top
+# record a planned gather: the list emptied, its arguments covering no entry
+# and its header bits set, the meta serial the next step's, then a slot an
+# invocation below the top
 fun record_gather(g: *Gpu, op: *Op) err[gfx.Error] {
-    var args: [4]u32;
+    var args: [5]u32;
     args[0] = 8;
     args[1] = 0;
     args[2] = 1;
     args[3] = op.bits;
-    val ea: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.flags, layout.FLAGS_ARGS::usize * 4, (?args[0])::*u8, 16);
+    args[4] = 0;
+    val ea: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.flags, layout.FLAGS_ARGS::usize * 4, (?args[0])::*u8, 20);
     if (sel ea.err) { ret ea; }
     val es: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.meta, layout.SERIAL_AT::usize * 4, (?op.now)::*u8, 4);
     if (sel es.err) { ret es; }
@@ -2885,9 +3414,9 @@ fun record_gather(g: *Gpu, op: *Op) err[gfx.Error] {
     bufs[0] = ?g.p.meta;
     bufs[1] = ?g.p.flags;
     bufs[2] = ?g.p.status;
-    var groups: u32 = ((g.hi + 63) / 64)::u32;
-    if (groups == 0) { groups = 1; }
-    ret gfx.renderer_dispatch(g.r, ?g.gather, ?bufs[0], 3, groups, 1, 1);
+    var slots: usize = g.hi;
+    if (slots == 0) { slots = 1; }
+    ret dispatch_each(g, ?g.gather, ?bufs[0], 3, slots);
 }
 
 # record a planned pass: its header into the status head, then the mark, the
@@ -2895,36 +3424,39 @@ fun record_gather(g: *Gpu, op: *Op) err[gfx.Error] {
 fun record_pass(g: *Gpu, op: *Op) err[gfx.Error] {
     var h: [17]u32;
     mem.zero[u32](?h[0], 17);
-    h[0]  = g.top::u32;
-    h[1]  = g.p.cap::u32;
-    h[3]  = 0;
-    h[4]  = op.id;
-    h[5]  = op.now;
-    h[6]  = op.gens;
-    h[8]  = op.span;
-    h[11] = 0;
-    h[12] = 1;
+    h[0] = g.top::u32;
+    h[3] = 0;
+    h[4] = op.id;
+    h[5] = op.now;
+    h[6] = op.gens;
+    h[8] = op.span;
+    # the settle's and the clear's arguments cover no row until the mark and
+    # the settle raise them, the clear's workgroups along x covering the widest
+    # span, 64 words a workgroup
+    h[11] = 1;
+    h[12] = 0;
     h[13] = 1;
-    # the clear of the state layer covers its span, 64 words a workgroup
-    h[14] = (span_bytes(?g.p, 0) / 256)::u32;
+    h[14] = clear_groups(?g.p);
     h[15] = 0;
     h[16] = 1;
     val eh: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.status, layout.CTL_TOP::usize * 4, (?h[0])::*u8, 17 * 4);
     if (sel eh.err) { ret eh; }
-    var mb: [layer.LIVE_BINDING + layer.LIVE_MAX]*gfx.StorageBuffer;
-    mb[0] = cells_of(?g.p, 0, op.src);
-    mb[1] = ?g.p.meta;
-    mb[2] = ?g.p.status;
-    mb[3] = ?g.p.flags;
-    val mn: usize          = bind_lives(g, ?mb[0], op.src);
-    val em: err[gfx.Error] = gfx.renderer_dispatch(g.r, judge(g, ?g.mark, 2), ?mb[0], mn, 1, g.top::u32, 1);
+    # the list the settle fills for the clear starts empty
+    val none: u32            = 0;
+    val el:   err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.list, 0, (?none)::*u8, 4);
+    if (sel el.err) { ret el; }
+    var mb: [3]*gfx.StorageBuffer;
+    mb[0] = ?g.p.meta;
+    mb[1] = ?g.p.status;
+    mb[2] = ?g.p.flags;
+    val em: err[gfx.Error] = dispatch_rows(g, ?g.mark, ?mb[0], 3, 1, g.top);
     if (sel em.err) { ret em; }
     if (op.free) {
         var fb: [3]*gfx.StorageBuffer;
         fb[0] = ?g.p.meta;
         fb[1] = ?g.p.status;
         fb[2] = ?g.p.flags;
-        val ef: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.free, ?fb[0], 3, ((g.top + 63) / 64)::u32, 1, 1);
+        val ef: err[gfx.Error] = dispatch_each(g, ?g.free, ?fb[0], 3, g.top);
         if (sel ef.err) { ret ef; }
     }
     var sb: [3]*gfx.StorageBuffer;
@@ -2933,24 +3465,41 @@ fun record_pass(g: *Gpu, op: *Op) err[gfx.Error] {
     sb[2] = ?g.p.list;
     val es: err[gfx.Error] = gfx.renderer_dispatch_indirect(g.r, ?g.settle, ?sb[0], 3, ?g.p.status, layout.ARGS_SETTLE::usize * 4);
     if (sel es.err) { ret es; }
-    # a clear a layer, the arguments' workgroups along x covering its span
-    var k: usize = 0;
-    for (k < g.p.set.n) {
-        if (k != 0) {
-            val x:  u32            = (span_bytes(?g.p, k) / 256)::u32;
-            val ex: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.status, layout.ARGS_CLEAR::usize * 4, (?x)::*u8, 4);
-            if (sel ex.err) { ret ex; }
-        }
-        var zb: [4]*gfx.StorageBuffer;
-        zb[0] = cells_of(?g.p, k, 0);
-        zb[1] = cells_of(?g.p, k, 1);
-        zb[2] = ?g.p.list;
-        zb[3] = ?g.p.flags;
-        val ez: err[gfx.Error] = gfx.renderer_dispatch_indirect(g.r, ?g.clear, ?zb[0], 4, ?g.p.status, layout.ARGS_CLEAR::usize * 4);
-        if (sel ez.err) { ret ez; }
+    var zb: [3]*gfx.StorageBuffer;
+    zb[0] = ?g.p.meta;
+    zb[1] = ?g.p.list;
+    zb[2] = ?g.p.flags;
+    ret gfx.renderer_dispatch_indirect(g.r, ?g.clear, ?zb[0], 3, ?g.p.status, layout.ARGS_CLEAR::usize * 4);
+}
+
+# dispatch a stage over rows rows of x workgroups each, the rows past the
+# device's most along y folded onto z (layout.row), so no dispatch passes the
+# device's workgroup counts however many slots or entries it covers. every
+# stage finds its row as layout.row does and bounds it, since the last step
+# along z may run past rows. the counts are within what any device holds
+# (test dispatch_rows__fold_the_most_rows_within_any_device)
+fun dispatch_rows(g: *Gpu, c: *gfx.Compute, bufs: **gfx.StorageBuffer, n: usize, x: u32, rows: usize) err[gfx.Error] {
+    if (rows == 0) { ret err[gfx.Error].ok{}; }
+    val last: u32 = (rows - 1)::u32;
+    ret gfx.renderer_dispatch(g.r, c, bufs, n, x, layout.fold_y(last, g.fold), layout.fold_z(last, g.fold));
+}
+
+# dispatch a stage over count invocations, a row of 64 a workgroup
+# (dispatch_rows)
+fun dispatch_each(g: *Gpu, c: *gfx.Compute, bufs: **gfx.StorageBuffer, n: usize, count: usize) err[gfx.Error] {
+    ret dispatch_rows(g, c, bufs, n, 1, (count + 63) / 64);
+}
+
+# the clear stage's workgroups along x for a pool: 64 words of the widest
+# layer's span each
+fun clear_groups(p: *Pool) u32 {
+    var most: usize = 0;
+    var k:    usize = 0;
+    for (k < p.set.n) {
+        if (span_bytes(p, k) > most) { most = span_bytes(p, k); }
         k = k + 1;
     }
-    ret err[gfx.Error].ok{};
+    ret (most / 256)::u32;
 }
 
 # record the frame's planned dispatches: the gate stage first while the GPU
@@ -2962,7 +3511,7 @@ fun record_ops(g: *Gpu, step: *gfx.Compute, bound: usize, tab: u32) err[gfx.Erro
         var gb: [2]*gfx.StorageBuffer;
         gb[0] = ?g.p.status;
         gb[1] = ?g.p.flags;
-        val eg: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.gate, ?gb[0], 2, 1, 1, 1);
+        val eg: err[gfx.Error] = dispatch_rows(g, ?g.gate, ?gb[0], 2, 1, 1);
         if (sel eg.err) { ret eg; }
     }
     var k: usize = 0;
@@ -3052,8 +3601,8 @@ pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, 
     val step: *gfx.Compute = ?g.steps[fam];
     var tab:  u32          = 0;
     if (rule.table(fam)) { tab = 1; }
-    # the stage binds every layer of the pool (cellar.layer binding)
-    val bound: usize = layer.bindings(g.p.set.n::u32, tab)::usize;
+    # the stage binds the meta and flags buffers and a rule buffer it has
+    val bound: usize = layout.STEP_BINDINGS::usize + tab::usize;
     # the list holds no more than the slots below the top, and what the newest
     # census found it held is what a generation is expected to step
     var est: usize = g.est;
@@ -3070,8 +3619,10 @@ pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, 
     for (n < steps) {
         if (!g.going) {
             # a family the device could not build a stage for is refused before
-            # it runs (cellar.sim), so it is never asked to step here
-            if (!g.ready[fam]) { brk; }
+            # it runs (cellar.sim), so it is never asked to step here. one the
+            # world met in the tree, where no rule is asked of the GPU, is
+            # built the first frame it steps here
+            if (!prepare(g, fam)) { brk; }
             if (!g.owns && budget(g, radius) == 0) {
                 g.cut = true;
                 brk;
@@ -3087,11 +3638,11 @@ pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, 
             val gather: bool  = pass || !g.listed || g.gathered + radius > layout.LIST_SPREAD::usize;
             var cost:   usize = 0;
             if (pass) {
-                cost = pass_calls(g.p.set.n);
+                cost = PASS_CALLS;
                 if (first) { cost = cost + 1; }
             }
             if (gather) { cost = cost + 1; }
-            if (calls + cost >= max_calls(g.p.set.n)) {
+            if (calls + cost >= MAX_STEPS) {
                 g.limited = true;
                 brk;
             }
@@ -3122,7 +3673,7 @@ pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, 
             # the span does not cut covers the list to its end, however long
             var left: usize = 0;
             if (g.at < est) { left = est - g.at; }
-            if ((room == 0 && left != 0) || calls >= max_calls(g.p.set.n)) {
+            if ((room == 0 && left != 0) || calls >= MAX_STEPS) {
                 g.limited = true;
                 brk;
             }
@@ -3143,10 +3694,7 @@ pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, 
             }
         }
         # the generation is complete, and the back cells become the world
-        if (g.at != 0) {
-            g.serial = g.serial + 1;
-            g.front  = 1 - g.front;
-        }
+        if (g.at != 0) { g.serial = g.serial + 1; }
         g.going    = false;
         g.counted  = false;
         g.spread   = g.spread + radius::u64;
@@ -3185,26 +3733,21 @@ pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, 
     if (g.going && g.counted) { ret res[usize, gfx.Error].ok{n}; }
     g.counted = true;
     if (g.hi != 0) {
-        var rb: [layer.SHOWN_BINDING + 1]*gfx.StorageBuffer;
-        rb[0] = cells_of(?g.p, 0, g.front);
-        rb[1] = ?g.p.meta;
-        rb[2] = ?g.p.flags;
-        rb[3] = ?g.p.mip;
-        val rn: usize          = bind_shown(g, ?rb[0], bind_lives(g, ?rb[0], g.front), g.front);
-        val er: err[gfx.Error] = gfx.renderer_dispatch(g.r, judge(g, ?g.reduce, 1), ?rb[0], rn, 1, g.hi::u32, 1);
+        var rb: [2]*gfx.StorageBuffer;
+        rb[0] = ?g.p.meta;
+        rb[1] = ?g.p.flags;
+        val er: err[gfx.Error] = dispatch_rows(g, ?g.reduce, ?rb[0], 2, 1, g.hi);
         if (sel er.err) { ret res[usize, gfx.Error].err{er.err}; }
     }
 
     # a workgroup a slot, and one even with none, to write the census id
-    var groups: u32 = g.hi::u32;
+    var groups: usize = g.hi;
     if (groups == 0) { groups = 1; }
-    var cb: [layer.SHOWN_BINDING + 1]*gfx.StorageBuffer;
-    cb[0] = cells_of(?g.p, 0, g.front);
-    cb[1] = ?g.p.meta;
-    cb[2] = ?g.p.status;
-    cb[3] = ?g.p.flags;
-    val cn:  usize          = bind_shown(g, ?cb[0], bind_lives(g, ?cb[0], g.front), g.front);
-    val e19: err[gfx.Error] = gfx.renderer_dispatch(g.r, judge(g, ?g.census, 0), ?cb[0], cn, 1, groups, 1);
+    var cb: [3]*gfx.StorageBuffer;
+    cb[0] = ?g.p.meta;
+    cb[1] = ?g.p.status;
+    cb[2] = ?g.p.flags;
+    val e19: err[gfx.Error] = dispatch_rows(g, ?g.census, ?cb[0], 3, 1, groups);
     if (sel e19.err) { ret res[usize, gfx.Error].err{e19.err}; }
     val e20: err[gfx.Error] = gfx.renderer_readback(g.r, ?g.p.rb, ?g.p.status, 0);
     if (sel e20.err) { ret res[usize, gfx.Error].err{e20.err}; }
@@ -3257,13 +3800,10 @@ pub fun aim(g: *Gpu, look: *Look) err[gfx.Error] {
 # draw every chunk into an open pass
 pub fun draw(g: *Gpu, p: *gfx.Pass) {
     if (g.hi == 0) { ret; }
-    var bufs: [5]*gfx.StorageBuffer;
-    bufs[0] = cells_of(?g.p, 0, g.front);
-    bufs[1] = ?g.p.meta;
-    bufs[2] = ?g.view;
-    bufs[3] = ?g.p.mip;
-    bufs[4] = shown_cells(?g.p, g.front);
-    gfx.pass_draw_storage(p, ?bufs[0], 5, 6, g.hi::u32, ?g.mat, ?g.xf, ?g.draw);
+    var bufs: [2]*gfx.StorageBuffer;
+    bufs[0] = ?g.p.meta;
+    bufs[1] = ?g.view;
+    gfx.pass_draw_storage(p, ?bufs[0], 2, 6, g.hi::u32, ?g.mat, ?g.xf, ?g.draw);
 }
 
 test pace_for__follows_the_refresh_interval_and_falls_back_to_sixty {
@@ -3314,27 +3854,56 @@ test timers__outnumber_the_frames_in_flight {
 }
 
 test max_steps__fills_the_frames_storage_binding_sets {
-    if (MAX_STEPS != max_calls(1)) { ret 1; }
-    # a pool of more layers grows, clears and edits each of them, leaving its steps fewer
-    var n: usize = 1;
-    for (n <= layer.LAYERS_MAX::usize) {
-        if (max_calls(n) + frame_sets(n) != gfx.MAX_STORAGE_SETS || max_calls(n) > MAX_STEPS) { ret 2; }
-        n = n + 1;
+    if (MAX_STEPS + FRAME_SETS != gfx.MAX_STORAGE_SETS) { ret 1; }
+    ret 0;
+}
+
+test most_slots__is_what_the_largest_geometry_s_shards_hold {
+    if (MOST_SLOTS != layout.shard_start(layout.SHARDS_MAX, layout.SHARD_LOG_MAX)::usize) { ret 1; }
+    # a painted cell's key holds every slot
+    if ((paint_key((MOST_SLOTS - 1)::u32, 4095, 0xfffffff) >> 40) != (MOST_SLOTS - 1)::u64) { ret 2; }
+    ret 0;
+}
+
+test dispatch_rows__fold_the_most_rows_within_any_device {
+    # every device holds 65535 workgroups along each axis (vulkan's
+    # maxComputeWorkGroupCount), and the most rows a stage covers are a slot's
+    # or an entry's each, 64 buckets' or 64 edits' each
+    val least: u32      = 65535;
+    val most:  [3]usize = [3]usize{MOST_SLOTS, layout.buckets(MOST_SLOTS::u32)::usize / 64, layout.EDITS_MAX::usize / 64};
+    var k:     usize    = 0;
+    for (k < 3) {
+        val last: u32 = (most[k] - 1)::u32;
+        if (layout.fold_y(last, least) > least || layout.fold_z(last, least) > least) { ret 1 + k::i32; }
+        k = k + 1;
     }
     ret 0;
 }
 
-test ceiling__is_the_cells_share_of_the_storage_range {
+test ceiling__is_whole_shards_inside_the_storage_range_and_the_memory_limit {
     var l: gfx.Limits;
     mem.zero[u8]((?l)::*u8, $size_of(gfx.Limits));
-    if (ceiling(l) != 0) { ret 1; }
-    # the 128 MiB every device guarantees holds 8192 chunks of 16 KiB
+    var set: plane.Set = plane.state("cells", layer.WIDTH_MAX);
+    if (ceiling(l, ?set, 0) != 0) { ret 1; }
+    # the 128 MiB every device binds holds the meta buffer's page table of
+    # more than a million slots, so the shards bound a 32-bit pool there
     l.max_storage_buffer_range = 134217728;
-    if (ceiling(l) != 8192) { ret 2; }
-    l.max_storage_buffer_range = 100 * 1048576;
-    if (ceiling(l) != 6400) { ret 3; }
-    # past what the stages' arrays are declared for, those cap it
-    l.max_storage_buffer_range = 4294967295;
-    if (ceiling(l) != layout.MAX_SLOTS::usize) { ret 4; }
+    val m:   u32   = geometry(?set, 0);
+    val all: usize = ceiling(l, ?set, 0);
+    if (all != layout.shard_start(layout.SHARDS_MAX, m)::usize) { ret 2; }
+    # a limit holds the pool to the whole shards that fit it
+    val limit: u64   = 1073741824;
+    val n:     usize = ceiling(l, ?set, limit);
+    if (n == 0 || (n * slot_bytes(?set) + pool_bytes(n))::u64 > limit) { ret 3; }
+    val k: u32 = layout.shard_of(n::u32, m);
+    if (layout.shard_start(k, m)::usize != n) { ret 4; }
+    val next: usize = layout.shard_start(k + 1, m)::usize;
+    if ((next * slot_bytes(?set) + pool_bytes(next))::u64 <= limit) { ret 5; }
+    # a range too small for the bound buffers of the first shard holds none
+    l.max_storage_buffer_range = 1024;
+    if (ceiling(l, ?set, 0) != 0) { ret 6; }
+    # a 1-bit set's shards hold more slots, the pyramids then the widest
+    var bit: plane.Set = plane.state("cells", 1);
+    if (geometry(?bit, 0) <= geometry(?set, 0) || geometry(?set, 1048576) != 6) { ret 7; }
     ret 0;
 }

@@ -1,7 +1,7 @@
 # free every chunk no pass needs any more, while the GPU owns the pool
 #
 # runs once a frame, in its first pass, after the mark stage. an invocation is
-# one slot below the top: a chunk the step left nothing warm in at the front,
+# one slot below the top, a row of 64 of them a workgroup (cellar.layout row): a chunk the step left nothing warm in at the front,
 # that no live chunk asked for this pass, is freed as space.release frees one.
 # a stamp of the next serial, left by a generation an edit started over,
 # keeps a chunk too, as the census counts it.
@@ -32,22 +32,26 @@ val BUF: u32 = sy.SEMANTICS_UNIFORM_MEMORY;
 #[stage("compute")]
 #[workgroup(64, 1, 1)]
 fun comp_main() {
-    val s: u32 = gid[0];
+    val s: u32 = layout.row(gid[1], gid[2], meta.base[layout.FOLD_AT - layout.BASE_AT]) * 64 + gid[0];
     val e: u32 = s * layout.ENTRY;
-    if (s >= status.head[layout.CTL_TOP] || meta.table[e + layout.INCARNATION_AT] == 0) { ret; }
+    if (s >= status.head[layout.CTL_TOP])           { ret; }
+    if (meta.table[e + layout.INCARNATION_AT] == 0) { ret; }
     # while the gate is closed the steps since it closed were voided, and the
     # stamps are older than the serial in the header, so nothing is freed
     if (status.head[layout.CTL_GATE] != 0) { ret; }
+    val cap: u32 = meta.base[layout.CAP_AT - layout.BASE_AT];
     val now: u32 = status.head[layout.CTL_NOW];
-    if (status.asked[s] == status.head[layout.CTL_PASS]) { ret; }
+    if (status.v[layout.asked_at(cap) + s] == status.head[layout.CTL_PASS]) { ret; }
     val a: u32 = flags.v[s * 2];
     val w: u32 = flags.v[s * 2 + 1];
     if (a == now || a == now + 1 || w == now || w == now + 1) { ret; }
     val bx: u32 = meta.table[e + 9];
     val by: u32 = meta.table[e + 10];
-    var b:  u32 = layout.bucket(bx, by);
-    for (at.atomic_load_u32(?status.hash[b], DEV, sy.SEMANTICS_ACQUIRE | BUF) != s) { b = (b + 1) & (layout.HASH - 1); }
-    at.atomic_store_u32(?status.hash[b], DEV, sy.SEMANTICS_RELEASE | BUF, layout.TOMB);
+    val n:  u32 = layout.buckets(cap);
+    val h:  u32 = layout.hash_at(cap);
+    var b:  u32 = layout.bucket(bx, by, n);
+    for (at.atomic_load_u32(?status.v[h + b], DEV, sy.SEMANTICS_ACQUIRE | BUF) != s) { b = (b + 1) & (n - 1); }
+    at.atomic_store_u32(?status.v[h + b], DEV, sy.SEMANTICS_RELEASE | BUF, layout.TOMB);
     at.atomic_add_u32(?status.head[layout.CTL_TOMBS], DEV, sy.SEMANTICS_RELAXED, 1);
     var k: u32 = 0;
     for (k < 9) {
@@ -60,5 +64,5 @@ fun comp_main() {
         meta.table[e + k] = 0;
         k                 = k + 1;
     }
-    at.atomic_or_u32(?status.bitmap[s / 32], DEV, sy.SEMANTICS_ACQUIRE_RELEASE | BUF, 1 << (s % 32));
+    at.atomic_or_u32(?status.v[layout.bitmap_at(cap) + s / 32], DEV, sy.SEMANTICS_ACQUIRE_RELEASE | BUF, 1 << (s % 32));
 }
