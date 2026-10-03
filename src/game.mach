@@ -48,6 +48,7 @@ use cellar.bounds;
 use cellar.command;
 use cellar.config;
 use cellar.desk;
+use cellar.device;
 use cellar.exec;
 use cellar.format;
 use cellar.gpu;
@@ -257,6 +258,8 @@ pub fun on_init(ctx: *Context) {
     }
     g.renderer_ok = true;
     g.srgb        = gfx.renderer_is_srgb(?g.renderer);
+    var info: gfx.DeviceInfo = gfx.renderer_device_info(?g.renderer);
+    device.of(?g.app.device, ?info);
     sketch.init(?g.sketches, ?g.a, gfx.renderer_device(?g.renderer));
     g.gui_ok = gui.init(?g.gui, ?g.a, gfx.renderer_device(?g.renderer), ctx);
     if (g.gui_ok) {
@@ -286,8 +289,11 @@ pub fun on_init(ctx: *Context) {
         ret;
     }
     g.gpu_ok = true;
-    # a command-line engine decides this run, else the settings' choice does
-    val engine: u8 = pick_engine(?g.app, ?g.sim, g.engine);
+    # a command-line engine decides this run, else the settings' choice does,
+    # but a measurement steps where it was told to
+    val soft:   bool = g.app.device.software && g.bench == args.BENCH_NONE;
+    val engine: u8   = pick_engine(?g.app, ?g.sim, g.engine, soft);
+    if (soft) { say_software(?g.app, engine); }
     g.saved_tree = g.engine == args.ENGINE_ANY && engine == args.ENGINE_HASHLIFE;
     if (g.bench_cpu || engine == args.ENGINE_CPU) { gpu.forgo_compute(?g.gpu); }
     sim.attach(?g.sim, ?g.gpu);
@@ -313,13 +319,15 @@ pub fun on_init(ctx: *Context) {
 # a saved HashLife that cannot run the loaded rule gives way to the chunk
 # engine, with a message. a saved GPU is the default, which steps on the GPU
 # where it can, and so is ENGINE_ANY rather than ENGINE_GPU, which a machine
-# without one refuses.
+# without one refuses. on a software device that default steps on the CPU,
+# which outruns the GPU engine emulated there, and only --engine gpu steps on it.
 # ---
-# a:   application state, with the settings loaded
-# s:   the simulation, with the rule loaded
-# cli: the args.ENGINE_* the command line named
-# ret: the args.ENGINE_* to run on
-pub fun pick_engine(a: *app.App, s: *sim.Sim, cli: u8) u8 {
+# a:        application state, with the settings loaded
+# s:        the simulation, with the rule loaded
+# cli:      the args.ENGINE_* the command line named
+# software: the device is a software one (cellar.device)
+# ret:      the args.ENGINE_* to run on
+pub fun pick_engine(a: *app.App, s: *sim.Sim, cli: u8, software: bool) u8 {
     if (cli != args.ENGINE_ANY) { ret cli; }
     if (a.engine_tree) {
         if (rule.caps(?s.rule).no_tree == nil) { ret args.ENGINE_HASHLIFE; }
@@ -328,8 +336,21 @@ pub fun pick_engine(a: *app.App, s: *sim.Sim, cli: u8) u8 {
         app.say_also(a, "using the chunk engine");
         ret args.ENGINE_ANY;
     }
-    if (a.engine_cpu) { ret args.ENGINE_CPU; }
+    if (a.engine_cpu || software) { ret args.ENGINE_CPU; }
     ret args.ENGINE_ANY;
+}
+
+# say that the device is a software one, and where the world steps for it
+# ---
+# a:      application state
+# engine: the args.ENGINE_* the session runs on
+fun say_software(a: *app.App, engine: u8) {
+    var how: str = "stepping on the CPU, --engine gpu steps on the GPU";
+    if (engine == args.ENGINE_GPU)      { how = "stepping on the GPU as --engine gpu asked"; }
+    or (engine == args.ENGINE_HASHLIFE) { how = "stepping on HashLife"; }
+    print.eprintlnf("no hardware GPU was found, so drawing on {} will be slow; {}", ?a.device.name[0], how);
+    app.say_why(a, "no hardware GPU was found", "drawing will be slow");
+    app.say_also(a, how);
 }
 
 # stop the run that asked for HashLife on the command line when it could not
@@ -1229,13 +1250,17 @@ test pick_engine__the_command_line_overrides_the_saved_engine_and_a_rule_hashlif
     app.init(?a);
 
     # nothing saved runs the default, cpu the CPU, and a named engine wins
-    if (pick_engine(?a, ?s, args.ENGINE_ANY) != args.ENGINE_ANY) { ret 2; }
+    if (pick_engine(?a, ?s, args.ENGINE_ANY, false) != args.ENGINE_ANY) { ret 2; }
+    # a software device steps the default on the CPU unless the GPU is named
+    if (pick_engine(?a, ?s, args.ENGINE_ANY, true) != args.ENGINE_CPU) { ret 12; }
+    if (pick_engine(?a, ?s, args.ENGINE_GPU, true) != args.ENGINE_GPU) { ret 13; }
     a.engine_cpu = true;
-    if (pick_engine(?a, ?s, args.ENGINE_ANY) != args.ENGINE_CPU) { ret 3; }
+    if (pick_engine(?a, ?s, args.ENGINE_ANY, false) != args.ENGINE_CPU) { ret 3; }
     a.engine_tree = true;
-    if (pick_engine(?a, ?s, args.ENGINE_GPU) != args.ENGINE_GPU)      { ret 4; }
-    if (pick_engine(?a, ?s, args.ENGINE_ANY) != args.ENGINE_HASHLIFE) { ret 5; }
-    if (a.told != 0)                                                  { ret 6; }
+    if (pick_engine(?a, ?s, args.ENGINE_GPU, false) != args.ENGINE_GPU)      { ret 4; }
+    if (pick_engine(?a, ?s, args.ENGINE_ANY, false) != args.ENGINE_HASHLIFE) { ret 5; }
+    if (pick_engine(?a, ?s, args.ENGINE_ANY, true) != args.ENGINE_HASHLIFE)  { ret 14; }
+    if (a.told != 0)                                                         { ret 6; }
     # the command line's choice is not the saved one
     if (!a.engine_tree || !a.engine_cpu) { ret 7; }
 
@@ -1245,10 +1270,10 @@ test pick_engine__the_command_line_overrides_the_saved_engine_and_a_rule_hashlif
     sim.set_rule(?s, b0.ok);
     if (rule.caps(?s.rule).no_tree == nil) { ret 8; }
     val told: u32 = a.told;
-    if (pick_engine(?a, ?s, args.ENGINE_ANY) != args.ENGINE_ANY || a.told == told) { ret 9; }
+    if (pick_engine(?a, ?s, args.ENGINE_ANY, false) != args.ENGINE_ANY || a.told == told) { ret 9; }
     # a named engine is left to the run, which stops when it cannot
     val again: u32 = a.told;
-    if (pick_engine(?a, ?s, args.ENGINE_HASHLIFE) != args.ENGINE_HASHLIFE || a.told != again) { ret 10; }
+    if (pick_engine(?a, ?s, args.ENGINE_HASHLIFE, false) != args.ENGINE_HASHLIFE || a.told != again) { ret 10; }
 
     app.dnit(?a);
     sim.dnit(?s);
