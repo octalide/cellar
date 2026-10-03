@@ -13,10 +13,20 @@
 #   words 12..21 a link word per neighbour slot, and the edge word
 #
 # on the unbounded plane the neighbours are the chunks around it and every
-# link a move of one chunk. on a bounded grid (cellar.topology) a chunk off the
-# grid never exists, the links of a chunk at the grid's edge reach across its
-# seams, and the halo a live chunk asks for lands where the seams take it (see
-# cellar.layout for how a step reads through them).
+# link a move of one chunk. on a grid that wraps (cellar.topology) a chunk off
+# the grid never exists, the links of a chunk at the grid's edge reach across
+# its seams, and the halo a live chunk asks for lands where the seams take it
+# (see cellar.layout for how a step reads through them).
+#
+# a world with a boundary (cellar.boundary), a plane's or one drawn, lies on
+# the unbounded plane's links, and no chunk wholly outside the boundary ever
+# exists. each slot keeps its part of the boundary, the domain the stages
+# read too (layout.Domain): which chunks of its block lie wholly outside and
+# which cross the edge, and the mask of its own cells inside where it crosses
+# it, from a store of masks only those chunks take. a step reads a cell
+# outside the boundary as the rule's open edge and holds it at zero (Block),
+# and a write outside it is dropped (piece, mask). a world without one keeps
+# no domain at all.
 #
 # a chunk's cells are stored in layers (cellar.layer), the set the running
 # rule declares and any the view keeps, each holding every slot's span at its
@@ -42,18 +52,22 @@
 # the same. on the unbounded plane the GPU settles its pool itself instead,
 # and the pool here mirrors it (see Mirror and adopt).
 #
-# a grid bounded both ways whose chunks fit the pool's ceiling is held whole
-# instead (cover): every chunk on it is allocated and linked when the pool takes
-# the grid or is emptied, and stays, so settling neither surrounds nor frees
-# anything and no census need make room before a step. its census still counts
-# the live cells, and its empty chunks stay allocated.
+# a world that ends, a grid bounded both ways or a boundary that ends, whose
+# chunks fit the pool's ceiling is held whole instead (cover): every chunk of
+# it is allocated and linked when the pool takes the grid or the boundary or
+# is emptied, and stays, so settling neither surrounds nor frees anything and
+# no census need make room before a step. its census still counts the live
+# cells, and its empty chunks stay allocated.
 
+use cellar.boundary;
 use cellar.layer;
 use cellar.layer.plane;
 use cellar.layout;
 use cellar.topology;
 use allo: std.allocator;
 use std.allocator.page;
+use std.collections.vector;
+use std.collections.vector.Vector;
 use std.math.bits;
 use mem: std.memory;
 use std.types.bool.bool;
@@ -148,6 +162,10 @@ pub val DIRTY_CELLS: u8 = 2;
 pub val DIRTY_ZERO: u8 = 4;
 # a slot's coverage pyramid in mips was built from its cells as they stand
 pub val DIRTY_MIP: u8 = 8;
+# the domain's words a slot (layout.Domain)
+pub val DOM_WORDS: usize = layout.DOM_WORDS::usize;
+# words of a mask
+pub val MASK: usize = layout.MASK::usize;
 
 # a copy of the pool kept elsewhere, a device's, which must make room before
 # the pool grows, and which may own the page table for a while
@@ -228,10 +246,10 @@ pub tag Follow: u8 {
 # wide:      a chunk counted or painted on the host asks for the wide halo,
 #            as the GPU's census does while it steps uncapped
 # grid:      the grid the world runs on
-# rim:       every chunk along the grid's plane edge is kept, for a rule whose
+# rim:       every chunk along the boundary's edge is kept, for a rule whose
 #            step reads the edge live (see keep_rim)
-# whole:     every chunk on the grid is held and stays, so nothing is allocated
-#            or freed while the world steps (cover)
+# whole:     every chunk of the world is held and stays, so nothing is
+#            allocated or freed while the world steps (cover)
 # awake:     on a pool held whole, the slots whose cells or back cells may hold
 #            something; every other slot holds zeros in both and a zero census
 # nawake:    how many awake holds
@@ -242,6 +260,19 @@ pub tag Follow: u8 {
 # frames:    words the CPU's step gathers a seamed chunk's block into, kept
 #            between steps (scratch), or nil
 # nframes:   how many frames holds
+# bound:     the world's boundary, which no cell lies outside, or nil for none
+#            (set_bound): the caller's, which must not change or move while
+#            the pool holds it
+# dom:       while bound holds one, the domain's two words a slot
+#            (layout.Domain), cap of them, else nil
+# masks:     the masks the mask words name, layout.MASK words each, mask 1
+#            first
+# unmasked:  the masks no slot names, free to hand out again
+# bound_at:  how many times a boundary was set, so a mirror knows its domain
+#            is to go up whole
+# rims:      the chunks along the boundary's edge a pool keeping its rim
+#            keeps, a column and a row each, once ringed
+# ringed:    rims holds them for the boundary as it stands
 pub rec Space {
     a:         *allo.Allocator;
     cap:       usize;
@@ -283,6 +314,13 @@ pub rec Space {
     ndue:      usize;
     frames:    *u32;
     nframes:   usize;
+    bound:     *boundary.Region;
+    dom:       *u32;
+    masks:     Vector[u32];
+    unmasked:  Vector[u32];
+    bound_at:  u32;
+    rims:      Vector[i64];
+    ringed:    bool;
 }
 
 # one chunk's step, as a rule family's CPU step sees it
@@ -298,6 +336,21 @@ pub rec Space {
 #       chunk's own cells can change, since the pool's background steps to
 #       itself under every rule
 # gen:  the generation the block's cells hold
+# dom:  where the world has a boundary (cellar.boundary), the mask of each
+#       block chunk crossing its edge, row-major with the chunk itself at 4,
+#       nil for one wholly inside it or not held
+# outs: a bit per block chunk lying wholly outside the boundary, by its place
+# past: the value a cell outside the boundary holds in the state layer as the
+#       step reads it, the rule's open edge (cellar.rule outside): 0 but on
+#       the generations a flipping background holds as its complement
+# kept: the family's step left every cell outside the boundary zero, so the
+#       step need not clear them after it (cellar.cpu)
+#
+# a cell outside the boundary is held at zero in every layer, so a step reads
+# it as dead, or zero, as it reads a chunk that does not exist, and writes
+# zero there. a family that reads the edge otherwise asks block_in: the
+# reaction family's no-flux edge reads the cell itself in its place. a family
+# whose rule births on 0 reads past there instead (cellar.rules.weighted.rows).
 pub rec Block {
     set:  *plane.Set;
     wide: [layer.LAYERS_MAX]u32;
@@ -305,6 +358,10 @@ pub rec Block {
     out:  [layer.LAYERS_MAX]*u32;
     busy: bool;
     gen:  u64;
+    dom:  [9]*u32;
+    outs: u32;
+    past: u32;
+    kept: bool;
 }
 
 # make b a block with no chunk, of a set's layers, whose spans the caller
@@ -313,6 +370,14 @@ pub fun block(b: *Block, set: *plane.Set, gen: u64) {
     b.set  = set;
     b.busy = false;
     b.gen  = gen;
+    b.outs = 0;
+    b.past = 0;
+    b.kept = false;
+    var q: usize = 0;
+    for (q < 9) {
+        b.dom[q] = nil;
+        q        = q + 1;
+    }
     var k: usize = 0;
     for (k < set.n) {
         var q: usize = 0;
@@ -378,6 +443,43 @@ pub fun block_cell(b: *Block, width: u32, x: i64, y: i64) u32 {
     val src: *u32 = b.nb[cy * 3 + cx];
     if (src == nil) { ret 0; }
     ret plane.load(src, width, (ly * SIDE + lx)::usize);
+}
+
+# whether a block holds anything of a boundary: a chunk of it outside or
+# across the edge
+#[inline]
+pub fun block_edged(b: *Block) bool {
+    ret b.outs != 0 || b.dom[0] != nil || b.dom[1] != nil || b.dom[2] != nil || b.dom[3] != nil || b.dom[4] != nil
+        || b.dom[5] != nil || b.dom[6] != nil || b.dom[7] != nil || b.dom[8] != nil;
+}
+
+# the cells of row ly of block chunk q inside the boundary, bit x for column x
+# ---
+# q:  the block chunk, row-major with the chunk itself at 4
+# ly: the row, in [0, SIDE)
+#[inline]
+pub fun block_row_in(b: *Block, q: usize, ly: usize) u64 {
+    if (((b.outs >> q::u32) & 1) != 0) { ret 0; }
+    val m: *u32 = b.dom[q];
+    if (m == nil) { ret 0xffffffffffffffff; }
+    ret m[ly * 2]::u64 | (m[ly * 2 + 1]::u64 << 32);
+}
+
+# whether a cell of a block lies inside the boundary, in its chunk's
+# coordinates
+# ---
+# x: the column, in [-SIDE, 2 * SIDE)
+# y: the row, in [-SIDE, 2 * SIDE)
+#[inline]
+pub fun block_in(b: *Block, x: i64, y: i64) bool {
+    val cx: usize = ((x + SIDE) >> 6)::usize;
+    val cy: usize = ((y + SIDE) >> 6)::usize;
+    val q:  usize = cy * 3 + cx;
+    if (((b.outs >> q::u32) & 1) != 0) { ret false; }
+    val m: *u32 = b.dom[q];
+    if (m == nil) { ret true; }
+    val i: usize = local_of(y) * 64 + local_of(x);
+    ret ((m[i / 32] >> (i % 32)::u32) & 1) != 0;
 }
 
 # layer k's value of a cell of a block, as block_cell reads the state layer's,
@@ -1006,9 +1108,13 @@ fun alloc_arrays(sp: *Space, cap: usize) err[allo.Error] {
     if (sel rw.ok) { woke = rw.ok; }
     val awake: *u32 = zwords(a, cap);
     val due:   *u32 = zwords(a, cap);
+    var dom:   *u32 = nil;
+    if (sp.bound != nil) { dom = zwords(a, cap * DOM_WORDS); }
     if (table == nil || !made || census == nil
         || before == nil || frees == nil || hash == nil || dirty == nil || asked == nil
-        || woke == nil || awake == nil || due == nil || (pyr && (mips == nil || mback == nil))) {
+        || woke == nil || awake == nil || due == nil || (pyr && (mips == nil || mback == nil))
+        || (sp.bound != nil && dom == nil)) {
+        if (dom != nil)    { allo.deallocate[u32](a, dom, cap * DOM_WORDS); }
         if (table != nil)  { allo.deallocate[u32](a, table, cap * ENTRY); }
         if (made)          { drop_layers(a, ?sp.set, cap, ?fronts[0], ?backs[0]); }
         if (mips != nil)   { allo.deallocate[u32](a, mips, cap * MIP); }
@@ -1041,8 +1147,10 @@ fun alloc_arrays(sp: *Space, cap: usize) err[allo.Error] {
         mem.copy[u32](awake, sp.awake, sp.nawake);
         mem.copy[u32](due, sp.due, sp.ndue);
         mem.copy[u32](frees, sp.frees, sp.nfree);
+        if (dom != nil && sp.dom != nil) { mem.copy[u32](dom, sp.dom, sp.hi * DOM_WORDS); }
         free_arrays(sp);
     }
+    sp.dom   = dom;
     sp.table = table;
     var k: usize = 0;
     for (k < sp.set.n) {
@@ -1089,6 +1197,8 @@ fun free_arrays(sp: *Space) {
     allo.deallocate[u32](a, sp.due, sp.cap);
     allo.deallocate[u32](a, sp.frees, sp.cap);
     allo.deallocate[u32](a, sp.hash, sp.hcap);
+    if (sp.dom != nil) { allo.deallocate[u32](a, sp.dom, sp.cap * DOM_WORDS); }
+    sp.dom = nil;
 }
 
 # an empty pool
@@ -1111,15 +1221,22 @@ pub fun init(sp: *Space, a: *allo.Allocator, stepped: bool) err[allo.Error] {
     sp.mips_back = nil;
     sp.mip_on    = false;
     mem.zero[u8]((?sp.sense)::*u8, $size_of(layout.Sense));
-    sp.reach   = 1;
-    sp.wide    = false;
-    sp.grid    = topology.open();
-    sp.rim     = false;
-    sp.whole   = false;
-    sp.nawake  = 0;
-    sp.ndue    = 0;
-    sp.frames  = nil;
-    sp.nframes = 0;
+    sp.reach    = 1;
+    sp.wide     = false;
+    sp.grid     = topology.open();
+    sp.rim      = false;
+    sp.whole    = false;
+    sp.nawake   = 0;
+    sp.ndue     = 0;
+    sp.frames   = nil;
+    sp.nframes  = 0;
+    sp.bound    = nil;
+    sp.dom      = nil;
+    sp.masks    = vector.init[u32](a);
+    sp.unmasked = vector.init[u32](a);
+    sp.bound_at = 0;
+    sp.rims     = vector.init[i64](a);
+    sp.ringed   = false;
     # a 32-bit state layer until a rule names its own (relayer)
     var first: plane.Set = plane.state("cells", layer.WIDTH_MAX);
     take_set(sp, ?first);
@@ -1411,6 +1528,9 @@ pub fun dnit(sp: *Space) {
     if (sp.frames != nil) { allo.deallocate[u32](sp.a, sp.frames, sp.nframes); }
     sp.frames  = nil;
     sp.nframes = 0;
+    vector.dnit[u32](?sp.masks);
+    vector.dnit[u32](?sp.unmasked);
+    vector.dnit[i64](?sp.rims);
     if (sp.cap == 0) { ret; }
     free_arrays(sp);
     sp.cap  = 0;
@@ -1719,6 +1839,11 @@ pub fun reset(sp: *Space) {
     mem.zero[u32](sp.table, sp.hi * ENTRY);
     mem.zero[u32](sp.census, sp.hi * CENSUS);
     mem.fill[u32](sp.hash, NONE, sp.hcap);
+    if (sp.dom != nil) {
+        mem.zero[u32](sp.dom, sp.hi * DOM_WORDS);
+        vector.clear[u32](?sp.masks);
+        vector.clear[u32](?sp.unmasked);
+    }
     var s: usize = 0;
     for (s < sp.hi) {
         sp.dirty[s] = DIRTY_ENTRY;
@@ -1735,14 +1860,106 @@ pub fun seamed(sp: *Space, s: usize) bool {
     ret layout.seamed(sp.table[s * ENTRY + layout.EDGE_AT::usize]) != 0;
 }
 
-# whether the cell at (x, y) is on the world's grid
+# whether the cell at (x, y) is on the world's grid and inside its boundary
 pub fun holds(sp: *Space, x: i64, y: i64) bool {
-    ret topology.holds(?sp.grid, x, y);
+    if (!topology.holds(?sp.grid, x, y)) { ret false; }
+    ret sp.bound == nil || boundary.contains(sp.bound, x, y);
 }
 
-# whether the chunk at (cx, cy) has a cell on the world's grid
+# whether the chunk at (cx, cy) has a cell on the world's grid inside its
+# boundary
 pub fun on_grid(sp: *Space, cx: i64, cy: i64) bool {
-    ret topology.inside(?sp.grid, cx, cy);
+    ret topology.inside(?sp.grid, cx, cy) && class_of(sp, cx, cy) != boundary.OUT;
+}
+
+# whether the world has a boundary or a bounded grid, either of which the host
+# allocates its chunks around (cellar.gpu)
+pub fun bounded(sp: *Space) bool {
+    ret sp.bound != nil || topology.bounded(?sp.grid);
+}
+
+# the chunk at (cx, cy) against the world's boundary, boundary.IN where it has
+# none
+pub fun class_of(sp: *Space, cx: i64, cy: i64) u32 {
+    if (sp.bound == nil) { ret boundary.IN; }
+    ret boundary.class(sp.bound, cx, cy);
+}
+
+# the cells of a slot's chunk inside the boundary, a mask (layout.Domain), or
+# nil where it lies wholly inside or the world has none
+pub fun mask_of(sp: *Space, s: usize) *u32 {
+    if (sp.dom == nil) { ret nil; }
+    val m: u32 = sp.dom[s * DOM_WORDS + 1];
+    if (m == 0) { ret nil; }
+    ret ?sp.masks.data[(m::usize - 1) * MASK];
+}
+
+# a slot's block word (layout.Domain), 0 where the world has no boundary or
+# the slot's block lies wholly inside it
+pub fun block_word(sp: *Space, s: usize) u32 {
+    if (sp.dom == nil) { ret 0; }
+    ret sp.dom[s * DOM_WORDS];
+}
+
+# a free mask, from 1, or 0 when the masks could not grow
+fun take_mask(sp: *Space) u32 {
+    val free: opt[u32] = vector.pop[u32](?sp.unmasked);
+    if (sel free.some) { ret free.some; }
+    val n: usize                  = sp.masks.len / MASK;
+    val r: res[usize, allo.Error] = vector.reserve[u32](?sp.masks, MASK);
+    if (sel r.err) { ret 0; }
+    sp.masks.len = sp.masks.len + MASK;
+    ret (n + 1)::u32;
+}
+
+# give a mask back
+fun give_mask(sp: *Space, m: u32) {
+    vector.push[u32](?sp.unmasked, m);
+}
+
+# set a slot's domain words from the boundary: its block word, and its mask
+# where its chunk crosses the edge, marking its entry dirty
+# ---
+# ret: false when its mask could not be made, the slot's words then cleared
+fun bind(sp: *Space, s: usize) bool {
+    if (sp.dom == nil) { ret true; }
+    val cx: i64  = slot_x(sp, s);
+    val cy: i64  = slot_y(sp, s);
+    val d:  *u32 = ?sp.dom[s * DOM_WORDS];
+    var w:  u32  = 0;
+    var q:  u32  = 0;
+    for (q < 9) {
+        val c: u32 = boundary.class(sp.bound, cx + (q % 3)::i64 - 1, cy + (q / 3)::i64 - 1);
+        if (c == boundary.OUT)  { w = w | (1 << q); }
+        if (c == boundary.EDGE) { w = w | (1 << (layout.DOM_EDGE + q)); }
+        q = q + 1;
+    }
+    var m: u32 = d[1];
+    if (((w >> (layout.DOM_EDGE + 4)) & 1) != 0) {
+        if (m == 0) { m = take_mask(sp); }
+        if (m == 0) {
+            d[0] = 0;
+            ret false;
+        }
+        boundary.mask(sp.bound, cx, cy, ?sp.masks.data[(m::usize - 1) * MASK]);
+    }
+    or (m != 0) {
+        give_mask(sp, m);
+        m = 0;
+    }
+    d[0]        = w;
+    d[1]        = m;
+    sp.dirty[s] = sp.dirty[s] | DIRTY_ENTRY;
+    ret true;
+}
+
+# clear a slot's domain words, giving its mask back
+fun unbind(sp: *Space, s: usize) {
+    if (sp.dom == nil) { ret; }
+    val d: *u32 = ?sp.dom[s * DOM_WORDS];
+    if (d[1] != 0) { give_mask(sp, d[1]); }
+    d[0] = 0;
+    d[1] = 0;
 }
 
 # set every neighbour slot, link word and the edge word of a slot's entry from
@@ -1789,19 +2006,31 @@ fun relink_near(sp: *Space, cx: i64, cy: i64) {
     }
 }
 
-# clip the run of cells [x0, x1) of row y to the world's grid
+# narrow the run of cells [x0, x1) of row y to its first part on the world's
+# grid and inside its boundary, which may hold several parts of it: a caller
+# writing the whole run takes the part, then asks again from its end
 # ---
-# ret: false when nothing of the run is on the grid
-pub fun clip(sp: *Space, y: i64, x0: *i64, x1: *i64) bool {
-    ret topology.clip(?sp.grid, y, x0, x1);
+# ret: false when nothing of the run is, leaving it alone
+pub fun piece(sp: *Space, y: i64, x0: *i64, x1: *i64) bool {
+    var a: i64 = @x0;
+    var b: i64 = @x1;
+    if (!topology.clip(?sp.grid, y, ?a, ?b))                     { ret false; }
+    if (sp.bound != nil && !boundary.piece(sp.bound, y, ?a, ?b)) { ret false; }
+    @x0 = a;
+    @x1 = b;
+    ret true;
 }
 
-# zero a slot's cells that lie off the grid, marking them dirty when any was set
+# zero a slot's cells that lie off the grid or outside the boundary, marking
+# them dirty when any was set
 pub fun mask(sp: *Space, s: usize) {
     val e: u32   = sp.table[s * ENTRY + layout.EDGE_AT::usize];
+    val m: *u32  = mask_of(sp, s);
     var i: usize = 0;
     for (i < CELLS) {
-        if (layout.edge_side(e, (i & 63)::i32, (i >> 6)::i32) != 4 && holds_cell(sp, s, i)) {
+        var off: bool = layout.edge_side(e, (i & 63)::i32, (i >> 6)::i32) != 4;
+        if (m != nil && ((m[i / 32] >> (i % 32)::u32) & 1) == 0) { off = true; }
+        if (off && holds_cell(sp, s, i)) {
             clear_cell(sp, s, i);
             touch(sp, s);
         }
@@ -1814,7 +2043,7 @@ pub fun mask(sp: *Space, s: usize) {
 # whole (cover). the census is left as it was, for the caller to recount.
 # ---
 # sp: the pool
-# g:  the grid
+# g:  the grid, which a world with a boundary has only unbounded
 pub fun set_grid(sp: *Space, g: topology.Grid) {
     if (!own(sp)) { ret; }
     sp.grid = g;
@@ -1835,6 +2064,52 @@ pub fun set_grid(sp: *Space, g: topology.Grid) {
     cover(sp);
 }
 
+# put the world inside a boundary, or take it away: the chunks wholly outside
+# are freed, every other chunk takes its domain words and its cells outside
+# are cleared, and a boundary whose chunks fit the pool is held whole (cover).
+# the census is left as it was, for the caller to recount.
+# ---
+# sp:  the pool, on an unbounded grid
+# r:   the boundary, which the pool reads until it is set again and which
+#      must not change or move meanwhile, or nil for none
+# ret: false when the pool could not hold its domain words, or the mirror
+#      keeps the pool (own), the pool then as it was
+pub fun set_bound(sp: *Space, r: *boundary.Region) bool {
+    if (!own(sp))      { ret false; }
+    if (sp.dom != nil) { allo.deallocate[u32](sp.a, sp.dom, sp.cap * DOM_WORDS); }
+    sp.dom = nil;
+    vector.clear[u32](?sp.masks);
+    vector.clear[u32](?sp.unmasked);
+    vector.clear[i64](?sp.rims);
+    sp.ringed   = false;
+    sp.bound    = r;
+    sp.bound_at = sp.bound_at + 1;
+    var s: usize = 0;
+    if (r != nil) {
+        sp.dom = zwords(sp.a, sp.cap * DOM_WORDS);
+        if (sp.dom == nil) {
+            sp.bound = nil;
+            ret false;
+        }
+        for (s < sp.hi) {
+            if (used(sp, s) && boundary.class(r, slot_x(sp, s), slot_y(sp, s)) == boundary.OUT) { release(sp, s); }
+            s = s + 1;
+        }
+    }
+    s = 0;
+    for (s < sp.hi) {
+        if (used(sp, s)) {
+            if (!bind(sp, s)) { release(sp, s); }
+            or                { mask(sp, s); }
+        }
+        sp.dirty[s] = sp.dirty[s] | DIRTY_ENTRY;
+        s           = s + 1;
+    }
+    compact(sp);
+    cover(sp);
+    ret true;
+}
+
 # the chunks holding a cell of a grid bounded both ways, 0 for any other grid
 pub fun grid_chunks(g: *topology.Grid) usize {
     if (!topology.finite(g)) { ret 0; }
@@ -1843,13 +2118,24 @@ pub fun grid_chunks(g: *topology.Grid) usize {
     ret (w * h)::usize;
 }
 
-# hold every chunk of a grid bounded both ways, when they fit the pool's
-# ceiling, so stepping it never allocates or frees one (whole)
+# the chunks holding a cell of the world, past which the pool would not hold
+# it whole: its boundary's, or its grid's where it has none, up to most, 0
+# for a world without end
+pub fun world_chunks(sp: *Space, most: usize) usize {
+    if (sp.bound == nil)            { ret grid_chunks(?sp.grid); }
+    if (!boundary.finite(sp.bound)) { ret 0; }
+    val n: res[u64, allo.Error] = boundary.chunks(sp.bound, (most + 1)::u64);
+    if (sel n.err) { ret 0; }
+    ret n.ok::usize;
+}
+
+# hold every chunk of a world that ends, when they fit the pool's ceiling, so
+# stepping it never allocates or frees one (whole)
 #
-# the pool grows once to the grid's chunks, the mirror making room first, each
+# the pool grows once to the world's chunks, the mirror making room first, each
 # chunk missing is allocated empty, and every slot is linked through the seams.
-# a grid with an unbounded axis or more chunks than the ceiling, or a growth
-# either side refuses, is left to allocate around its live cells.
+# a world without end or with more chunks than the ceiling, or a growth either
+# side refuses, is left to allocate around its live cells.
 fun cover(sp: *Space) {
     # a settle on another grid may have left slots asked for
     sp.whole = false;
@@ -1858,7 +2144,7 @@ fun cover(sp: *Space) {
     sp.nawake = 0;
     sp.ndue   = 0;
     val g: *topology.Grid = ?sp.grid;
-    val n: usize          = grid_chunks(g);
+    val n: usize          = world_chunks(sp, sp.max_slots);
     if (n == 0 || n > sp.max_slots || !grow(sp, n)) { ret; }
     # a chunk held before may hold anything, in either cells; a new one holds zeros
     var s: usize = 0;
@@ -1870,25 +2156,76 @@ fun cover(sp: *Space) {
         }
         s = s + 1;
     }
-    val cx0: i64 = chunk_of(topology.left(g));
-    val cx1: i64 = chunk_of(topology.left(g) + g.w - 1);
-    val cy0: i64 = chunk_of(topology.top(g));
-    val cy1: i64 = chunk_of(topology.top(g) + g.h - 1);
-    var cy:  i64 = cy0;
-    for (cy <= cy1) {
-        var cx: i64 = cx0;
-        for (cx <= cx1) {
-            if (find(sp, cx, cy) == NONE) { quiet(sp, claim(sp, cx, cy)::usize); }
-            cx = cx + 1;
+    var all: bool = true;
+    if (sp.bound != nil) { all = cover_bound(sp); }
+    or {
+        val cx0: i64 = chunk_of(topology.left(g));
+        val cx1: i64 = chunk_of(topology.left(g) + g.w - 1);
+        val cy0: i64 = chunk_of(topology.top(g));
+        val cy1: i64 = chunk_of(topology.top(g) + g.h - 1);
+        var cy:  i64 = cy0;
+        for (cy <= cy1 && all) {
+            var cx: i64 = cx0;
+            for (cx <= cx1 && all) {
+                if (find(sp, cx, cy) == NONE) { all = hold(sp, cx, cy); }
+                cx = cx + 1;
+            }
+            cy = cy + 1;
         }
-        cy = cy + 1;
     }
     s = 0;
     for (s < sp.hi) {
         if (used(sp, s)) { link(sp, s); }
         s = s + 1;
     }
-    sp.whole = true;
+    sp.whole = all;
+}
+
+# claim the chunk at (cx, cy) for a pool held whole, quiet
+# ---
+# ret: false when it could not be made
+fun hold(sp: *Space, cx: i64, cy: i64) bool {
+    val t: u32 = claim(sp, cx, cy);
+    if (t == NONE) { ret false; }
+    quiet(sp, t::usize);
+    ret true;
+}
+
+# claim every chunk holding a cell of the boundary that the pool lacks, for
+# cover, chunk row by chunk row
+# ---
+# ret: false when one could not be made
+fun cover_bound(sp: *Space) bool {
+    var b: [4]i64;
+    if (!boundary.bounds(sp.bound, ?b[0])) { ret true; }
+    var reach: Vector[i64] = vector.init[i64](sp.a);
+    var whole: Vector[i64] = vector.init[i64](sp.a);
+    var ok:    bool        = true;
+    var cy:    i64         = chunk_of(b[1]);
+    val end:   i64         = chunk_of(b[3] - 1);
+    for (cy <= end && ok) {
+        val got: res[i64, allo.Error] = boundary.chunk_row(sp.bound, cy, ?reach, ?whole);
+        if (sel got.err) { ok = false; }
+        if (sel got.ok) {
+            var y: i64 = cy;
+            for (y <= got.ok && ok) {
+                var k: usize = 0;
+                for (k < reach.len && ok) {
+                    var cx: i64 = reach.data[k];
+                    for (cx < reach.data[k + 1] && ok) {
+                        if (find(sp, cx, y) == NONE) { ok = hold(sp, cx, y); }
+                        cx = cx + 1;
+                    }
+                    k = k + 2;
+                }
+                y = y + 1;
+            }
+            cy = got.ok + 1;
+        }
+    }
+    vector.dnit[i64](?reach);
+    vector.dnit[i64](?whole);
+    ret ok;
 }
 
 # zero what a slot just claimed for a pool held whole holds beyond its cells,
@@ -1906,16 +2243,15 @@ fun quiet(sp: *Space, s: usize) {
 
 # layer k's value of the cell at (x, y) of a slot's frame, taken through the
 # links where it lies outside the window (cellar.layout), zero where no chunk
-# holds it, and past a plane's dead edge past, the value the rule holds the
-# edge as in that layer (cellar.rule.outside)
-pub fun resolve(sp: *Space, k: usize, s: usize, x: i32, y: i32, past: u32) u32 {
-    ret resolve_at(sp, k, sp.set.at[k].width, s, x, y, past);
+# holds it
+pub fun resolve(sp: *Space, k: usize, s: usize, x: i32, y: i32) u32 {
+    ret resolve_at(sp, k, sp.set.at[k].width, s, x, y);
 }
 
 # resolve, layer k's width named by the caller, which must be its own, so a
 # word-wide layer is read a word a cell
 #[inline]
-pub fun resolve_at(sp: *Space, k: usize, width: u32, s: usize, x: i32, y: i32, past: u32) u32 {
+pub fun resolve_at(sp: *Space, k: usize, width: u32, s: usize, x: i32, y: i32) u32 {
     var sl: usize = s;
     var px: i32   = x;
     var py: i32   = y;
@@ -1925,8 +2261,7 @@ pub fun resolve_at(sp: *Space, k: usize, width: u32, s: usize, x: i32, y: i32, p
         val q: u32  = layout.edge_side(e[layout.EDGE_AT::usize], px, py);
         if (q == 4) { ret plane.load(?sp.fronts[k][sl * sp.spans[k]], width, (py * 64 + px)::usize); }
         val t: u32 = e[layout.LINK_AT::usize + q::usize];
-        if (e[q::usize] == NONE && (t & layout.LINK_EDGE) != 0) { ret past; }
-        if (h == layout.HOPS || e[q::usize] == NONE)            { ret 0; }
+        if (h == layout.HOPS || e[q::usize] == NONE) { ret 0; }
         val nx: i32 = layout.hop_x(t, px, py);
         py = layout.hop_y(t, px, py);
         px = nx;
@@ -2110,6 +2445,10 @@ fun move_slot(sp: *Space, s: usize, d: usize) {
     mem.zero[u32](?sp.census[s * CENSUS], CENSUS);
     sp.asked[d] = sp.asked[s];
     sp.asked[s] = 0;
+    if (sp.dom != nil) {
+        mem.copy[u32](?sp.dom[d * DOM_WORDS], ?sp.dom[s * DOM_WORDS], DOM_WORDS);
+        mem.zero[u32](?sp.dom[s * DOM_WORDS], DOM_WORDS);
+    }
     sp.dirty[d] = sp.dirty[s] | DIRTY_ENTRY;
     sp.dirty[s] = DIRTY_ENTRY;
     hash_put(sp, d);
@@ -2166,6 +2505,7 @@ pub fun alloc(sp: *Space, cx: i64, cy: i64) u32 {
     if (have != NONE) { ret have; }
     val bounded: bool = topology.bounded(?sp.grid);
     if (bounded && !topology.inside(?sp.grid, cx, cy)) { ret NONE; }
+    if (class_of(sp, cx, cy) == boundary.OUT)          { ret NONE; }
     val t: u32 = claim(sp, cx, cy);
     if (t == NONE) { ret NONE; }
     val s: usize = t::usize;
@@ -2240,6 +2580,10 @@ fun claim(sp: *Space, cx: i64, cy: i64) u32 {
         mem.zero[u32](?sp.mips[s * MIP], MIP);
         sp.dirty[s] = sp.dirty[s] | DIRTY_MIP;
     }
+    if (!bind(sp, s)) {
+        release(sp, s);
+        ret NONE;
+    }
     ret s::u32;
 }
 
@@ -2263,6 +2607,7 @@ pub fun release(sp: *Space, s: usize) {
     }
     mem.zero[u32](e, ENTRY);
     mem.zero[u32](?sp.census[s * CENSUS], CENSUS);
+    unbind(sp, s);
     sp.dirty[s]        = DIRTY_ENTRY;
     sp.frees[sp.nfree] = s::u32;
     sp.nfree           = sp.nfree + 1;
@@ -2356,11 +2701,14 @@ pub fun surround_by(sp: *Space, s: usize, mask: u32) bool {
             val dx: i64 = (k % w)::i64 - (w / 2)::i64;
             val dy: i64 = (k / w)::i64 - (w / 2)::i64;
             var n:  u32 = NONE;
-            # an adjacent chunk is in the entry, a further one is looked up
+            # an adjacent chunk is in the entry, a further one is looked up, and
+            # one wholly outside the boundary is never made
             if (dx >= -1 && dx <= 1 && dy >= -1 && dy <= 1) { n = sp.table[s * ENTRY + ((dy + 1) * 3 + dx + 1)::usize]; }
-            if (n == NONE)                                  { n = alloc(sp, cx + dx, cy + dy); }
-            if (n == NONE)                                  { ok = false; }
-            or                                              { ask(sp, n::usize); }
+            if (n == NONE && class_of(sp, cx + dx, cy + dy) != boundary.OUT) {
+                n = alloc(sp, cx + dx, cy + dy);
+                if (n == NONE) { ok = false; }
+            }
+            if (n != NONE) { ask(sp, n::usize); }
         }
         k = k + 1;
     }
@@ -2417,39 +2765,114 @@ pub fun surround(sp: *Space, s: usize) bool {
     ret surround_by(sp, s, halo(0xf, span(sp)));
 }
 
-# give a pool keeping its rim every seamed chunk on its grid, each marked asked
+# give a pool keeping its rim every chunk along its boundary's edge, each
+# marked asked
 #
-# a rule whose step reads a plane's dead edge live (cellar.rule.rimmed)
-# changes the cells along it with nothing alive near them, so every chunk a
-# step reads the edge from is kept, and stepped, as seamed chunks always are.
-# only a chunk within one of a chunk not whole on the grid is seamed, so the
-# rim is the two chunk rows and columns at each end of a plane bounded both ways.
-# a pool held whole has it already, and it is only marked due.
+# a rule whose step reads the edge of the world's boundary live on some
+# generation (space.Block past) changes the cells along it with nothing alive
+# near them, so every chunk a step reads the edge from is kept, and stepped:
+# every chunk holding a cell of the boundary whose 3 by 3 block it does not
+# hold whole (edge_chunks). a pool held whole has them already, and they are
+# only marked due.
 # ---
 # ret: false when the pool could not hold them
 pub fun keep_rim(sp: *Space) bool {
-    if (!sp.rim) { ret true; }
-    val g:   *topology.Grid = ?sp.grid;
-    val cx0: i64            = chunk_of(topology.left(g));
-    val cx1: i64            = chunk_of(topology.left(g) + g.w - 1);
-    val cy0: i64            = chunk_of(topology.top(g));
-    val cy1: i64            = chunk_of(topology.top(g) + g.h - 1);
-    var cy:  i64            = cy0;
-    for (cy <= cy1) {
-        val across: bool = cy <= cy0 + 1 || cy >= cy1 - 1;
-        var cx:     i64  = cx0;
-        for (cx <= cx1) {
-            if (!across && cx == cx0 + 2 && cx < cx1 - 1) { cx = cx1 - 1; }
-            if (topology.seamed(g, cx, cy)) {
-                val t: u32 = alloc(sp, cx, cy);
-                if (t == NONE) { ret false; }
-                ask(sp, t::usize);
-            }
-            cx = cx + 1;
-        }
-        cy = cy + 1;
+    if (!sp.rim || sp.bound == nil)     { ret true; }
+    if (!sp.ringed && !edge_chunks(sp)) { ret false; }
+    var i: usize = 0;
+    for (i < sp.rims.len) {
+        val t: u32 = alloc(sp, sp.rims.data[i], sp.rims.data[i + 1]);
+        if (t == NONE) { ret false; }
+        ask(sp, t::usize);
+        i = i + 2;
     }
     ret true;
+}
+
+# list the chunks keep_rim keeps into rims: chunk row by chunk row, the
+# chunks the boundary reaches less those whose 3 by 3 block it holds whole,
+# stopping past the pool's ceiling, which could not hold them all
+# ---
+# ret: false when the boundary has no end or the list passed the ceiling or
+#      could not grow
+fun edge_chunks(sp: *Space) bool {
+    vector.clear[i64](?sp.rims);
+    var b: [4]i64;
+    if (!boundary.bounds(sp.bound, ?b[0])) {
+        sp.ringed = true;
+        ret true;
+    }
+    if (!boundary.finite(sp.bound)) { ret false; }
+    var reach: Vector[i64] = vector.init[i64](sp.a);
+    var above: Vector[i64] = vector.init[i64](sp.a);
+    var here:  Vector[i64] = vector.init[i64](sp.a);
+    var below: Vector[i64] = vector.init[i64](sp.a);
+    var spare: Vector[i64] = vector.init[i64](sp.a);
+    var core:  Vector[i64] = vector.init[i64](sp.a);
+    var rim:   Vector[i64] = vector.init[i64](sp.a);
+    var ok:    bool        = true;
+    val top:   i64         = chunk_of(b[1]);
+    val end:   i64         = chunk_of(b[3] - 1);
+    var cy:    i64         = top;
+    # the chunk row above the first holds nothing of the boundary
+    val first: res[i64, allo.Error] = boundary.chunk_row(sp.bound, top, ?spare, ?here);
+    if (sel first.err) { ok = false; }
+    for (cy <= end && ok) {
+        val got:  res[i64, allo.Error] = boundary.chunk_row(sp.bound, cy, ?reach, ?spare);
+        val next: res[i64, allo.Error] = boundary.chunk_row(sp.bound, cy + 1, ?spare, ?below);
+        if (sel got.err || sel next.err) { ok = false; }
+        # the chunks whose rows above, at and below it the boundary holds,
+        # less a chunk either side
+        var e: err[allo.Error] = boundary.merge(above.data, above.len / 2, here.data, here.len / 2, boundary.INTERSECT, ?spare);
+        if (ok && !failed(e)) { e = boundary.merge(spare.data, spare.len / 2, below.data, below.len / 2, boundary.INTERSECT, ?core); }
+        var k: usize = 0;
+        var n: usize = 0;
+        for (k < core.len) {
+            if (core.data[k] + 1 < core.data[k + 1] - 1) {
+                core.data[n]     = core.data[k] + 1;
+                core.data[n + 1] = core.data[k + 1] - 1;
+                n                = n + 2;
+            }
+            k = k + 2;
+        }
+        if (ok && !failed(e)) { e = boundary.merge(reach.data, reach.len / 2, core.data, n / 2, boundary.SUBTRACT, ?rim); }
+        if (failed(e))        { ok = false; }
+        k = 0;
+        for (k < rim.len && ok) {
+            var cx: i64 = rim.data[k];
+            for (cx < rim.data[k + 1] && ok) {
+                if (sp.rims.len / 2 >= sp.max_slots) { ok = false; }
+                or {
+                    vector.push[i64](?sp.rims, cx);
+                    val p: res[usize, allo.Error] = vector.push[i64](?sp.rims, cy);
+                    if (sel p.err) { ok = false; }
+                }
+                cx = cx + 1;
+            }
+            k = k + 2;
+        }
+        # the rows move down one: above takes here's, here below's
+        val t: Vector[i64] = above;
+        above = here;
+        here  = below;
+        below = t;
+        cy    = cy + 1;
+    }
+    vector.dnit[i64](?reach);
+    vector.dnit[i64](?above);
+    vector.dnit[i64](?here);
+    vector.dnit[i64](?below);
+    vector.dnit[i64](?spare);
+    vector.dnit[i64](?core);
+    vector.dnit[i64](?rim);
+    if (!ok) { vector.clear[i64](?sp.rims); }
+    sp.ringed = ok;
+    ret ok;
+}
+
+# whether an allocation failed
+fun failed(e: err[allo.Error]) bool {
+    ret sel e.err;
 }
 
 # whether a census entry describes the chunk the slot holds now
