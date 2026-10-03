@@ -3,8 +3,8 @@
 # the readout sits in the top-left corner of the world's port in small type: whether the
 # world runs, its generation, population, the size of the box its live cells
 # span, rule and speed. it fades back as the cursor comes near, so it never
-# hides the cells under it. the cell under the cursor and the zoom sit in the
-# bottom-left corner, messages flash at the bottom centre of the world, and
+# hides the cells under it. the zoom sits in the bottom-left corner with the
+# cell under the cursor beside it, messages flash at the bottom centre of the world, and
 # the key reference opens over everything. each is a blit overlay, which
 # claims nothing of its own, so the world under them stays in reach; the key
 # reference lies over a scrim that takes every press and closes it. what
@@ -198,8 +198,19 @@ fun zoom_text(buf: *u8, ppc: f32) usize {
     ret text.buf_str(buf, o, " cells per px");
 }
 
-# the cell under the cursor and the zoom, in the bottom-left corner, with a
-# button each side of the zoom that steps it by a power of two
+# the zoom's text keeps the width of the widest of these, so its buttons hold
+# still as it changes; only HashLife's deepest zooms read wider
+val ZOOM_WIDEST_IN:  str = "888.88 px per cell";
+val ZOOM_WIDEST_OUT: str = "88.88 cells per px";
+
+# a cell's coordinate keeps the width of this many digits and a sign, wider
+# only past it
+val CELL_DIGITS: usize = 7;
+
+# the zoom in the bottom-left corner, with a button each side of it that steps
+# it by a power of two, and the cell under the cursor right of it, x and y
+# each in a box of its own. each box keeps its width as its text changes, and
+# none moves with the cursor, so a button stays under the cursor that is on it
 # ---
 # ui:   the interface
 # l:    cellar's look
@@ -210,67 +221,83 @@ fun zoom_text(buf: *u8, ppc: f32) usize {
 # my:   cursor y in screen pixels
 # ret:  1 when the zoom button was pressed to zoom in, -1 to zoom out, else 0
 pub fun position(ui: *bctx.Context, l: look.Look, cam: render.Camera, pt: render.Port, over: bool, mx: f32, my: f32) i32 {
-    var c:  [48]u8;
-    var co: usize = 0;
-    if (over) {
-        var cx: i64 = 0;
-        var cy: i64 = 0;
-        render.cell_at(cam, mx, my, ?cx, ?cy);
-        co = signed(?c[0], co, cx);
-        co = text.buf_str(?c[0], co, ", ");
-        co = signed(?c[0], co, cy);
-    }
-    c[co] = 0;
     var zb: [48]u8;
     zb[zoom_text(?zb[0], cam.ppc)] = 0;
+
+    bstyle.push_class(ui, l.hud);
+    bctx.push_style(ui, l.small);
+    val pd:  f32             = bctx.px(ui, 6.0);
+    val lh:  f32             = bctx.line_height(ui);
+    val bh:  f32             = lh + bctx.px(ui, 4.0);
+    val gap: f32             = bctx.px(ui, 6.0);
+    val h:   f32             = bh + pd * 2.0;
+    val tw:  f32             = maxf(maxf(bctx.text_width(ui, ZOOM_WIDEST_IN), bctx.text_width(ui, ZOOM_WIDEST_OUT)), bctx.text_width(ui, ?zb[0]));
+    val zw:  f32             = bh * 2.0 + gap * 2.0 + tw + pd * 2.0;
+    val dim: blit.draw.Color = look.colour(theme.TEXT_DIM, 1.0);
 
     var ov: bov.Overlay = bov.on_rect(area(pt), bov.BOTTOM_LEFT, bov.BOTTOM_LEFT);
     ov.dx   = bctx.px(ui, 6.0);
     ov.dy   = 0.0 - bctx.px(ui, 6.0);
     ov.band = band.BASE;
-    bstyle.push_class(ui, l.hud);
     val shown: bov.Shown = bov.begin(ui, "position", ov);
-    bctx.push_style(ui, l.small);
-    val pd:   f32 = bctx.px(ui, 6.0);
-    val room: f32 = maxf(pt.w - pd * 4.0, 0.0);
-    val cw:   f32 = bctx.text_width(ui, ?c[0]);
-    val lh:   f32 = bctx.line_height(ui);
-    # the zoom reads between its two buttons, in a group as wide as it needs
-    val bh:  f32 = lh + bctx.px(ui, 4.0);
-    val gap: f32 = bctx.px(ui, 6.0);
-    val zw:  f32 = bh * 2.0 + gap * 2.0 + bctx.text_width(ui, ?zb[0]);
-    val sep: f32 = bctx.text_width(ui, "    ");
-    # the cell and the zoom share a line while they fit, else the zoom drops under the cell
-    var rows: usize = 1;
-    var w:    f32   = zw;
-    if (co != 0) {
-        w = cw + sep + zw;
-        if (w > room) {
-            rows = 2;
-            w    = maxf(cw, zw);
-        }
-    }
-    w = minf(w, maxf(room, zw)) + pd * 2.0;
-    val h:   f32             = bh * rows::f32 + pd * 2.0;
-    val r:   bctx.Area       = bw.place(ui, blay.fixed(w), blay.fixed(h), w, h);
-    val dim: blit.draw.Color = look.colour(theme.TEXT_DIM, 1.0);
-    var y:   f32             = r.y0 + pd;
-    if (co != 0) {
-        btext.fit_at(ui, ?c[0], r.x0 + pd, y + (bh - lh) / 2.0, minf(cw, w - pd * 2.0), btext.CUT_END, dim);
-        if (rows == 2) { y = y + bh; }
-    }
-    var zx: f32 = r.x0 + pd;
-    if (co != 0 && rows == 1) { zx = zx + cw + sep; }
-    var step: i32 = 0;
+    val r:     bctx.Area = bw.place(ui, blay.fixed(zw), blay.fixed(h), zw, h);
+    val y:     f32       = r.y0 + pd;
+    val zx:    f32       = r.x0 + pd;
+    var step:  i32       = 0;
     if (bw.button_at(ui, "-###zoom_out", zx, y, zx + bh, y + bh, false)) { step = -1; }
     val tx: f32 = zx + bh + gap;
-    val tw: f32 = zw - bh * 2.0 - gap * 2.0;
-    btext.fit_at(ui, ?zb[0], tx, y + (bh - lh) / 2.0, tw, btext.CUT_END, dim);
+    btext.fit_at(ui, ?zb[0], tx + (tw - bctx.text_width(ui, ?zb[0])) / 2.0, y + (bh - lh) / 2.0, tw, btext.CUT_END, dim);
     if (bw.button_at(ui, "+###zoom_in", tx + tw + gap, y, tx + tw + gap + bh, y + bh, false)) { step = 1; }
-    bctx.pop_style(ui);
     bov.end(ui, shown);
+
+    var cx: i64 = 0;
+    var cy: i64 = 0;
+    if (over) { render.cell_at(cam, mx, my, ?cx, ?cy); }
+    ov.dx = ov.dx + zw + gap;
+    ov.dx = ov.dx + coordinate(ui, "cell_x", ov, "x", cx, over, pd, h) + gap;
+    coordinate(ui, "cell_y", ov, "y", cy, over, pd, h);
+    bctx.pop_style(ui);
     bstyle.pop(ui);
     ret step;
+}
+
+# one coordinate of the cell under the cursor, its name and value in a box
+# that holds CELL_DIGITS digits and a sign, the value blank when the cursor is
+# off the world
+# ---
+# ui:   the interface, in the small style
+# key:  the box's key
+# ov:   where the box goes
+# name: the coordinate's name
+# v:    its value
+# over: the cursor is over the world, so v names a cell
+# pd:   the box's padding
+# h:    the box's height
+# ret:  the box's width
+fun coordinate(ui: *bctx.Context, key: str, ov: bov.Overlay, name: str, v: i64, over: bool, pd: f32, h: f32) f32 {
+    var vb: [24]u8;
+    var vn: usize = 0;
+    if (over) { vn = signed(?vb[0], 0, v); }
+    vb[vn] = 0;
+    var wb: [24]u8;
+    var wn: usize = 0;
+    wb[0] = '-';
+    for (wn < CELL_DIGITS || wn + 1 < vn) {
+        wb[wn + 1] = '8';
+        wn         = wn + 1;
+    }
+    wb[wn + 1] = 0;
+    val sp: f32 = bctx.px(ui, 5.0);
+    val w:  f32 = bctx.text_width(ui, name) + sp + bctx.text_width(ui, ?wb[0]) + pd * 2.0;
+
+    val shown: bov.Shown = bov.begin(ui, key, ov);
+    val r:     bctx.Area = bw.place(ui, blay.fixed(w), blay.fixed(h), w, h);
+    val b:     bctx.Area = bctx.Area{x0: r.x0 + pd, y0: r.y0, x1: r.x1 - pd, y1: r.y1};
+    var value: str       = nil;
+    if (over) { value = ?vb[0]; }
+    btext.fit_pair(ui, bov.KIND_OVERLAY, name, string.str_len(name), look.colour(theme.TEXT_FAINT, 1.0), value, look.colour(theme.TEXT_DIM, 1.0), sp, r.y0 + (h - bctx.line_height(ui)) / 2.0, b);
+    bov.end(ui, shown);
+    ret w;
 }
 
 # append a signed integer
@@ -610,5 +637,89 @@ test pool_raise__doubles_the_pool_until_the_device_holds_no_more {
     if (pool_raise(sim.PoolMemory{taken: 0, bound: 8192 * mib, heap: 8192 * mib, share: 0}) != 0)    { ret 3; }
     # a host's pool, with no device to hold it to, doubles
     if (pool_raise(sim.PoolMemory{taken: 0, bound: 600 * mib, heap: 0, share: 0}) != 1200) { ret 4; }
+    ret 0;
+}
+
+# the world filling the surface, with the cell under the cursor and the zoom
+#[testing]
+rec PositionProbe {
+    l:    look.Look;
+    cam:  render.Camera;
+    pt:   render.Port;
+    step: i32;
+}
+
+#[testing]
+fun position_ui(ui: *bctx.Context, user: ptr) {
+    val pp: *PositionProbe = user::*PositionProbe;
+    val pt: render.Port    = pp.pt;
+    val w:  bint.Hit       = bint.hit(ui, bctx.id_of(ui, "world"), pt.x0, pt.y0, pt.x0 + pt.w, pt.y0 + pt.h, binp.BUTTON_LEFT);
+    val s:  i32            = position(ui, pp.l, pp.cam, pt, w.hot, w.mx, w.my);
+    if (s != 0) { pp.step = s; }
+}
+
+# the rect the last frame drew a widget in, empty when it was not drawn
+#[testing]
+fun rect_of(d: *blit.driver.Driver, id: u64) bctx.Area {
+    val r: opt[bctx.Area] = blit.driver.rect(d, id);
+    if (sel r.some) { ret r.some; }
+    ret bctx.Area{x0: 0.0, y0: 0.0, x1: 0.0, y1: 0.0};
+}
+
+# whether a widget was drawn in the rect r
+#[testing]
+fun drawn_in(d: *blit.driver.Driver, id: u64, r: bctx.Area) bool {
+    val a: bctx.Area = rect_of(d, id);
+    ret r.x1 > r.x0 && a.x0 == r.x0 && a.y0 == r.y0 && a.x1 == r.x1 && a.y1 == r.y1;
+}
+
+test position__the_zoom_holds_still_under_the_cursor_and_the_cell_reads_beside_it {
+    var al:   allo.Allocator;
+    val made: err[allo.Error] = page.make(?al);
+    if (sel made.err) { ret 1; }
+    var pp: PositionProbe;
+    pp.pt   = render.Port{x0: 0.0, y0: 0.0, w: 600.0, h: 300.0};
+    pp.cam  = render.Camera{x: 0.0, y: 0.0, ppc: 1.0, x0: 0.0, y0: 0.0, sw: 600.0, sh: 300.0};
+    pp.step = 0;
+    var d:  blit.driver.Driver;
+    val di: err[allo.Error] = blit.driver.init(?d, ?al, 600.0, 300.0, position_ui, (?pp)::ptr);
+    if (sel di.err) { ret 1; }
+    val l: opt[look.Look] = look.apply(?d.ctx);
+    if (sel l.none) { ret 1; }
+    pp.l = l.some;
+
+    # with the cursor over the world, the cell under it reads right of the zoom
+    blit.driver.move(?d, 590.0, 10.0);
+    blit.driver.steps(?d, 2);
+    val out: u64       = blit.driver.find(?d, "position/-###zoom_out");
+    val inn: u64       = blit.driver.find(?d, "position/+###zoom_in");
+    val ro:  bctx.Area = rect_of(?d, out);
+    val zr:  bctx.Area = rect_of(?d, inn);
+    if (ro.x1 <= ro.x0 || zr.x1 <= zr.x0)                                                               { ret 2; }
+    if (!string.str_equals(blit.driver.text_in(?d, zr.x1, zr.y0 - 20.0, 600.0, 300.0), "x 290 y -140")) { ret 3; }
+
+    # the cursor on a zoom button holds it in place frame after frame
+    if (!blit.driver.hover(?d, out)) { ret 4; }
+    var i: usize = 0;
+    for (i < 8) {
+        blit.driver.step(?d);
+        if (!drawn_in(?d, out, ro))    { ret 6; }
+        if (!blit.driver.hot(?d, out)) { ret 7; }
+        i = i + 1;
+    }
+    blit.driver.press(?d, binp.BUTTON_LEFT);
+    blit.driver.release(?d, binp.BUTTON_LEFT);
+    if (pp.step != -1)               { ret 8; }
+    if (!blit.driver.click(?d, inn)) { ret 9; }
+    if (pp.step != 1)                { ret 10; }
+
+    # a cell of fewer digits moves neither the zoom nor the cell's boxes
+    blit.driver.move(?d, 305.0, 152.0);
+    blit.driver.steps(?d, 2);
+    if (!drawn_in(?d, inn, zr))                                                                    { ret 11; }
+    if (!string.str_equals(blit.driver.text_in(?d, zr.x1, zr.y0 - 20.0, 600.0, 300.0), "x 5 y 2")) { ret 12; }
+
+    val freed: err[allo.Error] = blit.driver.free(?d);
+    if (sel freed.err) { ret 1; }
     ret 0;
 }
