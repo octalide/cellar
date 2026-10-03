@@ -623,6 +623,34 @@ fun drop_cells(g: *Gpu, st: *Store, k: usize, n: usize) {
     }
 }
 
+# let go of a store's shards past the first that hold cap slots, inside the
+# frame, their entries in the shard table zeroed. the shards a pool of cap
+# slots reaches stay as they are, and so do the cells they hold
+fun store_trim(g: *Gpu, st: *Store, cap: usize) err[gfx.Error] {
+    val from: usize = st.n;
+    for (st.n > 1 && layout.shard_start((st.n - 1)::u32, st.m)::usize >= cap) {
+        st.n = st.n - 1;
+        drop_shard(g, st, st.n, st.set.n * 2 + 1);
+        var i: usize = 0;
+        for (i < st.set.n * 2) {
+            st.addrs[layout.cells_entry((i / 2)::u32, (i % 2)::u32, st.n::u32)::usize] = 0;
+            i                                                                          = i + 1;
+        }
+        st.addrs[layout.mip_entry(st.n::u32)::usize] = 0;
+    }
+    if (st.n == from) { ret err[gfx.Error].ok{}; }
+    # the entries of the shards let go, each layer's two cells' and the pyramids'
+    var e: usize = 0;
+    for (e <= st.set.n * 2) {
+        var at: usize = layout.mip_entry(st.n::u32)::usize * 8;
+        if (e < st.set.n * 2) { at = layout.cells_entry((e / 2)::u32, (e % 2)::u32, st.n::u32)::usize * 8; }
+        val w: err[gfx.Error] = write_framed(g, true, ?st.table, at, (?st.addrs[at / 8])::*u8, (from - st.n) * 8);
+        if (sel w.err) { ret w; }
+        e = e + 1;
+    }
+    ret err[gfx.Error].ok{};
+}
+
 # delete every shard of a store and its table
 fun store_drop(g: *Gpu, st: *Store) {
     if (!st.made) { ret; }
@@ -879,6 +907,8 @@ fun pool_bytes(cap: usize) usize {
 # used:     slots in use the newest census found while owned
 # tallied:  pop, box and used are the world's, no edit having come since
 # squeeze:  a test's hold on the top, until the pool is next taken, 0 for none
+# shrink:   the host's pool shrank to the world it holds (cellar.sim
+#           set_views), which the next flush fits the pool to (shrink_pool)
 # listed:   the active list holds every slot the next generation may change,
 #           gathered since the pool and the rule last changed
 # gathered: cells of spread recorded since the list was gathered
@@ -1013,6 +1043,7 @@ pub rec Gpu {
     used:     usize;
     tallied:  bool;
     squeeze:  usize;
+    shrink:   bool;
     listed:   bool;
     gathered: usize;
     est:      usize;
@@ -1327,6 +1358,7 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     g.used     = 0;
     g.tallied  = false;
     g.squeeze  = 0;
+    g.shrink   = false;
     g.untaken  = "";
     g.listed   = false;
     g.gathered = 0;
@@ -1388,24 +1420,47 @@ pub fun fit(g: *Gpu, set: *plane.Set, limit: u64) usize {
     ret g.slots;
 }
 
-# whether the pool in use could hold its cells in a set's layers as it
-# stands, every shard its store holds made for them, within the memory and
-# the limits its ceiling was fitted to (fit), so the host may take the set up
-# while the GPU steps the world. the store's geometry leaves view layers out
-# (geometry), so a view layer wider than the rest must also fit the device's
-# largest allocation in the largest shard the store may grow
-pub fun holds_layers(g: *Gpu, set: *plane.Set) bool {
-    val st: *Store = store_of(g, ?g.p);
-    if (g.p.cap == 0 || !st.made) { ret true; }
+# the most slots a pool of a set's layers may hold under the memory limit it
+# was fitted to (fit), where the device holds them at all. the store's
+# geometry leaves view layers out (geometry), so a view layer wider than the
+# rest must also fit the device's largest allocation in the largest shard the
+# store may grow
+# ---
+# g:   the GPU side
+# set: the layers
+# ret: the slots, or why no pool holds the set's view layers
+pub fun room(g: *Gpu, set: *plane.Set) res[usize, str] {
     val l:    gfx.Limits = gfx.renderer_limits(g.r);
     val most: u64        = l.max_memory_allocation_size;
+    val m:    u32        = geometry(set, most);
     var k:    usize      = plane.exact(set);
     for (k < set.n) {
-        val len: u64 = ((1::usize << st.m::usize) * plane.span_words(set.at[k].width) * 4)::u64;
-        if (most != 0 && len > most) { ret false; }
+        val len: u64 = ((1::usize << m::usize) * plane.span_words(set.at[k].width) * 4)::u64;
+        if (most != 0 && len > most) { ret res[usize, str].err{"the device cannot allocate the layers in the pool's shards"}; }
         k = k + 1;
     }
-    ret ceiling(l, set, g.bound) >= store_slots(st);
+    ret res[usize, str].ok{ceiling(l, set, g.bound)};
+}
+
+# the capacity a pool fitted to its world takes: room for the slots in use,
+# all below hi, and the slack a pass claims above them, a power of two of
+# slots no fewer than a shard's, held to room
+# ---
+# hi:   one past the last slot in use, at most room (space.compact)
+# room: the most slots the pool may hold (room)
+pub fun fitted(hi: usize, room: usize) usize {
+    var fit: usize = layout.SHARD_FIRST::usize;
+    for (fit < hi + slack(hi)) { fit = fit * 2; }
+    if (fit > room) { ret room; }
+    ret fit;
+}
+
+# fit the pool to the host's, which shrank to the world it holds, in the next
+# flush (shrink_pool). only the render thread may call it, holding the world,
+# with the host's page table the GPU's (take) and the GPU's pool holding a set
+# of the host's layers in place (in_place)
+pub fun shrink(g: *Gpu) {
+    g.shrink = true;
 }
 
 # whether the next frame takes a set up in place (review): the GPU steps the
@@ -2738,6 +2793,10 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
         g.listed = false;
     }
     g.lit = sp.lit;
+    if (g.shrink) {
+        val es: err[gfx.Error] = shrink_pool(g, sp);
+        if (sel es.err) { ret es; }
+    }
     val ev: err[gfx.Error] = review(g, sp);
     if (sel ev.err) { ret ev; }
     val owed: usize = atomic.exchange(?g.owed, 0)::usize;
@@ -2745,12 +2804,13 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
         ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.overrun{(owed * slot_bytes(space.layers(sp)))::u64}}};
     }
     # buffers made for other layers than the host's are made again for them,
-    # at the capacity they were to have, and filled from the host's cells
+    # at the host's capacity, which holds the world the host's cells now are
+    # and which the set's ceiling holds (sim.set_views), and filled from them
     var aim: *Pool = ?g.p;
     if (g.reserved) { aim = ?g.next; }
     val relaid: bool = !plane.same_shape(?aim.set, space.layers(sp));
-    if (relaid && !make_next(g, aim.cap, true, space.layers(sp))) {
-        ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.overrun{(aim.cap * slot_bytes(space.layers(sp)))::u64}}};
+    if (relaid && !make_next(g, sp.cap, true, space.layers(sp))) {
+        ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.overrun{(sp.cap * slot_bytes(space.layers(sp)))::u64}}};
     }
     val grew: bool = g.reserved;
     # a growth made in another store than the pool's, as a pool made for
@@ -2946,6 +3006,49 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
             if (sel er.err) { ret er; }
         }
     }
+    ret err[gfx.Error].ok{};
+}
+
+# fit the pool to the host's capacity, which shrank to the world it holds
+# (shrink): buffers of that capacity beside the same store, whose shards past
+# it go (store_trim), the stamps of the slots below the host's top carried
+# into them, and the cells left where they lie. the host's page table is the
+# GPU's (take), so it goes up again and the GPU seeds its allocator from it
+fun shrink_pool(g: *Gpu, sp: *space.Space) err[gfx.Error] {
+    g.shrink = false;
+    val cap: usize = sp.cap;
+    if (cap >= g.p.cap) { ret err[gfx.Error].ok{}; }
+    drop_next(g);
+    val made: err[gfx.Error] = make_pool(g, ?g.next, cap, true, ?g.p.set, g.p.store);
+    if (sel made.err) { ret made; }
+    if (g.stepping && sp.hi != 0) {
+        var gb: [3]*gfx.StorageBuffer;
+        gb[0] = ?g.p.flags;
+        gb[1] = ?g.next.flags;
+        gb[2] = ?g.p.meta;
+        val eg: err[gfx.Error] = dispatch_each(g, ?g.grow, ?gb[0], 3, sp.hi);
+        if (sel eg.err) { ret eg; }
+    }
+    g.old      = g.p;
+    g.retired  = true;
+    g.p        = g.next;
+    g.reserved = false;
+    val et: err[gfx.Error] = store_trim(g, store_of(g, ?g.p), cap);
+    if (sel et.err) { ret et; }
+    g.est = UNKNOWN;
+    forget_censuses(g);
+    var t: usize = 0;
+    for (t < sp.hi) {
+        sp.dirty[t] = sp.dirty[t] | space.DIRTY_ENTRY;
+        t           = t + 1;
+    }
+    if (g.owns) { g.reseed = true; }
+    g.going   = false;
+    g.counted = false;
+    g.listed  = false;
+    g.aim     = 0;
+    if (g.top > cap) { g.top = cap; }
+    if (g.hi > cap)  { g.hi = cap; }
     ret err[gfx.Error].ok{};
 }
 
