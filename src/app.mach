@@ -4,12 +4,14 @@
 # the colours, the panels and what they show, and the messages it flashes.
 
 use blit;
+use cellar.boundary;
 use cellar.brush;
 use cellar.ceiling;
 use cellar.command;
 use cellar.device;
 use cellar.fill;
 use cellar.format;
+use cellar.gesture;
 use cellar.identify;
 use cellar.identify.worker;
 use cellar.journal;
@@ -76,7 +78,7 @@ pub val TOOL_ERASE: usize = 1;
 pub val TOOL_STAMP: usize = 2;
 # drag out a rectangle to operate on
 pub val TOOL_SELECT: usize = 3;
-# drag out the world's bounds, or the edges of the grid it is on
+# draw the world's boundary, or a grid's bounds, and act on its regions
 pub val TOOL_BOUNDS: usize = 4;
 # number of tools
 pub val TOOL_COUNT: usize = 5;
@@ -183,6 +185,28 @@ pub val ZOOM_TREE_MIN: f32 = 0.000000000001;
 # size_h:       the bounds section's height
 # size_h_buf:   its text
 # sized_grid:   the grid the size fields last showed
+# domain:       the world's boundary as last seen (cellar.exec), which the
+#               bounds tool and the draw read
+# dom_on:       the world has a boundary, which domain holds
+# dom_drawn:    it was drawn, rather than the plane the rule names
+# dom_seen:     the change to the boundary domain was copied at (sim.bound_revision)
+# dom_parts:    regions it holds
+# shape:        the shape the bounds tool is drawing (cellar.gesture)
+# choosing:     a press of the bounds tool picks a region rather than drawing
+# bound_op:     how a drawn shape combines with the boundary (boundary.ADD,
+#               SUBTRACT or INTERSECT)
+# part_on:      a region of the boundary is picked
+# part_x:       the column of a cell it holds
+# part_y:       its row
+# part:         the region, as last seen
+# moving:       the picked region is being dragged
+# move_dx:      columns it is dragged by so far
+# move_dy:      rows it is dragged by so far
+# shade_tmp:    spans the draw of a region works out (cellar.shade)
+# fill_on:      a region is chosen for a region fill, which fill_part holds
+# fill_x:       the column of the cell that chose it
+# fill_y:       its row
+# fill_part:    the region, as the boundary was last seen
 # alloc:        allocator behind the patterns and the queue, once attach has run
 # queue:        edits to the world, applied at the start of the next frame
 # start:        the world reset returns to, once attach has run
@@ -266,6 +290,26 @@ pub rec App {
     size_h:       blit.field.Field;
     size_h_buf:   [SIZE_DIGITS + 1]u8;
     sized_grid:   topology.Grid;
+    domain:       boundary.Region;
+    dom_on:       bool;
+    dom_drawn:    bool;
+    dom_seen:     u64;
+    dom_parts:    usize;
+    shape:        gesture.Gesture;
+    choosing:     bool;
+    bound_op:     u32;
+    part_on:      bool;
+    part_x:       i64;
+    part_y:       i64;
+    part:         boundary.Region;
+    moving:       bool;
+    move_dx:      i64;
+    move_dy:      i64;
+    shade_tmp:    Vector[i64];
+    fill_on:      bool;
+    fill_x:       i64;
+    fill_y:       i64;
+    fill_part:    boundary.Region;
     alloc:        *allo.Allocator;
     queue:        command.Queue;
     start:        snapshot.Snapshot;
@@ -515,6 +559,11 @@ pub fun attach(a: *App, alloc: *allo.Allocator) err[format.Error] {
     a.clip       = vector.init[u8](alloc);
     a.clip_ready = false;
     a.layout     = vector.init[u8](alloc);
+    a.domain     = boundary.init(alloc);
+    a.part       = boundary.init(alloc);
+    a.shade_tmp  = vector.init[i64](alloc);
+    a.fill_part  = boundary.init(alloc);
+    gesture.init(?a.shape, alloc);
     val l: err[format.Error] = library.init(?a.library, alloc);
     if (sel l.err) { ret l; }
     val p: err[allo.Error] = pattern.init(?a.picked, alloc, 0, 0, "");
@@ -539,6 +588,11 @@ pub fun dnit(a: *App) {
     journal.dnit(?a.log);
     vector.dnit[u8](?a.clip);
     vector.dnit[u8](?a.layout);
+    boundary.dnit(?a.domain);
+    boundary.dnit(?a.part);
+    vector.dnit[i64](?a.shade_tmp);
+    boundary.dnit(?a.fill_part);
+    gesture.dnit(?a.shape);
     worker.cancel(?a.identifier);
 }
 
@@ -697,6 +751,75 @@ pub fun deselect(a: *App) {
     a.dragging = false;
 }
 
+# pick the region of the boundary holding a cell, as the boundary was last
+# seen, or none where no region holds it
+# ---
+# ret: whether a region holds the cell
+pub fun pick_part(a: *App, x: i64, y: i64) bool {
+    a.part_on = false;
+    a.moving  = false;
+    boundary.clear(?a.part);
+    if (!a.dom_on) { ret false; }
+    val at: res[usize, allo.Error] = boundary.region_at(?a.domain, x, y);
+    if (!sel at.ok)                  { ret false; }
+    if (at.ok == boundary.NO_REGION) { ret false; }
+    val got: err[allo.Error] = boundary.region(?a.domain, at.ok, ?a.part);
+    if (sel got.err) { ret false; }
+    a.part_on = true;
+    a.part_x  = x;
+    a.part_y  = y;
+    ret true;
+}
+
+# take up the world's boundary as it now stands, once it has changed since
+# last seen, keeping the picked region picked where a region still holds its
+# cell
+# ---
+# a:       application state, attached
+# changes: the boundary's changes so far (sim.bound_revision)
+# b:       the boundary, or nil for none
+# drawn:   it was drawn, rather than the plane the rule names
+pub fun see_domain(a: *App, changes: u64, b: *boundary.Region, drawn: bool) {
+    if (changes == a.dom_seen) { ret; }
+    a.dom_seen  = changes;
+    a.dom_on    = false;
+    a.dom_drawn = false;
+    a.dom_parts = 0;
+    boundary.clear(?a.domain);
+    if (b != nil) {
+        val copied: err[allo.Error] = boundary.copy(?a.domain, b);
+        a.dom_on    = sel copied.ok;
+        a.dom_drawn = a.dom_on && drawn;
+    }
+    if (a.dom_on) {
+        val n: res[usize, allo.Error] = boundary.count(?a.domain);
+        if (sel n.ok) { a.dom_parts = n.ok; }
+    }
+    if (a.part_on) { pick_part(a, a.part_x, a.part_y); }
+    see_fill(a, a.fill_on, a.fill_x, a.fill_y, true);
+}
+
+# take up the cell that chooses the region a region fill takes, finding the
+# region in the boundary as last seen when the cell or the boundary changed
+# ---
+# a:     application state, attached
+# on:    a cell is chosen
+# x:     its column
+# y:     its row
+# again: the boundary changed, so the region is found again
+pub fun see_fill(a: *App, on: bool, x: i64, y: i64, again: bool) {
+    if (!again && on == a.fill_on && x == a.fill_x && y == a.fill_y) { ret; }
+    a.fill_on = on;
+    a.fill_x  = x;
+    a.fill_y  = y;
+    boundary.clear(?a.fill_part);
+    if (!on || !a.dom_on) { ret; }
+    val at: res[usize, allo.Error] = boundary.region_at(?a.domain, x, y);
+    if (!sel at.ok)                  { ret; }
+    if (at.ok == boundary.NO_REGION) { ret; }
+    boundary.region(?a.domain, at.ok, ?a.fill_part);
+}
+
 # ask for an operation on the selection, when there is one
 # ---
 # a:  application state
@@ -797,7 +920,27 @@ pub fun init(a: *App) {
     blit.field.init(?a.size_w, ?a.size_w_buf[0], SIZE_DIGITS + 1, 0, digit);
     blit.field.init(?a.size_h, ?a.size_h_buf[0], SIZE_DIGITS + 1, 0, digit);
     a.sized_grid = topology.open();
-    a.alloc      = nil;
+    a.domain     = boundary.init(nil);
+    a.dom_on     = false;
+    a.dom_drawn  = false;
+    a.dom_seen   = 0;
+    a.dom_parts  = 0;
+    gesture.init(?a.shape, nil);
+    a.choosing  = false;
+    a.bound_op  = boundary.ADD;
+    a.part_on   = false;
+    a.part_x    = 0;
+    a.part_y    = 0;
+    a.part      = boundary.init(nil);
+    a.moving    = false;
+    a.move_dx   = 0;
+    a.move_dy   = 0;
+    a.shade_tmp = vector.init[i64](nil);
+    a.fill_on   = false;
+    a.fill_x    = 0;
+    a.fill_y    = 0;
+    a.fill_part = boundary.init(nil);
+    a.alloc     = nil;
     worker.init(?a.identifier);
     a.id_limits     = identify.limits();
     a.identified[0] = 0;

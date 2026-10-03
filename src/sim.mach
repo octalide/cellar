@@ -808,6 +808,12 @@ pub fun drawn(s: *Sim) bool {
     ret s.drawn;
 }
 
+# changes to the world's boundary so far, which a copy of it compares to know
+# it is stale
+pub fun bound_revision(s: *Sim) u64 {
+    ret s.bound_rev;
+}
+
 # give the world a boundary, or take it away, as one change: the cells outside
 # it are dropped, and no cell is made there again until it changes
 #
@@ -2196,6 +2202,18 @@ pub fun choose_region(s: *Sim, x: i64, y: i64) {
     s.regions.valid = false;
 }
 
+# the cell that names the region a region fill takes (choose_region)
+# ---
+# x:   receives its column
+# y:   receives its row
+# ret: false when none is chosen, leaving x and y alone
+pub fun chosen_cell(s: *Sim, x: *i64, y: *i64) bool {
+    if (!s.chosen.set) { ret false; }
+    @x = s.chosen.x;
+    @y = s.chosen.y;
+    ret true;
+}
+
 # make out the chosen region into out
 # ---
 # ret: false when the world has no boundary, no cell is chosen or the cell is
@@ -2286,8 +2304,8 @@ pub fun randomize(s: *Sim, density: f32, side: usize) {
     randomize_shape(s, ?f);
 }
 
-# copy the world, its generation and its rule into a snapshot, pulling the
-# cells from the GPU first when it steps
+# copy the world, its generation, its rule and its drawn boundary into a
+# snapshot, pulling the cells from the GPU first when it steps
 #
 # the tree is copied as its distinct nodes, the pool as its chunks.
 # call outside a frame, or in one before gpu frame has recorded anything.
@@ -2342,7 +2360,15 @@ pub fun least_image(s: *Sim) usize {
 pub fun capture(s: *Sim, sn: *snapshot.Snapshot) bool {
     if (on_tree(s)) { ret snapshot.capture_tree(sn, ?s.tree, s.generation, ?s.rule); }
     val copied: err[allo.Error] = snapshot.capture(sn, ?s.space, s.generation, ?s.rule);
-    ret sel copied.ok;
+    if (sel copied.err) { ret false; }
+    var drawn: *boundary.Region = nil;
+    if (s.drawn) { drawn = ?s.bound; }
+    val kept: err[allo.Error] = snapshot.keep_bound(sn, drawn);
+    if (sel kept.err) {
+        snapshot.drop(sn);
+        ret false;
+    }
+    ret true;
 }
 
 # what a list of chunks by their words hands each one: its column and row and
@@ -2409,8 +2435,8 @@ pub fun chunks_in(s: *Sim, b: space.Box, f: Words, ctx: *u8) {
     }
 }
 
-# replace the world with a snapshot's, at its generation and under its rule,
-# paused
+# replace the world with a snapshot's, at its generation, under its rule and
+# inside its drawn boundary, paused
 #
 # a snapshot of either form goes back into whichever member holds the world
 # now. the population history starts over from the restored generation.
@@ -2421,11 +2447,21 @@ pub fun chunks_in(s: *Sim, b: space.Box, f: Words, ctx: *u8) {
 #      world, which marks it full
 pub fun restore(s: *Sim, sn: *snapshot.Snapshot) bool {
     if (!sn.held) { ret false; }
-    # the world empties first, so a rule that moves it out of the tree moves nothing
+    # the world empties first, so a rule that moves it out of the tree moves
+    # nothing, and a drawn boundary it lacks goes before its rule is judged
+    # against it
     clear(s);
-    set_rule(s, sn.rule);
     var ok: bool = true;
-    if (sn.treed) {
+    if (s.drawn && !sn.drawn) {
+        val off: opt[str] = set_bound(s, nil);
+        ok = sel off.none;
+    }
+    set_rule(s, sn.rule);
+    if (sn.drawn && ok) {
+        val on: opt[str] = set_bound(s, ?sn.bound);
+        ok = sel on.none;
+    }
+    if (sn.treed && ok) {
         val t: *hashlife.Tree = ?s.tree;
         ok = hashlife.make(t) && hashlife.import(t, sn.tree.data, sn.tree.len / 5);
         touched(s);
@@ -2434,7 +2470,7 @@ pub fun restore(s: *Sim, sn: *snapshot.Snapshot) bool {
             hashlife.clear(t);
         }
     }
-    or {
+    or (ok) {
         fill_begin(s);
         val w: *u32 = buffer(s, space.CELLS);
         if (w == nil) { ok = false; }
@@ -3196,6 +3232,68 @@ pub fun clear_outside(s: *Sim, b: space.Box) bool {
             y = y + 1;
         }
         sl = sl + 1;
+    }
+    ret edit_end(s);
+}
+
+# kill every cell a region holds
+#
+# only the cells the world may hold live are written: on the pool those of the
+# chunks it holds, in the tree those of the live box, so a region without end
+# costs what the world does.
+# ---
+# s:   simulation
+# r:   the region
+# ret: false when the edit could not be made
+pub fun clear_in(s: *Sim, r: *boundary.Region) bool {
+    var rb: [4]i64;
+    if (!boundary.bounds(r, ?rb[0])) { ret true; }
+    var e: space.Box = space.Box{x0: 0, y0: 0, x1: 0, y1: 0};
+    if (on_tree(s)) {
+        val live: opt[space.Box] = bounds(s);
+        if (sel live.none) { ret true; }
+        e = live.some;
+    }
+    or {
+        # the chunks are read from the page table as the GPU left it
+        if (!own(s)) { ret false; }
+        val sp:  *space.Space = ?s.space;
+        var any: bool         = false;
+        var sl:  usize        = 0;
+        for (sl < sp.hi) {
+            if (space.used(sp, sl)) {
+                val x: i64 = space.slot_x(sp, sl) * space.SIDE;
+                val y: i64 = space.slot_y(sp, sl) * space.SIDE;
+                if (!any || x < e.x0)              { e.x0 = x; }
+                if (!any || y < e.y0)              { e.y0 = y; }
+                if (!any || x + space.SIDE > e.x1) { e.x1 = x + space.SIDE; }
+                if (!any || y + space.SIDE > e.y1) { e.y1 = y + space.SIDE; }
+                any = true;
+            }
+            sl = sl + 1;
+        }
+        if (!any) { ret true; }
+    }
+    if (rb[0] > e.x0)                           { e.x0 = rb[0]; }
+    if (rb[1] > e.y0)                           { e.y0 = rb[1]; }
+    if (rb[2] < e.x1)                           { e.x1 = rb[2]; }
+    if (rb[3] < e.y1)                           { e.y1 = rb[3]; }
+    if (e.x1 <= e.x0 || e.y1 <= e.y0)           { ret true; }
+    if (!edit_begin(s, e.x0, e.y0, e.x1, e.y1)) { ret false; }
+    var y: i64 = e.y0;
+    for (y < e.y1) {
+        var n:  usize = 0;
+        val xs: *i64  = boundary.row(r, y, ?n);
+        var k:  usize = 0;
+        for (k < n) {
+            var x0: i64 = xs[k * 2];
+            var x1: i64 = xs[k * 2 + 1];
+            if (x0 < e.x0) { x0 = e.x0; }
+            if (x1 > e.x1) { x1 = e.x1; }
+            if (x0 < x1)   { edit_run(s, x0, y, (x1 - x0)::usize, 0); }
+            k = k + 1;
+        }
+        y = y + 1;
     }
     ret edit_end(s);
 }
@@ -5316,12 +5414,13 @@ test frame__steps_on_the_gpu_exactly_as_the_cpu_does_for_every_family {
     ret 0;
 }
 
-# whether two snapshots hold the same chunks, cells, generation and rule, in
-# whatever order they were taken
+# whether two snapshots hold the same chunks, cells, generation, rule and
+# drawn boundary, in whatever order they were taken
 #[testing]
 pub fun same_snapshot(a: *snapshot.Snapshot, b: *snapshot.Snapshot) bool {
     if (!a.held || !b.held || a.n != b.n || a.generation != b.generation) { ret false; }
-    if (!rule.same(?a.rule, ?b.rule))                                     { ret false; }
+    if (!rule.same(?a.rule, ?b.rule) || a.drawn != b.drawn)               { ret false; }
+    if (a.drawn && !boundary.same(?a.bound, ?b.bound))                    { ret false; }
     var i: usize = 0;
     for (i < a.n) {
         var j: usize = 0;

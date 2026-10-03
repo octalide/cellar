@@ -1,0 +1,264 @@
+# drawing a shape in the world with the pointer: a rectangle or an ellipse
+# dragged out, a polygon clicked corner by corner, or a freehand brush
+#
+# a gesture only makes the shape, as a region of cells (cellar.boundary). what
+# the shape is for is the caller's: the bounds tool combines it into the
+# world's boundary, and any other tool may take the same gestures for a
+# target of its own. while it is drawn the shape so far is held, so the
+# caller can show it (overlay), and a finished one stays until the next
+# gesture begins.
+#
+# a rectangle or an ellipse is the box from the press's cell to the release's,
+# both held, the ellipse inscribed in it, and a click with nothing dragged
+# makes none. a polygon takes a corner a click, and a click on its first
+# corner, or close, ends it. the brush lays a disc on every cell the pointer
+# passes, so its shape is the union of them.
+
+use cellar.boundary;
+use cellar.paint;
+use cellar.render;
+use cellar.shade;
+use cellar.theme;
+use allo: std.allocator;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+# a rectangle dragged out
+pub val RECT: usize = 0;
+# an ellipse dragged out, inscribed in the box
+pub val ELLIPSE: usize = 1;
+# a polygon clicked corner by corner
+pub val POLYGON: usize = 2;
+# a freehand brush of discs
+pub val FREEHAND: usize = 3;
+# number of kinds
+pub val COUNT: usize = 4;
+
+# the largest brush radius, in cells
+pub val RADIUS_MAX: f32 = 64.0;
+
+# unscaled pixels from a polygon's first corner that a click closes it within
+val CLOSE: f32 = 8.0;
+
+# a kind's name, as the tools offer it
+pub fun name(k: usize) str {
+    if (k == ELLIPSE)  { ret "Ellipse"; }
+    if (k == POLYGON)  { ret "Polygon"; }
+    if (k == FREEHAND) { ret "Freehand"; }
+    ret "Rectangle";
+}
+
+# a shape being drawn
+# ---
+# kind:   what is drawn (RECT, ELLIPSE, POLYGON or FREEHAND)
+# radius: the brush's radius in cells, 0 a single cell
+# active: a shape is being drawn
+# ax:     the column the gesture began on
+# ay:     its row
+# cx:     the column the pointer is on
+# cy:     its row
+# pts:    a polygon's corners, x then y each
+# shape:  the shape so far, or the finished one
+# disc:   one disc of the brush
+pub rec Gesture {
+    kind:   usize;
+    radius: f32;
+    active: bool;
+    ax:     i64;
+    ay:     i64;
+    cx:     i64;
+    cy:     i64;
+    pts:    Vector[i64];
+    shape:  boundary.Region;
+    disc:   boundary.Region;
+}
+
+# a gesture drawing nothing yet
+# ---
+# g: the gesture
+# a: allocator for its shapes, outliving it
+pub fun init(g: *Gesture, a: *allo.Allocator) {
+    g.kind   = RECT;
+    g.radius = 4.0;
+    g.active = false;
+    g.ax     = 0;
+    g.ay     = 0;
+    g.cx     = 0;
+    g.cy     = 0;
+    g.pts    = vector.init[i64](a);
+    g.shape  = boundary.init(a);
+    g.disc   = boundary.init(a);
+}
+
+# free a gesture's shapes
+pub fun dnit(g: *Gesture) {
+    vector.dnit[i64](?g.pts);
+    boundary.dnit(?g.shape);
+    boundary.dnit(?g.disc);
+}
+
+# stop drawing, making nothing
+pub fun cancel(g: *Gesture) {
+    g.active = false;
+    boundary.clear(?g.shape);
+}
+
+fun min(a: i64, b: i64) i64 {
+    if (a < b) { ret a; }
+    ret b;
+}
+
+fun max(a: i64, b: i64) i64 {
+    if (a > b) { ret a; }
+    ret b;
+}
+
+fun abs(v: i64) i64 {
+    if (v < 0) { ret 0 - v; }
+    ret v;
+}
+
+# the box from the gesture's first cell to the pointer's, as the shape
+fun boxed(g: *Gesture) {
+    val x0: i64 = min(g.ax, g.cx);
+    val y0: i64 = min(g.ay, g.cy);
+    val x1: i64 = max(g.ax, g.cx) + 1;
+    val y1: i64 = max(g.ay, g.cy) + 1;
+    if (g.kind == ELLIPSE) { boundary.ellipse(?g.shape, x0, y0, x1, y1); }
+    or                     { boundary.rect(?g.shape, x0, y0, x1, y1); }
+}
+
+# lay the brush's disc on a cell
+fun dab(g: *Gesture, x: i64, y: i64) {
+    val r: i64 = g.radius::i64;
+    boundary.ellipse(?g.disc, x - r, y - r, x + r + 1, y + r + 1);
+    boundary.combine(?g.shape, ?g.disc, boundary.ADD);
+}
+
+# lay the brush along the line from (x0, y0) to (x1, y1), past its start, a
+# disc every half radius or every cell for a small brush, and at its end
+fun stroke(g: *Gesture, x0: i64, y0: i64, x1: i64, y1: i64) {
+    val n:   i64 = max(abs(x1 - x0), abs(y1 - y0));
+    var gap: i64 = g.radius::i64 / 2;
+    if (gap < 1) { gap = 1; }
+    var i: i64 = gap;
+    for (i < n) {
+        dab(g, x0 + (x1 - x0) * i / n, y0 + (y1 - y0) * i / n);
+        i = i + gap;
+    }
+    if (n > 0) { dab(g, x1, y1); }
+}
+
+# the polygon so far, its last corner at the pointer
+fun outlined(g: *Gesture) {
+    val pushed: res[usize, allo.Error] = vector.push[i64](?g.pts, g.cx);
+    if (sel pushed.err) { ret; }
+    val again: res[usize, allo.Error] = vector.push[i64](?g.pts, g.cy);
+    if (sel again.ok) {
+        boundary.polygon(?g.shape, g.pts.data, g.pts.len / 2);
+        g.pts.len = g.pts.len - 1;
+    }
+    g.pts.len = g.pts.len - 1;
+}
+
+# end a polygon with the corners clicked so far
+# ---
+# ret: whether it makes a shape, which shape then holds
+pub fun close(g: *Gesture) bool {
+    if (!g.active || g.kind != POLYGON) { ret false; }
+    g.active = false;
+    boundary.polygon(?g.shape, g.pts.data, g.pts.len / 2);
+    ret !boundary.empty(?g.shape);
+}
+
+# whether a press at screen (mx, my) lands on a polygon's first corner
+fun on_first(g: *Gesture, cam: render.Camera, mx: f32, my: f32, scale: f32) bool {
+    if (g.pts.len < 6) { ret false; }
+    val px: f32 = render.screen_x(cam, g.pts.data[0]::f64 + 0.5);
+    val py: f32 = render.screen_y(cam, g.pts.data[1]::f64 + 0.5);
+    val r:  f32 = CLOSE * scale;
+    ret (mx - px) * (mx - px) + (my - py) * (my - py) <= r * r;
+}
+
+# follow the pointer
+# ---
+# g:       the gesture
+# cam:     the camera
+# scale:   the interface scale
+# mx:      the pointer's column on screen
+# my:      the pointer's row on screen
+# pressed: a press began on the world this frame
+# held:    the button is held
+# ret:     whether a shape was finished this frame, which shape then holds
+pub fun track(g: *Gesture, cam: render.Camera, scale: f32, mx: f32, my: f32, pressed: bool, held: bool) bool {
+    var x: i64 = 0;
+    var y: i64 = 0;
+    render.cell_at(cam, mx, my, ?x, ?y);
+    val moved: bool = x != g.cx || y != g.cy;
+    if (g.kind == POLYGON) {
+        if (pressed && g.active && on_first(g, cam, mx, my, scale)) { ret close(g); }
+        if (pressed && !g.active) {
+            g.active = true;
+            vector.clear[i64](?g.pts);
+        }
+        if (pressed) {
+            vector.push[i64](?g.pts, x);
+            vector.push[i64](?g.pts, y);
+        }
+        g.cx = x;
+        g.cy = y;
+        if (g.active && (pressed || moved)) { outlined(g); }
+        ret false;
+    }
+    if (pressed) {
+        g.active = true;
+        g.ax     = x;
+        g.ay     = y;
+        g.cx     = x;
+        g.cy     = y;
+        boundary.clear(?g.shape);
+        if (g.kind == FREEHAND) { dab(g, x, y); }
+        or                      { boxed(g); }
+        ret false;
+    }
+    if (!g.active) { ret false; }
+    if (held) {
+        if (moved && g.kind == FREEHAND) { stroke(g, g.cx, g.cy, x, y); }
+        g.cx = x;
+        g.cy = y;
+        if (moved && g.kind != FREEHAND) { boxed(g); }
+        ret false;
+    }
+    g.active = false;
+    # a click with nothing dragged is no box
+    if (g.kind != FREEHAND && g.ax == g.cx && g.ay == g.cy) {
+        boundary.clear(?g.shape);
+        ret false;
+    }
+    ret !boundary.empty(?g.shape);
+}
+
+# the shape being drawn, over the world: filled faintly and outlined, and a
+# polygon's corners marked
+pub fun overlay(p: *paint.Paint, g: *Gesture, cam: render.Camera, tmp: *Vector[i64]) {
+    if (!g.active) { ret; }
+    var d: shade.Draw = shade.Draw{r: ?g.shape, dx: 0, dy: 0, tmp: tmp};
+    shade.fill(p, ?d, cam, theme.ACCENT, 0.22);
+    shade.outline(p, ?d, cam, 2.0, theme.ACCENT, 0.9);
+    if (g.kind != POLYGON) { ret; }
+    var i: usize = 0;
+    for (i + 1 < g.pts.len) {
+        val x: f32 = render.screen_x(cam, g.pts.data[i]::f64 + 0.5);
+        val y: f32 = render.screen_y(cam, g.pts.data[i + 1]::f64 + 0.5);
+        var r: f32 = 3.0;
+        if (i == 0) { r = 5.0; }
+        paint.frame(p, x - r, y - r, x + r, y + r, 1.5, theme.ACCENT, 1.0);
+        i = i + 2;
+    }
+}
