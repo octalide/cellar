@@ -6,6 +6,18 @@ All notable changes to cellar are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-03
+
+### Added
+
+- The pool gives memory back. Clear and reset return it to its starting size, and a world that has sat below a quarter of its pool for about two seconds is packed and shrunk to twice what it needs. On the GPU the packing runs in one pass with nothing read back (#285).
+
+### Fixed
+
+- Clearing a world on the GPU no longer reads the pool back, so a multi-GiB world clears without a pause. A world too large for the host can now be cleared instead of being refused (#295).
+- Pausing to clear, or starting play, on a world too large for undo no longer reads the whole world back only to discard it. Smaller worlds keep their undo as before (#295).
+- Changing layers no longer holds the old and new GPU pools at once (#285).
+
 ## [0.10.1] - 2026-10-03
 
 ### Changed
