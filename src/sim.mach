@@ -97,7 +97,6 @@ use cellar.layer.plane;
 use cellar.layout;
 use cellar.render;
 use cellar.rule;
-use rd_word:   cellar.rules.reaction.word;
 use ruletable: cellar.rules.table;
 use cellar.rules.table.load;
 use cellar.rules.table.store;
@@ -552,6 +551,17 @@ pub fun word_len(s: *Sim) usize {
     ret rule.word_len(?s.rule);
 }
 
+# the state of cell i of slot sl, whose state layer holds c, under the rule
+# running: from c alone for a rule whose word is its state layer, of m = 1
+# values, else from the cell's whole word (rule.word_state)
+#[inline]
+fun state_in(s: *Sim, m: usize, sl: usize, i: usize, c: u32) u32 {
+    if (m == 1) { ret rule.state(?s.rule, c); }
+    var w: [layer.LAYERS_MAX]u32;
+    space.get_word(?s.space, sl, i, ?w[0]);
+    ret rule.word_state(?s.rule, ?w[0]);
+}
+
 # whether a word of m values is the quiescent background's, every value 0
 fun blank(w: *u32, m: usize) bool {
     var k: usize = 0;
@@ -659,6 +669,7 @@ fun own_pool(ctx: *u8) bool {
 
 # write every live chunk of the pool into the tree, emptied first
 fun pool_to_tree(s: *Sim) bool {
+    val m:  usize          = word_len(s);
     val t:  *hashlife.Tree = ?s.tree;
     val sp: *space.Space   = ?s.space;
     hashlife.clear(t);
@@ -671,7 +682,7 @@ fun pool_to_tree(s: *Sim) bool {
             var i:   usize = 0;
             space.get_sensed(sp, sl, 0, space.CELLS, ?c[0]);
             for (i < space.CELLS) {
-                buf[i] = rule.state(?s.rule, c[i])::u8;
+                buf[i] = state_in(s, m, sl, i, c[i])::u8;
                 if (buf[i] != 0) { any = true; }
                 i = i + 1;
             }
@@ -1945,6 +1956,7 @@ pub fun read_begin(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64) bool {
 # out: receives n states of the world, as the rule reads them
 # ret: false when any cell lies outside the area, leaving out untouched
 pub fun read_run(s: *Sim, x: i64, y: i64, n: usize, out: *u8) bool {
+    val m: usize = word_len(s);
     val r: *Read = ?s.read;
     if (!r.open || y < r.y0 || y >= r.y1 || x < r.x0 || x + n::i64 > r.x1) { ret false; }
     val sp: *space.Space = ?s.space;
@@ -1981,7 +1993,7 @@ pub fun read_run(s: *Sim, x: i64, y: i64, n: usize, out: *u8) bool {
             val row: usize = space.local_of(y) * 64 + space.local_of(at);
             var i:   usize = 0;
             for (i < k) {
-                out[o + i] = held(s, rule.state(?s.rule, space.sensed(sp, sl::usize, row + i))::u8);
+                out[o + i] = held(s, state_in(s, m, sl::usize, row + i, space.sensed(sp, sl::usize, row + i))::u8);
                 i          = i + 1;
             }
         }
@@ -2720,6 +2732,7 @@ fun any_alive(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64) bool {
 # f:   the visit
 # ctx: passed back to f
 pub fun chunks(s: *Sim, f: hashlife.Visit, ctx: *u8) {
+    val m:   usize = word_len(s);
     var buf: [4096]u8;
     if (on_tree(s)) {
         hashlife.chunks(?s.tree, f, ctx, ?buf[0]);
@@ -2734,7 +2747,7 @@ pub fun chunks(s: *Sim, f: hashlife.Visit, ctx: *u8) {
             var i:   usize = 0;
             space.get_sensed(sp, sl, 0, space.CELLS, ?c[0]);
             for (i < space.CELLS) {
-                buf[i] = rule.state(?s.rule, c[i])::u8;
+                buf[i] = state_in(s, m, sl, i, c[i])::u8;
                 if (buf[i] != 0) { any = true; }
                 i = i + 1;
             }
@@ -2753,6 +2766,7 @@ pub fun chunks(s: *Sim, f: hashlife.Visit, ctx: *u8) {
 # cy:  chunk row
 # out: receives space.CELLS states, row-major, 0 where no chunk exists
 pub fun chunk_cells(s: *Sim, cx: i64, cy: i64, out: *u8) {
+    val m: usize = word_len(s);
     if (on_tree(s)) {
         hashlife.chunk_cells(?s.tree, cx, cy, out);
         ret;
@@ -2764,7 +2778,7 @@ pub fun chunk_cells(s: *Sim, cx: i64, cy: i64, out: *u8) {
     var i: usize = 0;
     space.get_sensed(?s.space, sl::usize, 0, space.CELLS, ?c[0]);
     for (i < space.CELLS) {
-        out[i] = rule.state(?s.rule, c[i])::u8;
+        out[i] = state_in(s, m, sl::usize, i, c[i])::u8;
         i      = i + 1;
     }
 }
@@ -2854,6 +2868,7 @@ pub fun world_chunks(s: *Sim, f: hashlife.Visit, ctx: *u8) {
 # s:   simulation
 # ret: the box, half-open, or none when every cell is 0
 pub fun state_bounds(s: *Sim) opt[space.Box] {
+    val m: usize = word_len(s);
     if (on_tree(s) || complemented(s)) { ret bounds(s); }
     val sp:  *space.Space = ?s.space;
     var b:   space.Box    = space.Box{x0: 0, y0: 0, x1: 0, y1: 0};
@@ -2867,7 +2882,7 @@ pub fun state_bounds(s: *Sim) opt[space.Box] {
             val oy: i64   = space.slot_y(sp, sl) * space.SIDE;
             var i:  usize = 0;
             for (i < space.CELLS) {
-                if (rule.state(?s.rule, c[i]) != 0) {
+                if (state_in(s, m, sl, i, c[i]) != 0) {
                     val x: i64 = ox + (i % space.SIDE::usize)::i64;
                     val y: i64 = oy + (i / space.SIDE::usize)::i64;
                     if (!any || x < b.x0)     { b.x0 = x; }
@@ -3999,6 +4014,43 @@ test frame__a_cell_live_by_a_rule_layer_alone_is_counted_and_kept_on_both_engine
     if (!rig_same(?t) || population(?t.cpu) != 1) { ret 10; }
     if (t.on && population(?t.gpu) != 1)          { ret 11; }
     if (space.find(sp, 3, 0) != space.NONE)       { ret 12; }
+    rig_close(?t);
+    ret 0;
+}
+
+# a block of reaction-diffusion words by the origin: both fields, and either
+# alone, as a world under the reaction family's first sample holds them
+#[testing]
+fun edit_reaction_block(s: *Sim) bool {
+    var w: [16]u32 = [16]u32{65535, 0, 1, 65535, 0, 7, 300, 301, 0, 0, 4369, 8738, 12345, 54321, 40000, 3};
+    if (!edit_begin(s, 30, 30, 34, 32)) { ret false; }
+    edit_words(s, 30, 30, 4, ?w[0]);
+    edit_words(s, 30, 31, 4, ?w[8]);
+    ret edit_end(s);
+}
+
+test frame__a_world_moved_between_one_layer_and_two_steps_alike_on_both_engines {
+    var t:    Rig;
+    val code: i32 = rig_open(?t, rule.preset_rule(0), seed_world);
+    if (code != 0) { ret code; }
+    rig_step(?t, 3);
+    if (!rig_same(?t)) { ret 2; }
+    # the rule's cells take a second layer, so the GPU makes its buffers again,
+    # and its stage binds the U layer beside the state layer
+    val rd: rule.Rule = rule_named("F=0.0367,k=0.0649");
+    if (!set_rule(?t.cpu, rd) || !set_rule(?t.gpu, rd))               { ret 3; }
+    if (word_len(?t.cpu) != 2 || word_len(?t.gpu) != 2)               { ret 3; }
+    if (!edit_reaction_block(?t.cpu) || !edit_reaction_block(?t.gpu)) { ret 4; }
+    if (!rig_same(?t))                                                { ret 5; }
+    rig_step(?t, 40);
+    if (!rig_same(?t) || population(?t.cpu) == 0)       { ret 6; }
+    if (population(?t.cpu) != population(?t.gpu))       { ret 7; }
+    if (t.on && !gpu.pyramids_hold(?t.g, ?t.gpu.space)) { ret 8; }
+    # and back to one layer, its buffers made again
+    var life: rule.Rule = rule.preset_rule(0);
+    if (!set_rule(?t.cpu, life) || !set_rule(?t.gpu, life)) { ret 9; }
+    rig_step(?t, 3);
+    if (!rig_same(?t)) { ret 10; }
     rig_close(?t);
     ret 0;
 }
@@ -6086,7 +6138,7 @@ test reaction__gray_scott_presets_grow_their_patterns_on_both_engines {
                 if (space.used(?t.cpu.space, sl)) {
                     var i: usize = 0;
                     for (i < space.CELLS) {
-                        if (rd_word.b_of(space.sensed(?t.cpu.space, sl, i)) > 16384) { dense = dense + 1; }
+                        if (space.sensed(?t.cpu.space, sl, i) > 16384) { dense = dense + 1; }
                         i = i + 1;
                     }
                 }

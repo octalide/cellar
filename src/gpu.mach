@@ -193,19 +193,32 @@ val INK_AT: usize = LOOK + SHADES * 8;
 pub val MIP: usize = layout.MIP::usize;
 # entries in each palette
 pub val SHADES: usize = 256;
-# storage binding sets a frame keeps for the dispatches and draws after its
-# generations': the gate, the census, the reduction and the draw. what the
-# frame's flush records ahead of them, the clears, the growth and the edits of
-# each layer and the seeding's two, comes out of what its generations have
-# (sets)
-val FRAME_SETS: usize = 4;
-# dispatches one frame's generations may record, its steps, its passes and its
-# gathers, in the storage binding sets the frame has left besides FRAME_SETS
-# when its flush records none, which also bounds the generations it records
-pub val MAX_STEPS: usize = 252;
-# dispatches a pass records besides a clear of each layer, the mark and the
-# settle, and one more for the first of a frame, which frees
-pub val PASS_CALLS: usize = 2;
+
+# storage binding sets a frame keeps for the dispatches and draws besides its
+# generations', for a pool of n layers: a clear and an edit a layer, a growth a
+# layer in each of the two pools, the carry, the seeding's two, the gate, the
+# census, the reduction and the draw
+fun frame_sets(n: usize) usize {
+    ret 4 * n + 7;
+}
+
+# dispatches one frame's generations may record for a pool of n layers, its
+# steps, its passes and its gathers, in the storage binding sets the frame has
+# left besides frame_sets
+fun max_calls(n: usize) usize {
+    ret gfx.MAX_STORAGE_SETS - frame_sets(n);
+}
+
+# the most dispatches a frame's generations may record, a pool of one layer's
+# (max_calls), which also bounds the generations it records
+pub val MAX_STEPS: usize = 245;
+
+# dispatches a pass records for a pool of n layers, the mark, the settle and a
+# clear a layer, and one more for the first of a frame, which frees
+fun pass_calls(n: usize) usize {
+    ret 2 + n;
+}
+
 # the span a frame starts with, before a frame has been measured
 val FIRST_SPAN: usize = 4096;
 # the least a span shrinks to
@@ -476,8 +489,6 @@ fun span_offset(p: *Pool, k: usize, s: usize) usize {
 # carry:    the stage that carries the page table and the allocator's words
 #           into larger buffers while the GPU owns the pool
 # edit:     the stage that writes painted cells into a layer narrower than a word
-# sets:     storage binding sets the frame's flush recorded, which its
-#           generations do not have
 # edited:   the edits it reads, made larger as a frame paints more
 # room:     the edits edited holds
 # edit_at:  the frame's edits of a layer, as edited holds them
@@ -617,7 +628,6 @@ pub rec Gpu {
     grow:     gfx.Compute;
     carry:    gfx.Compute;
     edit:     gfx.Compute;
-    sets:     usize;
     edited:   gfx.StorageBuffer;
     room:     usize;
     edit_at:  Vector[u32];
@@ -989,7 +999,6 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     g.pyrs     = vector.init[u32](a);
     g.edit_at  = vector.init[u32](a);
     g.room     = 0;
-    g.sets     = 0;
     g.cut      = false;
     g.span     = FIRST_SPAN;
     g.fixed    = false;
@@ -2177,13 +2186,6 @@ fun queue_painted(g: *Gpu, sp: *space.Space, filled: bool, l: usize) err[gfx.Err
     ret err[gfx.Error].ok{};
 }
 
-# record a dispatch of the frame's flush, counting the storage binding set it
-# takes from those its generations have (sets)
-fun dispatch(g: *Gpu, c: *gfx.Compute, bufs: **gfx.StorageBuffer, n: usize, x: u32, y: u32, z: u32) err[gfx.Error] {
-    g.sets = g.sets + 1;
-    ret gfx.renderer_dispatch(g.r, c, bufs, n, x, y, z);
-}
-
 # write the painted cells of a layer l narrower than a word into the GPU's
 # front, none in a chunk going up whole (filled): each cell's last edit goes up
 # as the bits it takes in its word and its value in them, and the edit stage
@@ -2246,7 +2248,7 @@ fun edit_painted(g: *Gpu, sp: *space.Space, filled: bool, l: usize) err[gfx.Erro
     var eb: [2]*gfx.StorageBuffer;
     eb[0] = cells_of(?g.p, l, g.front);
     eb[1] = ?g.edited;
-    ret dispatch(g, ?g.edit, ?eb[0], 2, (n + 63) / 64, 1, 1);
+    ret gfx.renderer_dispatch(g.r, ?g.edit, ?eb[0], 2, (n + 63) / 64, 1, 1);
 }
 
 # batch the stamps that mark the slots in stamped alive and warm as of the
@@ -2359,7 +2361,7 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
             gb[1] = cells_of(?g.p, l, c);
             gb[2] = ?g.old.flags;
             gb[3] = ?g.p.flags;
-            val eg: err[gfx.Error] = dispatch(g, ?g.grow, ?gb[0], 4, (span_bytes(?g.p, l) / 256)::u32, g.hi::u32, 1);
+            val eg: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.grow, ?gb[0], 4, (span_bytes(?g.p, l) / 256)::u32, g.hi::u32, 1);
             if (sel eg.err) { ret eg; }
             k = k + 1;
         }
@@ -2372,7 +2374,7 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
             cb[1] = ?g.p.meta;
             cb[2] = ?g.old.status;
             cb[3] = ?g.p.status;
-            val ec: err[gfx.Error] = dispatch(g, ?g.carry, ?cb[0], 4, 1, g.old.cap::u32, 1);
+            val ec: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.carry, ?cb[0], 4, 1, g.old.cap::u32, 1);
             if (sel ec.err) { ret ec; }
             g.rehash = true;
         }
@@ -2449,7 +2451,7 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
                 zb[1] = cells_of(?g.p, k, 1);
                 zb[2] = ?g.p.list;
                 zb[3] = ?g.p.flags;
-                val ez: err[gfx.Error] = dispatch(g, ?g.clear, ?zb[0], 4, (span_bytes(?g.p, k) / 256)::u32, g.zeros.len::u32, 1);
+                val ez: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.clear, ?zb[0], 4, (span_bytes(?g.p, k) / 256)::u32, g.zeros.len::u32, 1);
                 if (sel ez.err) { ret ez; }
                 k = k + 1;
             }
@@ -2556,12 +2558,12 @@ fun rehash(g: *Gpu) err[gfx.Error] {
     if (sel et.err) { ret et; }
     var wb: [1]*gfx.StorageBuffer;
     wb[0] = ?g.p.status;
-    val ew: err[gfx.Error] = dispatch(g, ?g.wipe, ?wb[0], 1, layout.HASH / 64, 1, 1);
+    val ew: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.wipe, ?wb[0], 1, layout.HASH / 64, 1, 1);
     if (sel ew.err) { ret ew; }
     var sb: [2]*gfx.StorageBuffer;
     sb[0] = ?g.p.meta;
     sb[1] = ?g.p.status;
-    val es: err[gfx.Error] = dispatch(g, ?g.seed, ?sb[0], 2, ((g.p.cap + 63) / 64)::u32, 1, 1);
+    val es: err[gfx.Error] = gfx.renderer_dispatch(g.r, ?g.seed, ?sb[0], 2, ((g.p.cap + 63) / 64)::u32, 1, 1);
     if (sel es.err) { ret es; }
     g.rehash = false;
     ret err[gfx.Error].ok{};
@@ -3017,7 +3019,6 @@ fun timed_ops(g: *Gpu, step: *gfx.Compute, bound: usize, tab: u32) err[gfx.Error
 # look:  the camera and colours for the draw
 # ret:   the generations completed, or why recording failed
 pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, look: *Look) res[usize, gfx.Error] {
-    g.sets = 0;
     val e14: err[gfx.Error] = flush(g, sp, false, g.stepping && !topology.bounded(?sp.grid));
     if (sel e14.err) { ret res[usize, gfx.Error].err{e14.err}; }
     val ei: err[gfx.Error] = sync_ink(g, r, look);
@@ -3062,9 +3063,6 @@ pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, 
     var calls: usize = 0;
     var first: bool  = true;
     var n:     usize = 0;
-    # the dispatches the generations may record, less what the flush took
-    var most: usize = 0;
-    if (g.sets < MAX_STEPS) { most = MAX_STEPS - g.sets; }
     g.cut     = false;
     g.limited = false;
     g.worked  = 0;
@@ -3089,11 +3087,11 @@ pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, 
             val gather: bool  = pass || !g.listed || g.gathered + radius > layout.LIST_SPREAD::usize;
             var cost:   usize = 0;
             if (pass) {
-                cost = PASS_CALLS + g.p.set.n;
+                cost = pass_calls(g.p.set.n);
                 if (first) { cost = cost + 1; }
             }
             if (gather) { cost = cost + 1; }
-            if (calls + cost >= most) {
+            if (calls + cost >= max_calls(g.p.set.n)) {
                 g.limited = true;
                 brk;
             }
@@ -3124,7 +3122,7 @@ pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, 
             # the span does not cut covers the list to its end, however long
             var left: usize = 0;
             if (g.at < est) { left = est - g.at; }
-            if ((room == 0 && left != 0) || calls >= most) {
+            if ((room == 0 && left != 0) || calls >= max_calls(g.p.set.n)) {
                 g.limited = true;
                 brk;
             }
@@ -3316,7 +3314,13 @@ test timers__outnumber_the_frames_in_flight {
 }
 
 test max_steps__fills_the_frames_storage_binding_sets {
-    if (MAX_STEPS + FRAME_SETS != gfx.MAX_STORAGE_SETS) { ret 1; }
+    if (MAX_STEPS != max_calls(1)) { ret 1; }
+    # a pool of more layers grows, clears and edits each of them, leaving its steps fewer
+    var n: usize = 1;
+    for (n <= layer.LAYERS_MAX::usize) {
+        if (max_calls(n) + frame_sets(n) != gfx.MAX_STORAGE_SETS || max_calls(n) > MAX_STEPS) { ret 2; }
+        n = n + 1;
+    }
     ret 0;
 }
 
