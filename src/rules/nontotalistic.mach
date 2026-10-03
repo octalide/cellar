@@ -32,6 +32,8 @@ use cellar.layer.plane;
 use cellar.layout;
 use cellar.rule.family;
 use cellar.rules.nontotalistic.window;
+use cellar.rules.weighted;
+use cellar.rules.weighted.rows;
 use cellar.rules.weighted.word;
 use cellar.space;
 use cellar.text;
@@ -405,17 +407,15 @@ pub fun states(r: *Rule) u32 {
     ret 2;
 }
 
-# the word a cell of a state is written as: a live one starts at age 1 and
-# full heat, a dead one cold
+# the value a cell of a state is written as in the state layer: its bit
 pub fun word_of(r: *Rule, state: u32) u32 {
-    if (state != 0) { ret word.BORN; }
+    if (state != 0) { ret 1; }
     ret 0;
 }
 
-# the state a word holds, its display channels aside
+# the state a state layer's value holds
 pub fun state_of(c: u32) u32 {
-    if (c >= word.LIVE) { ret 1; }
-    ret 0;
+    ret c & 1;
 }
 
 # the state painted or seeded when none is chosen: the live one
@@ -429,16 +429,19 @@ pub fun slack(r: *Rule) u32 {
     ret 0;
 }
 
-# the value a fresh cell of a state holds in rule layer k: none, since the
-# family's cells are its state layer alone
+# the value a fresh cell of a state holds in layer k past the state layer,
+# the weighted family's (cellar.rules.weighted rest_of)
 pub fun rest_of(r: *Rule, state: u32, k: usize) u32 {
+    if (state != 0) { ret word.BORN; }
     ret 0;
 }
 
-# the layers the family's cells are stored in (cellar.layer): its word as
-# the state layer, word.WIDTH bits wide
+# the layers the family's cells are stored in (cellar.layer), the weighted
+# family's: a bit a cell, and its display channels beside it
 pub fun layers(r: *Rule) plane.Set {
-    ret plane.state("age and heat", word.WIDTH);
+    var s: plane.Set = plane.state("live", word.WIDTH);
+    plane.add_view(?s, weighted.SHOWN_NAME, word.SHOWN);
+    ret s;
 }
 
 # how shared code reads a value of the family's state layer
@@ -527,65 +530,59 @@ pub fun next_of(r: *Rule, nb: *u32) u32 {
     ret at(r, x);
 }
 
-# side of the cells a chunk's step reads, the chunk and a cell around it
-val FRAME: usize = 66;
-
 # step one chunk on the CPU, the rule the family's stage applies word for word
 #
-# a chunk with nothing alive nearby only cools, which holds in every form,
-# since the held background steps to itself. otherwise the live cells of the
-# chunk and the ring around it are read once, the ring through
-# space.block_cell, and each cell's neighbourhood indexes the map.
+# the cells are read and written as packed bits, a row of 64 a u64
+# (cellar.rules.weighted.rows), and a cell's neighbourhood is three bits of
+# each of the rows above, at and below it, which index the map. a chunk with
+# nothing alive nearby only cools, which holds in every form, since the held
+# background steps to itself. a generation held as the complement is read
+# complemented, so the map applies as written.
 # ---
 # r: the rule
 # b: the chunk's block and back cells, at generation b.gen
 # t: the tally of the cells written
 pub fun step_chunk(r: *Rule, b: *space.Block, t: *space.Tally) {
-    val own: *u32 = space.block_own(b, 0).w;
-    val out: *u32 = space.block_out(b, 0).w;
     if (!b.busy) {
-        var i: usize = 0;
-        for (i < space.CELLS) {
-            val v: u32 = word.cool(plane.load(own, word.WIDTH, i));
-            plane.store(out, word.WIDTH, i, v);
-            if (v != 0) { t.warm = 1; }
-            i = i + 1;
-        }
+        rows.cool_chunk(b, t);
         ret;
     }
     val f:       u32 = form(r);
-    var flip:    u32 = 0;
+    val fin:     u64 = 0 - word.inverted(f, (b.gen & 1)::u32)::u64;
     val inv_out: u32 = word.inverted(f, ((b.gen + 1) & 1)::u32);
-    if (word.inverted(f, (b.gen & 1)::u32) != 0) { flip = NEIGHBOURHOODS - 1; }
-    var lit: [FRAME * FRAME]u32;
-    var y:   i64 = -1;
+    # rows -1 to 64 of the world's live cells, each from column -64 to 127
+    var spans: [66 * 3]u64;
+    var y:     i64 = -1;
     for (y <= 64) {
-        var x: i64 = -1;
-        for (x <= 64) {
-            var c: u32 = 0;
-            if (x >= 0 && x < 64 && y >= 0 && y < 64) { c = plane.load(own, word.WIDTH, (y * 64 + x)::usize); }
-            or                                        { c = space.block_cell(b, word.WIDTH, x, y); }
-            lit[((y + 1) * FRAME::i64 + x + 1)::usize] = (c >= word.LIVE)::u32;
-            x                                          = x + 1;
-        }
-        y = y + 1;
+        val at: usize = (y + 1)::usize * 3;
+        rows.span(b, y, ?spans[at]);
+        spans[at]     = spans[at] ^ fin;
+        spans[at + 1] = spans[at + 1] ^ fin;
+        spans[at + 2] = spans[at + 2] ^ fin;
+        y             = y + 1;
     }
     y = 0;
     for (y < 64) {
-        val up:  usize = y::usize * FRAME;
-        val mid: usize = up + FRAME;
-        val dn:  usize = mid + FRAME;
-        var x:   usize = 0;
+        val up:   *u64 = ?spans[y::usize * 3];
+        val mid:  *u64 = ?spans[(y + 1)::usize * 3];
+        val dn:   *u64 = ?spans[(y + 2)::usize * 3];
+        var live: u64  = 0;
+        var x:    i64  = 0;
         for (x < 64) {
-            val n: u32   = (lit[up + x] << 8) | (lit[up + x + 1] << 7) | (lit[up + x + 2] << 6) | (lit[mid + x] << 5) | (lit[mid + x + 1] << 4) | (lit[mid + x + 2] << 3) | (lit[dn + x] << 2) | (lit[dn + x + 1] << 1) | lit[dn + x + 2];
-            val i: usize = y::usize * 64 + x;
-            val v: u32   = word.become(plane.load(own, word.WIDTH, i), at(r, n ^ flip) ^ inv_out);
-            plane.store(out, word.WIDTH, i, v);
-            space.note(t, v, x::u32, y::u32);
-            x = x + 1;
+            val n: u32 = (trio(up, x) << 6) | (trio(mid, x) << 3) | trio(dn, x);
+            live = live | ((at(r, n) ^ inv_out)::u64 << x::u64);
+            x    = x + 1;
         }
+        rows.emit(b, y, live, t);
         y = y + 1;
     }
+}
+
+# the three cells of a row span around column x as a neighbourhood's index
+# reads them, the westmost the most significant
+#[inline]
+fun trio(row: *u64, x: i64) u32 {
+    ret ((rows.at(row, x - 1) << 2) | (rows.at(row, x) << 1) | rows.at(row, x + 1))::u32;
 }
 
 # pack a rule into the family's window of the meta head, as its stage reads it

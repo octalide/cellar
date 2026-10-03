@@ -41,9 +41,11 @@
 # cells are shown as they are held, the world's live and dead swapped. which of
 # the three forms a rule runs in is word.PLAIN, word.STROBE or word.COMPLEMENT.
 
+use cellar.layer;
 use cellar.layer.plane;
 use cellar.layout;
 use cellar.rule.family;
+use cellar.rules.weighted.rows;
 use cellar.rules.weighted.word;
 use cellar.space;
 use cellar.text;
@@ -1185,17 +1187,15 @@ pub fun states(k: *Kernel) u32 {
     ret 2;
 }
 
-# the word a cell of a state is written as: a live one starts at age 1 and
-# full heat, a dead one cold
+# the value a cell of a state is written as in the state layer: its bit
 pub fun word_of(k: *Kernel, state: u32) u32 {
-    if (state != 0) { ret word.BORN; }
+    if (state != 0) { ret 1; }
     ret 0;
 }
 
-# the state a word holds, its display channels aside
+# the state a state layer's value holds
 pub fun state_of(c: u32) u32 {
-    if (c >= word.LIVE) { ret 1; }
-    ret 0;
+    ret c & 1;
 }
 
 # the state painted or seeded when none is chosen: the live one
@@ -1209,16 +1209,25 @@ pub fun slack(r: *Kernel) u32 {
     ret 0;
 }
 
-# the value a fresh cell of a state holds in rule layer k: none, since the
-# family's cells are its state layer alone
+# the value a fresh cell of a state holds in layer k past the state layer:
+# the family has no rule layer, and its display channels start a live cell at
+# age 1 and full heat and a dead one cold
 pub fun rest_of(k: *Kernel, state: u32, layer: usize) u32 {
+    if (state != 0) { ret word.BORN; }
     ret 0;
 }
 
-# the layers the family's cells are stored in (cellar.layer): its word as
-# the state layer, word.WIDTH bits wide
+# the name of the view layer the family keeps its display channels in
+pub val SHOWN_NAME: str = "age and heat";
+
+# the layers the family's cells are stored in (cellar.layer): a bit a cell in
+# the state layer, word.WIDTH bits wide, and the display channels its step
+# keeps in a view layer beside it, word.SHOWN bits wide, until the view keeps
+# them itself
 pub fun layers(k: *Kernel) plane.Set {
-    ret plane.state("age and heat", word.WIDTH);
+    var s: plane.Set = plane.state("live", word.WIDTH);
+    plane.add_view(?s, SHOWN_NAME, word.SHOWN);
+    ret s;
 }
 
 # how shared code reads a value of the family's state layer
@@ -1289,30 +1298,6 @@ fun isotropic(k: *Kernel) bool {
     ret true;
 }
 
-# the next word of a cell given its word and the weighted sum around it, both
-# as the pool holds them
-#
-# a cell held inverted reads as its complement, its sum as t less the held
-# one, and the result is held inverted when inv_out is set.
-# ---
-# k:       the rule
-# c:       the cell, age << 8 | heat
-# sum:     the weighted count of held live cells in its footprint
-# t:       the footprint's total weight
-# inv_in:  1 when the cells stepped from hold the world's complement
-# inv_out: 1 when the cells stepped to hold it
-# ret:     the cell one generation on, as held
-pub fun next(k: *Kernel, c: u32, sum: i32, t: i32, inv_in: u32, inv_out: u32) u32 {
-    var live: u8  = 0;
-    var s:    i32 = sum;
-    if (c >= word.LIVE) { live = 1; }
-    if (inv_in != 0) {
-        live = 1 - live;
-        s    = (t::i64 - sum::i64)::i32;
-    }
-    ret word.become(c, (next_state(k, live, s) ^ inv_out::u8)::u32);
-}
-
 # the state a cell becomes from the states of the 3 by 3 block around it, for
 # a kernel of radius 1, the only ones caps lets a quadtree engine run
 # ---
@@ -1331,17 +1316,12 @@ pub fun next_of(k: *Kernel, nb: *u32) u32 {
     ret next_state(k, alive, sum)::u32;
 }
 
-# how a kernel's CPU step is computed, chosen from the shape of its footprint
-# ---
-# SLICED:  unit weights on the radius-1 Moore ring, the Life-like rules: a row
-#          of 64 cells a word, the eight neighbours added bit-sliced
-# ROWS:    unit weights, each row of the footprint one run of them with the
-#          center perhaps left out, Larger than Life's box and HROT's diamond,
-#          circle and cross at any radius: each row's count from its prefix sums
-# GENERAL: any other kernel: every weight of the footprint, cell by cell
-pub val SLICED:  u32 = 0;
-pub val ROWS:    u32 = 1;
-pub val GENERAL: u32 = 2;
+# how a kernel's step is computed, chosen from the shape of its footprint
+# (cellar.rules.weighted.word SLICED): on the CPU a row of 64 cells a word,
+# and ROWS's counts from prefix sums along each row
+pub val SLICED:  u32 = word.SLICED;
+pub val ROWS:    u32 = word.ROWS;
+pub val GENERAL: u32 = word.GENERAL;
 
 # one row of a footprint as a run of unit weights
 # ---
@@ -1421,25 +1401,19 @@ pub fun path(k: *Kernel, sh: *Shape) u32 {
 
 # step one chunk on the CPU, the rule the family's stage applies word for word
 #
-# a chunk with nothing alive nearby only cools, which holds in every form,
-# since the held background steps to itself. otherwise the kernel's shape
-# picks the path (see path), and each reads its own chunk directly and every
-# cell beyond it through space.block_cell.
+# the cells are read and written as packed bits, a row of 64 a u64
+# (cellar.rules.weighted.rows), so a cell beyond the chunk costs what one in
+# it does. a chunk with nothing alive nearby only cools, which holds in every
+# form, since the held background steps to itself. otherwise the kernel's
+# shape picks the path (see path), and the display channels follow each row
+# as it is written.
 # ---
 # k: the rule
 # b: the chunk's block and back cells, at generation b.gen
 # t: the tally of the cells written
 pub fun step_chunk(k: *Kernel, b: *space.Block, t: *space.Tally) {
-    val own: *u32 = space.block_own(b, 0).w;
-    val out: *u32 = space.block_out(b, 0).w;
     if (!b.busy) {
-        var i: usize = 0;
-        for (i < space.CELLS) {
-            val v: u32 = word.cool(plane.load(own, word.WIDTH, i));
-            plane.store(out, word.WIDTH, i, v);
-            if (v != 0) { t.warm = 1; }
-            i = i + 1;
-        }
+        rows.cool_chunk(b, t);
         ret;
     }
     val f:       u32 = form(k);
@@ -1456,68 +1430,6 @@ pub fun step_chunk(k: *Kernel, b: *space.Block, t: *space.Tally) {
         ret;
     }
     step_general(k, b, t, inv_in, inv_out);
-}
-
-# 1 when a held cell is live
-#[inline]
-fun lit(c: u32) u64 {
-    ret (c >= word.LIVE)::u64;
-}
-
-# a row of the chunk's own live cells, bit x for column x
-# ---
-# own: the chunk's state layer
-# y:   the row
-# any: receives every bit set in any of the row's cells
-fun own_row(own: *u32, y: i64, any: *u32) u64 {
-    val at: usize = (y * 64)::usize;
-    var m:  u64   = 0;
-    var o:  u32   = 0;
-    var x:  usize = 0;
-    for (x < 64) {
-        val c: u32 = plane.load(own, word.WIDTH, at + x);
-        o = o | c;
-        m = m | (lit(c) << x::u64);
-        x = x + 1;
-    }
-    @any = o;
-    ret m;
-}
-
-# a row just outside the chunk's own, read through the block, bit x for column x
-fun edge_row(b: *space.Block, y: i64) u64 {
-    var m: u64 = 0;
-    var x: i64 = 0;
-    for (x < 64) {
-        m = m | (lit(space.block_cell(b, word.WIDTH, x, y)) << x::u64);
-        x = x + 1;
-    }
-    ret m;
-}
-
-# write a row of the chunk one generation on and count it
-# ---
-# own:  the chunk's state layer
-# out:  its back span
-# y:    the row
-# live: the row's cells live one generation on, as held, bit x for column x
-# any:  every bit set in any of the row's cells as they were
-# t:    the tally
-fun emit_row(own: *u32, out: *u32, y: i64, live: u64, any: u32, t: *space.Tally) {
-    val at: usize = (y * 64)::usize;
-    if (live == 0 && any == 0) {
-        plane.blank(out, word.WIDTH, at, 64);
-        ret;
-    }
-    var warm: u32   = 0;
-    var x:    usize = 0;
-    for (x < 64) {
-        val v: u32 = word.become(plane.load(own, word.WIDTH, at + x), ((live >> x::u64) & 1)::u32);
-        plane.store(out, word.WIDTH, at + x, v);
-        warm = warm | v;
-        x    = x + 1;
-    }
-    space.note_row(t, live, (warm & t.sense.warm_mask) != 0, y::u32);
 }
 
 # the cells whose bit-sliced count s3 s2 s1 s0 is one a set holds
@@ -1550,24 +1462,19 @@ fun counted(set: *Sums, s0: u64, s1: u64, s2: u64, s3: u64) u64 {
 # the world is read through the held cells, inverted where they hold its
 # complement, so the rule applies as written and its result is held back.
 fun step_sliced(k: *Kernel, b: *space.Block, t: *space.Tally, inv_in: u32, inv_out: u32) {
-    val own:  *u32 = space.block_own(b, 0).w;
-    val fin:  u64  = 0 - inv_in::u64;
-    val fout: u64  = 0 - inv_out::u64;
+    val fin:  u64 = 0 - inv_in::u64;
+    val fout: u64 = 0 - inv_out::u64;
     # rows -1 to 64 of the world's live cells, and the cells just west and east
     # of each
     var mid:  [66]u64;
     var west: [66]u64;
     var east: [66]u64;
-    var any:  [64]u32;
     var y:    i64 = -1;
     for (y <= 64) {
         val j: usize = (y + 1)::usize;
-        var m: u64   = 0;
-        if (y >= 0 && y < 64) { m = own_row(own, y, ?any[y::usize]); }
-        or                    { m = edge_row(b, y); }
-        mid[j]  = m ^ fin;
-        west[j] = (lit(space.block_cell(b, word.WIDTH, -1, y)) ^ fin) & 1;
-        east[j] = (lit(space.block_cell(b, word.WIDTH, 64, y)) ^ fin) & 1;
+        mid[j]  = rows.bits(b, 1, y) ^ fin;
+        west[j] = ((rows.bits(b, 0, y) >> 63) ^ fin) & 1;
+        east[j] = (rows.bits(b, 2, y) ^ fin) & 1;
         y       = y + 1;
     }
     y = 0;
@@ -1600,7 +1507,7 @@ fun step_sliced(k: *Kernel, b: *space.Block, t: *space.Tally, inv_in: u32, inv_o
         val s3:   u64 = v & w;
         val born: u64 = ~c & counted(?k.birth, s0, s1, s2, s3);
         val kept: u64 = c & counted(?k.survive, s0, s1, s2, s3);
-        emit_row(own, space.block_out(b, 0).w, y, (born | kept) ^ fout, any[j], t);
+        rows.emit(b, y, (born | kept) ^ fout, t);
         y = y + 1;
     }
 }
@@ -1612,35 +1519,28 @@ val PRE_SIDE: usize = 64 + 2 * MAX_RADIUS + 1;
 # chunk, from which a run of the footprint's row counts in one subtraction, so
 # a cell costs a subtraction per row of its footprint rather than per cell
 fun step_rows(k: *Kernel, sh: *Shape, b: *space.Block, t: *space.Tally, inv_in: u32, inv_out: u32) {
-    val own:  *u32 = space.block_own(b, 0).w;
-    val e:    i64  = sh.reach;
-    val side: i64  = 64 + 2 * e;
-    val fin:  u32  = inv_in & 1;
+    val e:    i64 = sh.reach;
+    val side: i64 = 64 + 2 * e;
+    val fin:  u64 = 0 - inv_in::u64;
     # pre[row * PRE_SIDE + n]: the world's live cells among the first n of the
     # row, rows and columns from -e
     var pre: [PRE_SIDE * (PRE_SIDE - 1)]u32;
-    var any: [64]u32;
+    var row: [3]u64;
     var yy:  i64 = 0;
     for (yy < side) {
-        val y:    i64   = yy - e;
+        rows.span(b, yy - e, ?row[0]);
+        row[0] = row[0] ^ fin;
+        row[1] = row[1] ^ fin;
+        row[2] = row[2] ^ fin;
         val base: usize = yy::usize * PRE_SIDE;
-        var o:    u32   = 0;
         var n:    u32   = 0;
         pre[base] = 0;
         var xx: i64 = 0;
         for (xx < side) {
-            val x: i64 = xx - e;
-            var c: u32 = 0;
-            if (y >= 0 && y < 64 && x >= 0 && x < 64) {
-                c = plane.load(own, word.WIDTH, (y * 64 + x)::usize);
-                o = o | c;
-            }
-            or { c = space.block_cell(b, word.WIDTH, x, y); }
-            n                         = n + (lit(c)::u32 ^ fin);
+            n                         = n + rows.at(?row[0], xx - e)::u32;
             pre[base + xx::usize + 1] = n;
             xx                        = xx + 1;
         }
-        if (y >= 0 && y < 64) { any[y::usize] = o; }
         yy = yy + 1;
     }
     # the rule's answer for a dead and a live cell at every count a unit-weight
@@ -1664,8 +1564,8 @@ fun step_rows(k: *Kernel, sh: *Shape, b: *space.Block, t: *space.Tally, inv_in: 
             for (dy <= e) {
                 val run: *Run = ?sh.runs[(dy + MAX_RADIUS::i64)::usize];
                 if (!run.none) {
-                    val row: usize = (y + dy + e)::usize * PRE_SIDE;
-                    sum = sum + pre[row + (x + run.hi + e + 1)::usize] - pre[row + (x + run.lo + e)::usize];
+                    val at: usize = (y + dy + e)::usize * PRE_SIDE;
+                    sum = sum + pre[at + (x + run.hi + e + 1)::usize] - pre[at + (x + run.lo + e)::usize];
                 }
                 dy = dy + 1;
             }
@@ -1677,45 +1577,72 @@ fun step_rows(k: *Kernel, sh: *Shape, b: *space.Block, t: *space.Tally, inv_in: 
             live = live | (next::u64 << x::u64);
             x    = x + 1;
         }
-        emit_row(own, space.block_out(b, 0).w, y, live ^ fout, any[y::usize], t);
+        rows.emit(b, y, live ^ fout, t);
         y = y + 1;
     }
 }
 
-# the GENERAL step: every weight of the footprint, cell by cell
+# the next live bit of a cell as held, given its bit and the weighted sum
+# around it, both as the pool holds them
+#
+# a cell held inverted reads as its complement, its sum as t less the held
+# one, and the result is held inverted when inv_out is set.
+# ---
+# k:       the rule
+# alive:   1 when the cell is live as held, else 0
+# sum:     the weighted count of held live cells in its footprint
+# t:       the footprint's total weight
+# inv_in:  1 when the cells stepped from hold the world's complement
+# inv_out: 1 when the cells stepped to hold it
+# ret:     1 when it lives one generation on, as held, else 0
+pub fun next(k: *Kernel, alive: u32, sum: i32, t: i32, inv_in: u32, inv_out: u32) u32 {
+    var live: u8  = alive::u8;
+    var s:    i32 = sum;
+    if (inv_in != 0) {
+        live = 1 - live;
+        s    = (t::i64 - sum::i64)::i32;
+    }
+    ret (next_state(k, live, s) ^ inv_out::u8)::u32;
+}
+
+# rows of a GENERAL step's span of bits, the chunk's and MAX_RADIUS each side
+val SPAN_ROWS: usize = 64 + 2 * MAX_RADIUS;
+
+# the GENERAL step: every weight of the footprint, cell by cell, over the
+# block's rows of bits
 fun step_general(k: *Kernel, b: *space.Block, t: *space.Tally, inv_in: u32, inv_out: u32) {
-    val own:   *u32 = space.block_own(b, 0).w;
-    val out:   *u32 = space.block_out(b, 0).w;
-    val r:     i64  = k.radius::i64;
-    val width: i64  = 2 * r + 1;
-    val all:   i32  = total(k);
-    var ly:    i64  = 0;
+    val r:     i64 = k.radius::i64;
+    val width: i64 = 2 * r + 1;
+    val all:   i32 = total(k);
+    # rows -r to 63 + r of the held cells, each from column -64 to 127
+    var spans: [SPAN_ROWS * 3]u64;
+    var yy:    i64 = 0;
+    for (yy < 64 + 2 * r) {
+        rows.span(b, yy - r, ?spans[yy::usize * 3]);
+        yy = yy + 1;
+    }
+    var ly: i64 = 0;
     for (ly < 64) {
-        var lx: i64 = 0;
+        var live: u64 = 0;
+        var lx:   i64 = 0;
         for (lx < 64) {
-            var sum:    i32  = 0;
-            val inside: bool = lx >= r && lx < 64 - r && ly >= r && ly < 64 - r;
-            var dy:     i64  = 0 - r;
+            var sum: i32 = 0;
+            var dy:  i64 = 0 - r;
             for (dy <= r) {
-                var dx: i64 = 0 - r;
+                val row: *u64 = ?spans[(ly + dy + r)::usize * 3];
+                var dx:  i64  = 0 - r;
                 for (dx <= r) {
                     val w: i32 = k.weights[((dy + r) * width + dx + r)::usize];
-                    if (w != 0) {
-                        var c: u32 = 0;
-                        if (inside)         { c = plane.load(own, word.WIDTH, ((ly + dy) * 64 + lx + dx)::usize); }
-                        or                  { c = space.block_cell(b, word.WIDTH, lx + dx, ly + dy); }
-                        if (c >= word.LIVE) { sum = sum + w; }
-                    }
+                    if (w != 0 && rows.at(row, lx + dx) != 0) { sum = sum + w; }
                     dx = dx + 1;
                 }
                 dy = dy + 1;
             }
-            val i: usize = (ly * 64 + lx)::usize;
-            val v: u32   = next(k, plane.load(own, word.WIDTH, i), sum, all, inv_in, inv_out);
-            plane.store(out, word.WIDTH, i, v);
-            space.note(t, v, lx::u32, ly::u32);
-            lx = lx + 1;
+            val alive: u32 = rows.at(?spans[(ly + r)::usize * 3], lx)::u32;
+            live = live | (next(k, alive, sum, all, inv_in, inv_out)::u64 << lx::u64);
+            lx   = lx + 1;
         }
+        rows.emit(b, ly, live, t);
         ly = ly + 1;
     }
 }
@@ -1741,6 +1668,24 @@ pub fun pack(k: *Kernel, w: *u32) {
     w[word.TOTAL_AT]  = total(k):~u32;
     w[word.TOP_AT]    = max_sum(k)::u32;
     w[word.WORDS_AT]  = set_words(k)::u32;
+    var sh: Shape;
+    val p:  u32 = path(k, ?sh);
+    w[word.PATH_AT] = p;
+    if (p != ROWS) { ret; }
+    if (sh.hole)   { w[word.HOLE_AT] = 1; }
+    val r:  i64 = k.radius::i64;
+    var dy: i64 = 0 - r;
+    for (dy <= r) {
+        val run: *Run  = ?sh.runs[(dy + MAX_RADIUS::i64)::usize];
+        val at:  usize = word.RUNS_AT::usize + ((dy + r) * 2)::usize;
+        w[at]     = word.RADIUS_MAX;
+        w[at + 1] = word.RADIUS_MAX;
+        if (!run.none) {
+            w[at]     = (run.lo + MAX_RADIUS::i64)::u32;
+            w[at + 1] = (run.hi + 1 + MAX_RADIUS::i64)::u32;
+        }
+        dy = dy + 1;
+    }
 }
 
 # the words of the rule buffer a kernel needs: its two sets, then its weights
@@ -2324,9 +2269,12 @@ test step_chunk__every_path_steps_as_the_naive_footprint_sum_does {
     val rules: [8]str = [8]str{"B3/S23", "B36/S23", "B03/S23", "B0123478/S01234678", "R3,C0,M1,S14..19,B14..19,NN",
         "R4,C0,M1,S34..81,B34..45,NM", "r2,c0,s2-4,b0-1,3", "r2,c0,s2-3,5,b3,nc"};
     val paths: [8]u32   = [8]u32{SLICED, SLICED, SLICED, SLICED, ROWS, ROWS, ROWS, ROWS};
-    var cells: [9 * 4096]u32;
-    var fast:  [4096]u32;
-    var slow:  [4096]u32;
+    val bits:  usize    = plane.span_words(word.WIDTH);
+    val chans: usize    = plane.span_words(word.SHOWN);
+    var cells: [9 * 128]u32;
+    var shown: [9 * 2048]u32;
+    var fast:  [128 + 2048]u32;
+    var slow:  [128 + 2048]u32;
     var rng:   rand.Rng = rand.seed(1, 2, 3, 4);
     var i:     usize    = 0;
     for (i < 8) {
@@ -2344,29 +2292,38 @@ test step_chunk__every_path_steps_as_the_naive_footprint_sum_does {
             space.block(?b, ?set, round);
             var q: usize = 0;
             for (q < 9 * 4096) {
-                var c: u32 = rand.range(?rng, 0, word.HEAT_MASK::i64 + 1)::u32;
-                if (rand.range(?rng, 0, 100) < 20 + round::i64 * 15) { c = (rand.range(?rng, 1, 1000)::u32 << word.AGE_SHIFT) | word.HEAT_MASK; }
-                plane.put(plane.at(?cells[(q / 4096) * 4096], word.WIDTH), q % 4096, c);
+                var on: u32 = 0;
+                var h:  u32 = rand.range(?rng, 0, word.HEAT_MASK::i64 + 1)::u32;
+                if (rand.range(?rng, 0, 100) < 20 + round::i64 * 15) {
+                    on = 1;
+                    h  = (rand.range(?rng, 1, word.AGE_MAX::i64 + 1)::u32 << word.AGE_SHIFT) | word.HEAT_MASK;
+                }
+                plane.put(plane.at(?cells[(q / 4096) * bits], word.WIDTH), q % 4096, on);
+                plane.put(plane.at(?shown[(q / 4096) * chans], word.SHOWN), q % 4096, h);
                 q = q + 1;
             }
             q = 0;
             for (q < 9) {
-                b.nb[q] = ?cells[q * 4096];
-                q       = q + 1;
+                b.nb[q]     = ?cells[q * bits];
+                b.nb[9 + q] = ?shown[q * chans];
+                q           = q + 1;
             }
-            b.nb[(round * 2 + 1)::usize] = nil;
-            b.busy                       = true;
-            b.out[0]                     = ?fast[0];
+            b.nb[(round * 2 + 1)::usize]     = nil;
+            b.nb[(9 + round * 2 + 1)::usize] = nil;
+            b.busy                           = true;
+            b.out[0]                         = ?fast[0];
+            b.out[1]                         = ?fast[bits];
             var ft: space.Tally = space.tally(sense());
             step_chunk(?k, ?b, ?ft);
             b.out[0] = ?slow[0];
+            b.out[1] = ?slow[bits];
             var st: space.Tally = space.tally(sense());
             val f:  u32         = form(?k);
             step_general(?k, ?b, ?st, word.inverted(f, (round & 1)::u32), word.inverted(f, ((round + 1) & 1)::u32));
             q = 0;
             for (q < 4096) {
-                val fq: u32 = plane.get(plane.at(?fast[0], word.WIDTH), q);
-                val sq: u32 = plane.get(plane.at(?slow[0], word.WIDTH), q);
+                val fq: u32 = layer.sensed(plane.get(plane.at(?fast[0], word.WIDTH), q), plane.get(plane.at(?fast[bits], word.SHOWN), q), word.WIDTH);
+                val sq: u32 = layer.sensed(plane.get(plane.at(?slow[0], word.WIDTH), q), plane.get(plane.at(?slow[bits], word.SHOWN), q), word.WIDTH);
                 if (fq != sq) {
                     print.eprintlnf("{} round {}: cell ({}, {}) is {} for {}", rules[i], round, q % 64, q / 64, fq, sq);
                     ret 3;

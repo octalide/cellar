@@ -344,6 +344,7 @@ pub fun init(s: *Sim, a: *allo.Allocator) err[allo.Error] {
     # an empty world has no cells to re-encode
     s.rule        = rule.preset_rule(0);
     s.space.sense = rule.sense(?s.rule);
+    s.space.lit   = rule.lit(?s.rule);
     s.space.reach = rule.radius(?s.rule);
     hashlife.set_rule(?s.tree, s.rule);
     s.rng        = rand.init();
@@ -416,6 +417,25 @@ fun kept(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64, whole: bool, current: bool
     s.watch.keep(s.watch.ctx, space.Box{x0: x0, y0: y0, x1: x1, y1: y1}, whole, current);
 }
 
+# the layers the pool holds a world in under a new rule: the new rule's own,
+# then the view layers the pool holds beside the old rule's own, which are the
+# view's and stay
+fun laid_for(old: *rule.Rule, new: *rule.Rule, pool: *plane.Set) plane.Set {
+    var lay:  plane.Set = rule.layers(new);
+    var mine: plane.Set = rule.layers(old);
+    var k:    usize     = plane.exact(pool);
+    for (k < pool.n) {
+        val d:      *plane.Decl = ?pool.at[k];
+        val theirs: opt[usize]  = plane.find(?mine, d.name);
+        val held:   opt[usize]  = plane.find(?lay, d.name);
+        if (sel theirs.none) {
+            if (sel held.none) { plane.add_view(?lay, d.name, d.width); }
+        }
+        k = k + 1;
+    }
+    ret lay;
+}
+
 # replace the rule the world runs
 #
 # a rule whose words read as the old one's keeps the cells as they are, ages
@@ -455,6 +475,7 @@ pub fun set_rule(s: *Sim, r: rule.Rule) bool {
         if (fewer && wanted(s, 0, 0, 0, 0, true)) { kept(s, 0, 0, 0, 0, true, true); }
         s.rule        = r;
         s.space.sense = rule.sense(?s.rule);
+        s.space.lit   = rule.lit(?s.rule);
         s.space.reach = rule.radius(?s.rule);
         hashlife.set_rule(?s.tree, r);
         touched(s);
@@ -464,8 +485,7 @@ pub fun set_rule(s: *Sim, r: rule.Rule) bool {
     # the cells move into the new rule's layers, each word re-encoded unless
     # the two rules write every state alike
     # the view's layers stay as they are, beside the new rule's
-    var bare:   plane.Set  = rule.layers(?new);
-    var lay:    plane.Set  = plane.with_views(?bare, space.layers(?s.space));
+    var lay:    plane.Set  = laid_for(?old, ?new, space.layers(?s.space));
     val was:    *plane.Set = space.layers(?s.space);
     val relaid: bool       = !plane.same_shape(was, ?lay) || !plane.same_words(was, ?lay);
     if (!same || regrid || relaid) {
@@ -477,10 +497,17 @@ pub fun set_rule(s: *Sim, r: rule.Rule) bool {
     var rc:  Recode      = Recode{from: ?old, to: ?new};
     var map: space.Remap = recode;
     if (same) { map = nil; }
+    # a shown layer the new rule adds starts from the cells as the new rule
+    # reads them
+    s.space.sense = rule.sense(?new);
+    s.space.lit   = rule.lit(?new);
     val laid: err[allo.Error] = space.relayer(?s.space, ?lay, map, (?rc)::*u8);
-    if (sel laid.err) { ret false; }
+    if (sel laid.err) {
+        s.space.sense = rule.sense(?old);
+        s.space.lit   = rule.lit(?old);
+        ret false;
+    }
     s.rule        = r;
-    s.space.sense = rule.sense(?s.rule);
     s.space.reach = rule.radius(?s.rule);
     s.space.rim   = rule.rimmed(?s.rule);
     if (rule.caps(?new).no_tree == nil) { hashlife.set_rule(?s.tree, r); }
@@ -1154,7 +1181,7 @@ fun show_square(ctx: *u8, qx: i64, qy: i64, n: u32) {
     val s: *Sim           = ctx::*Sim;
     val i: usize          = space.local_of(qy) * 64 + space.local_of(qx);
     val t: *hashlife.Tree = ?s.tree;
-    if (s.seen.shift == 0) { s.seen.cells[i] = rule.value(?s.rule, n); }
+    if (s.seen.shift == 0) { s.seen.cells[i] = rule.sensed(?s.rule, n); }
     or {
         val was:  u32 = s.seen.cells[i];
         val new:  u32 = summary(s.seen.shift, hashlife.live(t, n), hashlife.heat(t, n));
@@ -2079,11 +2106,10 @@ pub fun edit_begin(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64) bool {
     val pull: bool = !read_covers(s, e.x0, e.y0, e.x1, e.y1);
     if (e.sparse) {
         # a small edit writes single cells and pulls nothing, unless the watch
-        # needs the chunks as they stand, or a layer narrower than a word
-        # sends a painted cell up with the cells sharing its word
-        # (cellar.gpu note_write)
-        val share: bool = on_gpu(s) && space.packed(?s.space);
-        if ((watch || share) && !stage(s, e.x0, e.y0, e.x1, e.y1, pull, false)) { ret false; }
+        # needs the chunks as they stand. a cell of a layer narrower than a
+        # word goes up alone, and the GPU writes it into its word
+        # (cellar.gpu edit_painted)
+        if (watch && !stage(s, e.x0, e.y0, e.x1, e.y1, pull, false)) { ret false; }
     }
     or (!stage(s, e.x0, e.y0, e.x1, e.y1, pull, true)) { ret false; }
     if (watch)                                         { kept(s, e.x0, e.y0, e.x1, e.y1, false, true); }
@@ -2576,8 +2602,9 @@ pub fun paint(s: *Sim, x: i64, y: i64, v: u8) {
     edit_end(s);
 }
 
-# the value of the cell at (x, y) in the rule's state layer, the one its state
-# is read from, from the host's cells or the tree
+# the sensed value (cellar.layer) of the cell at (x, y): its value in the
+# rule's state layer, the one its state is read from, with its shown layer's
+# above it, from the host's cells or the tree
 #
 # on the GPU this is the staging copy, current only after sync.
 # ---
@@ -2586,7 +2613,7 @@ pub fun paint(s: *Sim, x: i64, y: i64, v: u8) {
 # y:   row
 # ret: the value, 0 where no chunk exists
 pub fun cell(s: *Sim, x: i64, y: i64) u32 {
-    if (on_tree(s)) { ret rule.value(?s.rule, hashlife.get(?s.tree, x, y)); }
+    if (on_tree(s)) { ret rule.sensed(?s.rule, hashlife.get(?s.tree, x, y)); }
     val sl: u32 = space.find(?s.space, space.chunk_of(x), space.chunk_of(y));
     if (sl == space.NONE) { ret 0; }
     ret space.sensed(?s.space, sl::usize, space.local_of(y) * 64 + space.local_of(x));
@@ -3330,13 +3357,17 @@ test step__age_accumulates_and_heat_decays {
     paint(?s, 2, 2, 1);
     step(?s);
     step(?s);
-    if ((cell(?s, 1, 1) >> 8) != 3)    { ret 2; }
-    if ((cell(?s, 1, 1) & 255) != 255) { ret 3; }
+    val sn: layout.Sense = rule.sense(?s.rule);
+    val c:  u32          = cell(?s, 1, 1);
+    if (((c >> sn.age_shift) & sn.age_mask) != 3)     { ret 2; }
+    if (((c >> sn.heat_shift) & sn.heat_mask) != 255) { ret 3; }
 
     # an isolated cell dies, and its heat decays rather than vanishing
     paint(?s, 40, 40, 1);
     step(?s);
-    if (cell(?s, 40, 40) != 255 - word.DECAY) { ret 4; }
+    val d: u32 = cell(?s, 40, 40);
+    if (layout.live(d, sn.live_mask, sn.live_lo, sn.live_hi) != 0 || ((d >> sn.heat_shift) & sn.heat_mask) != 255 - word.DECAY) { ret 4; }
+    if (((d >> sn.age_shift) & sn.age_mask) != 0)                                                                               { ret 4; }
     dnit(?s);
     ret 0;
 }
@@ -3798,11 +3829,11 @@ test set_rule__re_encodes_the_cells_between_families {
     paint(?s, 0, 1, 1);
     paint(?s, 1, 1, 1);
     step(?s);
-    if (cell(?s, 0, 0) == rule.value(?s.rule, 1)) { ret 2; }
+    if (cell(?s, 0, 0) == rule.sensed(?s.rule, 1)) { ret 2; }
 
     # live Life cells become live Brian's Brain cells
-    if (!set_rule(?s, brain))                                           { ret 3; }
-    if (cell(?s, 0, 0) != rule.value(?brain, 1) || population(?s) != 4) { ret 3; }
+    if (!set_rule(?s, brain))                                            { ret 3; }
+    if (cell(?s, 0, 0) != rule.sensed(?brain, 1) || population(?s) != 4) { ret 3; }
 
     # every block cell has three live neighbours, so all start dying, and the
     # cells beside the block's edges have two and are born
@@ -3811,9 +3842,9 @@ test set_rule__re_encodes_the_cells_between_families {
     val born: usize = population(?s);
 
     # dying cells are a state Life lacks, so they become dead, and live ones live
-    if (!set_rule(?s, life))                                            { ret 5; }
-    if (cell(?s, 0, 0) != 0 || cell(?s, -1, 0) != rule.value(?life, 1)) { ret 5; }
-    if (population(?s) != born)                                         { ret 6; }
+    if (!set_rule(?s, life))                                             { ret 5; }
+    if (cell(?s, 0, 0) != 0 || cell(?s, -1, 0) != rule.sensed(?life, 1)) { ret 5; }
+    if (population(?s) != born)                                          { ret 6; }
     dnit(?s);
     ret 0;
 }
@@ -3911,6 +3942,11 @@ fun same_world(a: *Sim, b: *Sim) bool {
                             ret false;
                         }
                         k = k + 1;
+                    }
+                    # and its display channels, where a shown layer keeps them
+                    if (slack == 0 && cell(x, cx, cy) != cell(y, cx, cy)) {
+                        print.eprintlnf("cells differ at ({}, {}) as shown: {} and {}", cx, cy, cell(x, cx, cy), cell(y, cx, cy));
+                        ret false;
                     }
                     i = i + 1;
                 }
@@ -4934,13 +4970,14 @@ test frame__a_host_refused_the_memory_leaves_the_pool_to_the_gpu_and_pauses {
         ret 0;
     }
     # the soups outgrow the first pool, which the GPU grows without the host,
-    # until its top is past what the host holds
+    # until its top is past what the host holds. a gate that closes on the
+    # way takes the pool back, which the GPU has then not moved since
     var round: usize = 0;
-    for (round < 40 && t.g.top <= t.gpu.space.cap) {
+    for (round < 40 && !(t.g.moved && t.g.top > t.gpu.space.cap)) {
         if (uncapped_frames(?t.r, ?t.gpu, t.gpu.generation + 20) == 0) { ret 4; }
         round = round + 1;
     }
-    if (t.g.top <= t.gpu.space.cap) { ret 5; }
+    if (!t.g.moved || t.g.top <= t.gpu.space.cap) { ret 5; }
     # the host cannot grow to hold the GPU's pool: a read of the cells and a
     # clear are refused, the run pauses, and the world stays whole on the GPU
     val gen: u64 = t.gpu.generation;
@@ -5172,8 +5209,8 @@ test hashlife__a_view_of_a_generations_rule_shows_dying_cells_as_the_pool_does {
     # as the pool's pyramid summarises cells: the live ones as coverage, and
     # the hottest heat of any, so a square of dying cells alone shows its trail
     val sn:    layout.Sense = rule.sense(?t.rule);
-    val hot:   u32          = layout.texel_heat(rule.value(?t.rule, 1), sn.heat_shift, sn.heat_mask);
-    val dying: u32          = layout.texel_heat(rule.value(?t.rule, 2), sn.heat_shift, sn.heat_mask);
+    val hot:   u32          = layout.texel_heat(rule.sensed(?t.rule, 1), sn.heat_shift, sn.heat_mask);
+    val dying: u32          = layout.texel_heat(rule.sensed(?t.rule, 2), sn.heat_shift, sn.heat_mask);
     var look:  gpu.Look     = far_look();
     look.mode = render.MODE_HEAT::u32;
     show_tree(?t, ?look);
@@ -5190,10 +5227,10 @@ test hashlife__a_view_of_a_generations_rule_shows_dying_cells_as_the_pool_does {
     look.ppc = 2.0;
     show_tree(?t, ?look);
     val at: u32 = space.find(sp, 0, 0);
-    if (look.shift != 0 || at == space.NONE)                                { ret 10; }
-    if (space.sensed(sp, at::usize, 0) != rule.value(?t.rule, 1))           { ret 11; }
-    if (space.sensed(sp, at::usize, 65) != rule.value(?t.rule, 2))          { ret 12; }
-    if (space.sensed(sp, at::usize, 5 * 64 + 12) != rule.value(?t.rule, 2)) { ret 13; }
+    if (look.shift != 0 || at == space.NONE)                                 { ret 10; }
+    if (space.sensed(sp, at::usize, 0) != rule.sensed(?t.rule, 1))           { ret 11; }
+    if (space.sensed(sp, at::usize, 65) != rule.sensed(?t.rule, 2))          { ret 12; }
+    if (space.sensed(sp, at::usize, 5 * 64 + 12) != rule.sensed(?t.rule, 2)) { ret 13; }
 
     # a rule that words its states otherwise is shown as that rule's
     val sw: res[rule.Rule, str] = rule.parse("345/2/4");
@@ -5203,7 +5240,7 @@ test hashlife__a_view_of_a_generations_rule_shows_dying_cells_as_the_pool_does {
     look.mode = render.MODE_HEAT::u32;
     show_tree(?t, ?look);
     val sn4:    layout.Sense = rule.sense(?t.rule);
-    val dying4: u32          = layout.texel_heat(rule.value(?t.rule, 2), sn4.heat_shift, sn4.heat_mask);
+    val dying4: u32          = layout.texel_heat(rule.sensed(?t.rule, 2), sn4.heat_shift, sn4.heat_mask);
     val at4:    u32          = space.find(sp, 0, 0);
     if (dying4 == dying || at4 == space.NONE)                               { ret 16; }
     if (space.sensed(sp, at4::usize, 1) != (dying4 << layout.SUMMARY_HEAT)) { ret 17; }
