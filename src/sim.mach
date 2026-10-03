@@ -511,7 +511,7 @@ rec Recode {
 # first reads in it, a state the other lacks becoming 0 (see cellar.rule)
 fun recode(ctx: *u8, from: *u32, to: *u32) {
     val rc: *Recode = ctx::*Recode;
-    var st: u32     = rule.state(rc.from, from[0]);
+    var st: u32     = rule.word_state(rc.from, from);
     if (st >= rule.states(rc.to)) { st = 0; }
     rule.fresh(rc.to, st, to);
 }
@@ -1513,7 +1513,7 @@ pub fun fill_chunk(s: *Sim, cx: i64, cy: i64, cells: *u32) bool {
         if (p == nil) { ret false; }
         var i: usize = 0;
         for (i < space.CELLS) {
-            p[i] = rule.state(?s.rule, cells[i * m])::u8;
+            p[i] = rule.word_state(?s.rule, ?cells[i * m])::u8;
             i    = i + 1;
         }
         hashlife.wrote(?s.tree, cx, cy);
@@ -1787,7 +1787,7 @@ pub fun place(s: *Sim, g: topology.Grid, dx: i64, dy: i64) Placed {
                 val x: i64 = x0 + (k % 64)::i64;
                 val y: i64 = y0 + (k / 64)::i64;
                 if (!space.holds(sp, x, y)) {
-                    if (space.live(sp, w[0])) { out.dropped = out.dropped + 1; }
+                    if (space.live_word(sp, w)) { out.dropped = out.dropped + 1; }
                 }
                 or {
                     val sl: u32 = space.alloc(sp, space.chunk_of(x), space.chunk_of(y));
@@ -2149,7 +2149,7 @@ pub fun edit_words(s: *Sim, x: i64, y: i64, n: usize, w: *u32) bool {
     for (i < n) {
         var k: usize = i + 1;
         for (k < n && mem.equal[u32](?w[k * m], ?w[i * m], m)) { k = k + 1; }
-        if (!put_run(s, x + i::i64, y, k - i, ?w[i * m], rule.state(?s.rule, w[i * m])::u8)) { ok = false; }
+        if (!put_run(s, x + i::i64, y, k - i, ?w[i * m], rule.word_state(?s.rule, ?w[i * m])::u8)) { ok = false; }
         i = k;
     }
     ret ok;
@@ -2234,7 +2234,7 @@ pub fun edit_chunk(s: *Sim, cx: i64, cy: i64, cells: *u32) bool {
         var i: usize = 0;
         for (i < space.CELLS) {
             p[i] = 0;
-            if (cells != nil) { p[i] = rule.state(?s.rule, cells[i * m])::u8; }
+            if (cells != nil) { p[i] = rule.word_state(?s.rule, ?cells[i * m])::u8; }
             i = i + 1;
         }
         hashlife.wrote(?s.tree, cx, cy);
@@ -2598,7 +2598,9 @@ pub fun word_at(s: *Sim, x: i64, y: i64, out: *u32) {
 # a cell off a bounded grid is dead
 pub fun alive(s: *Sim, x: i64, y: i64) bool {
     if (!topology.holds(?s.rule.grid, x, y)) { ret false; }
-    ret space.live(?s.space, cell(s, x, y)) != flipped(s);
+    var w: [layer.LAYERS_MAX]u32;
+    word_at(s, x, y, ?w[0]);
+    ret space.live_word(?s.space, ?w[0]) != flipped(s);
 }
 
 # whether reads report the true cells of a world the pool holds as the
@@ -3854,8 +3856,9 @@ fun settle_frames(r: *gfx.Renderer, s: *Sim, want: u64) bool {
     ret s.generation == want && sampled(s) == want;
 }
 
-# whether every cell either world holds is the same in the other, or as near
-# as the rule's slack lets two engines' words lie a generation apart
+# whether every cell either world holds is the same in the other, every value
+# of its word, or as near as the rule's slack lets two engines' words lie a
+# generation apart
 #[testing]
 fun same_world(a: *Sim, b: *Sim) bool {
     val slack: u32   = rule.slack(?a.rule);
@@ -3876,13 +3879,21 @@ fun same_world(a: *Sim, b: *Sim) bool {
                 for (i < space.CELLS) {
                     val cx: i64 = ox + (i % 64)::i64;
                     val cy: i64 = oy + (i / 64)::i64;
-                    val p:  u32 = cell(x, cx, cy);
-                    val q:  u32 = cell(y, cx, cy);
-                    var d:  u32 = p - q;
-                    if (q > p) { d = q - p; }
-                    if (d > slack) {
-                        print.eprintlnf("cells differ at ({}, {}): {} and {}", cx, cy, cell(x, cx, cy), cell(y, cx, cy));
-                        ret false;
+                    var wp: [layer.LAYERS_MAX]u32;
+                    var wq: [layer.LAYERS_MAX]u32;
+                    word_at(x, cx, cy, ?wp[0]);
+                    word_at(y, cx, cy, ?wq[0]);
+                    var k: usize = 0;
+                    for (k < word_len(x)) {
+                        val p: u32 = wp[k];
+                        val q: u32 = wq[k];
+                        var d: u32 = p - q;
+                        if (q > p) { d = q - p; }
+                        if (d > slack) {
+                            print.eprintlnf("cells differ at ({}, {}) in layer {}: {} and {}", cx, cy, k, p, q);
+                            ret false;
+                        }
+                        k = k + 1;
                     }
                     i = i + 1;
                 }
@@ -3903,7 +3914,7 @@ fun live_cells(s: *Sim) usize {
         if (space.used(?s.space, sl)) {
             var i: usize = 0;
             for (i < space.CELLS) {
-                if (space.live(?s.space, space.sensed(?s.space, sl, i))) { n = n + 1; }
+                if (space.live_at(?s.space, sl, i)) { n = n + 1; }
                 i = i + 1;
             }
         }
