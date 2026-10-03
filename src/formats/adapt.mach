@@ -9,6 +9,7 @@
 use gfx: boom.graphics;
 use cellar.format;
 use cellar.hashlife;
+use cellar.layer;
 use cellar.pattern;
 use cellar.rule;
 use cellar.sim;
@@ -158,8 +159,10 @@ pub fun pattern_sink(s: *PatternSink, p: *pattern.Pattern) *format.Sink {
 # rule:    the rule to take
 # refused: the simulation refused the rule, so the world kept its own
 # exact:   the world's rule reads the words of the rule the file names alike,
-#          and the file's words hold as many values as the world's, so word
+#          and the file's words hold as many values as the world's, or as an
+#          older version of its family recorded (cellar.rule adopt), so word
 #          runs are written as their words rather than their states
+# from:    the values the file's words hold
 # tree:    the tree the sink offers while the quadtree holds the world
 # sink:    the sink to hand to formats.load
 pub rec WorldSink {
@@ -174,6 +177,7 @@ pub rec WorldSink {
     rule:    rule.Rule;
     refused: bool;
     exact:   bool;
+    from:    usize;
     tree:    format.TreeSink;
     sink:    format.Sink;
 }
@@ -210,7 +214,8 @@ fun world_open(ctx: *u8, info: *format.Info) bool {
     val w: *WorldSink = ctx::*WorldSink;
     take_rule(w);
     val named: res[rule.Rule, str] = rule.parse(format.text_of(?info.rule));
-    if (sel named.ok)  { w.exact = !sim.flipped(w.s) && rule.alike(?named.ok, ?w.s.rule) && info.values == sim.word_len(w.s); }
+    w.from = info.values;
+    if (sel named.ok)  { w.exact = !sim.flipped(w.s) && rule.alike(?named.ok, ?w.s.rule) && rule.adopts(?w.s.rule, info.values); }
     if (!info.bounded) { ret true; }
     w.opened = sim.edit_begin(w.s, info.x0 + w.dx, info.y0 + w.dy, info.x1 + w.dx, info.y1 + w.dy);
     ret w.opened;
@@ -223,7 +228,18 @@ fun world_run(ctx: *u8, x: i64, y: i64, n: usize, v: u8) bool {
 
 fun world_words(ctx: *u8, x: i64, y: i64, n: usize, v: u8, c: *u32) bool {
     val w: *WorldSink = ctx::*WorldSink;
-    if (w.exact) { ret sim.edit_words(w.s, x + w.dx, y + w.dy, n, c); }
+    if (w.exact && w.from == sim.word_len(w.s)) { ret sim.edit_words(w.s, x + w.dx, y + w.dy, n, c); }
+    if (w.exact) {
+        # words an older version of the family recorded, each as its word now
+        var i: usize = 0;
+        for (i < n) {
+            var now: [layer.LAYERS_MAX]u32;
+            if (!rule.adopt(?w.s.rule, ?c[i * w.from], w.from, ?now[0]))       { ret false; }
+            if (!sim.edit_words(w.s, x + w.dx + i::i64, y + w.dy, 1, ?now[0])) { ret false; }
+            i = i + 1;
+        }
+        ret true;
+    }
     # a cell whose state is 0 is dead to a rule that reads the states alone
     if (v == 0) { ret true; }
     ret sim.edit_run(w.s, x + w.dx, y + w.dy, n, v);
@@ -274,6 +290,7 @@ pub fun world_sink(w: *WorldSink, s: *sim.Sim, dx: i64, dy: i64) *format.Sink {
     w.take      = false;
     w.refused   = false;
     w.exact     = false;
+    w.from      = 1;
     w.tree.ctx  = w::*u8;
     w.tree.x0   = 0 - dx;
     w.tree.y0   = 0 - dy;
@@ -580,9 +597,15 @@ fun world_rewind(ctx: *u8) err[format.Error] {
     ret err[format.Error].ok{};
 }
 
+# the state a word of the world's rule holds
+fun word_state(w: *WorldSource, c: *u32) u32 {
+    if (w.m == 1) { ret rule.state(?w.s.rule, c[0]); }
+    ret rule.word_state(?w.s.rule, c);
+}
+
 # the state of a cell of chunk k of the row being read, its word's in word mode
 fun state_at(w: *WorldSource, k: usize, lx: i64, ly: i64) u8 {
-    if (w.exact) { ret rule.state(?w.s.rule, word_at(w, k, lx, ly)[0])::u8; }
+    if (w.exact) { ret word_state(w, word_at(w, k, lx, ly))::u8; }
     ret w.cells.data[(k - w.band) * space.CELLS + (ly * space.SIDE + lx)::usize];
 }
 
@@ -669,8 +692,8 @@ fun world_next_words(ctx: *u8, r: *format.Run) bool {
                 cnt;
             }
             val at: i64 = w.lx;
-            val v:  u32 = rule.state(?w.s.rule, word_at(w, w.k, at, w.ly)[0]);
-            for (w.lx < space.SIDE && !blank(word_at(w, w.k, w.lx, w.ly), w.m) && rule.state(?w.s.rule, word_at(w, w.k, w.lx, w.ly)[0]) == v) { w.lx = w.lx + 1; }
+            val v:  u32 = word_state(w, word_at(w, w.k, at, w.ly));
+            for (w.lx < space.SIDE && !blank(word_at(w, w.k, w.lx, w.ly), w.m) && word_state(w, word_at(w, w.k, w.lx, w.ly)) == v) { w.lx = w.lx + 1; }
             r.x = c.cx * space.SIDE + at;
             r.y = c.cy * space.SIDE + w.ly;
             r.n = (w.lx - at)::usize;

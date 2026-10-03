@@ -794,12 +794,21 @@ pub fun load_world(a: *allo.Allocator, s: *sim.Sim, v: *View, path: str) res[Loa
     ret r;
 }
 
-# the state a word of a "cellar 5" file holds under the rule it names, or live
-# for a word but 0 under a rule this cellar does not know
-fun word_state(named: opt[rule.Rule], c: u32) u32 {
+# the state a word of m values a file holds under the rule it names, from
+# its whole word as the rule's family takes it (rule.adopt), or live for a
+# word but 0 under a rule this cellar does not know
+fun word_state(named: opt[rule.Rule], c: *u32, m: usize) u32 {
     var r: opt[rule.Rule] = named;
-    if (sel r.some) { ret rule.state(?r.some, c); }
-    if (c != 0)     { ret 1; }
+    if (sel r.some) {
+        var w: [layer.LAYERS_MAX]u32;
+        if (rule.adopt(?r.some, c, m, ?w[0])) { ret rule.word_state(?r.some, ?w[0]); }
+        ret rule.state(?r.some, c[0]);
+    }
+    var k: usize = 0;
+    for (k < m) {
+        if (c[k] != 0) { ret 1; }
+        k = k + 1;
+    }
     ret 0;
 }
 
@@ -840,23 +849,39 @@ fun world_from(a: *allo.Allocator, s: *sim.Sim, v: *View, data: *Vector[u8]) res
             val named: opt[rule.Rule] = head_rule(?h);
             if (sel named.some && !sim.set_rule(s, named.some)) { refused = true; }
             # words are the named rule's, and go in whole where it was taken
-            # and holds words of as many values
-            val whole: bool  = words && sel named.some && !refused && sim.word_len(s) == m;
-            val have:  u32   = rule.states(?s.rule);
-            var per:   usize = space.CELLS;
+            # and holds words of as many values, or as an older version of
+            # its family recorded, which are each its word now
+            var whole: bool  = words && sel named.some && !refused && rule.adopts(?s.rule, m);
+            val mw:    usize = sim.word_len(s);
+            var now:   *u32  = nil;
+            if (whole && m != mw) {
+                # a chunk at a time, or its states where that cannot be had
+                val got: res[*u32, allo.Error] = allo.allocate[u32](a, space.CELLS * mw);
+                if (sel got.ok) { now = got.ok; }
+                or              { whole = false; }
+            }
+            val have: u32   = rule.states(?s.rule);
+            var per:  usize = space.CELLS;
             if (words) { per = space.CELLS * m; }
             var k: usize = 0;
             for (k < at.len / 2) {
                 val c: *u32 = ?cells.data[k * per];
-                if (whole) { sim.fill_chunk(s, at.data[k * 2], at.data[k * 2 + 1], c); }
+                if (whole && now != nil) {
+                    var i: usize = 0;
+                    for (i < space.CELLS) {
+                        rule.adopt(?s.rule, ?c[i * m], m, ?now[i * mw]);
+                        i = i + 1;
+                    }
+                    sim.fill_chunk(s, at.data[k * 2], at.data[k * 2 + 1], now);
+                }
+                or (whole) { sim.fill_chunk(s, at.data[k * 2], at.data[k * 2 + 1], c); }
                 or {
                     val ox: i64   = at.data[k * 2] * space.SIDE;
                     val oy: i64   = at.data[k * 2 + 1] * space.SIDE;
                     var i:  usize = 0;
                     for (i < space.CELLS) {
                         var st: u32 = c[i];
-                        if (words)      { st = c[i * m]; }
-                        if (words)      { st = word_state(named, st); }
+                        if (words)      { st = word_state(named, ?c[i * m], m); }
                         if (st >= have) { st = 1; }
                         if (st != 0)    { sim.fill_cell(s, ox + (i % 64)::i64, oy + (i / 64)::i64, st); }
                         i = i + 1;
@@ -864,6 +889,7 @@ fun world_from(a: *allo.Allocator, s: *sim.Sim, v: *View, data: *Vector[u8]) res
                 }
                 k = k + 1;
             }
+            if (now != nil) { allo.deallocate[u32](a, now, space.CELLS * mw); }
             sim.fill_end(s);
             s.generation = h.generation;
             @v           = h.view;

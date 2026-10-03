@@ -22,7 +22,10 @@
 # value, so those files are what they always were.
 #
 # a word's state is its state under the named rule, or live for a word but 0
-# under a rule this cellar does not know, as a world file's. a source that
+# under a rule this cellar does not know, as a world file's. a file whose
+# words hold as many values as an older version of the named rule's family
+# recorded is read as that family's words now (cellar.rule adopt), so a file
+# keeps its exact values however the family's layers change. a source that
 # offers no words is written as the words of its states under the rule the
 # Info names, which must be one cellar reads.
 
@@ -75,19 +78,27 @@ fun begins(p: *u8, n: usize, i: usize, s: str) bool {
 # how the decode reads words: the rule they are the words of
 # ---
 # known: the named rule parses, so words have their states under it
+# adopt: the file's words hold as many values as an older version of the
+#        rule's family recorded, so each is read as its word now
+# whole: each word read is the rule's word, as it records one now, so a
+#        word's state is read from all of it
 # r:     that rule
 rec Reading {
     known: bool;
+    adopt: bool;
+    whole: bool;
     r:     rule.Rule;
 }
 
-# the state a word holds, false when the rule has no such state
-fun state_of(rd: *Reading, c: u32, v: *u8) bool {
+# the state a word holds, from the whole word where it is the rule's, false
+# when the rule has no such state
+fun state_of(rd: *Reading, c: *u32, v: *u8) bool {
     if (!rd.known) {
         @v = 1;
         ret true;
     }
-    val st: u32 = rule.state(?rd.r, c);
+    var st: u32 = rule.state(?rd.r, c[0]);
+    if (rd.whole)                             { st = rule.word_state(?rd.r, c); }
     if (st >= rule.states(?rd.r) || st > 255) { ret false; }
     @v = st::u8;
     ret true;
@@ -181,13 +192,13 @@ fun read_word(p: *u8, n: usize, i: *usize, out: *u32, zero: bool) err[format.Err
 # i:  the body's first byte
 # e:  where the cells go
 # rd: the rule the words are read under
-# m:  values a word holds
+# m:  values a word holds, as the file records it
 # ox, oy: the world position of the pattern's top-left corner
 # w, h:   the declared size, which the cells must stay inside
 fun read_body(p: *u8, n: usize, i: usize, e: *format.Emit, rd: *Reading, m: usize, ox: i64, oy: i64, w: i64, h: i64) err[format.Error] {
     var pend: Pending;
     pend.n = 0;
-    pend.m = m;
+    pend.m = e.info.values;
     var at:    usize = i;
     var x:     i64   = 0;
     var y:     i64   = 0;
@@ -241,8 +252,12 @@ fun read_body(p: *u8, n: usize, i: usize, e: *format.Emit, rd: *Reading, m: usiz
         }
         # a cell of all 0 is '.'
         if (!any) { ret err[format.Error].err{format.Error.malformed{}}; }
+        if (rd.adopt) {
+            var was: [layer.LAYERS_MAX]u32 = c;
+            if (!rule.adopt(?rd.r, ?was[0], m, ?c[0])) { ret err[format.Error].err{format.Error.range{}}; }
+        }
         var v: u8 = 0;
-        if (!state_of(rd, c[0], ?v))                            { ret err[format.Error].err{format.Error.range{}}; }
+        if (!state_of(rd, ?c[0], ?v))                           { ret err[format.Error].err{format.Error.range{}}; }
         if (x + k > w || y >= h)                                { ret err[format.Error].err{format.Error.malformed{}}; }
         if (!add(e, ?pend, ox + x, oy + y, k::usize, v, ?c[0])) { ret err[format.Error].err{format.Error.sink{}}; }
         x = x + k;
@@ -286,10 +301,19 @@ fun decode(a: *allo.Allocator, p: *u8, n: usize, e: *format.Emit) err[format.Err
     }
     var rd: Reading;
     rd.known = false;
+    rd.adopt = false;
+    rd.whole = false;
     val r: res[rule.Rule, str] = rule.parse(named);
     if (sel r.ok) {
         rd.known = true;
         rd.r     = r.ok;
+        # words an older version of the rule's family recorded are read as its
+        # words now
+        if (m != rule.word_len(?rd.r) && rule.adopts(?rd.r, m)) {
+            rd.adopt      = true;
+            e.info.values = rule.word_len(?rd.r);
+        }
+        rd.whole = rd.adopt || m == rule.word_len(?rd.r);
     }
     ret read_body(p, n, at, e, ?rd, m, ox, oy, w, h);
 }
