@@ -63,7 +63,9 @@
 # cells with it, grows only once take next brings it level.
 #
 # a pool whose world has died down gives its memory back (cellar.sim weigh),
-# and a cleared one goes back to the size it started at. where the host
+# and a cleared one goes back to the size it started at, nothing read back
+# where the GPU owns it: its page table is emptied from the host's and the
+# pool fitted to the host's (empty, empty_owned). where the host
 # allocates, it moves its chunks below the smaller capacity itself
 # (cellar.space relocate), the move stage moves the GPU's cells alike
 # (shift), and the pool follows the host's capacity down (shrink_pool). where
@@ -931,6 +933,8 @@ fun pool_bytes(cap: usize) usize {
 # squeeze:  a test's hold on the top, until the pool is next taken, 0 for none
 # shrink:   the host's pool shrank to the world it holds while the GPU owns
 #           it, which the next flush fits the pool to (shrink_pool)
+# emptied:  the host emptied the pool the GPU owns without taking it back,
+#           which the next flush empties on the GPU too (empty_owned)
 # shifts:   chunks the host moved to other slots (moved) that the next flush
 #           moves on the GPU, in rounds each of a count, the slots moved from
 #           and the slots moved to
@@ -1079,6 +1083,7 @@ pub rec Gpu {
     tallied:  bool;
     squeeze:  usize;
     shrink:   bool;
+    emptied:  bool;
     shifts:   Vector[u32];
     pack_to:  usize;
     trim:     usize;
@@ -1399,6 +1404,7 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     g.tallied  = false;
     g.squeeze  = 0;
     g.shrink   = false;
+    g.emptied  = false;
     g.shifts   = vector.init[u32](a);
     g.pack_to  = 0;
     g.trim     = 0;
@@ -1507,6 +1513,28 @@ pub fun fitted(hi: usize, room: usize) usize {
 # host's capacity down on its own
 pub fun shrink(g: *Gpu) {
     g.shrink = true;
+}
+
+# the host is emptying its pool whole (cellar.space reset) while the GPU may
+# own it, so nothing is read back: the next flush empties the GPU's page
+# table from the host's and fits the pool to the host's capacity
+# (empty_owned). until then a take finds nothing to bring level, generations
+# a closed gate voided are no longer owed, and no census or compaction in
+# flight is wanted. a pool the host allocates mirrors the host's emptied
+# table on its own. only the thread holding the world may call it
+pub fun empty(g: *Gpu) {
+    if (!owned(g)) { ret; }
+    g.emptied = true;
+    g.moved   = false;
+    g.rewound = 0;
+    g.squeeze = 0;
+    g.top     = 0;
+    g.aim     = 0;
+    g.tallied = false;
+    g.shrink  = false;
+    untrim(g);
+    vector.clear[u32](?g.shifts);
+    forget_censuses(g);
 }
 
 # give back the memory of a pool the GPU owns past cap slots, its world
@@ -2939,6 +2967,7 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
         # the host's cells are the world's and go up whole, so chunks the host
         # moved need no moving here, and the pool made for other layers goes
         # before the one for these is made: the device never holds both
+        g.emptied = false;
         vector.clear[u32](?g.shifts);
         untrim(g);
         g.shrink = false;
@@ -2946,6 +2975,13 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
         drop_old(g);
         drop_pool(g, ?g.p);
         store_drop(g, store_of(g, ?g.p));
+    }
+    # a pool the host emptied is emptied here first, from which the host's
+    # page table is the world's
+    if (g.emptied) {
+        held = false;
+        val ee: err[gfx.Error] = empty_owned(g, sp);
+        if (sel ee.err) { ret ee; }
     }
     # chunks the host moved move here first, in the pool they lie in
     val em: err[gfx.Error] = shift(g);
@@ -3195,6 +3231,33 @@ fun shrink_pool(g: *Gpu, sp: *space.Space) err[gfx.Error] {
     if (sel ed.err) { ret ed; }
     var t: usize = 0;
     for (t < sp.hi) {
+        sp.dirty[t] = sp.dirty[t] | space.DIRTY_ENTRY;
+        t           = t + 1;
+    }
+    if (g.owns) { g.reseed = true; }
+    ret err[gfx.Error].ok{};
+}
+
+# empty the pool the GPU owned when the host emptied its own (empty), nothing
+# read back: a pool larger than the host's goes to fresh buffers of the
+# host's capacity beside the same store, whose shards past it go (swap_down),
+# so the page table, the stamps and the allocator's words start from nothing,
+# and one the host's capacity already holds has every entry below the GPU's
+# top go up again from the host's emptied table. either way the host's page
+# table, empty but for what it allocated since, is the world's, and a pool
+# the GPU owns seeds its allocator from it. the cells left in the store are
+# stale, and every chunk allocated from here on is cleared before it is read
+fun empty_owned(g: *Gpu, sp: *space.Space) err[gfx.Error] {
+    g.emptied = false;
+    if (sp.cap < g.p.cap) {
+        val ed: err[gfx.Error] = swap_down(g, sp.cap, 0);
+        if (sel ed.err) { ret ed; }
+    }
+    var top: usize = g.hi;
+    if (sp.hi > top)  { top = sp.hi; }
+    if (top > sp.cap) { top = sp.cap; }
+    var t: usize = 0;
+    for (t < top) {
         sp.dirty[t] = sp.dirty[t] | space.DIRTY_ENTRY;
         t           = t + 1;
     }
