@@ -804,7 +804,7 @@ pub fun attach(s: *Sim, g: *gpu.Gpu) {
     if (!gpu.prepare(g, rule.family_of(?s.rule))) { gpu.forgo_compute(g); }
     s.gpu = g;
     gpu.mirror(g, ?s.space);
-    space.set_mirror(?s.space, space.Mirror{ctx: s::*u8, reserve: reserve_pool, own: own_pool, move: move_pool}, s.space.max_slots);
+    space.set_mirror(?s.space, space.Mirror{ctx: s::*u8, reserve: reserve_pool, own: own_pool, empty: empty_pool, move: move_pool}, s.space.max_slots);
     var t: usize = 0;
     for (t < s.space.hi) {
         s.space.dirty[t] = space.DIRTY_ENTRY | space.DIRTY_CELLS;
@@ -902,6 +902,16 @@ fun reserve_pool(ctx: *u8, cap: usize) bool {
 fun own_pool(ctx: *u8) bool {
     val s: *Sim = ctx::*Sim;
     ret own(s);
+}
+
+# take the pool back emptied, the host about to free every slot: the GPU
+# reads nothing back and empties its own in the next frame (gpu.empty), so it
+# keeps nothing the host could not take, and no voided generation is owed
+fun empty_pool(ctx: *u8) {
+    val s: *Sim = ctx::*Sim;
+    if (s.gpu == nil) { ret; }
+    gpu.empty(s.gpu);
+    s.withheld = false;
 }
 
 # have chunks the host is about to move to other slots move on the GPU too,
@@ -1830,10 +1840,14 @@ fun rewind(s: *Sim) {
 }
 
 # empty the world and reset the generation counter
+#
+# nothing is read back from a GPU that owns the pool: it empties its own
+# (gpu.empty) and both sides go back to the size an empty world starts at.
+# only a watch that wants the cells has them pulled first, and when they
+# cannot be read it is told so and the clear goes ahead
 # ---
 # s: simulation
 pub fun clear(s: *Sim) {
-    if (!own(s)) { ret; }
     if (wanted(s, 0, 0, 0, 0, true)) {
         val synced: err[gfx.Error] = sync(s);
         kept(s, 0, 0, 0, 0, true, sel synced.ok);
@@ -1855,10 +1869,7 @@ pub fun clear(s: *Sim) {
     # it started, the GPU's following in the next frame
     val sp: *space.Space = ?s.space;
     val to: usize        = gpu.fitted(sp.hi, gpu.MOST_SLOTS);
-    if (to < sp.cap) {
-        val shrunk: err[allo.Error] = space.shrink(sp, to);
-        if ((sel shrunk.ok) && on_gpu(s) && gpu.owned(s.gpu)) { gpu.shrink(s.gpu); }
-    }
+    if (to < sp.cap) { space.shrink(sp, to); }
     note_pool(s);
 }
 
@@ -1995,6 +2006,34 @@ pub fun take(s: *Sim, sn: *snapshot.Snapshot) bool {
         ret false;
     }
     ret capture(s, sn);
+}
+
+# a lower bound on the bytes a snapshot of the whole world takes (take),
+# found without reading a cell back, for a watch to judge a copy it could not
+# keep before asking for one
+#
+# a snapshot holds every chunk with a word but 0 at snapshot.chunk_bytes
+# each. where the GPU owns the pool, the chunks its newest census found a live
+# cell in, when that census is of the last generation recorded and no edit
+# came since (gpu.least_chunks); where the host holds the world, the chunks
+# its cells hold a word in, which is what the snapshot copies. 0 where nothing
+# bounds it without a read: a GPU stepping a pool the host allocates, an
+# uncounted world, and the tree, whose copy is its nodes
+pub fun least_image(s: *Sim) usize {
+    if (on_tree(s)) { ret 0; }
+    val per: usize = snapshot.chunk_bytes(?s.rule);
+    if (on_gpu(s)) {
+        if (!gpu.owned(s.gpu)) { ret 0; }
+        ret gpu.least_chunks(s.gpu) * per;
+    }
+    val sp: *space.Space = ?s.space;
+    var n:  usize        = 0;
+    var sl: usize        = 0;
+    for (sl < sp.hi) {
+        if (space.used(sp, sl) && space.holds_word(sp, sl)) { n = n + 1; }
+        sl = sl + 1;
+    }
+    ret n * per;
 }
 
 # copy the world as the host holds it now into a snapshot, pulling nothing, as
@@ -5274,7 +5313,7 @@ fun far_rule() rule.Rule {
 
 # seed small soups against chunk edges and corners, where the halo leans
 #[testing]
-fun seed_edges(s: *Sim) {
+pub fun seed_edges(s: *Sim) {
     s.rng = rand.seed(5, 6, 7, 8);
     fill_begin(s);
     var k: usize = 0;
@@ -5309,7 +5348,7 @@ fun seed_edges(s: *Sim) {
 # ---
 # ret: the most generations one frame recorded, 0 when a frame failed
 #[testing]
-fun uncapped_frames(r: *gfx.Renderer, s: *Sim, want: u64) usize {
+pub fun uncapped_frames(r: *gfx.Renderer, s: *Sim, want: u64) usize {
     var most:   usize = 0;
     var frames: usize = 0;
     var look:   gpu.Look;
@@ -5434,16 +5473,15 @@ test frame__a_host_refused_the_memory_leaves_the_pool_to_the_gpu_and_pauses {
         round = round + 1;
     }
     if (!t.g.moved || t.g.top <= t.gpu.space.cap) { ret 5; }
-    # the host cannot grow to hold the GPU's pool: a read of the cells and a
-    # clear are refused, the run pauses, and the world stays whole on the GPU
+    # the host cannot grow to hold the GPU's pool: a read of the cells is
+    # refused, the run pauses, and the world stays whole on the GPU
     val gen: u64 = t.gpu.generation;
     t.gpu.space.max_slots = t.gpu.space.cap;
     t.gpu.running         = 1;
     val synced: err[gfx.Error] = sync(?t.gpu);
-    if (sel synced.ok)                    { ret 6; }
-    if (t.gpu.running != 0 || t.gpu.full) { ret 7; }
-    if (!t.gpu.withheld)                  { ret 8; }
-    clear(?t.gpu);
+    if (sel synced.ok)                         { ret 6; }
+    if (t.gpu.running != 0 || t.gpu.full)      { ret 7; }
+    if (!t.gpu.withheld)                       { ret 8; }
     if (t.gpu.generation != gen || t.gpu.full) { ret 9; }
     # a colour mode's view layer comes and goes on the GPU's pool all the
     # same, its cells staying there and the host taking the layers up without one
@@ -5669,6 +5707,48 @@ test frame__clear_gives_the_pool_back_as_it_started_on_both_engines {
     if (pool_memory(?t.gpu).taken >= taken)                                        { ret 6; }
     if (pool_memory(?t.cpu).taken > (first * space.slot_bytes(?t.cpu.space))::u64) { ret 7; }
     # and a world seeded afresh grows it again and steps as on the CPU
+    seed_edges(?t.cpu);
+    seed_edges(?t.gpu);
+    if (uncapped_frames(?t.r, ?t.gpu, 200) == 0) { ret 8; }
+    if (!caught_up(?t))                          { ret 9; }
+    rig_close(?t);
+    ret 0;
+}
+
+test frame__clear_empties_a_pool_the_gpu_grew_past_the_host_without_reading_it_back {
+    var t:    Rig;
+    val code: i32 = rig_open_within(?t, rule.preset_rule(2), seed_edges, 16384);
+    if (code != 0) { ret code; }
+    if (!t.on) {
+        rig_close(?t);
+        ret 0;
+    }
+    # the soups outgrow the first pool, which the GPU grows without the host
+    # until its top is past what the host holds
+    var round: usize = 0;
+    for (round < 40 && !(t.g.moved && t.g.top > t.gpu.space.cap)) {
+        if (uncapped_frames(?t.r, ?t.gpu, t.gpu.generation + 20) == 0) { ret 1; }
+        round = round + 1;
+    }
+    if (!t.g.moved || t.g.top <= t.gpu.space.cap) { ret 2; }
+    # the host can hold no more than it does, so a take would be refused: the
+    # clear reads nothing back and goes ahead all the same
+    val grown: usize = t.g.p.cap;
+    val bytes: u64   = gpu.pool_bytes_of(?t.g);
+    val most:  usize = t.gpu.space.max_slots;
+    t.gpu.space.max_slots = t.gpu.space.cap;
+    clear(?t.cpu);
+    clear(?t.gpu);
+    if (t.gpu.withheld || t.gpu.generation != 0 || population(?t.gpu) != 0) { ret 3; }
+    if (t.gpu.space.live != 0 || t.g.moved)                                 { ret 4; }
+    # both sides take what an empty world started with, the GPU still owning it
+    if (!rig_frame(?t) || !rig_frame(?t)) { ret 5; }
+    val first: usize = gpu.fitted(0, gpu.MOST_SLOTS);
+    if (grown <= first || t.g.p.cap != first || t.gpu.space.cap != first) { ret 6; }
+    if (gpu.pool_bytes_of(?t.g) >= bytes || !gpu.owned(?t.g))             { ret 7; }
+    # and a world seeded afresh steps as on the CPU, nothing of the old one
+    # left in the GPU's page table, stamps or allocator
+    t.gpu.space.max_slots = most;
     seed_edges(?t.cpu);
     seed_edges(?t.gpu);
     if (uncapped_frames(?t.r, ?t.gpu, 200) == 0) { ret 8; }
