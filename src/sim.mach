@@ -245,6 +245,8 @@ pub rec Watch {
 # space:      the pool of chunks: the world on the cpu and gpu members, what is
 #             drawn on hashlife
 # rule:       the active rule, whose sense the pool reads its cells by
+# views:      the view's colour mode reads heat or age, so the pool holds the
+#             view layer the rule's family keeps them in (set_views)
 # engine:     the member that holds the world
 # tree:       the quadtree the hashlife member holds it in
 # epoch:      changes each time the tree does
@@ -286,6 +288,7 @@ pub rec Watch {
 pub rec Sim {
     space:      space.Space;
     rule:       rule.Rule;
+    views:      bool;
     engine:     Engine;
     tree:       hashlife.Tree;
     epoch:      u64;
@@ -332,9 +335,10 @@ pub fun init(s: *Sim, a: *allo.Allocator) err[allo.Error] {
         space.dnit(?s.space);
         ret ev;
     }
-    var first: rule.Rule       = rule.preset_rule(0);
-    var lay:   plane.Set       = rule.layers(?first);
-    val laid:  err[allo.Error] = space.relayer(?s.space, ?lay, nil, nil);
+    var first: rule.Rule = rule.preset_rule(0);
+    var lay:   plane.Set = rule.layers(?first);
+    s.views = false;
+    val laid: err[allo.Error] = space.relayer(?s.space, ?lay, nil, nil);
     if (sel laid.err) {
         space.dnit(?s.space);
         space.dnit(?s.view);
@@ -427,23 +431,88 @@ fun kept(s: *Sim, x0: i64, y0: i64, x1: i64, y1: i64, whole: bool, current: bool
     s.watch.keep(s.watch.ctx, space.Box{x0: x0, y0: y0, x1: x1, y1: y1}, whole, current);
 }
 
-# the layers the pool holds a world in under a new rule: the new rule's own,
-# then the view layers the pool holds beside the old rule's own, which are the
-# view's and stay
-fun laid_for(old: *rule.Rule, new: *rule.Rule, pool: *plane.Set) plane.Set {
-    var lay:  plane.Set = rule.layers(new);
-    var mine: plane.Set = rule.layers(old);
-    var k:    usize     = plane.exact(pool);
-    for (k < pool.n) {
-        val d:      *plane.Decl = ?pool.at[k];
-        val theirs: opt[usize]  = plane.find(?mine, d.name);
-        val held:   opt[usize]  = plane.find(?lay, d.name);
-        if (sel theirs.none) {
-            if (sel held.none) { plane.add_view(?lay, d.name, d.width); }
+# the layers the pool holds a world under a rule in: the rule's own, and the
+# view layer its family keeps heat and age in while the view's colour mode
+# reads them (cellar.layer)
+fun laid_for(s: *Sim, r: *rule.Rule) plane.Set {
+    if (s.views) { ret rule.viewed(r); }
+    ret rule.layers(r);
+}
+
+# hold the view layers a colour mode reads, or let them go: while on, the pool
+# holds the view layer the rule's family keeps heat and age in, made from the
+# cells as they stand and stepped with them, and while off it holds the
+# rule's own layers alone, so a run pays nothing for heat or age it does not
+# show. the tree keeps none, and the pool takes the view's choice up when the
+# world leaves it.
+#
+# where the GPU steps the world in a pool it made, its cells stay where they
+# are: the GPU makes the layer's shards and starts them from the state layer,
+# or drops them, in the next frame (gpu.in_place), and the host's staging
+# copy takes the layers up without a cell moving (space.restage). elsewhere
+# the host's cells are the world's, and move into the layers there. call outside a frame, or in one
+# before gpu frame has recorded anything
+# ---
+# s:   simulation, with no read or edit open
+# on:  the colour mode reads heat or age
+# ret: false when the GPU's pool cannot take the layer within its memory,
+#      the GPU's cells could not be read or the allocator refused the layers,
+#      leaving the pool's layers as they were and the view's choice unmade
+pub fun set_views(s: *Sim, on: bool) bool {
+    if (on == s.views) { ret true; }
+    s.views = on;
+    if (on_tree(s)) { ret true; }
+    var lay: plane.Set = laid_for(s, ?s.rule);
+    if (plane.same(space.layers(?s.space), ?lay)) { ret true; }
+    if (on_gpu(s) && gpu.in_place(s.gpu, ?lay)) {
+        if (!gpu.holds_layers(s.gpu, ?lay)) {
+            s.views = !on;
+            ret false;
         }
-        k = k + 1;
+        val staged: err[allo.Error] = space.restage(?s.space, ?lay);
+        if (sel staged.err) {
+            s.views = !on;
+            ret false;
+        }
+        refit(s);
+        ret true;
     }
-    ret lay;
+    val synced: err[gfx.Error] = sync(s);
+    if (sel synced.err) {
+        s.views = !on;
+        ret false;
+    }
+    val laid: err[allo.Error] = space.relayer(?s.space, ?lay, nil, nil);
+    if (sel laid.err) {
+        s.views = !on;
+        ret false;
+    }
+    refit(s);
+    val sp: *space.Space = ?s.space;
+    if (on_gpu(s)) { gpu.forget_writes(s.gpu, 0, sp.hi); }
+    # the cells are as they were, and only what keeps a chunk warm changed
+    fill_end(s);
+    ret true;
+}
+
+# whether the pool holds the view layers a colour mode reads, or would once
+# the world leaves the tree (set_views)
+pub fun views(s: *Sim) bool {
+    ret s.views;
+}
+
+# bits a cell takes in the layers the pool holds the world in, in the cells
+# stepped from and into, or would hold it in once it leaves the tree
+pub fun cell_bits(s: *Sim) u64 {
+    var set: plane.Set = laid_for(s, ?s.rule);
+    if (!on_tree(s)) { set = @space.layers(?s.space); }
+    var bits: u64   = 0;
+    var k:    usize = 0;
+    for (k < set.n) {
+        bits = bits + 2 * set.at[k].width::u64;
+        k    = k + 1;
+    }
+    ret bits;
 }
 
 # replace the rule the world runs
@@ -493,9 +562,9 @@ pub fun set_rule(s: *Sim, r: rule.Rule) bool {
         ret true;
     }
     # the cells move into the new rule's layers, each word re-encoded unless
-    # the two rules write every state alike
-    # the view's layers stay as they are, beside the new rule's
-    var lay:    plane.Set  = laid_for(?old, ?new, space.layers(?s.space));
+    # the two rules write every state alike. a view layer the old rule's
+    # family kept heat and age in stays where the new one's keeps them alike
+    var lay:    plane.Set  = laid_for(s, ?new);
     val was:    *plane.Set = space.layers(?s.space);
     val relaid: bool       = !plane.same_shape(was, ?lay) || !plane.same_words(was, ?lay);
     if (!same || regrid || relaid) {
@@ -881,7 +950,7 @@ fun move_hashlife(s: *Sim, on: bool) bool {
     val fits: bool = !n.spent;
     need_dnit(?n);
     if (!fits) { ret false; }
-    var held: plane.Set       = rule.layers(?s.rule);
+    var held: plane.Set       = laid_for(s, ?s.rule);
     val laid: err[allo.Error] = space.relayer(?s.space, ?held, nil, nil);
     if (sel laid.err) { ret false; }
     s.engine = pool_engine(s);
@@ -3502,11 +3571,17 @@ test step__age_accumulates_and_heat_decays {
     val made: err[allo.Error] = init(?s, ?a);
     if (sel made.err) { ret 1; }
 
-    # a block is still life under Life, so its cells stay alive every step
+    # a block is still life under Life, so its cells stay alive every step.
+    # with no colour mode reading heat or age the pool holds the live bits
+    # alone, and a cell reads no heat or age
     paint(?s, 1, 1, 1);
     paint(?s, 2, 1, 1);
     paint(?s, 1, 2, 1);
     paint(?s, 2, 2, 1);
+    step(?s);
+    if (space.layers(?s.space).n != 1 || cell(?s, 1, 1) != 1) { ret 5; }
+    # a mode that reads them makes the layer from the cells as they stand
+    if (!set_views(?s, true) || space.layers(?s.space).n != 2) { ret 6; }
     step(?s);
     step(?s);
     val sn: layout.Sense = rule.sense(?s.rule);
@@ -3520,6 +3595,8 @@ test step__age_accumulates_and_heat_decays {
     val d: u32 = cell(?s, 40, 40);
     if (layout.live(d, sn.live_mask, sn.live_lo, sn.live_hi) != 0 || ((d >> sn.heat_shift) & sn.heat_mask) != 255 - word.DECAY) { ret 4; }
     if (((d >> sn.age_shift) & sn.age_mask) != 0)                                                                               { ret 4; }
+    # switching away frees the layer, and the cells stay as they were
+    if (!set_views(?s, false) || space.layers(?s.space).n != 1 || cell(?s, 1, 1) != 1 || cell(?s, 40, 40) != 0) { ret 7; }
     dnit(?s);
     ret 0;
 }
@@ -3975,7 +4052,9 @@ test set_rule__re_encodes_the_cells_between_families {
     if (sel bb.err) { ret 1; }
     var brain: rule.Rule = bb.ok;
 
-    # a Life block, stepped so its cells carry an age
+    # a Life block, stepped so its cells carry an age, which the pool holds
+    # while a colour mode reads it
+    if (!set_views(?s, true)) { ret 1; }
     paint(?s, 0, 0, 1);
     paint(?s, 1, 0, 1);
     paint(?s, 0, 1, 1);
@@ -4215,6 +4294,11 @@ test frame__a_world_moved_between_one_layer_and_two_steps_alike_on_both_engines 
     if (code != 0) { ret code; }
     rig_step(?t, 3);
     if (!rig_same(?t)) { ret 2; }
+    # a colour mode reading heat and age has both pools take the view layer,
+    # made from the cells as they stand and stepped alike on both engines
+    if (!set_views(?t.cpu, true) || !set_views(?t.gpu, true)) { ret 11; }
+    rig_step(?t, 3);
+    if (!rig_same(?t) || space.layers(?t.gpu.space).n != 2) { ret 12; }
     # the rule's cells take a second layer, so the GPU makes its buffers again,
     # and its stage binds the U layer beside the state layer
     val rd: rule.Rule = rule_named("F=0.0367,k=0.0649");
@@ -4231,6 +4315,10 @@ test frame__a_world_moved_between_one_layer_and_two_steps_alike_on_both_engines 
     if (!set_rule(?t.cpu, life) || !set_rule(?t.gpu, life)) { ret 9; }
     rig_step(?t, 3);
     if (!rig_same(?t)) { ret 10; }
+    # and letting the view layer go leaves the live bits, stepped alike
+    if (!set_views(?t.cpu, false) || !set_views(?t.gpu, false)) { ret 13; }
+    rig_step(?t, 3);
+    if (!rig_same(?t) || space.layers(?t.gpu.space).n != 1) { ret 14; }
     rig_close(?t);
     ret 0;
 }
@@ -5169,10 +5257,20 @@ test frame__a_host_refused_the_memory_leaves_the_pool_to_the_gpu_and_pauses {
     if (!t.gpu.withheld)                  { ret 8; }
     clear(?t.gpu);
     if (t.gpu.generation != gen || t.gpu.full) { ret 9; }
-    # with the memory back, the host takes the pool as the GPU kept it
+    # a colour mode's view layer comes and goes on the GPU's pool all the
+    # same, its cells staying there and the host taking the layers up without one
+    if (!set_views(?t.gpu, true) || space.layers(?t.gpu.space).n != 2)  { ret 12; }
+    if (!rig_frame(?t) || t.g.p.set.n != 2 || t.g.restart)              { ret 13; }
+    if (!set_views(?t.gpu, false) || space.layers(?t.gpu.space).n != 1) { ret 14; }
+    if (!rig_frame(?t) || t.g.p.set.n != 1)                             { ret 15; }
+    if (!set_views(?t.gpu, true) || !rig_frame(?t))                     { ret 16; }
+    # with the memory back, the host takes the pool as the GPU kept it, its
+    # view layer started from the cells as the CPU's starts at that generation
     t.gpu.space.max_slots = space.HOST_SLOTS;
-    if (!caught_up(?t)) { ret 10; }
-    if (t.gpu.withheld) { ret 11; }
+    for (t.cpu.generation < t.gpu.generation) { step(?t.cpu); }
+    if (!set_views(?t.cpu, true)) { ret 17; }
+    if (!caught_up(?t))           { ret 10; }
+    if (t.gpu.withheld)           { ret 11; }
     rig_close(?t);
     ret 0;
 }

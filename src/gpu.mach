@@ -144,6 +144,7 @@ use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
+use std.types.string;
 use std.types.string.str;
 
 #[embed("{artifact.stage-clear_comp.out}")]
@@ -170,6 +171,8 @@ val WIPE_SPV:   [_]u8;
 val SEED_SPV:   [_]u8;
 #[embed("{artifact.stage-gather_comp.out}")]
 val GATHER_SPV: [_]u8;
+#[embed("{artifact.stage-start_comp.out}")]
+val START_SPV:  [_]u8;
 #[embed("{artifact.stage-edit_comp.out}")]
 val EDIT_SPV:   [_]u8;
 #[embed("{artifact.stage-cells_vert.out}")]
@@ -192,14 +195,14 @@ pub val SHADES: usize = 256;
 # storage binding sets a frame keeps for the dispatches and draws besides its
 # generations': the clear, the edit, the growth's carry of the stamps and of
 # the page table, the seeding's two, the gate, the census, the reduction and
-# the draw. the stages reach every layer by address, so none of these is one
-# a layer
-val FRAME_SETS: usize = 10;
+# the draw, and the start of a shown layer taken up. the stages reach every
+# layer by address, so none of these is one a layer
+val FRAME_SETS: usize = 11;
 
 # the most dispatches a frame's generations may record, its steps, its passes
 # and its gathers, in the storage binding sets the frame has left besides
 # FRAME_SETS, which also bounds the generations it records
-pub val MAX_STEPS: usize = 246;
+pub val MAX_STEPS: usize = 245;
 
 # dispatches a pass records, the mark, the settle and the clear, and one more
 # for the first of a frame, which frees
@@ -415,12 +418,14 @@ val STORE_CELLS: usize = (layout.SHARD_LAYERS * 2 * layout.SHARDS_MAX)::usize;
 val SHARD_BYTES: u64 = 268435456;
 
 # the geometry for a set's store on a device that allocates at most most bytes
-# at once, zero for no limit: the largest shard of the widest of its layers
-# and the pyramids no larger than SHARD_BYTES or most
+# at once, zero for no limit: the largest shard of the widest of its state
+# and rule layers and the pyramids no larger than SHARD_BYTES or most. its
+# view layers come and go on the store as it stands (store_views), so they
+# have no say in it
 fun geometry(set: *plane.Set, most: u64) u32 {
     var widest: u64   = (MIP * 4)::u64;
     var k:      usize = 0;
-    for (k < set.n) {
+    for (k < plane.exact(set)) {
         val b: u64 = (plane.span_words(set.at[k].width) * 4)::u64;
         if (b > widest) { widest = b; }
         k = k + 1;
@@ -533,6 +538,87 @@ fun drop_shard(g: *Gpu, st: *Store, j: usize, n: usize) {
     for (i < n) {
         if (i < st.set.n * 2) { gfx.storage_buffer_delete(g.d, ?st.cells[layout.cells_entry((i / 2)::u32, (i % 2)::u32, j::u32)::usize]); }
         or                    { gfx.storage_buffer_delete(g.d, ?st.mip[j]); }
+        i = i + 1;
+    }
+}
+
+# whether two sets differ in their view layers alone, and one's view layers
+# are where the other's begin, so a store of either takes the other's by
+# making or deleting the shards of the layers past them (store_views)
+fun views_nest(a: *plane.Set, b: *plane.Set) bool {
+    if (!plane.same_words(a, b) || plane.exact(a) != plane.exact(b)) { ret false; }
+    var k: usize = plane.exact(a);
+    for (k < a.n && k < b.n) {
+        if (a.at[k].width != b.at[k].width || !string.str_equals(a.at[k].name, b.at[k].name)) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# give a store a set's layers whose view layers nest with its own
+# (views_nest), inside the frame, under its geometry as it stands: a view
+# layer past the store's has shards made for every shard the store holds,
+# uninitialised, and one past the set's has its shards deleted, each written
+# into the shard table. no other layer's shard moves. a shard refused, or
+# past what the device allocates at once, leaves the store as it was
+fun store_views(g: *Gpu, st: *Store, set: *plane.Set) err[gfx.Error] {
+    val most: u64   = gfx.renderer_limits(g.r).max_memory_allocation_size;
+    val from: usize = st.set.n;
+    var made: usize = 0;
+    var k:    usize = from;
+    for (k < set.n) {
+        var j: usize = 0;
+        for (j < st.n * 2) {
+            val len: usize              = shard_slots(st, j / 2) * plane.span_words(set.at[k].width) * 4;
+            val e:   usize              = layout.cells_entry(k::u32, (j % 2)::u32, (j / 2)::u32)::usize;
+            val b:   *gfx.StorageBuffer = ?st.cells[e];
+            var mk:  err[gfx.Error]     = err[gfx.Error].ok{};
+            if (most != 0 && len::u64 > most) { mk = err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.overrun{len::u64}}}; }
+            or                                { mk = make_framed(g, true, len, b); }
+            if (sel mk.err) {
+                drop_cells(g, st, from, made);
+                ret mk;
+            }
+            val at: res[u64, gfx.Error] = gfx.storage_buffer_address(g.d, b);
+            if (sel at.err) {
+                gfx.storage_buffer_delete(g.d, b);
+                drop_cells(g, st, from, made);
+                ret err[gfx.Error].err{at.err};
+            }
+            st.addrs[e] = at.ok;
+            made        = made + 1;
+            j           = j + 1;
+        }
+        k = k + 1;
+    }
+    k = set.n;
+    for (k < st.set.n) {
+        drop_cells(g, st, k, st.n * 2);
+        val at: usize = layout.cells_entry(k::u32, 0, 0)::usize;
+        mem.zero[u64](?st.addrs[at], layout.SHARDS_MAX::usize * 2);
+        k = k + 1;
+    }
+    # the entries of every layer made or let go
+    k = from;
+    if (set.n < from) { k = set.n; }
+    for (k < from || k < set.n) {
+        val at: usize          = layout.cells_entry(k::u32, 0, 0)::usize * 8;
+        val e:  err[gfx.Error] = write_framed(g, true, ?st.table, at, (?st.addrs[at / 8])::*u8, layout.SHARDS_MAX::usize * 2 * 8);
+        if (sel e.err) { ret e; }
+        k = k + 1;
+    }
+    st.set = @set;
+    ret err[gfx.Error].ok{};
+}
+
+# delete the first n of the shards of layers from k on, both cells of each of
+# a layer's shards in turn, as store_views makes them
+fun drop_cells(g: *Gpu, st: *Store, k: usize, n: usize) {
+    var i: usize = 0;
+    for (i < n) {
+        val l: usize = k + i / (st.n * 2);
+        val j: usize = i % (st.n * 2);
+        gfx.storage_buffer_delete(g.d, ?st.cells[layout.cells_entry(l::u32, (j % 2)::u32, (j / 2)::u32)::usize]);
         i = i + 1;
     }
 }
@@ -686,6 +772,12 @@ fun pool_bytes(cap: usize) usize {
 # carry:    the stage that carries the page table and the allocator's words
 #           into larger buffers while the GPU owns the pool
 # edit:     the stage that writes painted cells into a layer narrower than a word
+# start:    the stage that starts a shown layer the pool took up from its state
+#           layer
+# restart:  the pool took up a shown layer this frame, which start fills once
+#           the frame's edits are in
+# lit:      the value a fresh live cell holds in the shown layer, the host
+#           pool's, which the head holds for start
 # edited:   the edits it reads, made larger as a frame paints more
 # room:     the edits edited holds
 # edit_at:  the frame's edits of a layer, as edited holds them
@@ -826,6 +918,9 @@ pub rec Gpu {
     grow:     gfx.Compute;
     carry:    gfx.Compute;
     edit:     gfx.Compute;
+    start:    gfx.Compute;
+    restart:  bool;
+    lit:      u32;
     edited:   gfx.StorageBuffer;
     room:     usize;
     edit_at:  Vector[u32];
@@ -1159,6 +1254,8 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     g.p.cap    = 0;
     g.owed     = 0;
     g.reserved = false;
+    g.restart  = false;
+    g.lit      = 0;
     mem.zero[u8]((?g.drawn)::*u8, $size_of(layout.Sense));
     g.retired  = false;
     g.hi       = 0;
@@ -1285,6 +1382,38 @@ pub fun fit(g: *Gpu, set: *plane.Set, limit: u64) usize {
     g.bound = limit;
     g.slots = ceiling(gfx.renderer_limits(g.r), set, limit);
     ret g.slots;
+}
+
+# whether the pool in use could hold its cells in a set's layers as it
+# stands, every shard its store holds made for them, within the memory and
+# the limits its ceiling was fitted to (fit), so the host may take the set up
+# while the GPU steps the world. the store's geometry leaves view layers out
+# (geometry), so a view layer wider than the rest must also fit the device's
+# largest allocation in the largest shard the store may grow
+pub fun holds_layers(g: *Gpu, set: *plane.Set) bool {
+    val st: *Store = store_of(g, ?g.p);
+    if (g.p.cap == 0 || !st.made) { ret true; }
+    val l:    gfx.Limits = gfx.renderer_limits(g.r);
+    val most: u64        = l.max_memory_allocation_size;
+    var k:    usize      = plane.exact(set);
+    for (k < set.n) {
+        val len: u64 = ((1::usize << st.m::usize) * plane.span_words(set.at[k].width) * 4)::u64;
+        if (most != 0 && len > most) { ret false; }
+        k = k + 1;
+    }
+    ret ceiling(l, set, g.bound) >= store_slots(st);
+}
+
+# whether the next frame takes a set up in place (review): the GPU steps the
+# world in a pool it made, the set differs from the pool's in view layers
+# alone, and no growth waits to move the world into a store of other layers.
+# else the host's cells must be the world's before the set is taken up, and
+# the next frame uploads them whole
+pub fun in_place(g: *Gpu, set: *plane.Set) bool {
+    if (!g.stepping || g.p.cap == 0 || !views_nest(?g.p.set, set)) { ret false; }
+    if (g.reserved && g.next.store != g.p.store)                   { ret false; }
+    val st: *Store = store_of(g, ?g.p);
+    ret st.made && plane.same(?st.set, ?g.p.set);
 }
 
 # the share of the device's memory a pool takes when its ceiling leaves it to
@@ -1424,13 +1553,18 @@ fun stage_of(g: *Gpu, i: usize, spv: **u8, len: *usize) *gfx.Compute {
         @len = $length_of(CARRY_SPV);
         ret ?g.carry;
     }
+    if (i == 12) {
+        @spv = ?START_SPV[0];
+        @len = $length_of(START_SPV);
+        ret ?g.start;
+    }
     @spv = ?EDIT_SPV[0];
     @len = $length_of(EDIT_SPV);
     ret ?g.edit;
 }
 
 # the shared compute stages
-val STAGES: usize = 13;
+val STAGES: usize = 14;
 
 # hold the clocks a frame's stepping is timed by, all of them or none, none on
 # a device whose queue writes no timestamps, which leaves the frame time to
@@ -2345,14 +2479,22 @@ pub fun forget_writes(g: *Gpu, lo: usize, n: usize) {
 }
 
 # read every layer of the GPU's front cells of a run of slots into the host's
-# staging cells, which the GPU's layers must match, as every flush leaves them
+# staging cells, which the GPU's layers must match, as every flush leaves them.
+# view layers the host took up in place (in_place) and the next flush has not
+# yet made are read as that flush starts them: the layers both hold are read,
+# and a shown layer the GPU lacks starts from the state layer just read
 fun read_run(g: *Gpu, sp: *space.Space, s: usize, run: usize) err[gfx.Error] {
-    # layers changed since the last flush leave every slot's staging newer
-    if (!plane.same_shape(?g.p.set, space.layers(sp))) { ret err[gfx.Error].ok{}; }
+    val set:  *plane.Set = space.layers(sp);
+    val nest: bool       = views_nest(?g.p.set, set);
+    # layers changed otherwise since the last flush leave every slot's
+    # staging newer
+    if (!plane.same_shape(?g.p.set, set) && !nest) { ret err[gfx.Error].ok{}; }
+    var both: usize = g.p.set.n;
+    if (nest && set.n < both) { both = set.n; }
     # a run read a shard at a time, since no span straddles two
     val st: *Store = store_of(g, ?g.p);
     var k:  usize  = 0;
-    for (k < g.p.set.n) {
+    for (k < both) {
         var at: usize = s;
         for (at < s + run) {
             val n:  usize          = in_shard(st, at, s + run - at);
@@ -2362,6 +2504,15 @@ fun read_run(g: *Gpu, sp: *space.Space, s: usize, run: usize) err[gfx.Error] {
             at = at + n;
         }
         k = k + 1;
+    }
+    val now: opt[usize] = plane.shown(set);
+    val was: opt[usize] = plane.shown(?g.p.set);
+    if (nest && (sel now.some) && (sel was.none)) {
+        var t: usize = s;
+        for (t < s + run) {
+            space.start_shown(sp, t);
+            t = t + 1;
+        }
     }
     ret err[gfx.Error].ok{};
 }
@@ -2575,6 +2726,9 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
         sp.wide  = false;
         g.listed = false;
     }
+    g.lit = sp.lit;
+    val ev: err[gfx.Error] = review(g, sp);
+    if (sel ev.err) { ret ev; }
     val owed: usize = atomic.exchange(?g.owed, 0)::usize;
     if (owed > g.p.cap && !(g.reserved && owed <= g.next.cap) && !make_next(g, owed, true, space.layers(sp))) {
         ret err[gfx.Error].err{gfx.Error.buffer{gfx.BufferError.overrun{(owed * slot_bytes(space.layers(sp)))::u64}}};
@@ -2734,6 +2888,10 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
     }
     val e16: err[gfx.Error] = edit_painted(g);
     if (sel e16.err) { ret e16; }
+    if (g.restart) {
+        val es: err[gfx.Error] = start_shown(g, sp);
+        if (sel es.err) { ret es; }
+    }
     vector.clear[Write](?g.writes);
     if (g.stepping) {
         val es: err[gfx.Error] = queue_stamps(g);
@@ -2773,6 +2931,56 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
         }
     }
     ret err[gfx.Error].ok{};
+}
+
+# take up the host's view layers in place, where the GPU steps the world and
+# the host's layers differ from its own in view layers alone (views_nest):
+# the store makes or deletes those layers' shards and keeps every other
+# (store_views), so no cell moves and the host's staging copy, which took
+# them up without a cell (space.restage), sends none. a shown layer taken up
+# is started from the state layer once the frame's edits are in (start_shown).
+# a generation part way through starts over, since its finished ranges wrote
+# no shown layer or one now gone. other layers than the host's are left to
+# the relayout that makes them again from the host's cells
+fun review(g: *Gpu, sp: *space.Space) err[gfx.Error] {
+    val set: *plane.Set = space.layers(sp);
+    if (plane.same(?g.p.set, set) || !in_place(g, set)) { ret err[gfx.Error].ok{}; }
+    val st:    *Store         = store_of(g, ?g.p);
+    val now:   opt[usize]     = plane.shown(set);
+    val was:   opt[usize]     = plane.shown(?g.p.set);
+    val shown: bool           = (sel now.some) && (sel was.none);
+    val e:     err[gfx.Error] = store_views(g, st, set);
+    if (sel e.err) { ret e; }
+    g.p.set = @set;
+    if (g.reserved) { g.next.set = @set; }
+    if (shown)      { g.restart = true; }
+    g.going   = false;
+    g.counted = false;
+    ret err[gfx.Error].ok{};
+}
+
+# start the shown layer the pool just took up from its state layer, in both
+# cells of every slot below the GPU's top or the host's, under the rule's
+# sense and lit value as the host holds them (start_comp)
+fun start_shown(g: *Gpu, sp: *space.Space) err[gfx.Error] {
+    g.restart = false;
+    var top: usize = sp.hi;
+    if (g.hi > top)            { top = g.hi; }
+    if (g.owns && g.top > top) { top = g.top; }
+    if (top > g.p.cap)         { top = g.p.cap; }
+    if (top == 0)              { ret err[gfx.Error].ok{}; }
+    val k: opt[usize] = plane.shown(?g.p.set);
+    if (sel k.none) { ret err[gfx.Error].ok{}; }
+    # the head's sense and pool words, which the stage reads, as the host
+    # holds them now, ahead of the frame's own head
+    val es: err[gfx.Error] = gfx.renderer_buffer_update(g.r, ?g.p.meta, 3 * 4, (?sp.sense)::*u8, $size_of(layout.Sense));
+    if (sel es.err) { ret es; }
+    val ew: err[gfx.Error] = write_pool_words(g);
+    if (sel ew.err) { ret ew; }
+    var mb: [1]*gfx.StorageBuffer;
+    mb[0] = ?g.p.meta;
+    val words: usize = plane.span_words(g.p.set.at[k.some].width);
+    ret gfx.renderer_dispatch(g.r, ?g.start, ?mb[0], 1, ((words + 63) / 64)::u32, top::u32, 1);
 }
 
 # hand the pool the host changed back to the GPU: the gate reopened, the
@@ -3096,6 +3304,7 @@ fun fill_pool_words(g: *Gpu) {
     g.head[layout.WIDTHS_AT::usize]     = widths;
     g.head[layout.CAP_AT::usize]        = g.p.cap::u32;
     g.head[layout.SHARD_AT::usize]      = st.m;
+    g.head[layout.LIT_AT::usize]        = g.lit;
     g.head[layout.SHARDS_AT::usize]     = (st.at & 0xffffffff)::u32;
     g.head[layout.SHARDS_AT::usize + 1] = (st.at >> 32)::u32;
 }

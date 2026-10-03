@@ -3,8 +3,10 @@
 #
 # a cell is a bit in the family's state layer (word.WIDTH, cellar.layer), a
 # row of 32 to a word, and its display channels, age << 8 | heat, lie in the
-# view layer the family keeps beside it (word.SHOWN), layer 1 of its set. the
-# stage reaches both by address.
+# view layer the family keeps beside it (word.SHOWN), layer 1 of its set,
+# where the pool holds it while the view's colour mode reads them. the stage
+# reaches both by address, and steps the channels only where the meta head's
+# set word names a shown layer.
 #
 # an invocation is a run of 8 cells in a row, and 8 workgroups of 64 cover a
 # chunk, a band of 8 rows each; workgroup y names the chunk's slot through the
@@ -242,6 +244,7 @@ fun comp_main() {
     val hdst:  layout.Span    = layer.span(sh, SHOWN_LAYER, now & 1, place, word.SHOWN);
     val sw:    u32            = dst.at + ly::u32 * 2 + x0 / 32;
     val hw:    u32            = (ly::u32 * layout.SIDE + x0) / 2;
+    val shows: u32            = layer.set_shown(meta.base[layout.SET_AT - layout.BASE_AT]);
     if (lid == 0) {
         var busy: u32 = 0;
         var k:    u32 = 0;
@@ -267,19 +270,23 @@ fun comp_main() {
             # destination already holds zeros
             if (warm != last - 1) { ret; }
             if (x0 % 32 == 0)     { dst.p.v[sw] = 0; }
-            for (j < 4) {
-                hdst.p.v[hdst.at + hw + j] = 0;
-                j                          = j + 1;
+            if (shows != 0) {
+                for (j < 4) {
+                    hdst.p.v[hdst.at + hw + j] = 0;
+                    j                          = j + 1;
+                }
             }
             ret;
         }
         if (x0 % 32 == 0) { dst.p.v[sw] = 0; }
         var any: u32 = 0;
-        for (j < 4) {
-            val c: u32 = cool2(hsrc.p.v[hsrc.at + hw + j]);
-            hdst.p.v[hdst.at + hw + j] = c;
-            any                        = any | c;
-            j                          = j + 1;
+        if (shows != 0) {
+            for (j < 4) {
+                val c: u32 = cool2(hsrc.p.v[hsrc.at + hw + j]);
+                hdst.p.v[hdst.at + hw + j] = c;
+                any                        = any | c;
+                j                          = j + 1;
+            }
         }
         if (any != 0) { flags.v[slot * 2 + 1] = now; }
         ret;
@@ -462,18 +469,21 @@ fun comp_main() {
         }
     }
 
-    # the run's display channels follow its cells
-    var warm: u32 = 0;
-    for (j < 4) {
-        val h: u32 = hsrc.p.v[hsrc.at + hw + j];
-        var v: u32 = word.become(h & 0xffff, (next >> (j * 2)) & 1) | (word.become(h >> 16, (next >> (j * 2 + 1)) & 1) << 16);
-        if (seamed != 0) {
-            if (layout.edge_side(edge, (x0 + j * 2)::i32, ly) != 4)     { v = v & 0xffff0000; }
-            if (layout.edge_side(edge, (x0 + j * 2 + 1)::i32, ly) != 4) { v = v & 0xffff; }
+    # the run's display channels follow its cells, and where the pool holds
+    # none a live cell alone is warm
+    var warm: u32 = next;
+    if (shows != 0) {
+        for (j < 4) {
+            val h: u32 = hsrc.p.v[hsrc.at + hw + j];
+            var v: u32 = word.become(h & 0xffff, (next >> (j * 2)) & 1) | (word.become(h >> 16, (next >> (j * 2 + 1)) & 1) << 16);
+            if (seamed != 0) {
+                if (layout.edge_side(edge, (x0 + j * 2)::i32, ly) != 4)     { v = v & 0xffff0000; }
+                if (layout.edge_side(edge, (x0 + j * 2 + 1)::i32, ly) != 4) { v = v & 0xffff; }
+            }
+            hdst.p.v[hdst.at + hw + j] = v;
+            warm                       = warm | v;
+            j                          = j + 1;
         }
-        hdst.p.v[hdst.at + hw + j] = v;
-        warm                       = warm | v;
-        j                          = j + 1;
     }
 
     # the run's word of the state layer, from the four runs it holds

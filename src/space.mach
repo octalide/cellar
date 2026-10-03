@@ -63,6 +63,7 @@ use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
+use std.types.string;
 use std.types.string.str;
 
 # side of a chunk in cells
@@ -782,6 +783,12 @@ pub fun get_image(sp: *Space, s: usize, out: *u32) {
     }
 }
 
+# start slot s's shown layer over from its state layer, every cell of it, as
+# a shown layer the pool takes up starts (cellar.layer)
+pub fun start_shown(sp: *Space, s: usize) {
+    restart(sp, s, 0, CELLS);
+}
+
 # write an image under the pool's layers into slot s's state and rule
 # layers, as put_word does a cell
 pub fun put_image(sp: *Space, s: usize, img: *u32) {
@@ -1291,6 +1298,77 @@ pub fun limit(sp: *Space, slots: usize) {
 pub fun set_views(sp: *Space, views: *plane.Set) err[allo.Error] {
     var set: plane.Set = plane.with_views(?sp.set, views);
     ret relayer(sp, ?set, nil, nil);
+}
+
+# take up a set whose state and rule layers are the pool's, in place of the
+# view layers it holds, without moving a cell: for a pool that is the
+# staging copy of a world another holds (a GPU stepping it), which makes and
+# drops its own view layers. a layer of the same name and width stays as it
+# is, one taken up starts at zero, one let go is freed, and no slot is marked
+# changed, so nothing goes up from it
+# ---
+# sp:  the pool
+# set: the layers, holding to the contract, whose word is the pool's
+# ret: ok, or the allocator's refusal, which leaves the pool as it was
+pub fun restage(sp: *Space, set: *plane.Set) err[allo.Error] {
+    var old:    plane.Set = sp.set;
+    val m:      usize     = plane.exact(?old);
+    var fronts: [layer.LAYERS_MAX]*u32;
+    var backs:  [layer.LAYERS_MAX]*u32;
+    var made:   [layer.LAYERS_MAX]bool;
+    var k:      usize     = 0;
+    for (k < layer.LAYERS_MAX::usize) {
+        fronts[k] = sp.fronts[k];
+        backs[k]  = sp.backs[k];
+        made[k]   = false;
+        k         = k + 1;
+    }
+    # every layer taken up is made before any is let go
+    k = m;
+    for (k < set.n) {
+        val kept: bool = k < old.n && old.at[k].width == set.at[k].width && string.str_equals(old.at[k].name, set.at[k].name);
+        if (!kept) {
+            val n: usize = sp.cap * plane.span_words(set.at[k].width);
+            fronts[k] = zwords(sp.a, n);
+            backs[k]  = nil;
+            if (sp.stepped) { backs[k] = zwords(sp.a, n); }
+            made[k] = true;
+            if (fronts[k] == nil || (sp.stepped && backs[k] == nil)) {
+                var j: usize = m;
+                for (j <= k) {
+                    if (made[j]) {
+                        val w: usize = sp.cap * plane.span_words(set.at[j].width);
+                        if (fronts[j] != nil) { allo.deallocate[u32](sp.a, fronts[j], w); }
+                        if (backs[j] != nil)  { allo.deallocate[u32](sp.a, backs[j], w); }
+                    }
+                    j = j + 1;
+                }
+                ret err[allo.Error].err{allo.Error.exhausted{}};
+            }
+        }
+        k = k + 1;
+    }
+    k = m;
+    for (k < old.n) {
+        if (k >= set.n || made[k]) {
+            val n: usize = sp.cap * plane.span_words(old.at[k].width);
+            if (sp.fronts[k] != nil) { allo.deallocate[u32](sp.a, sp.fronts[k], n); }
+            if (sp.backs[k] != nil)  { allo.deallocate[u32](sp.a, sp.backs[k], n); }
+        }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < layer.LAYERS_MAX::usize) {
+        sp.fronts[k] = fronts[k];
+        sp.backs[k]  = backs[k];
+        if (k >= set.n) {
+            sp.fronts[k] = nil;
+            sp.backs[k]  = nil;
+        }
+        k = k + 1;
+    }
+    take_set(sp, set);
+    ret err[allo.Error].ok{};
 }
 
 # words of scratch the CPU's step may use for as long as the pool lives, kept
