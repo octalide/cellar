@@ -450,49 +450,91 @@ fun laid_for(s: *Sim, r: *rule.Rule) plane.Set {
 # are: the GPU makes the layer's shards and starts them from the state layer,
 # or drops them, in the next frame (gpu.in_place), and the host's staging
 # copy takes the layers up without a cell moving (space.restage). elsewhere
-# the host's cells are the world's, and move into the layers there. call outside a frame, or in one
-# before gpu frame has recorded anything
+# the host's cells are the world's, and move into the layers there. either
+# way a pool grown past what the device holds of the layers, for a world
+# since cleared or gone, shrinks to the world it holds first (fit_pool). call
+# outside a frame, or in one before gpu frame has recorded anything
 # ---
 # s:   simulation, with no read or edit open
 # on:  the colour mode reads heat or age
-# ret: false when the GPU's pool cannot take the layer within its memory,
-#      the GPU's cells could not be read or the allocator refused the layers,
-#      leaving the pool's layers as they were and the view's choice unmade
-pub fun set_views(s: *Sim, on: bool) bool {
-    if (on == s.views) { ret true; }
+# ret: why the pool's layers stay as they were and the view's choice unmade:
+#      the device cannot hold the layers for the world within the pool's
+#      memory, the GPU's cells could not be read or the allocator refused the
+#      layers
+pub fun set_views(s: *Sim, on: bool) opt[str] {
+    if (on == s.views) { ret opt[str].none{}; }
     s.views = on;
-    if (on_tree(s)) { ret true; }
+    if (on_tree(s)) { ret opt[str].none{}; }
     var lay: plane.Set = laid_for(s, ?s.rule);
-    if (plane.same(space.layers(?s.space), ?lay)) { ret true; }
+    if (plane.same(space.layers(?s.space), ?lay)) { ret opt[str].none{}; }
     if (on_gpu(s) && gpu.in_place(s.gpu, ?lay)) {
-        if (!gpu.holds_layers(s.gpu, ?lay)) {
+        val fit: res[bool, str] = fit_pool(s, ?lay, s.gpu.p.cap);
+        if (sel fit.err) {
             s.views = !on;
-            ret false;
+            ret opt[str].some{fit.err};
         }
+        # the GPU's pool follows the host's in the next frame, ahead of the layers
+        if (fit.ok) { gpu.shrink(s.gpu); }
         val staged: err[allo.Error] = space.restage(?s.space, ?lay);
         if (sel staged.err) {
             s.views = !on;
-            ret false;
+            ret opt[str].some{"there is not enough memory for the colour mode's layer"};
         }
         refit(s);
-        ret true;
+        ret opt[str].none{};
     }
     val synced: err[gfx.Error] = sync(s);
     if (sel synced.err) {
         s.views = !on;
-        ret false;
+        if (s.withheld) { ret opt[str].some{gpu.untaken(s.gpu)}; }
+        ret opt[str].some{"the GPU's cells could not be read back"};
+    }
+    # the GPU makes its pool again for the layers at the host's capacity
+    val fit: res[bool, str] = fit_pool(s, ?lay, s.space.cap);
+    if (sel fit.err) {
+        s.views = !on;
+        ret opt[str].some{fit.err};
     }
     val laid: err[allo.Error] = space.relayer(?s.space, ?lay, nil, nil);
     if (sel laid.err) {
         s.views = !on;
-        ret false;
+        ret opt[str].some{"there is not enough memory for the colour mode's layer"};
     }
     refit(s);
     val sp: *space.Space = ?s.space;
     if (on_gpu(s)) { gpu.forget_writes(s.gpu, 0, sp.hi); }
     # the cells are as they were, and only what keeps a chunk warm changed
     fill_end(s);
-    ret true;
+    ret opt[str].none{};
+}
+
+# fit the pool to a set of layers it is about to take up, a pool of cap slots
+# where they are to be taken up. a pool grows and never shrinks on its own,
+# so one grown for a world since cleared or gone may hold far more slots than
+# the device holds of the layers, while the world itself takes few: one the
+# device holds the layers in at its capacity stays as it is, and one grown
+# past it shrinks to the world it holds, the host's here and the GPU's
+# following it
+# ---
+# s:   simulation, holding no read or edit open
+# set: the layers
+# cap: the slots the pool holds where the layers are to be taken up
+# ret: whether the pool shrank, or why the device cannot hold the layers for
+#      the world, the GPU keeps the pool or the allocator refused, the pool
+#      then as it was
+fun fit_pool(s: *Sim, set: *plane.Set, cap: usize) res[bool, str] {
+    if (s.gpu == nil) { ret res[bool, str].ok{false}; }
+    val room: res[usize, str] = gpu.room(s.gpu, set);
+    if (sel room.err)   { ret res[bool, str].err{room.err}; }
+    if (cap <= room.ok) { ret res[bool, str].ok{false}; }
+    # the host's page table names every slot in use, the GPU's taken back
+    if (!own(s)) { ret res[bool, str].err{gpu.untaken(s.gpu)}; }
+    val sp: *space.Space = ?s.space;
+    space.compact(sp);
+    if (sp.hi > room.ok || room.ok == 0) { ret res[bool, str].err{"the world is too large for the pool to keep the colour mode's layer within its memory ceiling"}; }
+    val shrunk: err[allo.Error] = space.shrink(sp, gpu.fitted(sp.hi, room.ok));
+    if (sel shrunk.err) { ret res[bool, str].err{"there is not enough memory to fit the pool to the world"}; }
+    ret res[bool, str].ok{true};
 }
 
 # whether the pool holds the view layers a colour mode reads, or would once
@@ -3581,7 +3623,7 @@ test step__age_accumulates_and_heat_decays {
     step(?s);
     if (space.layers(?s.space).n != 1 || cell(?s, 1, 1) != 1) { ret 5; }
     # a mode that reads them makes the layer from the cells as they stand
-    if (!set_views(?s, true) || space.layers(?s.space).n != 2) { ret 6; }
+    if (!views_taken(set_views(?s, true)) || space.layers(?s.space).n != 2) { ret 6; }
     step(?s);
     step(?s);
     val sn: layout.Sense = rule.sense(?s.rule);
@@ -3596,7 +3638,7 @@ test step__age_accumulates_and_heat_decays {
     if (layout.live(d, sn.live_mask, sn.live_lo, sn.live_hi) != 0 || ((d >> sn.heat_shift) & sn.heat_mask) != 255 - word.DECAY) { ret 4; }
     if (((d >> sn.age_shift) & sn.age_mask) != 0)                                                                               { ret 4; }
     # switching away frees the layer, and the cells stay as they were
-    if (!set_views(?s, false) || space.layers(?s.space).n != 1 || cell(?s, 1, 1) != 1 || cell(?s, 40, 40) != 0) { ret 7; }
+    if (!views_taken(set_views(?s, false)) || space.layers(?s.space).n != 1 || cell(?s, 1, 1) != 1 || cell(?s, 40, 40) != 0) { ret 7; }
     dnit(?s);
     ret 0;
 }
@@ -4054,7 +4096,7 @@ test set_rule__re_encodes_the_cells_between_families {
 
     # a Life block, stepped so its cells carry an age, which the pool holds
     # while a colour mode reads it
-    if (!set_views(?s, true)) { ret 1; }
+    if (!views_taken(set_views(?s, true))) { ret 1; }
     paint(?s, 0, 0, 1);
     paint(?s, 1, 0, 1);
     paint(?s, 0, 1, 1);
@@ -4296,7 +4338,7 @@ test frame__a_world_moved_between_one_layer_and_two_steps_alike_on_both_engines 
     if (!rig_same(?t)) { ret 2; }
     # a colour mode reading heat and age has both pools take the view layer,
     # made from the cells as they stand and stepped alike on both engines
-    if (!set_views(?t.cpu, true) || !set_views(?t.gpu, true)) { ret 11; }
+    if (!views_taken(set_views(?t.cpu, true)) || !views_taken(set_views(?t.gpu, true))) { ret 11; }
     rig_step(?t, 3);
     if (!rig_same(?t) || space.layers(?t.gpu.space).n != 2) { ret 12; }
     # the rule's cells take a second layer, so the GPU makes its buffers again,
@@ -4316,7 +4358,7 @@ test frame__a_world_moved_between_one_layer_and_two_steps_alike_on_both_engines 
     rig_step(?t, 3);
     if (!rig_same(?t)) { ret 10; }
     # and letting the view layer go leaves the live bits, stepped alike
-    if (!set_views(?t.cpu, false) || !set_views(?t.gpu, false)) { ret 13; }
+    if (!views_taken(set_views(?t.cpu, false)) || !views_taken(set_views(?t.gpu, false))) { ret 13; }
     rig_step(?t, 3);
     if (!rig_same(?t) || space.layers(?t.gpu.space).n != 1) { ret 14; }
     rig_close(?t);
@@ -4440,6 +4482,12 @@ pub rec Rig {
     g:      gpu.Gpu;
     made:   u8;
     parted: bool;
+}
+
+# whether set_views took the layers up, refused nothing
+#[testing]
+fun views_taken(why: opt[str]) bool {
+    ret sel why.none;
 }
 
 # seed both worlds and attach the GPU world where a GPU can step it
@@ -5278,18 +5326,72 @@ test frame__a_host_refused_the_memory_leaves_the_pool_to_the_gpu_and_pauses {
     if (t.gpu.generation != gen || t.gpu.full) { ret 9; }
     # a colour mode's view layer comes and goes on the GPU's pool all the
     # same, its cells staying there and the host taking the layers up without one
-    if (!set_views(?t.gpu, true) || space.layers(?t.gpu.space).n != 2)  { ret 12; }
-    if (!rig_frame(?t) || t.g.p.set.n != 2 || t.g.restart)              { ret 13; }
-    if (!set_views(?t.gpu, false) || space.layers(?t.gpu.space).n != 1) { ret 14; }
-    if (!rig_frame(?t) || t.g.p.set.n != 1)                             { ret 15; }
-    if (!set_views(?t.gpu, true) || !rig_frame(?t))                     { ret 16; }
+    if (!views_taken(set_views(?t.gpu, true)) || space.layers(?t.gpu.space).n != 2)  { ret 12; }
+    if (!rig_frame(?t) || t.g.p.set.n != 2 || t.g.restart)                           { ret 13; }
+    if (!views_taken(set_views(?t.gpu, false)) || space.layers(?t.gpu.space).n != 1) { ret 14; }
+    if (!rig_frame(?t) || t.g.p.set.n != 1)                                          { ret 15; }
+    if (!views_taken(set_views(?t.gpu, true)) || !rig_frame(?t))                     { ret 16; }
     # with the memory back, the host takes the pool as the GPU kept it, its
     # view layer started from the cells as the CPU's starts at that generation
     t.gpu.space.max_slots = space.HOST_SLOTS;
     for (t.cpu.generation < t.gpu.generation) { step(?t.cpu); }
-    if (!set_views(?t.cpu, true)) { ret 17; }
-    if (!caught_up(?t))           { ret 10; }
-    if (t.gpu.withheld)           { ret 11; }
+    if (!views_taken(set_views(?t.cpu, true))) { ret 17; }
+    if (!caught_up(?t))                        { ret 10; }
+    if (t.gpu.withheld)                        { ret 11; }
+    rig_close(?t);
+    ret 0;
+}
+
+# a soup across a square of 64 chunks a side, which grows the pool to
+# thousands of slots
+#[testing]
+fun seed_wide_soup(s: *Sim) {
+    s.rng = rand.seed(1, 2, 3, 4);
+    fill_begin(s);
+    var y: i64 = 0;
+    for (y < 2048) {
+        var x: i64 = 0;
+        for (x < 2048) {
+            if (rand.range(?s.rng, 0, 1000) < 300) { fill_cell(s, x, y, 1); }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    fill_end(s);
+}
+
+test frame__a_pool_grown_past_what_holds_a_view_layer_fits_its_world_to_take_one {
+    var t:    Rig;
+    val code: i32 = rig_open(?t, rule.preset_rule(2), seed_wide_soup);
+    if (code != 0) { ret code; }
+    if (!t.on) {
+        rig_close(?t);
+        ret 0;
+    }
+    if (uncapped_frames(?t.r, ?t.gpu, 20) == 0) { ret 1; }
+    # the pool's memory ceiling is what the grown pool takes, which leaves no
+    # room for a view layer across its capacity, nor across the world it holds
+    val grown: usize            = t.g.p.cap;
+    var c:     ceiling.Ceilings = ceiling.defaults();
+    c.limit[ceiling.POOL] = gpu.pool_bytes_of(?t.g) / 1048576 + 1;
+    set_ceilings(?t.gpu, c);
+    val why: opt[str] = set_views(?t.gpu, true);
+    if (sel why.none)                                       { ret 2; }
+    if (views(?t.gpu) || space.layers(?t.gpu.space).n != 1) { ret 3; }
+    if (!rig_frame(?t) || t.g.p.set.n != 1)                 { ret 4; }
+    # cleared and seeded afresh, the world fits a pool that holds the layer
+    clear(?t.cpu);
+    clear(?t.gpu);
+    seed_edges(?t.cpu);
+    seed_edges(?t.gpu);
+    if (!views_taken(set_views(?t.gpu, true)) || !views_taken(set_views(?t.cpu, true))) { ret 5; }
+    if (!rig_frame(?t))                                                                 { ret 6; }
+    if (t.g.p.cap >= grown || t.gpu.space.cap > t.g.p.cap || t.g.p.set.n != 2)          { ret 7; }
+    # the world goes on in the fitted pool as on the CPU, growing it again
+    if (uncapped_frames(?t.r, ?t.gpu, 120) == 0)                  { ret 8; }
+    if (!caught_up(?t))                                           { ret 9; }
+    if (!views_taken(set_views(?t.gpu, false)) || !rig_frame(?t)) { ret 10; }
+    if (!views_taken(set_views(?t.gpu, true)) || !rig_frame(?t))  { ret 11; }
     rig_close(?t);
     ret 0;
 }
