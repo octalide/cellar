@@ -296,8 +296,9 @@ pub rec Watch {
 # bound:      the world's boundary, while bounded
 # bounded:    the world has a boundary, which the pool holds it inside
 # drawn:      the boundary was drawn, rather than the plane the rule names
-# reframed:   changes to the boundary, counted, so a copy of it knows when it
-#             is stale
+# bound_rev:  counts the boundary's changes
+# chosen:     the cell a region fill's region is the one holding
+# regions:    what the interface is shown of the regions (region_view)
 pub rec Sim {
     space:      space.Space;
     rule:       rule.Rule;
@@ -337,7 +338,37 @@ pub rec Sim {
     bound:      boundary.Region;
     bounded:    bool;
     drawn:      bool;
-    reframed:   u64;
+    bound_rev:  u64;
+    chosen:     Chosen;
+    regions:    Regions;
+}
+
+# the cell that names a boundary region
+# ---
+# set: a cell was chosen
+# x:   its column
+# y:   its row
+rec Chosen {
+    set: bool;
+    x:   i64;
+    y:   i64;
+}
+
+# what is known of the boundary's regions, as of one of its revisions
+# ---
+# valid:  the rest holds for the boundary and the chosen cell as they are
+# rev:    the boundary's revision they were made for
+# n:      how many regions the boundary holds, 0 for a world without one
+# whole:  the box of the whole boundary, or none where it has none or does not
+#         end
+# chosen: the chosen region's box, or none where there is none or it does not
+#         end
+pub rec Regions {
+    valid:  bool;
+    rev:    u64;
+    n:      usize;
+    whole:  opt[space.Box];
+    chosen: opt[space.Box];
 }
 
 # an empty world stepped by the CPU, with the first preset's rule
@@ -391,14 +422,16 @@ pub fun init(s: *Sim, a: *allo.Allocator) err[allo.Error] {
     s.read.open  = false;
     s.watched    = false;
     history.clear(?s.history);
-    s.ceil     = ceiling.defaults();
-    s.began    = opt[time.Instant].none{};
-    s.fit      = hashlife.MAX_EXPONENT;
-    s.asked    = 0;
-    s.bound    = boundary.init(a);
-    s.bounded  = false;
-    s.drawn    = false;
-    s.reframed = 0;
+    s.ceil      = ceiling.defaults();
+    s.began     = opt[time.Instant].none{};
+    s.fit       = hashlife.MAX_EXPONENT;
+    s.asked     = 0;
+    s.bound     = boundary.init(a);
+    s.bounded   = false;
+    s.bound_rev = 0;
+    s.chosen    = Chosen{set: false, x: 0, y: 0};
+    s.regions   = Regions{valid: false, rev: 0, n: 0, whole: opt[space.Box].none{}, chosen: opt[space.Box].none{}};
+    s.drawn     = false;
     disarm(s);
     ret e;
 }
@@ -721,8 +754,8 @@ fun rim(s: *Sim) {
 fun ground(s: *Sim) {
     val sp: *space.Space  = ?s.space;
     val g:  topology.Grid = s.rule.grid;
-    s.drawn    = false;
-    s.reframed = s.reframed + 1;
+    s.drawn     = false;
+    s.bound_rev = s.bound_rev + 1;
     if (g.shape != topology.PLANE) {
         if (s.bounded) {
             s.bounded = false;
@@ -777,8 +810,8 @@ pub fun drawn(s: *Sim) bool {
 
 # changes to the world's boundary so far, which a copy of it compares to know
 # it is stale
-pub fun reframed(s: *Sim) u64 {
-    ret s.reframed;
+pub fun bound_revision(s: *Sim) u64 {
+    ret s.bound_rev;
 }
 
 # give the world a boundary, or take it away, as one change: the cells outside
@@ -809,6 +842,7 @@ pub fun set_bound(s: *Sim, r: *boundary.Region) opt[str] {
     val sp: *space.Space = ?s.space;
     if (!space.own(sp)) { ret opt[str].some{"the GPU keeps the pool"}; }
     if (on_gpu(s))      { gpu.forget_writes(s.gpu, 0, sp.hi); }
+    s.bound_rev = s.bound_rev + 1;
     if (r == nil) {
         s.bounded = false;
         s.drawn   = false;
@@ -827,8 +861,7 @@ pub fun set_bound(s: *Sim, r: *boundary.Region) opt[str] {
         }
     }
     # the plane's rectangle is the boundary's to replace
-    s.rule     = ruled;
-    s.reframed = s.reframed + 1;
+    s.rule = ruled;
     rim(s);
     var sl: usize = 0;
     for (sl < sp.hi) {
@@ -2150,21 +2183,87 @@ pub fun fill_end(s: *Sim) bool {
     ret ok;
 }
 
+# the box a region spans, when it ends
+fun box_of(r: *boundary.Region, out: *space.Box) bool {
+    var b: [4]i64;
+    if (!boundary.finite(r) || !boundary.bounds(r, ?b[0])) { ret false; }
+    @out = space.Box{x0: b[0], y0: b[1], x1: b[2], y1: b[3]};
+    ret true;
+}
+
+# choose the region of the boundary that holds a cell, for a region fill and
+# for the interface to frame. which region it is follows the boundary
+# ---
+# s: simulation
+# x: column
+# y: row
+pub fun choose_region(s: *Sim, x: i64, y: i64) {
+    s.chosen        = Chosen{set: true, x: x, y: y};
+    s.regions.valid = false;
+}
+
+# make out the chosen region into out
+# ---
+# ret: false when the world has no boundary, no cell is chosen or the cell is
+#      in none of its regions
+fun chosen_region(s: *Sim, out: *boundary.Region) bool {
+    if (!s.bounded || !s.chosen.set) { ret false; }
+    val at: res[usize, allo.Error] = boundary.region_at(?s.bound, s.chosen.x, s.chosen.y);
+    if (!sel at.ok)                  { ret false; }
+    if (at.ok == boundary.NO_REGION) { ret false; }
+    val made: err[allo.Error] = boundary.region(?s.bound, at.ok, out);
+    ret !sel made.err;
+}
+
+# what the interface is shown of the boundary's regions, which it frames
+# ---
+# s:   simulation
+# ret: the regions
+pub fun region_view(s: *Sim) Regions {
+    if (!s.regions.valid || s.regions.rev != s.bound_rev) {
+        var r: Regions = Regions{valid: true, rev: s.bound_rev, n: 0, whole: opt[space.Box].none{}, chosen: opt[space.Box].none{}};
+        if (s.bounded) {
+            val c: res[usize, allo.Error] = boundary.count(?s.bound);
+            if (sel c.ok) { r.n = c.ok; }
+            var b: space.Box;
+            if (box_of(?s.bound, ?b)) { r.whole = opt[space.Box].some{b}; }
+            var one: boundary.Region = boundary.init(s.space.a);
+            if (chosen_region(s, ?one) && box_of(?one, ?b)) { r.chosen = opt[space.Box].some{b}; }
+            boundary.dnit(?one);
+        }
+        s.regions = r;
+    }
+    ret s.regions;
+}
+
 # replace the world with a random soup over a shape, resetting the count. cells
-# off the world's grid are never filled
+# off the world's grid or boundary are never filled
 # ---
 # s:   simulation
 # f:   what to fill
-# ret: false when the shape is the grid of a world that has none, which leaves
-#      the world as it was
+# ret: false when the shape is the world's grid and it has none that ends, or a
+#      region and none is chosen, which leaves the world as it was
 pub fun randomize_shape(s: *Sim, f: *fill.Fill) bool {
-    var grid: space.Box = space.Box{x0: 0, y0: 0, x1: 0, y1: 0};
-    if (sel f.shape.grid) {
-        val g: opt[space.Box] = fill.grid_box(?s.rule.grid);
-        if (!sel g.some) { ret false; }
-        grid = g.some;
+    var held: boundary.Region = boundary.init(s.space.a);
+    fin { boundary.dnit(?held); }
+    var dom: fill.Domain = fill.nowhere();
+    if (sel f.shape.region) {
+        if (!chosen_region(s, ?held) || !box_of(?held, ?dom.box)) { ret false; }
+        dom.area = ?held;
     }
-    val b:      space.Box = fill.bounds(?f.shape, grid);
+    if (sel f.shape.grid) {
+        # a boundary holds the grid's place, and a plane's rectangle is one
+        if (s.bounded) {
+            if (!box_of(?s.bound, ?dom.box)) { ret false; }
+            dom.area = ?s.bound;
+        }
+        or {
+            val g: opt[space.Box] = fill.grid_box(?s.rule.grid);
+            if (!sel g.some) { ret false; }
+            dom.box = g.some;
+        }
+    }
+    val b:      space.Box = fill.bounds(?f.shape, ?dom);
     var thresh: i64       = (f.density * 1000.0)::i64;
     if (thresh < 0)    { thresh = 0; }
     if (thresh > 1000) { thresh = 1000; }
@@ -2173,7 +2272,7 @@ pub fun randomize_shape(s: *Sim, f: *fill.Fill) bool {
     for (y < b.y1) {
         var x: i64 = b.x0;
         for (x < b.x1) {
-            if (fill.covers(?f.shape, x, y) && rand.range(?s.rng, 0, 1000) < thresh) { fill_cell(s, x, y, 1); }
+            if (fill.covers(?f.shape, ?dom, x, y) && rand.range(?s.rng, 0, 1000) < thresh) { fill_cell(s, x, y, 1); }
             x = x + 1;
         }
         y = y + 1;
@@ -4663,6 +4762,44 @@ test randomize_shape__fills_a_circle_off_centre_and_a_grid_whole_or_refuses {
     if (!randomize_shape(?s, ?f)) { ret 7; }
     # every cell of the 40 x 30 grid, and none past it
     if (population(?s) != 1200 || alive(?s, 20, 0) || alive(?s, 0, 15)) { ret 8; }
+    dnit(?s);
+    ret 0;
+}
+
+test randomize_shape__fills_the_chosen_region_or_every_region_and_nothing_outside {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    Sim;
+    val made: err[allo.Error] = init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    var left:  boundary.Region = boundary.init(?a);
+    var right: boundary.Region = boundary.init(?a);
+    boundary.rect(?left, 0, 0, 20, 10);
+    boundary.rect(?right, 40, 0, 50, 10);
+    boundary.combine(?left, ?right, boundary.ADD);
+    val set: opt[str] = set_bound(?s, ?left);
+    boundary.dnit(?left);
+    boundary.dnit(?right);
+    if (sel set.some) { ret 2; }
+    var f: fill.Fill = fill.Fill{shape: fill.Shape.region{}, density: 1.0};
+    # none chosen, or a cell in no region, fills nothing
+    if (randomize_shape(?s, ?f)) { ret 3; }
+    choose_region(?s, 25, 5);
+    if (randomize_shape(?s, ?f) || population(?s) != 0) { ret 4; }
+    choose_region(?s, 45, 5);
+    if (!randomize_shape(?s, ?f))                                                           { ret 5; }
+    if (population(?s) != 100 || !alive(?s, 40, 0) || !alive(?s, 49, 9) || alive(?s, 5, 5)) { ret 6; }
+    val seen: Regions = region_view(?s);
+    if (seen.n != 2)           { ret 7; }
+    if (!sel seen.chosen.some) { ret 7; }
+    if (!sel seen.whole.some)  { ret 7; }
+    val one: space.Box = seen.chosen.some;
+    val all: space.Box = seen.whole.some;
+    if (one.x0 != 40 || one.x1 != 50 || all.x0 != 0 || all.x1 != 50) { ret 7; }
+    # the grid is every region, and the gap between them stays empty
+    f.shape = fill.Shape.grid{};
+    if (!randomize_shape(?s, ?f))                                      { ret 8; }
+    if (population(?s) != 300 || alive(?s, 30, 5) || alive(?s, 20, 5)) { ret 9; }
     dnit(?s);
     ret 0;
 }
