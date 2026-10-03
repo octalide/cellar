@@ -278,7 +278,7 @@ Vulkan driver; on macOS that is MoltenVK.
 
 ## Build
 
-Requires [Mach](https://github.com/briar-systems/mach) 6.7 or newer and a C
+Requires [Mach](https://github.com/briar-systems/mach) 6.10.1 or newer and a C
 compiler for GLFW, which mach-glfw builds from source (on linux, the X11 and
 Wayland development headers and `wayland-scanner`).
 
