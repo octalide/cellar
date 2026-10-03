@@ -12,15 +12,18 @@
 # any order, Du and Dv Pearson's when left out, as format leaves them. F and k
 # run from 0 to 1/4, and Du and Dv from 0 to 1/4, the explicit step's
 # stability bound. each is kept as a decimal to the ninth place, so a rule
-# string round-trips exactly. its cell word is cellar.rules.reaction.word's,
-# both fields in one word, and its step stage is reaction_comp.
+# string round-trips exactly. its cells are stored in two 16-bit layers
+# (cellar.layer), v in the state layer and 1 - u in a rule layer declared
+# live, as cellar.rules.reaction.word lays them out, and its step stage is
+# reaction_comp, which binds both.
 #
 # the fields are continuous, but a cell still has states, for everything in
 # cellar that trades in them: state 16 j + i holds u = 1 - i/15 and v = j/15,
-# so a pattern format keeps both fields to 4 bits, a 256-state format such as
-# Golly's multi-state RLE carries the rule, and one that holds fewer states
-# refuses it (format.Error.levels). a world file keeps the words themselves
-# (caps continuous).
+# read from a cell's whole word (word_state), so a pattern format keeps both
+# fields to 4 bits, a 256-state format such as Golly's multi-state RLE carries
+# the rule, and one that holds fewer states refuses it (format.Error.levels).
+# a world file and a copy keep the words themselves, both fields exactly (caps
+# continuous).
 #
 # the quadtree engine cannot run a continuous rule. the empty world, u = 1 and
 # v = 0 everywhere, steps to itself under every rule.
@@ -185,16 +188,24 @@ pub fun states(r: *Rule) u32 {
     ret STATES;
 }
 
-# the word of a cell of a state: u = 1 - (state % 16)/15 and v = (state / 16)/15
+# the value of a fresh cell of a state in the state layer: v = (state / 16)/15
 pub fun word_of(r: *Rule, state: u32) u32 {
-    ret word.cell((state % LEVELS) * LEVEL, (state / LEVELS) * LEVEL);
+    ret (state / LEVELS) * LEVEL;
 }
 
-# the state a word holds, each field to the nearest 15th
+# a field's level, to the nearest 15th
+fun level(f: u32) u32 {
+    ret (f + LEVEL / 2) / LEVEL;
+}
+
+# the state the state layer's value alone holds: v's level, u taken as 1
 pub fun state_of(c: u32) u32 {
-    val i: u32 = (word.a_of(c) + LEVEL / 2) / LEVEL;
-    val j: u32 = (word.b_of(c) + LEVEL / 2) / LEVEL;
-    ret j * LEVELS + i;
+    ret level(c) * LEVELS;
+}
+
+# the state a cell's word holds, each field to the nearest 15th
+pub fun word_state(r: *Rule, w: *u32) u32 {
+    ret level(w[0]) * LEVELS + level(w[word.U::usize]);
 }
 
 # the state painted or seeded when none is chosen: u = 1 and v = 1, which
@@ -209,16 +220,33 @@ pub fun slack(r: *Rule) u32 {
     ret 0;
 }
 
-# the value a fresh cell of a state holds in rule layer k: none, since the
-# family's cells are its state layer alone
-pub fun rest_of(r: *Rule, state: u32, k: usize) u32 {
-    ret 0;
+# a cell's word from one an older version recorded: up to 0.8.0 a cell was
+# one value holding both fields, a = 1 - u in its low half and b = v in its
+# high half, which the layers hold apart now
+# ---
+# from: n values
+# out:  receives the word, v then 1 - u
+# ret:  false for any count but 1
+pub fun adopt(r: *Rule, from: *u32, n: usize, out: *u32) bool {
+    if (n != 1) { ret false; }
+    out[0]             = word.b_of(from[0]);
+    out[word.U::usize] = word.a_of(from[0]);
+    ret true;
 }
 
-# the layers the family's cells are stored in (cellar.layer): its word as
-# the state layer, word.WIDTH bits wide
+# the value a fresh cell of a state holds in rule layer k, the U layer's
+# alone: 1 - u = (state % 16)/15
+pub fun rest_of(r: *Rule, state: u32, k: usize) u32 {
+    ret (state % LEVELS) * LEVEL;
+}
+
+# the layers the family's cells are stored in (cellar.layer): v and heat in
+# the state layer and 1 - u in a rule layer declared live, so a cell holding
+# u below 1 alone is live too, word.WIDTH bits each
 pub fun layers(r: *Rule) plane.Set {
-    ret plane.state("u, v and heat", word.WIDTH);
+    var s: plane.Set = plane.state("v and heat", word.WIDTH);
+    plane.add_live(?s, "1 - u", word.WIDTH);
+    ret s;
 }
 
 # how shared code reads a value of the family's state layer
@@ -257,12 +285,14 @@ fun rates(r: *Rule, w: *u32) {
     w[word.K_AT]  = units(r.k, word.FEED_ONE);
 }
 
-# the word at (x, y) of a block, in its chunk's coordinates
+# the pair of the cell at (x, y) of a block, in its chunk's coordinates
 #[inline]
-fun at(b: *space.Block, x: i64, y: i64) u32 {
-    val own: *u32 = space.block_own(b, 0).w;
-    if (x >= 0 && x < 64 && y >= 0 && y < 64) { ret plane.load(own, word.WIDTH, (y * 64 + x)::usize); }
-    ret space.block_cell(b, word.WIDTH, x, y);
+fun at(b: *space.Block, v: *u32, u: *u32, x: i64, y: i64) u32 {
+    if (x >= 0 && x < 64 && y >= 0 && y < 64) {
+        val i: usize = (y * 64 + x)::usize;
+        ret word.cell(plane.load(u, word.WIDTH, i), plane.load(v, word.WIDTH, i));
+    }
+    ret word.cell(space.block_value(b, word.U::usize, x, y), space.block_value(b, 0, x, y));
 }
 
 # step one chunk on the CPU, the function the family's stage applies
@@ -271,9 +301,11 @@ fun at(b: *space.Block, x: i64, y: i64) u32 {
 # b: the chunk's block and back cells
 # t: the tally of the cells written
 pub fun step_chunk(r: *Rule, b: *space.Block, t: *space.Tally) {
-    val own: *u32 = space.block_own(b, 0).w;
-    val out: *u32 = space.block_out(b, 0).w;
-    var w:   [4]u32;
+    val own:  *u32 = space.block_own(b, 0).w;
+    val out:  *u32 = space.block_out(b, 0).w;
+    val owna: *u32 = space.block_own(b, word.U::usize).w;
+    val outa: *u32 = space.block_out(b, word.U::usize).w;
+    var w:    [4]u32;
     rates(r, ?w[0]);
     var y: i64 = 0;
     for (y < 64) {
@@ -284,7 +316,7 @@ pub fun step_chunk(r: *Rule, b: *space.Block, t: *space.Tally) {
             var sb: u32   = 0;
             # a block with no live cell is all zeros, and its sums with it
             if (b.busy) {
-                val n: [4]u32 = [4]u32{at(b, x, y - 1), at(b, x - 1, y), at(b, x + 1, y), at(b, x, y + 1)};
+                val n: [4]u32 = [4]u32{at(b, own, owna, x, y - 1), at(b, own, owna, x - 1, y), at(b, own, owna, x + 1, y), at(b, own, owna, x, y + 1)};
                 var q: usize  = 0;
                 for (q < 4) {
                     sa = sa + word.a_of(n[q]);
@@ -292,9 +324,11 @@ pub fun step_chunk(r: *Rule, b: *space.Block, t: *space.Tally) {
                     q  = q + 1;
                 }
             }
-            val v: u32 = word.next(plane.load(own, word.WIDTH, i), sa, sb, w[word.DU_AT], w[word.DV_AT], w[word.F_AT], w[word.K_AT]);
-            plane.store(out, word.WIDTH, i, v);
-            space.note(t, v, x::u32, y::u32);
+            val c: u32 = word.cell(plane.load(owna, word.WIDTH, i), plane.load(own, word.WIDTH, i));
+            val v: u32 = word.next(c, sa, sb, w[word.DU_AT], w[word.DV_AT], w[word.F_AT], w[word.K_AT]);
+            plane.store(out, word.WIDTH, i, word.b_of(v));
+            plane.store(outa, word.WIDTH, i, word.a_of(v));
+            space.note_with(t, word.b_of(v), word.a_of(v), x::u32, y::u32);
             x = x + 1;
         }
         y = y + 1;
@@ -399,6 +433,7 @@ pub val FAMILY: family.Family = family.Family{
     rest_of:     fam_rest_of,
     state_of:    state_of,
     word_state:  fam_word_state,
+    adopt:       fam_adopt,
     ink:         fam_ink,
     slack:       fam_slack,
     sense:       sense,
@@ -465,9 +500,13 @@ fun fam_rest_of(p: *family.Payload, state: u32, k: usize) u32 {
     ret rest_of(held(p), state, k);
 }
 
-# a cell's state, read from its state layer alone
+fun fam_adopt(p: *family.Payload, from: *u32, n: usize, out: *u32) bool {
+    ret adopt(held(p), from, n, out);
+}
+
+# a cell's state, read from both its fields
 fun fam_word_state(p: *family.Payload, w: *u32) u32 {
-    ret state_of(w[0]);
+    ret word_state(held(p), w);
 }
 
 fun fam_ink(p: *family.Payload) u32 {
@@ -548,18 +587,21 @@ test format__round_trips_through_parse {
 }
 
 test word__every_state_round_trips_and_shades_by_v {
-    var r:  Rule;
-    var st: u32 = 0;
+    var r:   Rule;
+    var st:  u32          = 0;
+    var set: plane.Set    = layers(?r);
+    val sn:  layout.Sense = sense();
     for (st < STATES) {
-        val c: u32 = word_of(?r, st);
-        if (state_of(c) != st)                                                       { ret 1; }
-        if (layout.texel_heat(c, word.HEAT_SHIFT, word.HEAT_MASK) != (st / 16) * 17) { ret 2; }
-        if (layout.live(c, 0xffffffff, 1, 0xffffffff) != (st != 0)::u32)             { ret 3; }
+        var w: [2]u32 = [2]u32{word_of(?r, st), rest_of(?r, st, word.U::usize)};
+        if (word_state(?r, ?w[0]) != st)                                                { ret 1; }
+        if (state_of(w[0]) != (st / 16) * 16)                                           { ret 1; }
+        if (layout.texel_heat(w[0], word.HEAT_SHIFT, word.HEAT_MASK) != (st / 16) * 17) { ret 2; }
+        # a cell holding u below 1 alone is live by its U layer
+        if (plane.live_word(?set, sn, ?w[0]) != (st != 0)) { ret 3; }
         st = st + 1;
     }
     # the ink is u = 1 and v at its greatest
-    val ink_word: u32 = word_of(?r, ink(?r));
-    if (word.a_of(ink_word) != 0 || word.b_of(ink_word) != word.MAX) { ret 4; }
+    if (rest_of(?r, ink(?r), word.U::usize) != 0 || word_of(?r, ink(?r)) != word.MAX) { ret 4; }
     ret 0;
 }
 
