@@ -1,0 +1,188 @@
+# the rate the world actually runs at, measured from the generations it
+# completes against the clock
+#
+# the interface feeds it the generation it shows once a frame. a generation
+# count is the same measure on every engine: a HashLife step that covers 2^k
+# generations moves it by 2^k, so its rate reads in generations a second like
+# any other. samples gather in a window of at least WINDOW seconds that holds
+# a generation, and each window's rate moves the shown one halfway, so the
+# reading is steady without lagging a change long. a pause, a reset or a full
+# world drops the reading rather than holding it stale.
+
+use cellar.text;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+
+# seconds a window gathers at least
+pub val WINDOW: f64 = 0.25;
+# seconds a window waits for its first generation before the reading is dropped
+pub val PATIENCE: f64 = 4.0;
+
+# the measure
+# ---
+# gen:   the generation the window began at
+# t:     when the window began, in seconds
+# open:  a window is gathering
+# per_s: the smoothed rate in generations a second
+# valid: per_s is a measure
+pub rec Rate {
+    gen:   u64;
+    t:     f64;
+    open:  bool;
+    per_s: f64;
+    valid: bool;
+}
+
+# start with no reading
+pub fun init(r: *Rate) {
+    r.gen   = 0;
+    r.t     = 0.0;
+    r.open  = false;
+    r.per_s = 0.0;
+    r.valid = false;
+}
+
+# drop the reading and the window
+pub fun reset(r: *Rate) {
+    init(r);
+}
+
+# take what the frame shows
+# ---
+# r:       the measure
+# gen:     the generation shown
+# running: the world steps on its own
+# now:     the clock, in seconds
+pub fun feed(r: *Rate, gen: u64, running: bool, now: f64) {
+    if (!running || (r.open && gen < r.gen)) {
+        reset(r);
+        ret;
+    }
+    if (!r.open) {
+        r.gen  = gen;
+        r.t    = now;
+        r.open = true;
+        ret;
+    }
+    val dt: f64 = now - r.t;
+    if (dt < WINDOW) { ret; }
+    if (gen == r.gen) {
+        # no generation yet: wait on, and drop the reading when it never comes
+        if (dt >= PATIENCE) {
+            r.valid = false;
+            r.per_s = 0.0;
+            r.gen   = gen;
+            r.t     = now;
+        }
+        ret;
+    }
+    val inst: f64 = (gen - r.gen)::f64 / dt;
+    if (r.valid) { r.per_s = (r.per_s + inst) / 2.0; }
+    or {
+        r.per_s = inst;
+        r.valid = true;
+    }
+    r.gen = gen;
+    r.t   = now;
+}
+
+# append a value of tenths with one decimal below 10 and whole above
+fun tenths(buf: *u8, off: usize, v10: u64) usize {
+    if (v10 >= 100) { ret text.buf_grouped(buf, off, (v10 + 5) / 10); }
+    var o: usize = text.buf_u64(buf, off, v10 / 10);
+    buf[o] = '.';
+    ret text.buf_u64(buf, o + 1, v10 % 10);
+}
+
+# what a step takes in nanoseconds for display: the measured time, or, on a
+# GPU that writes no timestamps and runs uncapped, the interval between
+# generations, which is then the step's wall time. 0 for none
+pub fun step_for(r: *Rate, step_ns: u64, uncapped: bool) u64 {
+    if (step_ns != 0)                         { ret step_ns; }
+    if (uncapped && r.valid && r.per_s > 0.0) { ret (1000000000.0 / r.per_s)::u64; }
+    ret 0;
+}
+
+# append the rate in generations a second, or a dash for no reading
+# ---
+# ret: offset just past the text
+pub fun rate_text(buf: *u8, off: usize, r: *Rate) usize {
+    if (!r.valid) { ret text.buf_str(buf, off, "-"); }
+    ret tenths(buf, off, (r.per_s * 10.0 + 0.5)::u64);
+}
+
+# append a duration with a unit chosen so it reads in a few digits, or a dash
+# for none
+# ---
+# ns:  nanoseconds, 0 for none
+# ret: offset just past the text
+pub fun duration_text(buf: *u8, off: usize, ns: u64) usize {
+    if (ns == 0) { ret text.buf_str(buf, off, "-"); }
+    if (ns < 1000) {
+        val o: usize = text.buf_u64(buf, off, ns);
+        ret text.buf_str(buf, o, " ns");
+    }
+    if (ns < 1000000) {
+        val o: usize = tenths(buf, off, (ns + 50) / 100);
+        ret text.buf_str(buf, o, " us");
+    }
+    if (ns < 1000000000) {
+        val o: usize = tenths(buf, off, (ns + 50000) / 100000);
+        ret text.buf_str(buf, o, " ms");
+    }
+    val o: usize = tenths(buf, off, (ns + 50000000) / 100000000);
+    ret text.buf_str(buf, o, " s");
+}
+
+test feed__a_run_reads_steadily_and_a_pause_drops_the_reading {
+    var r: Rate;
+    init(?r);
+    feed(?r, 0, true, 0.0);
+    feed(?r, 5, true, 0.1);
+    if (r.valid) { ret 1; }
+    feed(?r, 10, true, 0.25);
+    if (!r.valid || r.per_s < 39.9 || r.per_s > 40.1) { ret 2; }
+    # a window at another rate moves it halfway
+    feed(?r, 30, true, 0.5);
+    if (r.per_s < 59.9 || r.per_s > 60.1) { ret 3; }
+    # a step covering many generations reads as the generations it moved
+    feed(?r, 30 + 1024, true, 0.75);
+    if (r.per_s < 2000.0) { ret 4; }
+    feed(?r, 2000, false, 1.0);
+    if (r.valid) { ret 5; }
+    # a count that went back is a reset
+    feed(?r, 500, true, 2.0);
+    feed(?r, 600, true, 2.25);
+    if (!r.valid) { ret 6; }
+    feed(?r, 3, true, 2.5);
+    if (r.valid) { ret 7; }
+    # a world that completes nothing for PATIENCE seconds has no reading
+    feed(?r, 3, true, 2.75);
+    feed(?r, 8, true, 3.0);
+    if (!r.valid) { ret 8; }
+    feed(?r, 8, true, 8.0);
+    if (r.valid) { ret 9; }
+    ret 0;
+}
+
+test text__rates_and_durations_read_short {
+    var b: [32]u8;
+    var r: Rate;
+    init(?r);
+    b[rate_text(?b[0], 0, ?r)] = 0;
+    if (b[0] != '-' || b[1] != 0) { ret 1; }
+    r.valid                    = true;
+    r.per_s                    = 41.2;
+    b[rate_text(?b[0], 0, ?r)] = 0;
+    if (b[0] != '4' || b[1] != '1' || b[2] != 0) { ret 2; }
+    r.per_s                    = 2.5;
+    b[rate_text(?b[0], 0, ?r)] = 0;
+    if (b[0] != '2' || b[1] != '.' || b[2] != '5' || b[3] != 0) { ret 3; }
+    b[duration_text(?b[0], 0, 1230000)] = 0;
+    if (b[0] != '1' || b[1] != '.' || b[2] != '2' || b[3] != ' ' || b[4] != 'm' || b[5] != 's' || b[6] != 0) { ret 4; }
+    b[duration_text(?b[0], 0, 0)] = 0;
+    if (b[0] != '-') { ret 5; }
+    ret 0;
+}
