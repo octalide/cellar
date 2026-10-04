@@ -6,6 +6,26 @@ All notable changes to cellar are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-03
+
+### Added
+
+- Drawn boundaries. A world can be any shape you draw, and any number of separate regions: rectangles, ellipses, polygons and freehand strokes, each added, subtracted or intersected. Outside the boundary there are no cells. Nothing grows or is painted there, no memory is spent, and each rule meets its own open edge there (dead for Life, zero for Lenia, no-flux for reaction-diffusion). Regions can be picked, moved, deleted or cleared, and the outside is drawn shaded (#287, #288).
+- Walls. Cells inside the world with a fixed state that the rule's cells live against: dead, live, or a fixed value as a source or sink in Lenia and reaction-diffusion. Drawn with the same shapes and erased with the eraser, in their own colours in every colour mode. Painting cells never overwrites a wall, and painting a walled world on the GPU reads nothing back (#289).
+- Randomize fills a square or circle around the view, the whole grid, a chosen boundary region or every region, or the selection, at a chosen density. The last choice is remembered and F frames it (#290).
+- World files (`cellar 7`), RLW patterns and the clipboard carry walls, and world files and copies carry the boundary. Older files load unchanged (#291).
+
+### Changed
+
+- Bounds and Walls share one toolbar button, which shows the last of the two you used. W and L still take each directly.
+- A `:P` plane is a boundary rectangle, so reaction-diffusion on a plane is no-flux at its edge where it read a fixed value before (#287).
+- Cut takes walls with the cells, since copy carries them (#291).
+- HashLife refuses a world with a drawn boundary or walls, and says why.
+
+### Fixed
+
+- A toast could show garbled text after a refused edit (#288).
+
 ## [0.11.0] - 2026-10-03
 
 ### Added
