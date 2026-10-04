@@ -6,6 +6,12 @@ All notable changes to cellar are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.13.2] - 2026-10-04
+
+### Changed
+
+- cellar has its own website at [octalide.github.io/cellar](https://octalide.github.io/cellar/), served from `docs/`, which `doc/` became (#322).
+
 ## [0.13.1] - 2026-10-04
 
 ### Changed

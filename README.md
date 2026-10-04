@@ -1,21 +1,21 @@
 <p align="center">
-  <img src="doc/logo.svg" width="96" alt="cellar logo, a glider on a three by three grid">
+  <img src="docs/logo.svg" width="96" alt="cellar logo, a glider on a three by three grid">
 </p>
 
 <h1 align="center">cellar</h1>
 
 <p align="center">
   A fast, unbounded cellular-automata editor and visualizer.<br>
-  <a href="https://briar.systems/projects/cellar">Project page</a> ·
+  <a href="https://octalide.github.io/cellar/">Website</a> ·
   <a href="https://github.com/octalide/cellar/releases">Download</a> ·
-  <a href="doc/guide.md">Guide</a>
+  <a href="docs/guide.md">Guide</a>
 </p>
 
-![cellar running Gray-Scott stripes, with its toolbar and docked panels](doc/screenshot.png)
+![cellar running Gray-Scott stripes, with its toolbar and docked panels](docs/screenshot.png)
 
 | Life | Gray-Scott | Lenia |
 |:---:|:---:|:---:|
-| ![a Gosper glider gun and its stream](doc/life.png) | ![Gray-Scott mitosis](doc/gray-scott.png) | ![Hydrogeminium natans](doc/lenia.png) |
+| ![a Gosper glider gun and its stream](docs/life.png) | ![Gray-Scott mitosis](docs/gray-scott.png) | ![Hydrogeminium natans](docs/lenia.png) |
 
 cellar steps an unbounded world on the GPU with compute shaders, falls back to
 every CPU core where it must, and switches to HashLife for patterns that need
@@ -54,7 +54,7 @@ Release archives for linux (x86-64 and arm64), windows (x86-64) and macOS
 
 cellar needs a Vulkan 1.2 GPU with buffer device addresses. On macOS that is
 MoltenVK. If it runs slowly, see
-[troubleshooting](doc/guide.md#troubleshooting).
+[troubleshooting](docs/guide.md#troubleshooting).
 
 ## Usage
 
@@ -72,7 +72,7 @@ Settings, saved worlds and screenshots live in `~/.local/share/cellar` on
 linux, `~/Library/Application Support/cellar` on macOS and `%APPDATA%\cellar`
 on windows.
 
-The [guide](doc/guide.md) covers every rule family, the controls, file
+The [guide](docs/guide.md) covers every rule family, the controls, file
 formats, headless runs and the bench in full.
 
 ## Build
