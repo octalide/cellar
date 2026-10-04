@@ -23,7 +23,7 @@
 # a dock space at either side, so a version 7 layout is not read. version 9
 # keeps the pool's ceiling in MiB of memory, where versions 6 to 8 kept it in
 # chunks, which are read as the memory they stand for
-# (cellar.ceiling pool_of_chunks).
+# (cellar.ceiling pool_of_chunks). version 10 added the window line.
 #
 # the engine line is "<engine> <exponent>" after the rule line: the engine
 # chosen, cpu, gpu or hashlife, and HashLife's step exponent. a file without it
@@ -37,12 +37,21 @@
 # or 0 for on or off, then its limit. a file without it keeps the defaults, and
 # `cellar run` reads it alone (load_ceilings).
 #
-# the rest of the file after the ceilings line is the panels' layout, blit's
+# the window line follows the ceilings line from version 10: the window's mode,
+# 0 windowed, 1 borderless or 2 fullscreen, then 1 or 0 for whether the
+# platform keeps a position, then the windowed client's x, y, width and height,
+# which is what leaving the mode returns to, so quitting fullscreen keeps the
+# windowed size and place. a file without it opens windowed at the default
+# size. the window is opened before the settings are loaded, so load_frame
+# reads it alone.
+#
+# the rest of the file after the window line is the panels' layout, blit's
 # store document as cellar.panel keeps it. a file before version 8 has none
 # this version reads, so the panels open in the default layout. the first line's five slots after
 # the panel flag held which sections of the old side panel were expanded, and
 # are written as 0 and skipped.
 
+use win: boom.window;
 use cellar.app;
 use cellar.ceiling;
 use cellar.format;
@@ -70,8 +79,8 @@ use std.types.size.usize;
 use std.types.string;
 use std.types.string.str;
 
-# settings-format version written; versions 1 to 8 are still read
-val VERSION: u64 = 9;
+# settings-format version written; versions 1 to 9 are still read
+val VERSION: u64 = 10;
 # the last version that kept the rule as a weighted kernel's integers
 val KERNEL_INTS: usize = 3;
 # the first version with the selection line
@@ -84,6 +93,48 @@ val CEILING_LINE: usize = 6;
 val LAYOUT: usize = 8;
 # the first version keeping the pool's ceiling in MiB
 val POOL_MIB: usize = 9;
+# the first version with the window line
+val WINDOW_LINE: usize = 10;
+
+# the client size a window opens at without a saved one
+pub val DEFAULT_WIDTH:  i32 = 1280;
+pub val DEFAULT_HEIGHT: i32 = 820;
+# the largest saved client size read, so a corrupt file cannot ask for more
+val SIZE_MAX: i64 = 16384;
+
+# how the window is presented and where its windowed client sits
+# ---
+# mode:      the presentation mode
+# placement: the windowed client's bounds, which leaving the mode returns to
+pub rec Frame {
+    mode:      win.WindowMode;
+    placement: win.WindowPlacement;
+}
+
+# a window as a fresh install opens it
+pub fun default_frame() Frame {
+    ret Frame{
+        mode:      win.WindowMode.windowed{},
+        placement: win.WindowPlacement{
+            position: opt[win.WindowPosition].none{}, width: DEFAULT_WIDTH, height: DEFAULT_HEIGHT
+        }
+    };
+}
+
+# the window line's number for a mode
+fun mode_word(m: win.WindowMode) u64 {
+    if (sel m.fullscreen) { ret 2; }
+    if (sel m.borderless) { ret 1; }
+    ret 0;
+}
+
+# the mode a window line's number names; one it does not know is windowed
+fun word_mode(w: usize) win.WindowMode {
+    if (w == 2) { ret win.WindowMode.fullscreen{}; }
+    if (w == 1) { ret win.WindowMode.borderless{}; }
+    ret win.WindowMode.windowed{};
+}
+
 # the first line's retired slots, between the panel flag and the scale
 val RETIRED: usize = 5;
 
@@ -221,8 +272,9 @@ fun read_int(b: *Vector[u8], pos: *usize) i64 {
 # a:   allocator backing the transient buffer
 # ap:  application state to serialize
 # s:   simulation whose rule is serialized
+# f:   the window's mode and windowed bounds
 # ret: ok, or why the settings were not written
-pub fun save(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) err[persist.Error] {
+pub fun save(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, f: Frame, path: str) err[persist.Error] {
     val made: err[fs.FsError] = persist.make_parent(a, path);
     if (sel made.err) { ret err[persist.Error].err{persist.Error.fs{made.err}}; }
 
@@ -276,6 +328,20 @@ pub fun save(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) err[persi
         o = wr(buf, o, c.limit[k]);
         k = k + 1;
     }
+    buf[o - 1] = '\n';
+    o          = wr(buf, o, mode_word(f.mode));
+    if (sel f.placement.position.some) {
+        o = wr(buf, o, 1);
+        o = wr_int(buf, o, f.placement.position.some.x::i64);
+        o = wr_int(buf, o, f.placement.position.some.y::i64);
+    }
+    or {
+        o = wr(buf, o, 0);
+        o = wr_int(buf, o, 0);
+        o = wr_int(buf, o, 0);
+    }
+    o          = wr_int(buf, o, f.placement.width::i64);
+    o          = wr_int(buf, o, f.placement.height::i64);
     buf[o - 1] = '\n';
     # the layout runs to the end of the file, without its NUL
     var l: usize = 0;
@@ -376,8 +442,13 @@ pub fun load(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) err[persi
                 sim.set_ceilings(s, c);
             }
         }
+        if (version >= WINDOW_LINE) {
+            # the window line follows the ceilings, and load_frame reads it
+            at = at + 1;
+            for (at < full && data.data[at] != '\n') { at = at + 1; }
+        }
         if (version >= LAYOUT) {
-            # the layout is the rest of the file after the ceilings
+            # the layout is the rest of the file after the window line
             at = at + 1;
             for (at < full && data.data[at] != '\n') { at = at + 1; }
             if (at < full) { app.keep_layout(ap, ?data.data[at + 1], full - at - 1); }
@@ -499,6 +570,62 @@ pub fun load_ceilings(a: *allo.Allocator, path: str, c: *ceiling.Ceilings) err[p
     ret err[persist.Error].ok{};
 }
 
+# read the window the settings at path keep into f, leaving f as it is when
+# the file is missing or older than its window line
+# ---
+# a:    allocator for the read buffer
+# path: the settings file
+# f:    the window
+# ret:  ok when read or absent, or why the file was refused
+pub fun load_frame(a: *allo.Allocator, path: str, f: *Frame) err[persist.Error] {
+    val rr: res[Vector[u8], fs.FsError] = fs.read_bytes(a, path);
+    if (sel rr.err) {
+        if (sel rr.err.io && rr.err.io.kind == io_error.NOT_FOUND) { ret err[persist.Error].ok{}; }
+        ret err[persist.Error].err{persist.Error.fs{rr.err}};
+    }
+    var data:    Vector[u8] = rr.ok;
+    var p:       usize      = 0;
+    val version: usize      = read_uint(?data, ?p);
+    if (version < 1 || version > VERSION::usize) {
+        vector.dnit[u8](?data);
+        ret err[persist.Error].err{persist.Error.version{}};
+    }
+    if (version >= WINDOW_LINE) {
+        # the integers, the selection, the rule, the engine and the ceilings come first
+        var at:    usize = 0;
+        var lines: usize = 0;
+        for (at < data.len && lines < 5) {
+            if (data.data[at] == '\n') { lines = lines + 1; }
+            at = at + 1;
+        }
+        if (lines == 5) { read_window(?data, at, f); }
+    }
+    vector.dnit[u8](?data);
+    ret err[persist.Error].ok{};
+}
+
+# read the window line into f; a line with a size out of range keeps f
+fun read_window(b: *Vector[u8], at: usize, f: *Frame) {
+    val full: usize = b.len;
+    var end:  usize = at;
+    for (end < full && b.data[end] != '\n') { end = end + 1; }
+    b.len = end;
+    var p:   usize = at;
+    val m:   usize = read_uint(b, ?p);
+    val has: usize = read_uint(b, ?p);
+    val x:   i64   = read_int(b, ?p);
+    val y:   i64   = read_int(b, ?p);
+    val w:   i64   = read_int(b, ?p);
+    val h:   i64   = read_int(b, ?p);
+    b.len = full;
+    if (w < 1 || h < 1 || w > SIZE_MAX || h > SIZE_MAX) { ret; }
+    f.mode               = word_mode(m);
+    f.placement.width    = w::i32;
+    f.placement.height   = h::i32;
+    f.placement.position = opt[win.WindowPosition].none{};
+    if (has != 0) { f.placement.position = opt[win.WindowPosition].some{win.WindowPosition{x: x::i32, y: y::i32}}; }
+}
+
 # read the rule line, "<family> <rule string>", into s when its family reads it
 # ---
 # b:  the file
@@ -549,7 +676,7 @@ test load__round_trips_settings {
     sim.set_rule(?s, rule.preset_rule(1));
 
     val path:  str                = "out/test/test_config.config";
-    val saved: err[persist.Error] = save(?a, ?ap, ?s, path);
+    val saved: err[persist.Error] = save(?a, ?ap, ?s, default_frame(), path);
     if (sel saved.err) { ret 1; }
 
     var bp: app.App;
@@ -592,7 +719,7 @@ test load__round_trips_negative_weights_and_reads_wrapped_ones {
     weighted.set(?wk.survive, 200);
 
     val path:  str                = "out/test/test_config_weights.config";
-    val saved: err[persist.Error] = save(?a, ?ap, ?s, path);
+    val saved: err[persist.Error] = save(?a, ?ap, ?s, default_frame(), path);
     if (sel saved.err) { ret 1; }
 
     var t:     sim.Sim;
@@ -676,9 +803,37 @@ fun write_v2(path: str, sel_idx: u64) bool {
     ret !(sel wrote.err);
 }
 
+# rewrite the settings file in old as an older version's, which has no window
+# line, and write it to path
+fun as_older(a: *allo.Allocator, old: *Vector[u8], path: str, version: u8) bool {
+    if (old.data[0] != '1' || old.data[1] != '0' || old.data[2] != ' ') { ret false; }
+    var out:   Vector[u8]             = vector.init[u8](a);
+    var lines: usize                  = 0;
+    var i:     usize                  = 3;
+    val pv:    res[usize, allo.Error] = vector.push[u8](?out, version);
+    val ps:    res[usize, allo.Error] = vector.push[u8](?out, ' ');
+    var ok:    bool                   = !(sel pv.err) && !(sel ps.err);
+    for (i < old.len && ok) {
+        val c: u8 = old.data[i];
+        if (lines != 5) {
+            val pushed: res[usize, allo.Error] = vector.push[u8](?out, c);
+            ok = !(sel pushed.err);
+        }
+        if (c == '\n') { lines = lines + 1; }
+        i = i + 1;
+    }
+    var wrote: bool = false;
+    if (ok) {
+        val r: err[fs.FsError] = fs.write_bytes(path, out.data, out.len, persist.FILE_MODE);
+        wrote = !(sel r.err);
+    }
+    vector.dnit[u8](?out);
+    ret wrote;
+}
+
 # whether settings save to path
 fun saves_ok(a: *allo.Allocator, ap: *app.App, s: *sim.Sim, path: str) bool {
-    val r: err[persist.Error] = save(a, ap, s, path);
+    val r: err[persist.Error] = save(a, ap, s, default_frame(), path);
     ret !(sel r.err);
 }
 
@@ -782,8 +937,9 @@ fun as_v4(a: *allo.Allocator, path: str) bool {
         if (data.data[n] == '\n') { lines = lines + 1; }
         n = n + 1;
     }
-    data.data[0] = '4';
-    val wrote: err[fs.FsError] = fs.write_bytes(path, data.data::*u8, n, persist.FILE_MODE);
+    # the version is two digits, so the file starts one byte in
+    data.data[1] = '4';
+    val wrote: err[fs.FsError] = fs.write_bytes(path, ?data.data[1], n - 1, persist.FILE_MODE);
     vector.dnit[u8](?data);
     ret lines == 3 && !(sel wrote.err);
 }
@@ -898,11 +1054,9 @@ test load__reads_every_version {
     val rr: res[Vector[u8], fs.FsError] = fs.read_bytes(?a, path);
     if (sel rr.err) { ret 83; }
     var old: Vector[u8] = rr.ok;
-    if (old.data[0] != '9' || old.data[1] != ' ') { ret 83; }
-    old.data[0] = '8';
-    val w8: err[fs.FsError] = fs.write_bytes(path, old.data, old.len, persist.FILE_MODE);
+    val v8:  bool       = as_older(?a, ?old, path, '8');
     vector.dnit[u8](?old);
-    if (sel w8.err)                                                                 { ret 84; }
+    if (!v8)                                                                        { ret 84; }
     if (!loads_ok(?a, ?ap, ?s, path) || sim.ceilings(?s).limit[ceiling.POOL] != 22) { ret 85; }
     c.limit[ceiling.POOL] = 0;
     sim.set_ceilings(?s, c);
@@ -924,6 +1078,67 @@ test load__reads_every_version {
     val w7: err[fs.FsError] = fs.write_bytes(path, v7::*u8, string.str_len(v7), persist.FILE_MODE);
     if (sel w7.err)                                         { ret 84; }
     if (!loads_ok(?a, ?ap, ?s, path) || ap.layout.len != 0) { ret 85; }
+
+    fs.remove_file(path);
+    app.dnit(?ap);
+    sim.dnit(?s);
+    ret 0;
+}
+
+test load_frame__round_trips_the_window_and_reads_older_files_as_the_default {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    var ap: app.App;
+    app.init(?ap);
+    val shown: err[format.Error] = app.attach(?ap, ?a);
+    if (sel shown.err) { ret 16; }
+    val path: str = "out/test/test_config_frame.config";
+
+    # fullscreen with the windowed bounds it returns to, a negative origin included
+    var f: Frame = default_frame();
+    f.mode               = win.WindowMode.fullscreen{};
+    f.placement.position = opt[win.WindowPosition].some{win.WindowPosition{x: -40, y: 25}};
+    f.placement.width    = 900;
+    f.placement.height   = 600;
+    val doc: str = "[window.12]\nx = 4.0\n";
+    if (!app.keep_layout(?ap, doc::*u8, string.str_len(doc))) { ret 2; }
+    val saved: err[persist.Error] = save(?a, ?ap, ?s, f, path);
+    if (sel saved.err) { ret 3; }
+    var got:  Frame              = default_frame();
+    val read: err[persist.Error] = load_frame(?a, path, ?got);
+    if (sel read.err || !sel got.mode.fullscreen)                                    { ret 4; }
+    if (!sel got.placement.position.some)                                            { ret 5; }
+    if (got.placement.position.some.x != -40 || got.placement.position.some.y != 25) { ret 6; }
+    if (got.placement.width != 900 || got.placement.height != 600)                   { ret 7; }
+    # the window line does not disturb the layout after it
+    app.keep_layout(?ap, nil, 0);
+    if (!loads_ok(?a, ?ap, ?s, path) || !string.str_equals(ap.layout.data::str, doc)) { ret 8; }
+
+    # a platform without a position saves none
+    f.placement.position = opt[win.WindowPosition].none{};
+    f.mode               = win.WindowMode.windowed{};
+    val saved2: err[persist.Error] = save(?a, ?ap, ?s, f, path);
+    if (sel saved2.err) { ret 9; }
+    var again: Frame = default_frame();
+    again.placement.position = opt[win.WindowPosition].some{win.WindowPosition{x: 1, y: 1}};
+    val read2: err[persist.Error] = load_frame(?a, path, ?again);
+    if (sel read2.err || sel again.placement.position.some) { ret 10; }
+    if (!sel again.mode.windowed)                           { ret 11; }
+
+    # a version 9 file has no window line, so the frame stays as it was
+    val rr: res[Vector[u8], fs.FsError] = fs.read_bytes(?a, path);
+    if (sel rr.err) { ret 12; }
+    var old: Vector[u8] = rr.ok;
+    val v9:  bool       = as_older(?a, ?old, path, '9');
+    vector.dnit[u8](?old);
+    if (!v9) { ret 13; }
+    var keep:  Frame              = default_frame();
+    val read3: err[persist.Error] = load_frame(?a, path, ?keep);
+    if (sel read3.err || !sel keep.mode.windowed)                                         { ret 14; }
+    if (keep.placement.width != DEFAULT_WIDTH || keep.placement.height != DEFAULT_HEIGHT) { ret 15; }
 
     fs.remove_file(path);
     app.dnit(?ap);
