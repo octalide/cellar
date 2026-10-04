@@ -6,6 +6,12 @@ All notable changes to cellar are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-10-04
+
+### Changed
+
+- A logo, and a short README around fresh screenshots. The full reference moved to `doc/guide.md`, and cellar has a project page at [briar.systems/projects/cellar](https://briar.systems/projects/cellar/) (#318).
+
 ## [0.13.0] - 2026-10-04
 
 ### Added
