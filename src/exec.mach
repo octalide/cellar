@@ -1951,3 +1951,104 @@ test run__wall_shapes_and_an_erase_are_each_one_change {
     sim.dnit(?s);
     ret 0;
 }
+
+# a world bounded by a square, a row of live walls and a row of dead ones in
+# it, and a block, for a stamp to change
+#[testing]
+fun seed_bounded(s: *sim.Sim) bool {
+    var r: boundary.Region = boundary.init(s.space.a);
+    fin { boundary.dnit(?r); }
+    boundary.rect(?r, -30, -30, 30, 30);
+    if (!sim.taken(sim.set_bound(s, ?r))) { ret false; }
+    boundary.rect(?r, -20, 0, 20, 1);
+    sim.paint_region(s, ?r, 1, sim.EDIT_WALLS);
+    boundary.rect(?r, -20, 4, 20, 5);
+    sim.paint_region(s, ?r, 0, sim.EDIT_WALLS);
+    world.paint(s, 10, 10, 1);
+    world.paint(s, 11, 10, 1);
+    world.paint(s, 10, 11, 1);
+    world.paint(s, 11, 11, 1);
+    ret true;
+}
+
+# whether two worlds hold the same boundary, and the same walls and cells over
+# the box (-60, -60) to (60, 60)
+#[testing]
+fun same_bounded(s: *sim.Sim, t: *sim.Sim) bool {
+    if (sim.drawn(s) != sim.drawn(t) || sim.walls(s) != sim.walls(t)) { ret false; }
+    if (sim.drawn(s) && !boundary.same(sim.bound(s), sim.bound(t)))   { ret false; }
+    var y: i64 = -60;
+    for (y < 60) {
+        var x: i64 = -60;
+        for (x < 60) {
+            if (sim.wall_at(s, x, y) != sim.wall_at(t, x, y) || sim.cell(s, x, y) != sim.cell(t, x, y)) { ret false; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    ret true;
+}
+
+test run__a_stamp_that_carries_a_boundary_undoes_and_redoes_whole {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    var was:  sim.Sim;
+    var then: sim.Sim;
+    val m1:   err[allo.Error] = sim.init(?s, ?a);
+    val m2:   err[allo.Error] = sim.init(?was, ?a);
+    val m3:   err[allo.Error] = sim.init(?then, ?a);
+    if (sel m1.err || sel m2.err || sel m3.err)                           { ret 1; }
+    if (!seed_bounded(?s) || !seed_bounded(?was) || !seed_bounded(?then)) { ret 1; }
+    var ap: app.App;
+    app.init(?ap);
+    val shown: err[format.Error] = app.attach(?ap, ?a);
+    if (sel shown.err) { ret 1; }
+    var d: Deps = Deps{a: ?a};
+
+    # a 20 by 10 pattern astride the boundary's east edge: its left half
+    # inside the boundary it carries, a wall and a live cell in each half
+    var p:    pattern.Pattern;
+    val made: err[allo.Error] = pattern.init(?p, ?a, 20, 10, "astride");
+    if (sel made.err) { ret 2; }
+    val hw: err[allo.Error] = pattern.hold_walls(?p);
+    val hd: err[allo.Error] = pattern.hold_domain(?p);
+    if (sel hw.err || sel hd.err) { ret 2; }
+    var y: usize = 0;
+    for (y < 10) {
+        var x: usize = 0;
+        for (x < 10) {
+            p.domain[y * 20 + x] = 1;
+            x                    = x + 1;
+        }
+        y = y + 1;
+    }
+    pattern.set(?p, 2, 2, 1);
+    pattern.set_wall(?p, 3, 3, true);
+    pattern.set_wall(?p, 4, 3, true);
+    pattern.set(?p, 4, 3, 1);
+    pattern.set(?p, 15, 5, 1);
+    pattern.set_wall(?p, 16, 6, true);
+
+    # centred on (35, 5), its box (25, 0) to (45, 10)
+    val direct: opt[str] = world.stamp(?then, ?p, 35, 5);
+    if (sel direct.some) { ret 2; }
+    app.stamp(?ap, ?p, 0, 35, 5);
+    run(?ap, ?s, ?d);
+    if (!same_bounded(?s, ?then))                                                            { ret 3; }
+    if (!sim.wall_at(?s, 28, 3) || !sim.alive(?s, 29, 3) || sim.alive(?s, 40, 5))            { ret 4; }
+    if (!boundary.contains(sim.bound(?s), 34, 5) || boundary.contains(sim.bound(?s), 35, 5)) { ret 5; }
+    app.submit(?ap, command.Command.undo{});
+    run(?ap, ?s, ?d);
+    if (!same_bounded(?s, ?was)) { ret 6; }
+    app.submit(?ap, command.Command.redo{});
+    run(?ap, ?s, ?d);
+    if (!same_bounded(?s, ?then)) { ret 7; }
+
+    pattern.dnit(?p);
+    app.dnit(?ap);
+    sim.dnit(?s);
+    sim.dnit(?was);
+    sim.dnit(?then);
+    ret 0;
+}
