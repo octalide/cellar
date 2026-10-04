@@ -316,6 +316,8 @@ pub rec Watch {
 # past:       each ceiling the run was carried past, until it falls back under
 # tripped:    the ceiling the run last paused at, ceiling.COUNT for none
 # began:      when the step under way began, if the step ceiling times it
+# lap:        when the step under way began on the host, always
+# lapped:     what a host step takes, smoothed, in nanoseconds, 0 for none yet
 # fit:        the largest step exponent the run to a generation under way found
 #             fits the memory ceiling
 # asked:      1 once another thread asks the CPU's step under way to cancel
@@ -359,6 +361,8 @@ pub rec Sim {
     past:       [4]bool;
     tripped:    usize;
     began:      opt[time.Instant];
+    lap:        opt[time.Instant];
+    lapped:     u64;
     fit:        u32;
     asked:      i64;
     bound:      boundary.Region;
@@ -451,6 +455,8 @@ pub fun init(s: *Sim, a: *allo.Allocator) err[allo.Error] {
     history.clear(?s.history);
     s.ceil      = ceiling.defaults();
     s.began     = opt[time.Instant].none{};
+    s.lap       = opt[time.Instant].none{};
+    s.lapped    = 0;
     s.fit       = hashlife.MAX_EXPONENT;
     s.asked     = 0;
     s.bound     = boundary.init(a);
@@ -1530,7 +1536,10 @@ pub fun step(s: *Sim) {
 # ret: whether commit is owed to finish the step
 pub fun advance(s: *Sim) bool {
     if (s.full || s.tripped != ceiling.COUNT) { ret false; }
-    if (on_tree(s))                           { ret tree_advance(s, false); }
+    if (on_tree(s)) {
+        s.lap = lap();
+        ret tree_advance(s, false);
+    }
     if (on_gpu(s)) {
         if (s.pending < MAX_PENDING) { s.pending = s.pending + 1; }
         ret false;
@@ -1542,6 +1551,7 @@ pub fun advance(s: *Sim) bool {
         }
         s.unsettled = false;
     }
+    s.lap   = lap();
     s.began = clock(s);
     if (cpu.compute(?s.space, ?s.rule, s.generation, ?s.team, ?s.asked)) { ret true; }
     atomic.store(?s.asked, 0);
@@ -1571,6 +1581,12 @@ pub fun unask(s: *Sim) {
 # ---
 # s: simulation, after advance asked for it
 pub fun commit(s: *Sim) {
+    commit_step(s);
+    note_lap(s);
+}
+
+# make the step's generation the world's
+fun commit_step(s: *Sim) {
     if (on_tree(s)) {
         tree_commit(s);
         ret;
@@ -1592,6 +1608,35 @@ pub fun commit(s: *Sim) {
     val pop: u64 = population(s)::u64;
     history.add(?s.history, s.generation, pop);
     check(s, pop, took(s.began));
+}
+
+# when a step starts on the host
+fun lap() opt[time.Instant] {
+    val c: time.InstantClock = time.instant();
+    if (sel c.err) { ret opt[time.Instant].none{}; }
+    ret opt[time.Instant].some{c.ok};
+}
+
+# take the step that just finished into what a host step takes, an eighth of
+# the way toward it
+fun note_lap(s: *Sim) {
+    val ns: opt[u64] = took(s.lap);
+    s.lap = opt[time.Instant].none{};
+    if (sel ns.none)   { ret; }
+    if (s.lapped == 0) { s.lapped = ns.some; }
+    or                 { s.lapped = s.lapped - s.lapped / 8 + ns.some / 8; }
+    if (s.lapped == 0) { s.lapped = 1; }
+}
+
+# what a step takes in nanoseconds, smoothed: on the GPU what its timestamps
+# measure, elsewhere (the chunk engine and HashLife, where a step covers 2^k
+# generations) the wall time of the step on the host. 0 for none yet, or on a
+# GPU whose queue writes no timestamps
+# ---
+# s: simulation
+pub fun step_ns(s: *Sim) u64 {
+    if (!on_tree(s) && on_gpu(s)) { ret gpu.step_ns(s.gpu); }
+    ret s.lapped;
 }
 
 # when a step starts, if the step ceiling wants it timed
@@ -4169,6 +4214,7 @@ pub fun toggle_running(s: *Sim) {
         ret;
     }
     s.running = 1 - s.running;
+    s.lapped  = 0;
     # a pause drops the generations the run asked of the GPU and it has not
     # recorded, so the frame stops stepping at once
     if (s.running == 0) { s.pending = 0; }
