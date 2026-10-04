@@ -60,6 +60,7 @@ use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string;
@@ -325,11 +326,11 @@ rec Gather {
     ok:    bool;
 }
 
-fun gather(ctx: *u8, cx: i64, cy: i64, cells: *u32) {
+fun gather(ctx: *u8, cx: i64, cy: i64, cells: *u32, wl: *u32) {
     val g: *Gather = ctx::*Gather;
     if (!g.ok || covered(g.st, g.n, cx, cy)) { ret; }
     if (g.into != nil) {
-        val added: err[allo.Error] = snapshot.add(g.into, cx, cy, cells);
+        val added: err[allo.Error] = snapshot.add(g.into, cx, cy, cells, wl);
         if (sel added.err) { g.ok = false; }
     }
     if (g.where != nil) {
@@ -386,7 +387,7 @@ pub fun begin(j: *Journal, kind: u8, join: bool) {
     step_init(?j.cur, j.a);
     j.cur.rule       = s.rule;
     j.cur.generation = s.generation;
-    snapshot.open(?j.cur.chunks, s.generation, ?s.rule);
+    snapshot.open(?j.cur.chunks, s.generation, ?s.rule, sim.walls(s));
     j.open    = true;
     j.kind    = kind;
     j.lost    = false;
@@ -500,7 +501,8 @@ fun put_chunk(j: *Journal, st: *Step, i: usize, cx: i64, cy: i64) bool {
     if (sel r.err) { ret false; }
     fin { allo.deallocate[u32](j.a, r.ok, space.CELLS * (m + mw)); }
     snapshot.words_of(?st.chunks, i, r.ok);
-    if (rule.alike(?st.chunks.rule, ?s.rule)) { ret sim.edit_chunk(s, cx, cy, r.ok); }
+    val wl: *u32 = snapshot.walls_of(?st.chunks, i);
+    if (rule.alike(?st.chunks.rule, ?s.rule)) { ret sim.edit_chunk(s, cx, cy, r.ok, wl); }
     val w: *u32  = ?r.ok[space.CELLS * m];
     var c: usize = 0;
     for (c < space.CELLS) {
@@ -509,7 +511,7 @@ fun put_chunk(j: *Journal, st: *Step, i: usize, cx: i64, cy: i64) bool {
         rule.fresh(?s.rule, v, ?w[c * mw]);
         c = c + 1;
     }
-    ret sim.edit_chunk(s, cx, cy, w);
+    ret sim.edit_chunk(s, cx, cy, w, wl);
 }
 
 # write a step's chunk images over the areas it covers, keeping what they held
@@ -525,6 +527,15 @@ fun lay(j: *Journal, st: *Step, back: *Step) bool {
     var k:  usize             = 0;
     for (ok && k < st.areas.len) {
         val c: space.Box = st.areas.data[k];
+        # an image of walls goes back into a world that holds the wall layer,
+        # which the last area's edit may have let go
+        if (st.chunks.walled) {
+            val held: opt[str] = sim.hold_walls(s);
+            if (sel held.some) {
+                ok = false;
+                brk;
+            }
+        }
         if (!sim.edit_begin(s, c.x0 * space.SIDE, c.y0 * space.SIDE, c.x1 * space.SIDE, c.y1 * space.SIDE)) {
             ok = false;
             brk;
@@ -539,7 +550,7 @@ fun lay(j: *Journal, st: *Step, back: *Step) bool {
         for (ok && i < at.len) {
             val cx: i64 = at.data[i].x0;
             val cy: i64 = at.data[i].y0;
-            if (snapshot.find(?st.chunks, cx, cy) == st.chunks.n) { ok = sim.edit_chunk(s, cx, cy, nil); }
+            if (snapshot.find(?st.chunks, cx, cy) == st.chunks.n) { ok = sim.edit_chunk(s, cx, cy, nil, nil); }
             i = i + 1;
         }
         i = 0;
@@ -573,7 +584,7 @@ fun swap(j: *Journal, i: usize, custom: *pattern.Pattern) bool {
         if (ok) { ok = lay(j, st, nil); }
     }
     or {
-        snapshot.open(?back.chunks, s.generation, ?s.rule);
+        snapshot.open(?back.chunks, s.generation, ?s.rule, sim.walls(s));
         ok = lay(j, st, ?back);
         # the areas move to the image of the world as it was
         back.areas = st.areas;

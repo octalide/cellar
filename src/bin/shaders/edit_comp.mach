@@ -7,8 +7,11 @@
 # setting its value with atomics on the word, so edits of cells that share a
 # word, applied at once by other invocations, leave each other alone, and the
 # host need not hold the word's other cells as the GPU holds them. the host
-# sends a cell's last edit alone.
+# sends a cell's last edit alone. a guarded edit, a cell edit, is dropped
+# where its cell is a wall of a walled chunk (cellar.layer WALL), so a cell
+# painted over a wall leaves it whatever the host's staging holds there.
 
+use cellar.bin.shaders.pool;
 use cellar.layer;
 use cellar.layout;
 use cellar.layout.Edits;
@@ -35,11 +38,19 @@ fun comp_main() {
     val slot:  u32          = edits.v[i * 4];
     val kw:    u32          = edits.v[i * 4 + 1];
     val m:     u32          = edits.v[i * 4 + 2];
-    val k:     u32          = kw >> layout.EDIT_LAYER;
+    val k:     u32          = (kw >> layout.EDIT_LAYER) & 0xff;
     val width: u32          = layer.width_in(meta.base[layout.WIDTHS_AT - layout.BASE_AT], k);
     val place: layout.Where = layout.where(slot, meta.base[layout.SHARD_AT - layout.BASE_AT]);
     val s:     layout.Span  = layer.span(meta.shards, k, edits.front, place, width);
-    val w:     u32          = s.at + (kw & ((1 << layout.EDIT_LAYER) - 1));
+    val wd:    u32          = kw & ((1 << layout.EDIT_LAYER) - 1);
+    val w:     u32          = s.at + wd;
+    if ((kw & layout.EDIT_GUARD) != 0) {
+        # the cell is the one whose bits the edit takes, its lowest
+        var sh: u32 = 0;
+        for (sh < 31 && ((m >> sh) & 1) == 0) { sh = sh + 1; }
+        val cell: u32 = wd * layer.per_word(width) + sh / width;
+        if (pool.wall(meta.shards, meta.base[layout.SET_AT - layout.BASE_AT], meta.table[slot * layout.ENTRY + layout.EDGE_AT], place, cell) != 0) { ret; }
+    }
     at.atomic_and_u32(?s.p.v[w], DEV, RX, ~m);
     at.atomic_or_u32(?s.p.v[w], DEV, RX, edits.v[i * 4 + 3] & m);
 }
