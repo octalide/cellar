@@ -149,9 +149,13 @@ panel's Walls section. The bounds and wall tools share one toolbar button,
 named for the one it takes up; pressing it again switches to the other. The
 eraser takes them
 away. Drawing, stamping, randomizing and the selection's operations leave
-them where they stand, and a clear removes them. They show in a stone colour
-of their own in every colour mode, and HashLife does not run a world that has
-them.
+them where they stand, and a clear removes them. A copy of the selection
+carries its walls, a cut takes them with it, and a stamp lands a pattern's
+walls with its cells; with the selection section's "Copy keeps the boundary"
+on, the copy carries the boundary inside it too, which a stamp gives the
+world over its box. A saved world keeps its drawn boundary and its walls.
+They show in a stone colour of their own in every colour mode, and HashLife
+does not run a world that has them.
 
 Undo steps back through strokes, stamps, selection operations, pastes, rule
 changes, clears, randomizes, resets, loads and dropped files, with as many steps as 256 MiB of
@@ -179,6 +183,7 @@ at the sides, grouped by purpose:
   world, pattern and `.rule` file in the data directory to load or run, and
   screenshots. A pattern is saved as RLE unless its name gives another
   format's extension, or as RLW when it holds a continuous rule's exact values
+  or walls
 - **rule**: presets, the rule in B/S notation, radius, a clickable weight grid
   whose cells cycle from 0 up to 4 and on through -4 to -1, and birth and
   survive toggles over the reachable sums
@@ -237,14 +242,18 @@ A file dropped on the window opens the same way, a pattern stamped onto the
 world as it stands. When several are dropped the first opens and the rest are
 left alone. `Ctrl+V` reads any of those pattern formats from the clipboard as
 the stamp, and `Ctrl+C` puts a copied selection on the clipboard as RLE with
-its rule, ready to paste into LifeWiki or Golly.
+its rule, ready to paste into LifeWiki or Golly. RLE holds cells alone, so
+that text pasted back into cellar is the copy whole, its walls and boundary
+with it, while text another program wrote or changed pastes as its cells.
 
 RLW (`.rlw`) is cellar's pattern format for continuous rules. It is RLE's
 head with the rule required, and a body of run-counted cell words, each cell's
 exact value under that rule in base 26 (`mgeuN` is a third in Lenia), so a
 Lenia or reaction-diffusion pattern saved to it opens with every value as it
 was. Placed under a rule that reads its words differently, it takes their
-states, as any pattern does.
+states, as any pattern does. A pattern's walls follow its body as a section of
+their own, `[walls]` and a body of `o` for a wall and `b` for a cell that is
+not one, each wall holding its cell's word.
 
 `cellar --capture shot.png` draws a second of frames, saves the last one and
 exits, leaving the saved settings alone.
