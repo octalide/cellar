@@ -144,7 +144,10 @@ Walls are cells with a fixed state that the live cells around them read but
 never change. The wall tool draws them with the same shapes the bounds tool
 draws a boundary with, a rectangle, an ellipse, a polygon or a freehand
 brush, each wall dead or holding the pen's state: alive, or under Lenia and
-reaction-diffusion a fixed value, a source or a sink. The eraser takes them
+reaction-diffusion a fixed value, a source or a sink, chosen in the world
+panel's Walls section. The bounds and wall tools share one toolbar button,
+named for the one it takes up; pressing it again switches to the other. The
+eraser takes them
 away. Drawing, stamping, randomizing and the selection's operations leave
 them where they stand, and a clear removes them. They show in a stone colour
 of their own in every colour mode, and HashLife does not run a world that has
@@ -161,7 +164,7 @@ corner of the world. A toolbar runs across the top, and the panels are docked
 at the sides, grouped by purpose:
 
 - **toolbar**: play, step, reset, speed and uncapped stepping, the tool (draw,
-  erase, stamp, select), with a rule of more than two states the state the pen
+  erase, stamp, select, and bounds or walls under one button), with a rule of more than two states the state the pen
   and the custom pattern's editor paint, each in the rule's colour for it, the
   engine: the chunk pool, or HashLife where the rule allows, with its step of
   2^k generations and a generation to go straight to, the panels menu, and the

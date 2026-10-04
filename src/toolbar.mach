@@ -2,9 +2,9 @@
 # state, the engine, and the panels
 #
 # it holds play or pause, step and reset, the speed and uncapped, a button for
-# each tool (app.tool_name), the wall tool's shape and what its walls hold
-# while it is the tool, the state the pen paints under a rule of more than two
-# states, picked from a popup of the rule's states, the engine and,
+# each tool, the bounds and wall tools under one shapes button named for the
+# one it takes up (app.TOOL_BUTTONS), the state the pen
+# paints under a rule of more than two states, picked from a popup of the rule's states, the engine and,
 # on HashLife, its step and going to a generation. at its right end are the
 # panels menu, which opens or closes each panel and resets the layout, and
 # the settings and help buttons. its groups run left to right and wrap onto a
@@ -22,7 +22,6 @@ use bw:    blit.widget;
 use cellar.app;
 use cellar.arrange;
 use cellar.command;
-use cellar.gesture;
 use cellar.hashlife;
 use cellar.look;
 use cellar.panel;
@@ -47,19 +46,16 @@ val EXPONENT_W: f32 = 160.0;
 val GO_W:       f32 = 120.0;
 # unscaled width of the state picker's popup
 val INKS_W: f32 = 280.0;
-# unscaled width of the wall brush's radius slider
-val RADIUS_W: f32 = 150.0;
 
 # the groups, in the order they run
 val G_RUN:    usize = 0;
 val G_SPEED:  usize = 1;
 val G_TOOLS:  usize = 2;
-val G_WALL:   usize = 3;
-val G_INK:    usize = 4;
-val G_ENGINE: usize = 5;
-val G_TREE:   usize = 6;
-val G_END:    usize = 7;
-val GROUPS:   usize = 8;
+val G_INK:    usize = 3;
+val G_ENGINE: usize = 4;
+val G_TREE:   usize = 5;
+val G_END:    usize = 6;
+val GROUPS:   usize = 7;
 
 # the toolbar as it lays its groups out
 # ---
@@ -117,29 +113,12 @@ fun toggle_w(ui: *bctx.Context, s: str) f32 {
     ret bctx.text_width(ui, s) + in.r + (bw.control_height(ui) - pd.t - pd.b) * 2.0 + pd.r;
 }
 
-fun tool_labels(out: *str) {
+fun tool_labels(a: *app.App, out: *str) {
     var t: usize = 0;
-    for (t < app.TOOL_COUNT) {
-        out[t] = app.tool_name(t);
+    for (t < app.TOOL_BUTTONS) {
+        out[t] = app.button_name(a, t);
         t      = t + 1;
     }
-}
-
-# the wall tool's gestures, as the bounds tool names them
-fun wall_shape_labels(out: *str) {
-    var k: usize = 0;
-    for (k < gesture.COUNT) {
-        out[k] = gesture.name(k);
-        k      = k + 1;
-    }
-}
-
-# what a wall may hold: none, or the pen's state, a value under a continuous
-# rule and alive under any other
-fun wall_kind_labels(b: *Bar, out: *str) {
-    out[0] = "Dead";
-    out[1] = "Live";
-    if (rule.caps(world.rule(b.s)).continuous) { out[1] = "Value"; }
 }
 
 fun engine_labels(out: *str) {
@@ -162,19 +141,11 @@ fun width(b: *Bar, g: usize) f32 {
     if (g == G_RUN)   { ret button_w(ui, "Pause") + button_w(ui, "Step") + button_w(ui, "Reset") + it * 2.0; }
     if (g == G_SPEED) { ret bctx.px(ui, SPEED_W) + it + toggle_w(ui, "Uncapped"); }
     if (g == G_TOOLS) {
-        var tools: [app.TOOL_COUNT]str;
-        tool_labels(?tools[0]);
-        ret buttons_w(ui, ?tools[0], app.TOOL_COUNT);
-    }
-    if (g == G_WALL) {
-        if (b.a.tool != app.TOOL_WALL) { ret 0.0; }
-        var shapes: [gesture.COUNT]str;
-        var kinds:  [2]str;
-        wall_shape_labels(?shapes[0]);
-        wall_kind_labels(b, ?kinds[0]);
-        var w: f32 = buttons_w(ui, ?shapes[0], gesture.COUNT) + it + buttons_w(ui, ?kinds[0], 2);
-        if (b.a.walls.kind == gesture.FREEHAND) { w = w + it + bctx.px(ui, RADIUS_W); }
-        ret w;
+        # the shapes button as wide as its longer name, whichever it shows
+        var tools: [app.TOOL_BUTTONS]str;
+        tool_labels(b.a, ?tools[0]);
+        tools[app.SHAPES_BUTTON] = app.tool_name(app.TOOL_BOUNDS);
+        ret buttons_w(ui, ?tools[0], app.TOOL_BUTTONS);
     }
     if (g == G_INK) {
         if (rule.states(world.rule(b.s)) <= 2) { ret 0.0; }
@@ -252,43 +223,15 @@ fun speed(b: *Bar, r: bctx.Area) {
 }
 
 fun tools(b: *Bar, r: bctx.Area) {
-    var labels: [app.TOOL_COUNT]str;
-    tool_labels(?labels[0]);
+    var labels: [app.TOOL_BUTTONS]str;
+    tool_labels(b.a, ?labels[0]);
+    # a press on the button already chosen counts too, so the shapes button
+    # can switch between its tools
+    val on: usize = app.button_of(b.a.tool);
     open_cell(b.ui, r);
-    bw.segmented(b.ui, ?labels[0], app.TOOL_COUNT, ?b.a.tool);
+    val got: usize = bw.button_grid(b.ui, ?labels[0], app.TOOL_BUTTONS, app.TOOL_BUTTONS, on);
+    if (got < app.TOOL_BUTTONS && (got != on || got == app.SHAPES_BUTTON)) { app.pick_button(b.a, got); }
     bctx.pop_layout(b.ui);
-}
-
-# the wall tool's gesture, what the walls it draws hold, and the freehand
-# brush's radius
-fun wall(b: *Bar, r: bctx.Area) {
-    val ui:     *bctx.Context = b.ui;
-    val a:      *app.App      = b.a;
-    val it:     f32           = bctx.px(ui, ITEM);
-    var shapes: [gesture.COUNT]str;
-    var kinds:  [2]str;
-    wall_shape_labels(?shapes[0]);
-    wall_kind_labels(b, ?kinds[0]);
-    val sx:   f32   = r.x0 + buttons_w(ui, ?shapes[0], gesture.COUNT);
-    val kx:   f32   = sx + it + buttons_w(ui, ?kinds[0], 2);
-    var kind: usize = a.walls.kind;
-    open_cell(ui, bctx.Area{x0: r.x0, y0: r.y0, x1: sx, y1: r.y1});
-    if (bw.segmented(ui, ?shapes[0], gesture.COUNT, ?kind)) {
-        gesture.cancel(?a.walls);
-        a.walls.kind = kind;
-    }
-    bctx.pop_layout(ui);
-    open_cell(ui, bctx.Area{x0: sx + it, y0: r.y0, x1: kx, y1: r.y1});
-    bw.segmented(ui, ?kinds[0], 2, ?a.wall_kind);
-    bctx.pop_layout(ui);
-    if (a.walls.kind != gesture.FREEHAND) { ret; }
-    var rd: [32]u8;
-    var o:  usize = text.buf_u64(?rd[0], 0, (a.walls.radius + 0.5)::u64);
-    o     = text.buf_str(?rd[0], o, " cells");
-    rd[o] = 0;
-    open_cell(ui, bctx.Area{x0: kx + it, y0: r.y0, x1: r.x1, y1: r.y1});
-    bw.slider(ui, "Radius", ?rd[0], ?a.walls.radius, 0.0, gesture.RADIUS_MAX);
-    bctx.pop_layout(ui);
 }
 
 # the pen's state as a button with its colour, opening the rule's states to
@@ -405,7 +348,6 @@ fun group(b: *Bar, g: usize, r: bctx.Area) {
     if (g == G_RUN)    { run(b, r); }
     if (g == G_SPEED)  { speed(b, r); }
     if (g == G_TOOLS)  { tools(b, r); }
-    if (g == G_WALL)   { wall(b, r); }
     if (g == G_INK)    { ink(b, r); }
     if (g == G_ENGINE) { engine(b, r); }
     if (g == G_TREE)   { tree(b, r); }
