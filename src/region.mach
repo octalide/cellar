@@ -11,6 +11,7 @@ use cellar.rule;
 use cellar.sim;
 use cellar.space;
 use allo: std.allocator;
+use std.allocator.page;
 use std.print;
 use std.rand;
 use std.types.bool.bool;
@@ -41,34 +42,42 @@ fun kill(s: *sim.Sim, b: space.Box) {
     }
 }
 
-# read a rectangle's cells into p, replacing its cells and keeping its metadata
+# read a rectangle's cells and walls into p, and with bound the part of the
+# world's boundary it holds, replacing its cells and keeping its metadata
 # ---
-# s:   simulation
-# b:   the rectangle
-# p:   pattern to fill, initialized
-# ret: false when the GPU's cells could not be read or the pattern not grown
-pub fun copy(s: *sim.Sim, b: space.Box, p: *pattern.Pattern) bool {
+# s:     simulation
+# b:     the rectangle
+# p:     pattern to fill, initialized
+# bound: keep the boundary inside the rectangle too (pattern.capture_bound)
+# ret:   false when the GPU's cells could not be read or the pattern not grown
+pub fun copy(s: *sim.Sim, b: space.Box, p: *pattern.Pattern, bound: bool) bool {
     if (!sim.read_begin(s, b.x0, b.y0, b.x1, b.y1)) { ret false; }
-    val got: err[allo.Error] = pattern.capture(p, s, b.x0, b.y0, b.x1, b.y1);
+    var got: err[allo.Error] = pattern.capture(p, s, b.x0, b.y0, b.x1, b.y1);
+    if (sel got.ok && bound) { got = pattern.capture_bound(p, s); }
     sim.read_end(s);
     ret sel got.ok;
 }
 
-# read a rectangle's cells into p and kill them, in one read and one edit
+# read a rectangle's cells and walls into p as copy does and kill them, its
+# walls with them, which the pattern carries, in one read and one edit
 # ---
-# s:   simulation
-# b:   the rectangle
-# p:   pattern to fill, initialized
-# ret: false when the cells could not be read, leaving the world as it was, or
-#      the edit could not be made
-pub fun cut(s: *sim.Sim, b: space.Box, p: *pattern.Pattern) bool {
+# s:     simulation
+# b:     the rectangle
+# p:     pattern to fill, initialized
+# bound: keep the boundary inside the rectangle too, which stays the world's
+# ret:   false when the cells could not be read, leaving the world as it was, or
+#        the edit could not be made
+pub fun cut(s: *sim.Sim, b: space.Box, p: *pattern.Pattern, bound: bool) bool {
     if (!sim.read_begin(s, b.x0, b.y0, b.x1, b.y1)) { ret false; }
-    val got: err[allo.Error] = pattern.capture(p, s, b.x0, b.y0, b.x1, b.y1);
+    var got: err[allo.Error] = pattern.capture(p, s, b.x0, b.y0, b.x1, b.y1);
+    if (sel got.ok && bound) { got = pattern.capture_bound(p, s); }
     if (sel got.err) {
         sim.read_end(s);
         ret false;
     }
-    var ok: bool = sim.edit_begin(s, b.x0, b.y0, b.x1, b.y1);
+    var mode: u8 = sim.EDIT_CELLS;
+    if (pattern.walled(p)) { mode = sim.EDIT_ERASE; }
+    var ok: bool = sim.edit_begin_as(s, b.x0, b.y0, b.x1, b.y1, mode);
     if (ok) {
         kill(s, b);
         ok = sim.edit_end(s);
@@ -216,8 +225,8 @@ pub fun bounds(s: *sim.Sim, b: space.Box, out: *opt[space.Box]) bool {
 # apply an area operation, reading copy and cut into p and shrink's box into found
 #[testing]
 fun apply(s: *sim.Sim, op: u8, b: space.Box, p: *pattern.Pattern, found: *opt[space.Box]) bool {
-    if (op == command.AREA_COPY)          { ret copy(s, b, p); }
-    if (op == command.AREA_CUT)           { ret cut(s, b, p); }
+    if (op == command.AREA_COPY)          { ret copy(s, b, p, false); }
+    if (op == command.AREA_CUT)           { ret cut(s, b, p, false); }
     if (op == command.AREA_CLEAR)         { ret clear(s, b); }
     if (op == command.AREA_CLEAR_OUTSIDE) { ret clear_outside(s, b); }
     if (op == command.AREA_FILL)          { ret fill(s, b, 0.3); }
@@ -354,7 +363,7 @@ test every_operation__is_correct_across_chunk_borders_on_both_engines {
             sim.paint(?t.gpu, b.x0, b.y0, 1);
             sim.paint(?t.cpu, b.x0 - 1, b.y0 - 1, 1);
             sim.paint(?t.gpu, b.x0 - 1, b.y0 - 1, 1);
-            if (!copy(?t.cpu, m, ?pre)) { ret 3; }
+            if (!copy(?t.cpu, m, ?pre, false)) { ret 3; }
             var cf: opt[space.Box] = opt[space.Box].none{};
             var gf: opt[space.Box] = opt[space.Box].none{};
             if (!apply(?t.cpu, op, b, ?cg, ?cf)) { ret 4; }
@@ -363,7 +372,7 @@ test every_operation__is_correct_across_chunk_borders_on_both_engines {
                 if ((op == command.AREA_COPY || op == command.AREA_CUT) && !same_cells(?cg, ?gg)) { ret 6; }
                 if (!same_box(cf, gf))                                                            { ret 7; }
             }
-            if (!copy(?t.cpu, m, ?post)) { ret 8; }
+            if (!copy(?t.cpu, m, ?post, false)) { ret 8; }
             val bad: i32 = expect(op, m, b, ?pre, ?post, ?cg, cf);
             if (bad != 0) {
                 print.eprintlnf("rectangle {} operation {} failed with {}", bi::u64, op::u64, bad::i64);
@@ -390,5 +399,33 @@ test every_operation__is_correct_across_chunk_borders_on_both_engines {
     pattern.dnit(?cg);
     pattern.dnit(?gg);
     sim.rig_close(?t);
+    ret 0;
+}
+
+test fill__a_random_fill_of_the_selection_leaves_the_walls_where_they_stand {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    # a row of dead walls and one of live ones across the selection
+    if (!sim.edit_begin_as(?s, -40, 0, 40, 2, sim.EDIT_WALLS)) { ret 2; }
+    sim.edit_run(?s, -40, 0, 80, 0);
+    sim.edit_run(?s, -40, 1, 80, 1);
+    sim.edit_end(?s);
+    if (!fill(?s, space.Box{x0: -50, y0: -8, x1: 50, y1: 8}, 1.0)) { ret 3; }
+    # and clearing or inverting it leaves them too
+    if (!invert(?s, space.Box{x0: -50, y0: -8, x1: 50, y1: 8})) { ret 4; }
+    if (!clear(?s, space.Box{x0: -50, y0: -8, x1: 50, y1: -4})) { ret 5; }
+    var x: i64 = -40;
+    for (x < 40) {
+        if (!sim.wall_at(?s, x, 0) || sim.alive(?s, x, 0))  { ret 6; }
+        if (!sim.wall_at(?s, x, 1) || !sim.alive(?s, x, 1)) { ret 7; }
+        x = x + 1;
+    }
+    # the fill took the cells around them, which the invert killed
+    if (sim.alive(?s, 0, 3) || sim.alive(?s, -45, 0))                                     { ret 8; }
+    if (!fill(?s, space.Box{x0: -50, y0: 2, x1: 50, y1: 4}, 1.0) || !sim.alive(?s, 0, 3)) { ret 9; }
+    sim.dnit(?s);
     ret 0;
 }

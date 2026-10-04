@@ -4,11 +4,14 @@
 # the colours, the panels and what they show, and the messages it flashes.
 
 use blit;
+use cellar.boundary;
 use cellar.brush;
 use cellar.ceiling;
 use cellar.command;
 use cellar.device;
+use cellar.fill;
 use cellar.format;
+use cellar.gesture;
 use cellar.identify;
 use cellar.identify.worker;
 use cellar.journal;
@@ -44,6 +47,19 @@ pub val BOUNDS_COUNT: usize = 8;
 # bounds-table index used at startup (128)
 pub val DEFAULT_BOUNDS: usize = 2;
 
+# randomize fills a square around the view's centre
+pub val FILL_SQUARE: usize = 0;
+# randomize fills a circle around the view's centre
+pub val FILL_CIRCLE: usize = 1;
+# randomize fills the whole of a bounded grid
+pub val FILL_GRID: usize = 2;
+# randomize fills the boundary region last chosen with a click
+pub val FILL_REGION: usize = 3;
+# randomize fills the selection, leaving the rest of the world as it is
+pub val FILL_SELECTION: usize = 4;
+# number of things randomize fills
+pub val FILL_COUNT: usize = 5;
+
 # the pattern_sel that selects the custom pattern rather than a library one
 pub val CUSTOM: usize = 0xffffffffffffffff;
 # the library pattern selected at startup
@@ -62,21 +78,73 @@ pub val TOOL_ERASE: usize = 1;
 pub val TOOL_STAMP: usize = 2;
 # drag out a rectangle to operate on
 pub val TOOL_SELECT: usize = 3;
-# drag out the world's bounds, or the edges of the grid it is on
+# draw the world's boundary, or a grid's bounds, and act on its regions
 pub val TOOL_BOUNDS: usize = 4;
+# draw walls, with any of the gestures (cellar.gesture)
+pub val TOOL_WALL: usize = 5;
 # number of tools
-pub val TOOL_COUNT: usize = 5;
+pub val TOOL_COUNT: usize = 6;
+# the toolbar's tool buttons: one a tool, but one for the two shape tools,
+# the bounds tool and the wall tool, which draw with the same gestures
+# (cellar.gesture). it is named for the one it takes up, the last used, and a
+# press on it while that is the tool takes up the other
+pub val TOOL_BUTTONS: usize = 5;
+# the button the shape tools share
+pub val SHAPES_BUTTON: usize = 4;
+
+# a wall drawn holds no live state
+pub val WALL_DEAD: usize = 0;
+# a wall drawn holds the pen's state: alive, or a fixed value of a
+# continuous rule, a source or a sink
+pub val WALL_INK: usize = 1;
 
 # the most digits a bound's size has
 pub val SIZE_DIGITS: usize = 10;
 
-# a tool's name, as the toolbar labels it
+# a tool's name
 pub fun tool_name(t: usize) str {
     if (t == TOOL_ERASE)  { ret "Erase"; }
     if (t == TOOL_STAMP)  { ret "Stamp"; }
     if (t == TOOL_SELECT) { ret "Select"; }
     if (t == TOOL_BOUNDS) { ret "Bounds"; }
+    if (t == TOOL_WALL)   { ret "Walls"; }
     ret "Draw";
+}
+
+# a toolbar button's label (TOOL_BUTTONS): the shapes button is named for
+# the shape tool it takes up
+pub fun button_name(a: *App, i: usize) str {
+    if (i == SHAPES_BUTTON) { ret tool_name(a.shape_tool); }
+    ret tool_name(i);
+}
+
+# whether a tool is one of the shape tools
+pub fun shaping(t: usize) bool {
+    ret t == TOOL_BOUNDS || t == TOOL_WALL;
+}
+
+# the toolbar button a tool is under
+pub fun button_of(t: usize) usize {
+    if (shaping(t)) { ret SHAPES_BUTTON; }
+    ret t;
+}
+
+# take a tool up, a shape tool becoming the one the shapes button takes
+pub fun pick_tool(a: *App, t: usize) {
+    a.tool = t;
+    if (shaping(t)) { a.shape_tool = t; }
+}
+
+# take up the tool under a toolbar button: the shape tool last used for the
+# shapes button, or the other one where that is the tool already
+pub fun pick_button(a: *App, i: usize) {
+    if (i != SHAPES_BUTTON) {
+        a.tool = i;
+        ret;
+    }
+    if (a.tool == TOOL_BOUNDS) { pick_tool(a, TOOL_WALL); }
+    or (a.tool == TOOL_WALL)   { pick_tool(a, TOOL_BOUNDS); }
+    or                         { a.tool = a.shape_tool; }
 }
 
 # number of interface scales offered
@@ -102,7 +170,11 @@ pub val ZOOM_TREE_MIN: f32 = 0.000000000001;
 # uncapped:     1 to step as fast as the machine allows
 # tool:         what a left press does to the world (TOOL_*)
 # ink:          the state the draw tool paints, below the rule's states
-# bounds_idx:   index into the power-of-two randomize-area table
+# bounds_idx:   index into the power-of-two randomize-area table, the size of a
+#               shape fill
+# fill_target:  what randomize fills (FILL_*), which the randomize key repeats
+# picking:      the next click in the world chooses the region to fill
+# fill_density: the live-cell probability of a fill, in [0, 1]
 # pattern_sel:  the selected library pattern's index, or CUSTOM
 # library:      the bundled patterns, once attach has run
 # picked:       the selected library pattern, decoded
@@ -152,9 +224,13 @@ pub val ZOOM_TREE_MIN: f32 = 0.000000000001;
 # shot:         a screenshot of the next frame is wanted
 # selected:     a rectangle of the world is selected
 # area:         the selection, half-open
+# copy_bound:   a copy or cut of the selection keeps the boundary inside it
 # dragging:     the selection is being dragged out
 # anchor_x:     the cell the drag started on
 # anchor_y:     the cell the drag started on
+# shape_tool:   the shape tool the shapes button takes up, the last used
+# wall_kind:    what a wall drawn holds (WALL_DEAD, WALL_INK)
+# walls:        the shape the wall tool is drawing (cellar.gesture)
 # sizing:       the bounds are being dragged
 # edges:        the grid's edges the drag moves (cellar.bounds), 0 for a new box
 # sized:        the bounds as dragged so far, half-open
@@ -165,15 +241,38 @@ pub val ZOOM_TREE_MIN: f32 = 0.000000000001;
 # size_h:       the bounds section's height
 # size_h_buf:   its text
 # sized_grid:   the grid the size fields last showed
+# domain:       the world's boundary as last seen (cellar.exec), which the
+#               bounds tool and the draw read
+# dom_on:       the world has a boundary, which domain holds
+# dom_drawn:    it was drawn, rather than the plane the rule names
+# dom_seen:     the change to the boundary domain was copied at (sim.bound_revision)
+# dom_parts:    regions it holds
+# shape:        the shape the bounds tool is drawing (cellar.gesture)
+# choosing:     a press of the bounds tool picks a region rather than drawing
+# bound_op:     how a drawn shape combines with the boundary (boundary.ADD,
+#               SUBTRACT or INTERSECT)
+# part_on:      a region of the boundary is picked
+# part_x:       the column of a cell it holds
+# part_y:       its row
+# part:         the region, as last seen
+# moving:       the picked region is being dragged
+# move_dx:      columns it is dragged by so far
+# move_dy:      rows it is dragged by so far
+# shade_tmp:    spans the draw of a region works out (cellar.shade)
+# fill_on:      a region is chosen for a region fill, which fill_part holds
+# fill_x:       the column of the cell that chose it
+# fill_y:       its row
+# fill_part:    the region, as the boundary was last seen
 # alloc:        allocator behind the patterns and the queue, once attach has run
 # queue:        edits to the world, applied at the start of the next frame
 # start:        the world reset returns to, once attach has run
 # log:          the changes undo and redo walk, once attach has run
 # clip:         text the frame is to put on the clipboard, once attach has run
 # clip_ready:   clip holds text not yet put on the clipboard
-# copied:       the pattern clip was last written from when it holds words
-#               the clipboard's RLE cannot, empty otherwise, so a paste of
-#               that same text takes it whole (cellar.exec)
+# copied:       the pattern clip was last written from when it holds words,
+#               walls or a boundary the clipboard's RLE cannot, empty
+#               otherwise, so a paste of that same text takes it whole
+#               (cellar.exec)
 # identifier:   classifies a selection off the frame
 # id_limits:    the limits a selection is classified under
 # identified:   the last classification of a selection, empty for none
@@ -185,6 +284,9 @@ pub rec App {
     tool:         usize;
     ink:          u8;
     bounds_idx:   usize;
+    fill_target:  usize;
+    picking:      bool;
+    fill_density: f32;
     pattern_sel:  usize;
     library:      library.Library;
     picked:       pattern.Pattern;
@@ -233,9 +335,13 @@ pub rec App {
     shot:         bool;
     selected:     bool;
     area:         space.Box;
+    copy_bound:   u8;
     dragging:     bool;
     anchor_x:     i64;
     anchor_y:     i64;
+    shape_tool:   usize;
+    wall_kind:    usize;
+    walls:        gesture.Gesture;
     sizing:       bool;
     edges:        u8;
     sized:        space.Box;
@@ -245,6 +351,26 @@ pub rec App {
     size_h:       blit.field.Field;
     size_h_buf:   [SIZE_DIGITS + 1]u8;
     sized_grid:   topology.Grid;
+    domain:       boundary.Region;
+    dom_on:       bool;
+    dom_drawn:    bool;
+    dom_seen:     u64;
+    dom_parts:    usize;
+    shape:        gesture.Gesture;
+    choosing:     bool;
+    bound_op:     u32;
+    part_on:      bool;
+    part_x:       i64;
+    part_y:       i64;
+    part:         boundary.Region;
+    moving:       bool;
+    move_dx:      i64;
+    move_dy:      i64;
+    shade_tmp:    Vector[i64];
+    fill_on:      bool;
+    fill_x:       i64;
+    fill_y:       i64;
+    fill_part:    boundary.Region;
     alloc:        *allo.Allocator;
     queue:        command.Queue;
     start:        snapshot.Snapshot;
@@ -267,6 +393,29 @@ pub val IDENTIFYING: str = "identifying...";
 pub fun bounds_size(i: usize) usize {
     if (i >= BOUNDS_COUNT) { ret 4096; }
     ret (32::usize) << (i::u64);
+}
+
+# randomize as last chosen: a fill of the target and density in the world panel
+# ---
+# a: application state
+pub fun randomize(a: *App) {
+    if (a.fill_target == FILL_SELECTION) {
+        area(a, command.AREA_FILL);
+        ret;
+    }
+    submit(a, command.Command.randomize{fill_of(a)});
+}
+
+# the fill a shape target makes with the view: around its centre, or the grid
+pub fun fill_of(a: *App) fill.Fill {
+    val side: usize     = bounds_size(a.bounds_idx);
+    val cx:   i64       = render.floor64(a.pan_x);
+    val cy:   i64       = render.floor64(a.pan_y);
+    var f:    fill.Fill = fill.square(cx, cy, side, a.fill_density);
+    if (a.fill_target == FILL_CIRCLE) { f = fill.circle(cx, cy, side, a.fill_density); }
+    if (a.fill_target == FILL_GRID)   { f.shape = fill.Shape.grid{}; }
+    if (a.fill_target == FILL_REGION) { f.shape = fill.Shape.region{}; }
+    ret f;
 }
 
 # the interface scale for a scale index
@@ -292,8 +441,38 @@ pub fun fit_engine(a: *App, tree: bool) {
     a.zoom = clamp_zoom(a, a.zoom);
 }
 
-# frame the randomize area on the next frame
-pub fun frame_area(a: *App) {
+# frame the fill randomize would make now: its target around the view's centre
+# at its size, the grid, the chosen region or the selection
+# ---
+# a:      application state
+# grid:   the world's grid
+# bound:  the box of the world's boundary, which holds its grid's place
+# region: the box of the chosen region, or none
+pub fun frame_area(a: *App, grid: *topology.Grid, bound: opt[space.Box], region: opt[space.Box]) {
+    if (a.fill_target == FILL_REGION) {
+        if (sel region.some) { frame_box(a, region.some); }
+        or                   { say(a, "no region is chosen to frame"); }
+        ret;
+    }
+    if (a.fill_target == FILL_GRID) {
+        var b: opt[space.Box] = bound;
+        if (!sel b.some) { b = fill.grid_box(grid); }
+        if (sel b.some)  { frame_box(a, b.some); }
+        or               { say(a, "the world has no bounded grid to frame"); }
+        ret;
+    }
+    if (a.fill_target == FILL_SELECTION) {
+        if (a.selected) { frame_box(a, a.area); }
+        or              { say(a, "nothing is selected"); }
+        ret;
+    }
+    val f:    fill.Fill   = fill_of(a);
+    val none: fill.Domain = fill.nowhere();
+    frame_box(a, fill.bounds(?f.shape, ?none));
+}
+
+# frame the origin square of the randomize size, as a launch does
+fun frame_start(a: *App) {
     a.fit   = opt[space.Box].none{};
     a.refit = true;
 }
@@ -304,8 +483,8 @@ pub fun frame_box(a: *App, b: space.Box) {
     a.refit = true;
 }
 
-# the cells the next framing shows: the box asked for, or the randomize area
-# as big as it is when the frame comes
+# the cells the next framing shows: the box asked for, or at launch the
+# randomize size's square around the origin
 pub fun fit_box(a: *App) space.Box {
     if (sel a.fit.some) { ret a.fit.some; }
     val h: i64 = (bounds_size(a.bounds_idx) / 2)::i64;
@@ -441,6 +620,14 @@ pub fun attach(a: *App, alloc: *allo.Allocator) err[format.Error] {
     a.clip       = vector.init[u8](alloc);
     a.clip_ready = false;
     a.layout     = vector.init[u8](alloc);
+    a.domain     = boundary.init(alloc);
+    a.part       = boundary.init(alloc);
+    a.shade_tmp  = vector.init[i64](alloc);
+    a.fill_part  = boundary.init(alloc);
+    gesture.init(?a.shape, alloc);
+    gesture.init(?a.walls, alloc);
+    a.walls.kind   = gesture.FREEHAND;
+    a.walls.radius = 0.0;
     val l: err[format.Error] = library.init(?a.library, alloc);
     if (sel l.err) { ret l; }
     val p: err[allo.Error] = pattern.init(?a.picked, alloc, 0, 0, "");
@@ -465,6 +652,12 @@ pub fun dnit(a: *App) {
     journal.dnit(?a.log);
     vector.dnit[u8](?a.clip);
     vector.dnit[u8](?a.layout);
+    boundary.dnit(?a.domain);
+    boundary.dnit(?a.part);
+    vector.dnit[i64](?a.shade_tmp);
+    boundary.dnit(?a.fill_part);
+    gesture.dnit(?a.shape);
+    gesture.dnit(?a.walls);
     worker.cancel(?a.identifier);
 }
 
@@ -538,6 +731,19 @@ pub fun submit(a: *App, c: command.Command) {
         command.release(?own);
         say(a, "out of memory");
     }
+}
+
+# draw the walls of the shape the wall tool's gesture just finished, holding
+# the wall tool's state, as one change
+pub fun draw_walls(a: *App) {
+    var r:      boundary.Region = boundary.init(a.alloc);
+    val copied: err[allo.Error] = boundary.copy(?r, ?a.walls.shape);
+    if (sel copied.err) {
+        boundary.dnit(?r);
+        say(a, "out of memory");
+        ret;
+    }
+    submit(a, command.Command.walls{command.Walls{shape: r, v: wall_state(a)}});
 }
 
 # a file command's copy of a path, saying so when there is no memory for it
@@ -623,6 +829,75 @@ pub fun deselect(a: *App) {
     a.dragging = false;
 }
 
+# pick the region of the boundary holding a cell, as the boundary was last
+# seen, or none where no region holds it
+# ---
+# ret: whether a region holds the cell
+pub fun pick_part(a: *App, x: i64, y: i64) bool {
+    a.part_on = false;
+    a.moving  = false;
+    boundary.clear(?a.part);
+    if (!a.dom_on) { ret false; }
+    val at: res[usize, allo.Error] = boundary.region_at(?a.domain, x, y);
+    if (!sel at.ok)                  { ret false; }
+    if (at.ok == boundary.NO_REGION) { ret false; }
+    val got: err[allo.Error] = boundary.region(?a.domain, at.ok, ?a.part);
+    if (sel got.err) { ret false; }
+    a.part_on = true;
+    a.part_x  = x;
+    a.part_y  = y;
+    ret true;
+}
+
+# take up the world's boundary as it now stands, once it has changed since
+# last seen, keeping the picked region picked where a region still holds its
+# cell
+# ---
+# a:       application state, attached
+# changes: the boundary's changes so far (sim.bound_revision)
+# b:       the boundary, or nil for none
+# drawn:   it was drawn, rather than the plane the rule names
+pub fun see_domain(a: *App, changes: u64, b: *boundary.Region, drawn: bool) {
+    if (changes == a.dom_seen) { ret; }
+    a.dom_seen  = changes;
+    a.dom_on    = false;
+    a.dom_drawn = false;
+    a.dom_parts = 0;
+    boundary.clear(?a.domain);
+    if (b != nil) {
+        val copied: err[allo.Error] = boundary.copy(?a.domain, b);
+        a.dom_on    = sel copied.ok;
+        a.dom_drawn = a.dom_on && drawn;
+    }
+    if (a.dom_on) {
+        val n: res[usize, allo.Error] = boundary.count(?a.domain);
+        if (sel n.ok) { a.dom_parts = n.ok; }
+    }
+    if (a.part_on) { pick_part(a, a.part_x, a.part_y); }
+    see_fill(a, a.fill_on, a.fill_x, a.fill_y, true);
+}
+
+# take up the cell that chooses the region a region fill takes, finding the
+# region in the boundary as last seen when the cell or the boundary changed
+# ---
+# a:     application state, attached
+# on:    a cell is chosen
+# x:     its column
+# y:     its row
+# again: the boundary changed, so the region is found again
+pub fun see_fill(a: *App, on: bool, x: i64, y: i64, again: bool) {
+    if (!again && on == a.fill_on && x == a.fill_x && y == a.fill_y) { ret; }
+    a.fill_on = on;
+    a.fill_x  = x;
+    a.fill_y  = y;
+    boundary.clear(?a.fill_part);
+    if (!on || !a.dom_on) { ret; }
+    val at: res[usize, allo.Error] = boundary.region_at(?a.domain, x, y);
+    if (!sel at.ok)                  { ret; }
+    if (at.ok == boundary.NO_REGION) { ret; }
+    boundary.region(?a.domain, at.ok, ?a.fill_part);
+}
+
 # ask for an operation on the selection, when there is one
 # ---
 # a:  application state
@@ -646,6 +921,12 @@ pub fun pen(a: *App) u8 {
     ret a.ink;
 }
 
+# the state a wall the wall tool draws holds: none, or the pen's ink
+pub fun wall_state(a: *App) u8 {
+    if (a.wall_kind == WALL_DEAD) { ret 0; }
+    ret a.ink;
+}
+
 # bring the ink within a rule of n states, which has live states 1 to n - 1
 pub fun fit_ink(a: *App, n: u32) {
     if (a.ink == 0)      { a.ink = 1; }
@@ -666,14 +947,17 @@ pub fun step_ink(a: *App, n: u32, back: bool) {
 
 # seed the application state
 pub fun init(a: *App) {
-    a.speed       = 12.0;
-    a.mode        = render.MODE_SOLID::usize;
-    a.gutter      = 0;
-    a.uncapped    = 0;
-    a.tool        = TOOL_DRAW;
-    a.ink         = 1;
-    a.bounds_idx  = DEFAULT_BOUNDS;
-    a.pattern_sel = 0;
+    a.speed        = 12.0;
+    a.mode         = render.MODE_SOLID::usize;
+    a.gutter       = 0;
+    a.uncapped     = 0;
+    a.tool         = TOOL_DRAW;
+    a.ink          = 1;
+    a.bounds_idx   = DEFAULT_BOUNDS;
+    a.fill_target  = FILL_SQUARE;
+    a.picking      = false;
+    a.fill_density = fill.DENSITY;
+    a.pattern_sel  = 0;
     library.empty(?a.library);
     a.picked_at = CUSTOM;
     blit.field.init(?a.search, ?a.search_buf[0], SEARCH_MAX + 1, 0, nil);
@@ -685,7 +969,7 @@ pub fun init(a: *App) {
     a.zoom_min = ZOOM_MIN;
     a.pan_x    = 0.0;
     a.pan_y    = 0.0;
-    frame_area(a);
+    frame_start(a);
     a.panel = 1;
     ruletext.init(?a.rule_text);
     sumlist.init(?a.birth_list);
@@ -713,14 +997,40 @@ pub fun init(a: *App) {
     a.last_y     = 0;
     a.shot       = false;
     a.selected   = false;
+    a.copy_bound = 0;
     a.dragging   = false;
     a.sizing     = false;
+    a.wall_kind  = WALL_DEAD;
+    a.shape_tool = TOOL_BOUNDS;
     a.edges      = 0;
     a.grid_shape = 0;
     blit.field.init(?a.size_w, ?a.size_w_buf[0], SIZE_DIGITS + 1, 0, digit);
     blit.field.init(?a.size_h, ?a.size_h_buf[0], SIZE_DIGITS + 1, 0, digit);
     a.sized_grid = topology.open();
-    a.alloc      = nil;
+    a.domain     = boundary.init(nil);
+    a.dom_on     = false;
+    a.dom_drawn  = false;
+    a.dom_seen   = 0;
+    a.dom_parts  = 0;
+    gesture.init(?a.shape, nil);
+    gesture.init(?a.walls, nil);
+    a.walls.kind   = gesture.FREEHAND;
+    a.walls.radius = 0.0;
+    a.choosing     = false;
+    a.bound_op     = boundary.ADD;
+    a.part_on      = false;
+    a.part_x       = 0;
+    a.part_y       = 0;
+    a.part         = boundary.init(nil);
+    a.moving       = false;
+    a.move_dx      = 0;
+    a.move_dy      = 0;
+    a.shade_tmp    = vector.init[i64](nil);
+    a.fill_on      = false;
+    a.fill_x       = 0;
+    a.fill_y       = 0;
+    a.fill_part    = boundary.init(nil);
+    a.alloc        = nil;
     worker.init(?a.identifier);
     a.id_limits     = identify.limits();
     a.identified[0] = 0;
@@ -784,5 +1094,58 @@ test step_ink__cycles_the_live_states_and_fit_ink_clamps_them {
     a.ink = 255;
     fit_ink(?a, 256);
     if (a.ink != 255) { ret 7; }
+    ret 0;
+}
+
+test frame_area__frames_the_fill_around_the_view_floored_for_negative_centres {
+    var a: App;
+    a.bounds_idx   = 0;
+    a.fill_density = 0.5;
+    a.fill_target  = FILL_SQUARE;
+    a.pan_x        = -0.5;
+    a.pan_y        = -100.5;
+    a.selected     = false;
+    val f: fill.Fill = fill_of(?a);
+    if (!sel f.shape.square)                                { ret 1; }
+    if (f.shape.square.x != -1 || f.shape.square.y != -101) { ret 1; }
+    var g:  topology.Grid  = topology.Grid{shape: topology.PLANE, w: 40, h: 30, twist_w: false};
+    val no: opt[space.Box] = opt[space.Box].none{};
+    frame_area(?a, ?g, no, no);
+    if (!a.refit || !sel a.fit.some) { ret 2; }
+    val b: space.Box = fit_box(?a);
+    if (b.x0 != -17 || b.x1 != 15 || b.y0 != -117 || b.y1 != -85) { ret 3; }
+    a.fill_target = FILL_GRID;
+    frame_area(?a, ?g, no, no);
+    val c: space.Box = fit_box(?a);
+    if (c.x0 != -20 || c.x1 != 20 || c.y0 != -15 || c.y1 != 15) { ret 4; }
+    a.fill_target = FILL_REGION;
+    frame_area(?a, ?g, no, opt[space.Box].some{space.Box{x0: 7, y0: 8, x1: 9, y1: 12}});
+    val r: space.Box = fit_box(?a);
+    if (r.x0 != 7 || r.x1 != 9 || r.y1 != 12) { ret 6; }
+    a.fill_target = FILL_SELECTION;
+    a.selected    = true;
+    a.area        = space.Box{x0: 3, y0: 4, x1: 9, y1: 8};
+    frame_area(?a, ?g, no, no);
+    val d: space.Box = fit_box(?a);
+    if (d.x0 != 3 || d.x1 != 9 || d.y1 != 8) { ret 5; }
+    ret 0;
+}
+
+test pick_button__one_button_holds_both_shape_tools_and_switches_between_them {
+    var a: App;
+    a.tool       = TOOL_DRAW;
+    a.shape_tool = TOOL_BOUNDS;
+    # the keys take each tool up, and the shapes button follows the last one
+    pick_tool(?a, TOOL_WALL);
+    if (button_of(a.tool) != SHAPES_BUTTON || !string.str_equals(button_name(?a, SHAPES_BUTTON), "Walls")) { ret 1; }
+    pick_button(?a, TOOL_DRAW);
+    if (a.tool != TOOL_DRAW) { ret 2; }
+    pick_button(?a, SHAPES_BUTTON);
+    if (a.tool != TOOL_WALL) { ret 3; }
+    # pressed again it takes up the other shape tool
+    pick_button(?a, SHAPES_BUTTON);
+    if (a.tool != TOOL_BOUNDS || !string.str_equals(button_name(?a, SHAPES_BUTTON), "Bounds")) { ret 4; }
+    pick_button(?a, SHAPES_BUTTON);
+    if (a.tool != TOOL_WALL) { ret 5; }
     ret 0;
 }

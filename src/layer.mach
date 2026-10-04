@@ -30,6 +30,22 @@
 #          where it does not, so a run that shows neither pays for neither.
 #          it is never saved, copied, journaled or written by an edit, since
 #          the state gives it again
+#   wall   the world's walls (WALL_WIDTH bits a cell): 1 where a cell is a
+#          wall, whose word holds its fixed state or value. it belongs to the
+#          world rather than to a rule, so no family declares it, and a set
+#          holds it only while the world holds a wall (cellar.sim): a world
+#          that never held one pays nothing for it. it is static, never
+#          written by a step, so it has one cells rather than two: both of a
+#          slot's cells name the same span, on the host and in the shard
+#          table alike, and a stage or a host loop that reads either reads it.
+#          a step leaves a wall cell's word as it stands, held as an edit
+#          holds it (as the complement on the generations a flipping
+#          background holds it so), and its neighbours read it as any cell.
+#          the family's step never sees it: the CPU's block leaves it out and
+#          a stage finds it through the set word (set_wall). it is journaled,
+#          snapshotted and moved with its chunk as the word is, and a slot's
+#          page-table entry says whether its chunk holds a wall at all
+#          (cellar.layout WALLED), so a chunk without one reads none of it
 #
 # the state and rule layers are a cell's word, its exact value: a value for
 # each of them, in the set's order, each at its layer's width. a word is what
@@ -54,8 +70,10 @@
 # (cellar.rule word_state), its state layer's value and its rule layers'.
 #
 # a set is ordered. the state layer is layer 0, the rule layers follow in the
-# order declared, and the view layers come last, so a view layer coming or
-# going never moves a rule layer. a layer is named by its place in the set.
+# order declared, then the wall layer where the set holds one, and the view
+# layers come last, so a view layer coming or going never moves a rule layer
+# or the wall layer, and the wall layer coming or going never moves a rule
+# layer. a layer is named by its place in the set.
 #
 # a set's first view layer, where it has one, is its shown layer: the one the
 # display channels are read from. a cell an edit writes starts its shown
@@ -109,6 +127,10 @@ $if (LAYERS_MAX != layout.SHARD_LAYERS) {
 pub val STATE: u32 = 0;
 pub val RULE:  u32 = 1;
 pub val VIEW:  u32 = 2;
+pub val WALL:  u32 = 3;
+
+# the wall layer's width: a bit a cell, set where the cell is a wall
+pub val WALL_WIDTH: u32 = 1;
 
 # 1 when width is one a layer may have, 1, 2, 4, 8, 16 or 32, else 0
 pub fun valid(width: u32) u32 {
@@ -224,13 +246,15 @@ pub fun width_in(code: u32, k: u32) u32 {
 
 # the meta head's set word (cellar.layout.SET_AT): the set's n layers in the
 # low four bits, its shown layer above them, 0 for none since the state layer
-# is never shown, and a bit per live rule layer from SET_LIVE, by layer
-pub fun set_word(n: u32, shown: u32, lives: u32) u32 {
-    ret n | (shown << 4) | (lives << SET_LIVE);
+# is never shown, a bit per live rule layer from SET_LIVE, by layer, and the
+# wall layer from SET_WALL, 0 for none
+pub fun set_word(n: u32, shown: u32, lives: u32, wall: u32) u32 {
+    ret n | (shown << 4) | (lives << SET_LIVE) | (wall << SET_WALL);
 }
 
-# where the set word's live bits start
+# where the set word's live bits start, and its wall layer's
 pub val SET_LIVE: u32 = 8;
+pub val SET_WALL: u32 = 16;
 
 # the layers a set word names
 #[inline]
@@ -247,7 +271,14 @@ pub fun set_shown(w: u32) u32 {
 # the live rule layers a set word names, a bit a layer by its place in the set
 #[inline]
 pub fun set_lives(w: u32) u32 {
-    ret w >> SET_LIVE;
+    ret (w >> SET_LIVE) & 0xff;
+}
+
+# the wall layer a set word names, 0 for none since the state layer is never
+# the wall layer
+#[inline]
+pub fun set_wall(w: u32) u32 {
+    ret (w >> SET_WALL) & 0xf;
 }
 
 # a cell's sensed value: its state layer's value v, with its shown layer's
@@ -292,8 +323,9 @@ test address__packs_every_width_low_bit_first_a_row_to_a_word {
     if (width_in(code, 0) != 16 || width_in(code, 1) != 1 || width_in(code, 2) != 0) { ret 15; }
     if (width_in(widths_add(0, LAYERS_MAX - 1, 32), LAYERS_MAX - 1) != 32)           { ret 16; }
     # a set word names its layers, its shown layer and its live ones
-    val sw: u32 = set_word(4, 3, 0x6);
-    if (set_layers(sw) != 4 || set_shown(sw) != 3 || set_lives(sw) != 0x6 || set_shown(set_word(1, 0, 0)) != 0) { ret 17; }
-    if (sensed(1, 0x1ff, 1) != 0x3ff || sensed(0xabc, 7, WIDTH_MAX) != 0xabc)                                   { ret 18; }
+    val sw: u32 = set_word(5, 4, 0x6, 3);
+    if (set_layers(sw) != 5 || set_shown(sw) != 4 || set_lives(sw) != 0x6 || set_shown(set_word(1, 0, 0, 0)) != 0) { ret 17; }
+    if (set_wall(sw) != 3 || set_wall(set_word(4, 3, 0xfe, 0)) != 0 || set_lives(set_word(4, 0, 0xfe, 2)) != 0xfe) { ret 19; }
+    if (sensed(1, 0x1ff, 1) != 0x3ff || sensed(0xabc, 7, WIDTH_MAX) != 0xabc)                                      { ret 18; }
     ret 0;
 }

@@ -10,11 +10,19 @@
 # cold only clears. every family keeps the pool's background dead, a rule that
 # births on 0 included (see cellar.rule), so this holds under every rule.
 #
-# a seamed chunk of a bounded grid (cellar.layout) is stepped after the rest,
-# one at a time: its 3 by 3 block is gathered through its links into frames
-# the family steps as it would any block, busy, and what it writes off the
-# grid is cleared before the census is taken. a cell past a plane's dead edge
-# is gathered as the rule holds the edge at the generation (rule.outside).
+# a seamed chunk of a grid that wraps (cellar.layout) is stepped after the
+# rest, one at a time: its 3 by 3 block is gathered through its links into
+# frames the family steps as it would any block, busy, and what it writes off
+# the grid is cleared before the census is taken.
+#
+# a chunk whose block reaches the world's boundary (cellar.boundary) steps
+# with the rest, its block naming the masks of the chunks across the edge and
+# the chunks wholly outside (space.Block), so its family reads the edge as
+# the rule's open edge (rule.outside), and what it writes outside the
+# boundary is held at zero: by the family as it writes a row, a word
+# operation a row for a rule of one bit, else cleared once the family has
+# stepped the chunk and counted again (clip). a rule that reads the edge live
+# on some generation keeps every chunk along it busy.
 #
 # on a pool held whole (cellar.space.cover) only the due chunks are stepped
 # (space.plan): those that may hold anything in either cells, and those their
@@ -92,8 +100,9 @@ fun step_slot(arg: *u8, i: usize) {
     val cn: *u32         = ?sp.census[s * space.CENSUS];
     if (e[layout.INCARNATION_AT::usize] == 0 || space.seamed(sp, s)) { ret; }
 
-    # the census as the step began says whether anything nearby is alive
-    val set: *plane.Set = space.layers(sp);
+    # the census as the step began says whether anything nearby is alive. the
+    # family steps its own layers, the wall layer left out (hold_walls)
+    val set: *plane.Set = space.fam_set(sp);
     var b:   space.Block;
     space.block(?b, set, rd.gen);
     var q: usize = 0;
@@ -101,7 +110,7 @@ fun step_slot(arg: *u8, i: usize) {
         if (e[q] != space.NONE) {
             var k: usize = 0;
             for (k < set.n) {
-                b.nb[k * 9 + q] = space.plane_of(sp, k, e[q]::usize).w;
+                b.nb[k * 9 + q] = space.plane_of(sp, space.fam_layer(sp, k), e[q]::usize).w;
                 k               = k + 1;
             }
             if (sp.before[e[q]::usize * space.CENSUS] != 0) { b.busy = true; }
@@ -110,8 +119,25 @@ fun step_slot(arg: *u8, i: usize) {
     }
     var k: usize = 0;
     for (k < set.n) {
-        b.out[k] = space.back_of(sp, k, s).w;
+        b.out[k] = space.back_of(sp, space.fam_layer(sp, k), s).w;
         k        = k + 1;
+    }
+    # a wall held as a flipping background's complement changes every step
+    if (sp.flips && space.walled(sp, s)) { b.busy = true; }
+    # a block reaching the boundary reads it as the rule's open edge, and a
+    # rule whose step reads that edge live keeps every chunk along it busy
+    val dw: u32 = space.block_word(sp, s);
+    if (dw != 0) {
+        b.outs = dw & 0x1ff;
+        q      = 0;
+        for (q < 9) {
+            if (e[q] != space.NONE) { b.dom[q] = space.mask_of(sp, e[q]::usize); }
+            q = q + 1;
+        }
+        var past: [layer.LAYERS_MAX]u32;
+        rule.outside(rd.r, rd.gen, ?past[0]);
+        b.past = past[0];
+        if (sp.rim) { b.busy = true; }
     }
     var t: space.Tally = space.tally(rd.sens);
     if (!b.busy && sp.before[s * space.CENSUS + 1] == 0) {
@@ -121,9 +147,53 @@ fun step_slot(arg: *u8, i: usize) {
             k = k + 1;
         }
     }
-    or { rule.step_chunk(rd.r, ?b, ?t); }
+    or {
+        rule.step_chunk(rd.r, ?b, ?t);
+        if (b.dom[4] != nil && !b.kept) { clip(rd, s, ?b, ?t); }
+    }
+    if (space.hold_walls(sp, s)) { recount_back(rd, s, ?t); }
     space.tally_census(?t, cn, e[layout.INCARNATION_AT::usize]);
     build(sp, s, rd.sens);
+}
+
+# count a stepped chunk again from its back cells, once something past the
+# family's step changed them (hold_walls)
+fun recount_back(rd: *Round, s: usize, t: *space.Tally) {
+    @t = space.tally(rd.sens);
+    var lv: space.Lives = space.lives_of(rd.sp, s, true);
+    space.count(t, space.back_of(rd.sp, 0, s), ?lv);
+}
+
+# clear what a step wrote outside the boundary in a chunk across its edge, in
+# every layer the family steps, and count the chunk again, for a family whose
+# step writes the cells there as any others (space.Block kept)
+fun clip(rd: *Round, s: usize, b: *space.Block, t: *space.Tally) {
+    val sp:  *space.Space = rd.sp;
+    val set: *plane.Set   = space.fam_set(sp);
+    val m:   *u32         = b.dom[4];
+    var k:   usize        = 0;
+    for (k < set.n) {
+        val width: u32  = set.at[k].width;
+        val w:     *u32 = b.out[k];
+        if (width == 1) {
+            var j: usize = 0;
+            for (j < space.MASK) {
+                w[j] = w[j] & m[j];
+                j    = j + 1;
+            }
+        }
+        or {
+            var i: usize = 0;
+            for (i < space.CELLS) {
+                if (((m[i / 32] >> (i % 32)::u32) & 1) == 0) { plane.store(w, width, i, 0); }
+                i = i + 1;
+            }
+        }
+        k = k + 1;
+    }
+    @t = space.tally(rd.sens);
+    var lv: space.Lives = space.lives_of(sp, s, true);
+    space.count(t, space.block_out(b, 0), ?lv);
 }
 
 # build a stepped chunk's pyramid from its back cells, where the pool keeps them
@@ -169,12 +239,10 @@ fun frame_words(set: *plane.Set) usize {
 # step a seamed chunk from its block gathered into frames, frame_words long
 fun step_seamed(rd: *Round, s: usize, fr: *u32) {
     val sp:   *space.Space = rd.sp;
-    val set:  *plane.Set   = space.layers(sp);
+    val set:  *plane.Set   = space.fam_set(sp);
     val side: i32          = space.SIDE::i32;
     val r:    i32          = rule.radius(rd.r)::i32;
-    var past: [layer.LAYERS_MAX]u32;
-    rule.outside(rd.r, rd.gen, ?past[0]);
-    var b: space.Block;
+    var b:    space.Block;
     space.block(?b, set, rd.gen);
     var at: usize = 0;
     var k:  usize = 0;
@@ -189,17 +257,14 @@ fun step_seamed(rd: *Round, s: usize, fr: *u32) {
         k = k + 1;
     }
     # every cell the family can read, up to the radius around the frame, in
-    # every layer: past the dead edge a rule layer holds the edge's word's
-    # value there, and a view layer zero
+    # every layer
     k = 0;
     for (k < set.n) {
-        val d:  *plane.Decl = ?set.at[k];
-        var pk: u32         = 0;
-        if (k < plane.exact(set)) { pk = past[k]; }
+        val d: *plane.Decl = ?set.at[k];
         # a word-wide layer named as such, so its cells are gathered a word each
-        if (d.width == layer.WIDTH_MAX) { gather(sp, ?b, k, layer.WIDTH_MAX, s, r, pk); }
-        or                              { gather(sp, ?b, k, d.width, s, r, pk); }
-        b.out[k] = space.back_of(sp, k, s).w;
+        if (d.width == layer.WIDTH_MAX) { gather(sp, ?b, k, layer.WIDTH_MAX, s, r); }
+        or                              { gather(sp, ?b, k, d.width, s, r); }
+        b.out[k] = space.back_of(sp, space.fam_layer(sp, k), s).w;
         k        = k + 1;
     }
     b.busy = true;
@@ -215,26 +280,28 @@ fun step_seamed(rd: *Round, s: usize, fr: *u32) {
         or                                      { off_grid(b.out[k], set.at[k].width, edge); }
         k = k + 1;
     }
+    space.hold_walls(sp, s);
     var lv: space.Lives = space.lives_of(sp, s, true);
     space.count(?u, space.block_out(?b, 0), ?lv);
     space.tally_census(?u, ?sp.census[s * space.CENSUS], space.incarnation(sp, s));
     build(sp, s, rd.sens);
 }
 
-# gather layer k of a seamed chunk's block, at its width, into the block's
-# frames: every cell the family can read, up to the radius r around the frame,
-# and past the dead edge the value past
+# gather layer k of the family's set of a seamed chunk's block, at its width,
+# into the block's frames: every cell the family can read, up to the radius r
+# around the frame
 #[inline]
-fun gather(sp: *space.Space, b: *space.Block, k: usize, width: u32, s: usize, r: i32, past: u32) {
-    val side: i32 = space.SIDE::i32;
-    var y:    i32 = 0 - r;
+fun gather(sp: *space.Space, b: *space.Block, k: usize, width: u32, s: usize, r: i32) {
+    val pk:   usize = space.fam_layer(sp, k);
+    val side: i32   = space.SIDE::i32;
+    var y:    i32   = 0 - r;
     for (y < side + r) {
         val fy: i32 = (y + side) / side;
         var x:  i32 = 0 - r;
         for (x < side + r) {
             val fx: i32 = (x + side) / side;
             val i:  i32 = (y - (fy - 1) * side) * side + x - (fx - 1) * side;
-            plane.store(b.nb[k * 9 + (fy * 3 + fx)::usize], width, i::usize, space.resolve_at(sp, k, width, s, x, y, past));
+            plane.store(b.nb[k * 9 + (fy * 3 + fx)::usize], width, i::usize, space.resolve_at(sp, pk, width, s, x, y));
             x = x + 1;
         }
         y = y + 1;
@@ -266,7 +333,7 @@ fun step_seams(rd: *Round, n: usize, stop: *i64) bool {
 # only when a seamed chunk is stepped
 fun step_seams_from(rd: *Round, first: usize, n: usize, stop: *i64) bool {
     val sp: *space.Space = rd.sp;
-    val fr: *u32         = space.scratch(sp, frame_words(space.layers(sp)));
+    val fr: *u32         = space.scratch(sp, frame_words(space.fam_set(sp)));
     # a step that cannot gather its frames is cancelled, as one stopped is
     if (fr == nil) { ret false; }
     var i: usize = first;

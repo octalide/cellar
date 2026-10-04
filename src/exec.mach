@@ -20,8 +20,10 @@
 # flashed once (app.note_ceiling).
 
 use cellar.app;
+use cellar.boundary;
 use cellar.ceiling;
 use cellar.command;
+use cellar.domain;
 use cellar.format;
 use cellar.formats;
 use cellar.identify.worker;
@@ -134,6 +136,11 @@ fun load_world(a: *app.App, s: *sim.Sim, d: *Deps, path: str) Change {
         app.say_why(a, base(path), "loaded, but its rule is not one cellar can run; the current rule is kept");
         ret Change.fresh{};
     }
+    if (done.ok.dropped != nil) {
+        app.say_why(a, base(path), "loaded without its boundary or walls");
+        app.say_also(a, done.ok.dropped);
+        ret Change.fresh{};
+    }
     app.say_why(a, base(path), "loaded");
     ret Change.fresh{};
 }
@@ -210,13 +217,19 @@ fun open(a: *app.App, s: *sim.Sim, d: *Deps, path: str) Change {
         app.say_why(a, base(path), "opened, but it could not be copied into the data directory, so its rule is known only until cellar closes");
         ret got;
     }
+    if (done.ok.dropped != nil) {
+        app.say_why(a, base(path), "opened without its boundary or walls");
+        app.say_also(a, done.ok.dropped);
+        ret got;
+    }
     app.say_why(a, base(path), "opened");
     ret got;
 }
 
 # put a pattern on the clipboard as RLE, with its rule, for the frame to hand
 # the window. RLE holds states, which other apps read, so a pattern holding
-# words is remembered beside the text, and a paste of that same text takes it
+# words, walls or a boundary is remembered beside the text, and a paste of
+# that same text takes it
 fun clip(a: *app.App, d: *Deps, p: *pattern.Pattern) bool {
     pattern.resize(?a.copied, 0, 0);
     var f: format.Format;
@@ -226,7 +239,7 @@ fun clip(a: *app.App, d: *Deps, p: *pattern.Pattern) bool {
     if (sel enc.err) { ret false; }
     val end: res[usize, allo.Error] = vector.push[u8](?a.clip, 0);
     if (sel end.err) { ret false; }
-    if (pattern.exact(p)) {
+    if (pattern.rich(p)) {
         var kept: pattern.Pattern;
         val made: err[allo.Error] = pattern.clone(?kept, a.alloc, p);
         if (sel made.ok) {
@@ -240,7 +253,7 @@ fun clip(a: *app.App, d: *Deps, p: *pattern.Pattern) bool {
 
 # whether clipboard text is what clip last wrote for a pattern it remembered
 fun recalled(a: *app.App, c: *command.Paste) bool {
-    if (!pattern.exact(?a.copied) || a.clip.len != c.text.len + 1) { ret false; }
+    if (!pattern.rich(?a.copied) || a.clip.len != c.text.len + 1) { ret false; }
     var i: usize = 0;
     for (i < c.text.len) {
         if (a.clip.data[i] != c.text.data[i]) { ret false; }
@@ -262,8 +275,8 @@ fun take(a: *app.App, s: *sim.Sim, d: *Deps, b: space.Box, cut: bool) {
     var text:  [rule.FORMAT_MAX + 1]u8;
     val named: err[allo.Error] = pattern.set_rule(?p, rule.format(?s.rule, ?text[0]));
     var ok:    bool            = sel named.ok;
-    if (ok && cut) { ok = region.cut(s, b, ?p); }
-    or (ok)        { ok = region.copy(s, b, ?p); }
+    if (ok && cut) { ok = region.cut(s, b, ?p, a.copy_bound != 0); }
+    or (ok)        { ok = region.copy(s, b, ?p, a.copy_bound != 0); }
     if (!ok) {
         pattern.dnit(?p);
         app.say(a, "the selection could not be copied");
@@ -282,7 +295,8 @@ fun take(a: *app.App, s: *sim.Sim, d: *Deps, b: space.Box, cut: bool) {
 
 # read clipboard text as a pattern and make it the stamp, taking its rule when
 # asked. the stamp only changes when the whole text is a pattern that fits.
-# text cellar wrote for a pattern holding words is that pattern, words and all
+# text cellar wrote for a pattern holding words, walls or a boundary is that
+# pattern, all of them with it
 fun paste(a: *app.App, s: *sim.Sim, d: *Deps, c: *command.Paste) Change {
     var p:    pattern.Pattern;
     var made: err[allo.Error] = err[allo.Error].ok{};
@@ -293,7 +307,7 @@ fun paste(a: *app.App, s: *sim.Sim, d: *Deps, c: *command.Paste) Change {
         ret Change.none{};
     }
     var got: err[persist.Error] = err[persist.Error].ok{};
-    if (!pattern.exact(?p)) { got = persist.pattern_from(d.a, ?p, c.text.data, c.text.len); }
+    if (!pattern.rich(?p)) { got = persist.pattern_from(d.a, ?p, c.text.data, c.text.len); }
     if (sel got.err) {
         pattern.dnit(?p);
         if (sel got.err.format) {
@@ -400,7 +414,7 @@ fun identify_area(a: *app.App, s: *sim.Sim, b: space.Box) {
         ret;
     }
     fin { pattern.dnit(?p); }
-    if (!region.copy(s, b, ?p)) {
+    if (!region.copy(s, b, ?p, false)) {
         app.say(a, "the selection could not be read");
         ret;
     }
@@ -415,7 +429,7 @@ fun area(c: *command.Area, a: *app.App, s: *sim.Sim, d: *Deps) {
     if (c.op == command.AREA_CUT)           { take(a, s, d, b, true); }
     if (c.op == command.AREA_CLEAR)         { ok = region.clear(s, b); }
     if (c.op == command.AREA_CLEAR_OUTSIDE) { ok = region.clear_outside(s, b); }
-    if (c.op == command.AREA_FILL)          { ok = region.fill(s, b, sim.DEFAULT_DENSITY); }
+    if (c.op == command.AREA_FILL)          { ok = region.fill(s, b, a.fill_density); }
     if (c.op == command.AREA_INVERT)        { ok = region.invert(s, b); }
     if (c.op == command.AREA_SHRINK)        { shrink(a, s, b); }
     if (c.op == command.AREA_IDENTIFY)      { identify_area(a, s, b); }
@@ -429,6 +443,7 @@ val UNRECORDED: u8 = 255;
 fun recorded(c: *command.Command) u8 {
     if (sel c.toggle || sel c.step || sel c.jump) { ret journal.KIND_RUN; }
     if (sel c.paint || sel c.line)                { ret journal.KIND_STROKE; }
+    if (sel c.walls)                              { ret journal.KIND_EDIT; }
     if (sel c.area) {
         # shrink and identify only read the world
         if (c.area.op == command.AREA_SHRINK || c.area.op == command.AREA_IDENTIFY) { ret UNRECORDED; }
@@ -440,6 +455,7 @@ fun recorded(c: *command.Command) u8 {
         ret UNRECORDED;
     }
     if (sel c.clear || sel c.randomize || sel c.stamp || sel c.rule || sel c.bounds || sel c.reset) { ret journal.KIND_EDIT; }
+    if (sel c.domain)                                                                               { ret journal.KIND_EDIT; }
     if (sel c.load_world || sel c.load_pattern || sel c.open || sel c.paste || sel c.drop)          { ret journal.KIND_EDIT; }
     ret UNRECORDED;
 }
@@ -458,7 +474,19 @@ fun follow(a: *app.App, dx: i64, dy: i64) {
 # grid's notation puts it, the view moving with it, saying what was dropped and
 # which the caller tells when the world left HashLife for it
 fun bounds(a: *app.App, s: *sim.Sim, c: *command.Bounds) Change {
-    var want: rule.Rule = s.rule;
+    var open: topology.Grid = c.grid;
+    if (!topology.bounded(?open) && sim.drawn(s)) {
+        # taking the bounds away takes a drawn boundary with them
+        val off: opt[str] = sim.set_bound(s, nil);
+        if (sel off.some) {
+            app.say_why(a, "the bounds were not removed", off.some);
+            ret Change.none{};
+        }
+        app.say(a, "bounds removed");
+        ret Change.edit{};
+    }
+    val drawn: bool      = sim.drawn(s);
+    var want:  rule.Rule = s.rule;
     want.grid = c.grid;
     val why: opt[str] = rule.refusal(?want);
     if (sel why.some) {
@@ -494,6 +522,7 @@ fun bounds(a: *app.App, s: *sim.Sim, c: *command.Bounds) Change {
         var suffix: [topology.FORMAT_MAX + 1]u8;
         topology.format(?g, ?suffix[0], 0);
         app.say_why(a, "bounds set", ?suffix[1]);
+        if (drawn && !sim.drawn(s)) { app.say_also(a, "it replaces the drawn boundary, which undo brings back"); }
     }
     or { app.say(a, "bounds removed"); }
     if (p.dropped > 0) {
@@ -505,6 +534,39 @@ fun bounds(a: *app.App, s: *sim.Sim, c: *command.Bounds) Change {
         app.say_also(a, ?why[0]);
     }
     ret Change.fresh{};
+}
+
+# edit the world's domain, saying what was done or why it was not
+fun edit_domain(a: *app.App, s: *sim.Sim, c: *command.Domain) {
+    var why:  opt[str] = opt[str].none{};
+    var done: str      = "";
+    if (c.op == command.DOMAIN_SHAPE) {
+        why  = domain.combine(s, ?c.shape, c.how);
+        done = "boundary drawn";
+    }
+    if (c.op == command.DOMAIN_MOVE) {
+        why  = domain.move(s, c.x, c.y, c.dx, c.dy);
+        done = "region moved";
+    }
+    if (c.op == command.DOMAIN_DELETE) {
+        why  = domain.delete(s, c.x, c.y);
+        done = "region deleted";
+    }
+    if (c.op == command.DOMAIN_CLEAR) {
+        why  = domain.clear(s, c.x, c.y);
+        done = "region cleared";
+    }
+    if (sel why.some) {
+        app.say_why(a, "the boundary was not changed", why.some);
+        ret;
+    }
+    app.say(a, done);
+    # the picked region goes with a move, and is gone with a delete
+    if (c.op == command.DOMAIN_MOVE && a.part_on && a.part_x == c.x && a.part_y == c.y) {
+        a.part_x = c.x + c.dx;
+        a.part_y = c.y + c.dy;
+    }
+    if (c.op == command.DOMAIN_DELETE) { a.part_on = false; }
 }
 
 # undo or redo, leaving the world paused as it now stands, which becomes the start
@@ -538,9 +600,10 @@ fun engine(a: *app.App, s: *sim.Sim, tree: bool) {
             ret;
         }
     }
-    if (sim.use_hashlife(s, tree)) { ret; }
-    if (tree)                      { app.say(a, "HashLife could not take the world"); }
-    or                             { app.say(a, "the world is too large for the chunk pool"); }
+    if (sim.use_hashlife(s, tree))     { ret; }
+    if (tree && sim.no_tree(s) != nil) { app.say_why(a, "HashLife cannot run the world", sim.no_tree(s)); }
+    or (tree)                          { app.say(a, "HashLife could not take the world"); }
+    or                                 { app.say(a, "the world is too large for the chunk pool"); }
 }
 
 # advance the quadtree to a generation, saying why when it cannot
@@ -563,8 +626,8 @@ fun apply(c: *command.Command, a: *app.App, s: *sim.Sim, d: *Deps) {
     or (kind != UNRECORDED)                                                               { journal.begin(?a.log, kind, kind == journal.KIND_RUN || sel c.line); }
     if ((sel c.toggle || sel c.step || sel c.jump) && paused && !s.full && !a.start.held) { take_start(a, s); }
     var change: Change = Change.none{};
-    if (sel c.paint || sel c.line || sel c.stamp || sel c.rule) { change = Change.edit{}; }
-    if (sel c.clear || sel c.randomize)                         { change = Change.fresh{}; }
+    if (sel c.paint || sel c.line || sel c.walls || sel c.stamp || sel c.rule) { change = Change.edit{}; }
+    if (sel c.clear || sel c.randomize)                                        { change = Change.fresh{}; }
     # copy, shrink and identify only read the world
     if (sel c.area) {
         val op: u8 = c.area.op;
@@ -576,20 +639,37 @@ fun apply(c: *command.Command, a: *app.App, s: *sim.Sim, d: *Deps) {
     if (sel c.toggle)                             { world.toggle(s); }
     if (sel c.step)                               { world.step(s); }
     if (sel c.clear)                              { world.clear(s); }
-    if (sel c.randomize)                          { world.randomize(s, c.randomize); }
-    if (sel c.paint)                              { world.paint(s, c.paint.x, c.paint.y, c.paint.v); }
-    if (sel c.line)                               { world.line(s, c.line.x0, c.line.y0, c.line.x1, c.line.y1, c.line.v); }
-    if (sel c.stamp)                              { world.stamp(s, ?c.stamp.p, c.stamp.x, c.stamp.y); }
-    if (sel c.rule)                               { rule_to(a, s, c.rule); }
-    if (sel c.engine)                             { engine(a, s, c.engine); }
-    if (sel c.exponent)                           { sim.set_exponent(s, c.exponent); }
-    if (sel c.jump)                               { jump(a, s, c.jump); }
-    if (sel c.ceilings)                           { sim.set_ceilings(s, c.ceilings); }
-    if (sel c.area)                               { area(?c.area, a, s, d); }
-    if (sel c.bounds)                             { change = bounds(a, s, ?c.bounds); }
-    if (sel c.reset)                              { reset(a, s); }
-    if (sel c.save_world)                         { save_world(a, s, d, command.path(?c.save_world)); }
-    if (sel c.load_world)                         { change = load_world(a, s, d, command.path(?c.load_world)); }
+    if (sel c.randomize) {
+        if (!world.randomize(s, ?c.randomize)) {
+            if (sel c.randomize.shape.region) { app.say(a, "choose a region of the boundary to fill"); }
+            or                                { app.say(a, "the world has no bounded grid to fill"); }
+        }
+    }
+    if (sel c.region) { world.choose_region(s, c.region.x, c.region.y); }
+    if (sel c.paint)  { world.paint(s, c.paint.x, c.paint.y, c.paint.v); }
+    if (sel c.line)   { world.line(s, c.line.x0, c.line.y0, c.line.x1, c.line.y1, c.line.v); }
+    if (sel c.walls) {
+        val why: opt[str] = world.walls(s, ?c.walls);
+        if (sel why.some) { app.say_why(a, "the walls were not drawn", why.some); }
+    }
+    if (sel c.stamp) {
+        val why: opt[str] = world.stamp(s, ?c.stamp.p, c.stamp.x, c.stamp.y);
+        if (sel why.some) { app.say_why(a, "the pattern was not stamped", why.some); }
+    }
+    if (sel c.rule)     { rule_to(a, s, c.rule); }
+    if (sel c.engine)   { engine(a, s, c.engine); }
+    if (sel c.exponent) { sim.set_exponent(s, c.exponent); }
+    if (sel c.jump)     { jump(a, s, c.jump); }
+    if (sel c.ceilings) { sim.set_ceilings(s, c.ceilings); }
+    if (sel c.area)     { area(?c.area, a, s, d); }
+    if (sel c.bounds)   { change = bounds(a, s, ?c.bounds); }
+    if (sel c.domain) {
+        edit_domain(a, s, ?c.domain);
+        change = Change.edit{};
+    }
+    if (sel c.reset)      { reset(a, s); }
+    if (sel c.save_world) { save_world(a, s, d, command.path(?c.save_world)); }
+    if (sel c.load_world) { change = load_world(a, s, d, command.path(?c.load_world)); }
     if (sel c.save_pattern) {
         val path: str = command.path(?c.save_pattern);
         saved(a, path, persist.save_pattern(d.a, ?a.custom, path));
@@ -617,11 +697,17 @@ fun left(a: *app.App, s: *sim.Sim, c: *command.Command, was: bool, told: u32) {
     if (!was || sim.on_tree(s) || sel c.engine) { ret; }
     var m: [160]u8;
     var o: usize = text.buf_str(?m[0], 0, "HashLife cannot run ");
-    o    = text.buf_str(?m[0], o, rule.caps(?s.rule).no_tree);
+    o    = text.buf_str(?m[0], o, sim.no_tree(s));
     o    = text.buf_str(?m[0], o, ", so the world moved to the chunk engine");
     m[o] = 0;
-    if (a.told != told) { app.say_also(a, ?m[0]); }
-    or                  { app.say(a, ?m[0]); }
+    if (a.told != told) {
+        app.say_also(a, ?m[0]);
+        ret;
+    }
+    # the message outlives this frame, so it is said from the app's own buffer
+    o         = text.buf_str(?a.said[0], 0, ?m[0]);
+    a.said[o] = 0;
+    app.say(a, ?a.said[0]);
 }
 
 # apply every waiting command in order and empty the queue
@@ -641,6 +727,11 @@ pub fun run(a: *app.App, s: *sim.Sim, d: *Deps) {
         i = i + 1;
     }
     command.clear(?a.queue);
+    app.see_domain(a, sim.bound_revision(s), sim.bound(s), sim.drawn(s));
+    var fx:  i64  = 0;
+    var fy:  i64  = 0;
+    val fon: bool = sim.chosen_cell(s, ?fx, ?fy);
+    app.see_fill(a, fon, fx, fy, false);
     # any of them may have changed the rule: to another family, whose own ink
     # the pen takes up, or to one of fewer states
     if (rule.family_of(?s.rule) != family) { a.ink = rule.ink(?s.rule)::u8; }
@@ -837,6 +928,18 @@ test run__opens_a_pattern_with_its_rule_and_leaves_the_world_when_a_file_fails {
     ret 0;
 }
 
+# whether bytes hold a line that is exactly t
+#[testing]
+fun has_line(b: *vector.Vector[u8], t: str) bool {
+    val n: usize = string.str_len(t);
+    var i: usize = 0;
+    for (i + n <= b.len) {
+        if ((i == 0 || b.data[i - 1] == '\n') && string.str_region_equals(?b.data[i], 0, n, t) && (i + n == b.len || b.data[i + n] == '\n')) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
 # clipboard text as the window hands it over, a copy the test's allocator never refuses
 #[testing]
 fun clipboard(ap: *app.App, text: str) str {
@@ -910,6 +1013,95 @@ test run__pastes_a_pattern_as_the_stamp_and_a_copy_pastes_back_exactly {
     pattern.dnit(?copied);
     app.dnit(?ap);
     sim.dnit(?s);
+    ret 0;
+}
+
+test run__a_copy_keeps_its_walls_and_boundary_and_a_stamp_lands_them {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    var ap: app.App;
+    app.init(?ap);
+    val shown: err[format.Error] = app.attach(?ap, ?a);
+    if (sel shown.err) { ret 1; }
+    var d: Deps = Deps{a: ?a};
+
+    # two regions apart, a row of dead walls and one of live ones in the
+    # first, and a block beside them
+    var b:     boundary.Region = boundary.init(?a);
+    var other: boundary.Region = boundary.init(?a);
+    boundary.rect(?b, -20, -20, 20, 20);
+    boundary.rect(?other, 40, -20, 60, 20);
+    boundary.combine(?b, ?other, boundary.ADD);
+    if (!sim.taken(sim.set_bound(?s, ?b))) { ret 2; }
+    boundary.rect(?other, -10, 0, 10, 1);
+    sim.paint_region(?s, ?other, 0, sim.EDIT_WALLS);
+    boundary.rect(?other, -10, 2, 10, 3);
+    sim.paint_region(?s, ?other, 1, sim.EDIT_WALLS);
+    world.paint(?s, -5, 5, 1);
+    world.paint(?s, -4, 5, 1);
+
+    # a copy across both regions and the gap between them keeps the walls,
+    # and the boundary inside it when asked
+    app.select(?ap, -25, -5, 64, 7);
+    app.area(?ap, command.AREA_COPY);
+    run(?ap, ?s, ?d);
+    if (!pattern.walled(?ap.custom) || pattern.bounded(?ap.custom)) { ret 3; }
+    ap.copy_bound = 1;
+    app.area(?ap, command.AREA_COPY);
+    run(?ap, ?s, ?d);
+    if (!pattern.walled(?ap.custom) || !pattern.bounded(?ap.custom)) { ret 4; }
+    if (ap.custom.w != 90 || ap.custom.h != 13)                      { ret 4; }
+
+    # the clipboard's text pastes back as the copy, walls and boundary with it
+    pattern.clear(?ap.custom);
+    app.paste(?ap, clipboard(?ap, ap.clip.data::str), false);
+    run(?ap, ?s, ?d);
+    if (!pattern.walled(?ap.custom) || !pattern.bounded(?ap.custom)) { ret 5; }
+
+    # stamped 200 columns on into a world with no boundary, its box takes the
+    # copy's boundary and the rest of the world stays
+    var t:     sim.Sim;
+    val made2: err[allo.Error] = sim.init(?t, ?a);
+    if (sel made2.err) { ret 6; }
+    app.stamp(?ap, ?ap.custom, 0, 175 + 45, -5 + 6);
+    run(?ap, ?t, ?d);
+    if (!sim.drawn(?t) || !sim.walls(?t)) { ret 7; }
+    var y: i64 = -5;
+    for (y < 8) {
+        var x: i64 = -25;
+        for (x < 65) {
+            if (sim.wall_at(?t, x + 200, y) != sim.wall_at(?s, x, y))                        { ret 8; }
+            if (sim.alive(?t, x + 200, y) != sim.alive(?s, x, y))                            { ret 9; }
+            if (boundary.contains(sim.bound(?t), x + 200, y) != boundary.contains(?b, x, y)) { ret 10; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    if (!boundary.contains(sim.bound(?t), 0, 0) || !boundary.contains(sim.bound(?t), 200, 100)) { ret 11; }
+
+    # a cut takes the walls with the cells, which the copy carries
+    app.select(?ap, 175, -5, 264, 7);
+    app.area(?ap, command.AREA_CUT);
+    run(?ap, ?t, ?d);
+    if (sim.walls(?t) || sim.population(?t) != 0 || !pattern.walled(?ap.custom)) { ret 12; }
+
+    # text another app changed is the RLE it is, cells alone
+    var plain: [4096]u8;
+    var o:     usize = text.buf_str(?plain[0], 0, "#C edited\n");
+    o        = text.buf_str(?plain[0], o, ap.clip.data::str);
+    plain[o] = 0;
+    app.paste(?ap, clipboard(?ap, ?plain[0]), false);
+    run(?ap, ?s, ?d);
+    if (pattern.walled(?ap.custom) || pattern.bounded(?ap.custom) || ap.custom.w != 90) { ret 13; }
+
+    boundary.dnit(?b);
+    boundary.dnit(?other);
+    app.dnit(?ap);
+    sim.dnit(?s);
+    sim.dnit(?t);
     ret 0;
 }
 
@@ -1067,7 +1259,7 @@ test run__a_cell_of_two_layers_keeps_both_through_edits_undo_a_world_file_and_co
     run(?ap, ?s, ?d);
     if (!words_are(?s, 0, 0, 4, 3, ?vals[0])) { ret 3; }
 
-    # a world file keeps both fields, as a version 6 file of two values
+    # a world file keeps both fields, as words of two values
     app.submit(?ap, command.Command.save_world{file(?ap, "out/test/exec_layers/both.cellar")});
     app.submit(?ap, command.Command.clear{});
     run(?ap, ?s, ?d);
@@ -1075,7 +1267,7 @@ test run__a_cell_of_two_layers_keeps_both_through_edits_undo_a_world_file_and_co
     val bytes: res[vector.Vector[u8], fs.FsError] = fs.read_bytes(?a, "out/test/exec_layers/both.cellar");
     if (sel bytes.err) { ret 4; }
     var head: vector.Vector[u8] = bytes.ok;
-    val six:  bool              = head.len > 9 && string.str_region_equals(head.data, 0, 9, "cellar 6\n");
+    val six:  bool              = head.len > 9 && string.str_region_equals(head.data, 0, 9, "cellar 7\n") && has_line(?head, "values 2");
     vector.dnit[u8](?head);
     if (!six) { ret 4; }
     app.submit(?ap, command.Command.load_world{file(?ap, "out/test/exec_layers/both.cellar")});
@@ -1599,5 +1791,264 @@ test run__bounds_move_the_world_and_the_view_drop_what_falls_off_and_undo_puts_b
     if (!string.str_ends_with(ap.toast, "moved to the chunk engine")) { ret 19; }
     app.dnit(?ap);
     sim.dnit(?s);
+    ret 0;
+}
+
+# a domain command combining a shape, owned by the command
+#[testing]
+fun shaped(a: *allo.Allocator, kind: u32, how: u32, x0: i64, y0: i64, x1: i64, y1: i64) command.Command {
+    var r: boundary.Region = boundary.init(a);
+    if (kind == 0) { boundary.rect(?r, x0, y0, x1, y1); }
+    or             { boundary.ellipse(?r, x0, y0, x1, y1); }
+    ret command.Command.domain{command.Domain{op: command.DOMAIN_SHAPE, shape: r, how: how, x: 0, y: 0, dx: 0, dy: 0}};
+}
+
+# an edit of the region holding a cell
+#[testing]
+fun parted(a: *allo.Allocator, op: u8, x: i64, y: i64, dx: i64, dy: i64) command.Command {
+    ret command.Command.domain{command.Domain{op: op, shape: boundary.init(a), how: boundary.ADD, x: x, y: y, dx: dx, dy: dy}};
+}
+
+test run__boundary_edits_are_one_undo_step_each_and_regions_move_with_their_cells {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    var ap: app.App;
+    app.init(?ap);
+    val shown: err[format.Error] = app.attach(?ap, ?a);
+    if (sel shown.err) { ret 1; }
+    var d: Deps;
+    world.paint(?s, 0, 0, 1);
+    world.paint(?s, 40, 0, 1);
+    world.paint(?s, 200, 200, 1);
+
+    # a shape added to a world without a boundary becomes it, dropping what lies outside
+    app.submit(?ap, shaped(?a, 1, boundary.ADD, -60, -30, 60, 30));
+    run(?ap, ?s, ?d);
+    if (!sim.drawn(?s) || !ap.dom_drawn || ap.dom_parts != 1)           { ret 2; }
+    if (sim.alive(?s, 200, 200) || !sim.alive(?s, 40, 0) || !ap.dom_on) { ret 3; }
+    # undo takes the boundary away and brings the cell back, and redo draws it again
+    app.submit(?ap, command.Command.undo{});
+    run(?ap, ?s, ?d);
+    if (sim.bound(?s) != nil || ap.dom_on || !sim.alive(?s, 200, 200)) { ret 4; }
+    app.submit(?ap, command.Command.redo{});
+    run(?ap, ?s, ?d);
+    if (!sim.drawn(?s) || sim.alive(?s, 200, 200)) { ret 5; }
+
+    # a band subtracted cuts it in two
+    app.submit(?ap, shaped(?a, 0, boundary.SUBTRACT, 20, -40, 24, 40));
+    run(?ap, ?s, ?d);
+    if (ap.dom_parts != 2 || !sim.alive(?s, 40, 0)) { ret 6; }
+    # the region a region fill takes is found where the boundary was last seen
+    app.submit(?ap, command.Command.region{command.Cell{x: 0, y: 0}});
+    run(?ap, ?s, ?d);
+    if (!ap.fill_on || !boundary.contains(?ap.fill_part, 0, 0) || boundary.contains(?ap.fill_part, 40, 0)) { ret 18; }
+
+    # the right region moves with its cell, leaving nothing behind, as one step
+    if (!app.pick_part(?ap, 40, 0)) { ret 7; }
+    app.submit(?ap, parted(?a, command.DOMAIN_MOVE, 40, 0, 30, 5));
+    run(?ap, ?s, ?d);
+    if (!sim.alive(?s, 70, 5) || sim.alive(?s, 40, 0) || !sim.alive(?s, 0, 0))                   { ret 8; }
+    if (boundary.contains(sim.bound(?s), 25, 0) || !boundary.contains(sim.bound(?s), 85, 5))     { ret 9; }
+    if (!ap.part_on || ap.part_x != 70 || ap.part_y != 5 || !boundary.contains(?ap.part, 85, 5)) { ret 10; }
+    app.submit(?ap, command.Command.undo{});
+    run(?ap, ?s, ?d);
+    if (!sim.alive(?s, 40, 0) || sim.alive(?s, 70, 5) || !boundary.contains(sim.bound(?s), 25, 0)) { ret 11; }
+    app.submit(?ap, command.Command.redo{});
+    run(?ap, ?s, ?d);
+
+    # clearing a region kills its cells and keeps it; deleting one takes it away
+    app.submit(?ap, parted(?a, command.DOMAIN_CLEAR, 70, 5, 0, 0));
+    run(?ap, ?s, ?d);
+    if (sim.alive(?s, 70, 5) || !sim.alive(?s, 0, 0) || ap.dom_parts != 2) { ret 12; }
+    app.submit(?ap, parted(?a, command.DOMAIN_DELETE, 0, 0, 0, 0));
+    run(?ap, ?s, ?d);
+    if (sim.alive(?s, 0, 0) || ap.dom_parts != 1 || ap.part_on) { ret 13; }
+    app.submit(?ap, command.Command.undo{});
+    run(?ap, ?s, ?d);
+    if (!sim.alive(?s, 0, 0) || ap.dom_parts != 2) { ret 14; }
+
+    # a torus replaces the drawn boundary, saying so, and removing the bounds
+    # takes a drawn boundary away
+    val torus: topology.Grid = topology.Grid{shape: topology.TORUS, w: 100, h: 100, twist_w: false};
+    app.submit(?ap, command.Command.bounds{command.Bounds{grid: torus, x0: -50, y0: -50}});
+    run(?ap, ?s, ?d);
+    if (sim.drawn(?s) || ap.dom_on || !string.str_ends_with(ap.toast, "which undo brings back")) { ret 15; }
+    app.submit(?ap, command.Command.undo{});
+    run(?ap, ?s, ?d);
+    if (!sim.drawn(?s) || ap.dom_parts != 2) { ret 16; }
+    app.submit(?ap, command.Command.bounds{command.Bounds{grid: topology.open(), x0: 0, y0: 0}});
+    run(?ap, ?s, ?d);
+    if (sim.bound(?s) != nil || ap.dom_on || !string.str_equals(ap.toast, "bounds removed")) { ret 17; }
+    app.dnit(?ap);
+    sim.dnit(?s);
+    ret 0;
+}
+
+# whether every cell of row y from x0 to x1, ends included, is a wall
+#[testing]
+fun walls_along(s: *sim.Sim, x0: i64, x1: i64, y: i64) bool {
+    var x: i64 = x0;
+    for (x <= x1) {
+        if (!sim.wall_at(s, x, y)) { ret false; }
+        x = x + 1;
+    }
+    ret true;
+}
+
+# a walls command drawing a gesture's shape, a rectangle of kind 0 or an
+# ellipse, owned by the command
+#[testing]
+fun walled(a: *allo.Allocator, kind: u32, x0: i64, y0: i64, x1: i64, y1: i64, v: u8) command.Command {
+    var r: boundary.Region = boundary.init(a);
+    if (kind == 0) { boundary.rect(?r, x0, y0, x1, y1); }
+    or             { boundary.ellipse(?r, x0, y0, x1, y1); }
+    ret command.Command.walls{command.Walls{shape: r, v: v}};
+}
+
+test run__wall_shapes_and_an_erase_are_each_one_change {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    var ap: app.App;
+    app.init(?ap);
+    val shown: err[format.Error] = app.attach(?ap, ?a);
+    if (sel shown.err) { ret 1; }
+    var d: Deps;
+
+    # a row of dead walls, then a rectangle of live ones
+    app.submit(?ap, walled(?a, 0, 0, 0, 6, 1, 0));
+    run(?ap, ?s, ?d);
+    app.submit(?ap, walled(?a, 0, 10, 10, 15, 13, 1));
+    run(?ap, ?s, ?d);
+    if (!walls_along(?s, 0, 5, 0) || sim.alive(?s, 3, 0))                           { ret 2; }
+    if (!walls_along(?s, 10, 14, 10) || !walls_along(?s, 10, 14, 12))               { ret 3; }
+    if (!sim.alive(?s, 12, 11) || sim.wall_at(?s, 15, 11) || sim.wall_at(?s, 6, 0)) { ret 3; }
+    # the eraser takes a wall away with its cell
+    app.submit(?ap, command.Command.paint{command.Paint{x: 12, y: 11, v: 0}});
+    run(?ap, ?s, ?d);
+    if (sim.wall_at(?s, 12, 11) || sim.alive(?s, 12, 11)) { ret 4; }
+    # each undoes as one change, the last wall taking the layer with it
+    app.submit(?ap, command.Command.undo{});
+    run(?ap, ?s, ?d);
+    if (!sim.wall_at(?s, 12, 11) || !sim.alive(?s, 12, 11)) { ret 5; }
+    app.submit(?ap, command.Command.undo{});
+    run(?ap, ?s, ?d);
+    if (sim.wall_at(?s, 12, 11) || sim.alive(?s, 12, 11) || !walls_along(?s, 0, 5, 0)) { ret 6; }
+    app.submit(?ap, command.Command.undo{});
+    run(?ap, ?s, ?d);
+    if (sim.walls(?s) || sim.wall_at(?s, 3, 0)) { ret 7; }
+    app.submit(?ap, command.Command.redo{});
+    app.submit(?ap, command.Command.redo{});
+    run(?ap, ?s, ?d);
+    if (!walls_along(?s, 0, 5, 0) || !walls_along(?s, 10, 14, 11) || !sim.alive(?s, 12, 11)) { ret 8; }
+
+    app.dnit(?ap);
+    sim.dnit(?s);
+    ret 0;
+}
+
+# a world bounded by a square, a row of live walls and a row of dead ones in
+# it, and a block, for a stamp to change
+#[testing]
+fun seed_bounded(s: *sim.Sim) bool {
+    var r: boundary.Region = boundary.init(s.space.a);
+    fin { boundary.dnit(?r); }
+    boundary.rect(?r, -30, -30, 30, 30);
+    if (!sim.taken(sim.set_bound(s, ?r))) { ret false; }
+    boundary.rect(?r, -20, 0, 20, 1);
+    sim.paint_region(s, ?r, 1, sim.EDIT_WALLS);
+    boundary.rect(?r, -20, 4, 20, 5);
+    sim.paint_region(s, ?r, 0, sim.EDIT_WALLS);
+    world.paint(s, 10, 10, 1);
+    world.paint(s, 11, 10, 1);
+    world.paint(s, 10, 11, 1);
+    world.paint(s, 11, 11, 1);
+    ret true;
+}
+
+# whether two worlds hold the same boundary, and the same walls and cells over
+# the box (-60, -60) to (60, 60)
+#[testing]
+fun same_bounded(s: *sim.Sim, t: *sim.Sim) bool {
+    if (sim.drawn(s) != sim.drawn(t) || sim.walls(s) != sim.walls(t)) { ret false; }
+    if (sim.drawn(s) && !boundary.same(sim.bound(s), sim.bound(t)))   { ret false; }
+    var y: i64 = -60;
+    for (y < 60) {
+        var x: i64 = -60;
+        for (x < 60) {
+            if (sim.wall_at(s, x, y) != sim.wall_at(t, x, y) || sim.cell(s, x, y) != sim.cell(t, x, y)) { ret false; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    ret true;
+}
+
+test run__a_stamp_that_carries_a_boundary_undoes_and_redoes_whole {
+    var a: allo.Allocator;
+    page.make(?a);
+    var s:    sim.Sim;
+    var was:  sim.Sim;
+    var then: sim.Sim;
+    val m1:   err[allo.Error] = sim.init(?s, ?a);
+    val m2:   err[allo.Error] = sim.init(?was, ?a);
+    val m3:   err[allo.Error] = sim.init(?then, ?a);
+    if (sel m1.err || sel m2.err || sel m3.err)                           { ret 1; }
+    if (!seed_bounded(?s) || !seed_bounded(?was) || !seed_bounded(?then)) { ret 1; }
+    var ap: app.App;
+    app.init(?ap);
+    val shown: err[format.Error] = app.attach(?ap, ?a);
+    if (sel shown.err) { ret 1; }
+    var d: Deps = Deps{a: ?a};
+
+    # a 20 by 10 pattern astride the boundary's east edge: its left half
+    # inside the boundary it carries, a wall and a live cell in each half
+    var p:    pattern.Pattern;
+    val made: err[allo.Error] = pattern.init(?p, ?a, 20, 10, "astride");
+    if (sel made.err) { ret 2; }
+    val hw: err[allo.Error] = pattern.hold_walls(?p);
+    val hd: err[allo.Error] = pattern.hold_domain(?p);
+    if (sel hw.err || sel hd.err) { ret 2; }
+    var y: usize = 0;
+    for (y < 10) {
+        var x: usize = 0;
+        for (x < 10) {
+            p.domain[y * 20 + x] = 1;
+            x                    = x + 1;
+        }
+        y = y + 1;
+    }
+    pattern.set(?p, 2, 2, 1);
+    pattern.set_wall(?p, 3, 3, true);
+    pattern.set_wall(?p, 4, 3, true);
+    pattern.set(?p, 4, 3, 1);
+    pattern.set(?p, 15, 5, 1);
+    pattern.set_wall(?p, 16, 6, true);
+
+    # centred on (35, 5), its box (25, 0) to (45, 10)
+    val direct: opt[str] = world.stamp(?then, ?p, 35, 5);
+    if (sel direct.some) { ret 2; }
+    app.stamp(?ap, ?p, 0, 35, 5);
+    run(?ap, ?s, ?d);
+    if (!same_bounded(?s, ?then))                                                            { ret 3; }
+    if (!sim.wall_at(?s, 28, 3) || !sim.alive(?s, 29, 3) || sim.alive(?s, 40, 5))            { ret 4; }
+    if (!boundary.contains(sim.bound(?s), 34, 5) || boundary.contains(sim.bound(?s), 35, 5)) { ret 5; }
+    app.submit(?ap, command.Command.undo{});
+    run(?ap, ?s, ?d);
+    if (!same_bounded(?s, ?was)) { ret 6; }
+    app.submit(?ap, command.Command.redo{});
+    run(?ap, ?s, ?d);
+    if (!same_bounded(?s, ?then)) { ret 7; }
+
+    pattern.dnit(?p);
+    app.dnit(?ap);
+    sim.dnit(?s);
+    sim.dnit(?was);
+    sim.dnit(?then);
     ret 0;
 }

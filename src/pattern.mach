@@ -14,16 +14,27 @@
 # exactly onto a world whose rule reads them alike (rule.alike), and the
 # states otherwise. a rule whose state is all its word never gives a pattern
 # words, so its patterns hold states as they always have.
+#
+# a pattern may mark some of its cells as walls (cellar.sim EDIT_WALLS), each
+# holding its cell's state or word, and may carry the part of a boundary it
+# was copied inside (cellar.boundary), as a cell inside or outside it. place
+# writes its walls as walls, and stamp gives the world its boundary over the
+# pattern's box first. capture reads the walls, and capture_bound the boundary.
 
+use cellar.boundary;
 use rules: cellar.rule;
 use cellar.sim;
 use allo: std.allocator;
 use std.allocator.page;
+use std.collections.vector;
+use std.collections.vector.Vector;
 use mem: std.memory;
+use std.print;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string;
@@ -44,6 +55,10 @@ pub val MAX_CELLS: usize = 1073741824;
 #           together, length w*h*values, nil when it holds states alone
 # values:   values a word holds, its rule's state and rule layers'
 #           (cellar.layer), while it holds words
+# walls:    row-major, 1 where the cell is a wall, length w*h, nil when it
+#           holds no walls
+# domain:   row-major, 1 where the cell lies inside the boundary it carries,
+#           length w*h, nil when it carries none
 # w:        width in cells
 # h:        height in cells
 # x:        the world column the source placed the top-left cell at, 0 when it gave none
@@ -57,6 +72,8 @@ pub rec Pattern {
     cells:    *u8;
     words:    *u32;
     values:   usize;
+    walls:    *u8;
+    domain:   *u8;
     w:        usize;
     h:        usize;
     x:        i64;
@@ -95,6 +112,8 @@ pub fun init(p: *Pattern, a: *allo.Allocator, w: usize, h: usize, name: str) err
     p.cells    = nil;
     p.words    = nil;
     p.values   = 0;
+    p.walls    = nil;
+    p.domain   = nil;
     p.w        = 0;
     p.h        = 0;
     p.seen     = 0;
@@ -118,6 +137,8 @@ pub fun dnit(p: *Pattern) {
     if (p.a == nil)     { ret; }
     if (p.cells != nil) { allo.deallocate[u8](p.a, p.cells, p.w * p.h); }
     drop_words(p);
+    drop_walls(p);
+    drop_domain(p);
     string.owned_release(?p.name);
     string.owned_release(?p.rule);
     string.owned_release(?p.comments);
@@ -134,7 +155,7 @@ pub fun holds(w: u64, h: u64) bool {
 }
 
 # give a pattern new dimensions with every cell dead, holding states alone,
-# keeping its metadata
+# no walls and no boundary, keeping its metadata
 # ---
 # p:   pattern
 # w:   new width, see holds
@@ -150,6 +171,8 @@ pub fun resize(p: *Pattern, w: usize, h: usize) err[allo.Error] {
     }
     if (p.cells != nil) { allo.deallocate[u8](p.a, p.cells, p.w * p.h); }
     drop_words(p);
+    drop_walls(p);
+    drop_domain(p);
     p.cells = fresh;
     p.w     = w;
     p.h     = h;
@@ -185,6 +208,84 @@ fun drop_words(p: *Pattern) {
     p.values = 0;
 }
 
+# whether a pattern holds walls
+pub fun walled(p: *Pattern) bool {
+    ret p.walls != nil;
+}
+
+# whether a pattern carries a boundary
+pub fun bounded(p: *Pattern) bool {
+    ret p.domain != nil;
+}
+
+# whether a pattern holds more than RLE keeps: words, walls or a boundary
+pub fun rich(p: *Pattern) bool {
+    ret exact(p) || walled(p) || bounded(p);
+}
+
+# give a pattern walls, none of its cells one yet, unless it holds them already
+# ---
+# ret: ok, or the allocator's refusal, leaving p as it was
+pub fun hold_walls(p: *Pattern) err[allo.Error] {
+    if (p.walls != nil || p.w * p.h == 0) { ret err[allo.Error].ok{}; }
+    val r: res[*u8, allo.Error] = allo.zallocate[u8](p.a, p.w * p.h);
+    if (sel r.err) { ret err[allo.Error].err{r.err}; }
+    p.walls = r.ok;
+    ret err[allo.Error].ok{};
+}
+
+# let a pattern hold no walls
+pub fun drop_walls(p: *Pattern) {
+    if (p.walls != nil) { allo.deallocate[u8](p.a, p.walls, p.w * p.h); }
+    p.walls = nil;
+}
+
+# give a pattern a boundary, every cell outside it yet, unless it carries one already
+# ---
+# ret: ok, or the allocator's refusal, leaving p as it was
+pub fun hold_domain(p: *Pattern) err[allo.Error] {
+    if (p.domain != nil || p.w * p.h == 0) { ret err[allo.Error].ok{}; }
+    val r: res[*u8, allo.Error] = allo.zallocate[u8](p.a, p.w * p.h);
+    if (sel r.err) { ret err[allo.Error].err{r.err}; }
+    p.domain = r.ok;
+    ret err[allo.Error].ok{};
+}
+
+# let a pattern carry no boundary
+pub fun drop_domain(p: *Pattern) {
+    if (p.domain != nil) { allo.deallocate[u8](p.a, p.domain, p.w * p.h); }
+    p.domain = nil;
+}
+
+# whether the cell at (x, y) is a wall. caller guarantees x < w and y < h
+pub fun wall(p: *Pattern, x: usize, y: usize) bool {
+    ret p.walls != nil && p.walls[y * p.w + x] != 0;
+}
+
+# make the cell at (x, y) of a pattern holding walls a wall, or not
+pub fun set_wall(p: *Pattern, x: usize, y: usize, on: bool) {
+    var v: u8 = 0;
+    if (on) { v = 1; }
+    p.walls[y * p.w + x] = v;
+    p.seen               = 0;
+}
+
+# whether the cell at (x, y) is a wall, and how many cells from there along
+# the row are alike, to the row's end at most
+pub fun wall_run(p: *Pattern, x: usize, y: usize, n: *usize) bool {
+    val on: bool  = wall(p, x, y);
+    var i:  usize = x + 1;
+    for (i < p.w && wall(p, i, y) == on) { i = i + 1; }
+    @n = i - x;
+    ret on;
+}
+
+# whether the cell at (x, y) lies inside the boundary a pattern carries, every
+# cell of one that carries none
+pub fun inside(p: *Pattern, x: usize, y: usize) bool {
+    ret p.domain == nil || p.domain[y * p.w + x] != 0;
+}
+
 # copy a pattern's cells, dimensions and metadata into dst
 # ---
 # dst: pattern to initialize; it owns the copy until dnit
@@ -203,6 +304,11 @@ pub fun clone(dst: *Pattern, a: *allo.Allocator, src: *Pattern) err[allo.Error] 
         }
         mem.copy[u32](dst.words, src.words, src.w * src.h * src.values);
     }
+    val layered: err[allo.Error] = copy_layers(dst, src);
+    if (sel layered.err) {
+        dnit(dst);
+        ret layered;
+    }
     dst.x = src.x;
     dst.y = src.y;
     val r: err[allo.Error] = set_rule(dst, rule(src));
@@ -214,6 +320,21 @@ pub fun clone(dst: *Pattern, a: *allo.Allocator, src: *Pattern) err[allo.Error] 
     if (sel c.err) {
         dnit(dst);
         ret c;
+    }
+    ret err[allo.Error].ok{};
+}
+
+# give dst, of src's size, src's walls and boundary
+fun copy_layers(dst: *Pattern, src: *Pattern) err[allo.Error] {
+    if (src.walls != nil) {
+        val held: err[allo.Error] = hold_walls(dst);
+        if (sel held.err) { ret held; }
+        mem.copy[u8](dst.walls, src.walls, src.w * src.h);
+    }
+    if (src.domain != nil) {
+        val held: err[allo.Error] = hold_domain(dst);
+        if (sel held.err) { ret held; }
+        mem.copy[u8](dst.domain, src.domain, src.w * src.h);
     }
     ret err[allo.Error].ok{};
 }
@@ -248,12 +369,15 @@ pub fun set_comments(p: *Pattern, s: str) err[allo.Error] {
     ret assign(p.a, ?p.comments, s);
 }
 
-# kill every cell, preserving the pattern's dimensions and metadata
+# kill every cell, leaving no wall and no boundary, preserving the pattern's
+# dimensions and metadata
 # ---
 # p: pattern to clear
 pub fun clear(p: *Pattern) {
     if (p.cells != nil) { mem.zero[u8](p.cells, p.w * p.h); }
     if (p.words != nil) { mem.zero[u32](p.words, p.w * p.h * p.values); }
+    drop_walls(p);
+    drop_domain(p);
     p.seen = 0;
 }
 
@@ -360,40 +484,124 @@ fun fits_words(s: *sim.Sim, p: *Pattern) bool {
 # erase what they cover, otherwise they leave the world untouched and the
 # pattern overlays it. a state is written as live whatever its value. a
 # pattern's words are written as they are where the world's rule reads them
-# alike, and a cell whose word is not 0 is not dead though its state is.
+# alike, and a cell whose word is not 0 is not dead though its state is. the
+# pattern's walls are written as walls, dead ones too, holding their cells'
+# states or words, and its other cells pass the world's walls by.
 # ---
 # s:       simulation to write onto
 # p:       pattern to place
 # ox:      world column of the pattern's left edge
 # oy:      world row of the pattern's top edge
 # replace: dead pattern cells erase
-# ret:     false when the edit could not be made or the pool could not hold it all
+# ret:     false when the world could not take the pattern's walls, the edit
+#          could not be made or the pool could not hold it all
 pub fun place(s: *sim.Sim, p: *Pattern, ox: i64, oy: i64, replace: bool) bool {
     if (p.w == 0 || p.h == 0) { ret true; }
     val words: bool = fits_words(s, p);
+    if (walled(p)) {
+        val held: opt[str] = sim.hold_walls(s);
+        if (sel held.some) { ret false; }
+    }
     if (!sim.edit_begin(s, ox, oy, ox + p.w::i64, oy + p.h::i64)) { ret false; }
     var y: usize = 0;
     for (y < p.h) {
         var x: usize = 0;
         for (x < p.w) {
-            var n: usize = 0;
-            if (words) {
-                # a stretch of cells that are not 0, or the rest of the row
-                var e: usize = x;
-                for (e < p.w && (replace || !blank(p, e, y))) { e = e + 1; }
-                if (e > x) { sim.edit_words(s, ox + x::i64, oy + y::i64, e - x, word(p, x, y)); }
-                n = e - x;
-                if (n == 0) { run_word(p, x, y, ?n); }
+            var n:  usize = 0;
+            val on: bool  = wall_run(p, x, y, ?n);
+            if (on) {
+                sim.edit_as(s, sim.EDIT_WALLS);
+                put_row(s, p, ox, oy, y, x, x + n, true, words);
+                sim.edit_as(s, sim.EDIT_CELLS);
             }
-            or {
-                val v: u8 = run(p, x, y, ?n);
-                if (v != 0 || replace) { sim.edit_run(s, ox + x::i64, oy + y::i64, n, v); }
-            }
+            or { put_row(s, p, ox, oy, y, x, x + n, replace, words); }
             x = x + n;
         }
         y = y + 1;
     }
     ret sim.edit_end(s);
+}
+
+# write the cells [x0, x1) of a pattern's row y in the open edit, as place does
+fun put_row(s: *sim.Sim, p: *Pattern, ox: i64, oy: i64, y: usize, x0: usize, x1: usize, replace: bool, words: bool) {
+    var x: usize = x0;
+    for (x < x1) {
+        var n: usize = 0;
+        if (words) {
+            # a stretch of cells that are not 0, or the rest of the stretch
+            var e: usize = x;
+            for (e < x1 && (replace || !blank(p, e, y))) { e = e + 1; }
+            if (e > x) { sim.edit_words(s, ox + x::i64, oy + y::i64, e - x, word(p, x, y)); }
+            n = e - x;
+            if (n == 0) { run_word(p, x, y, ?n); }
+        }
+        or {
+            val v: u8 = run(p, x, y, ?n);
+            if (x + n > x1)        { n = x1 - x; }
+            if (v != 0 || replace) { sim.edit_run(s, ox + x::i64, oy + y::i64, n, v); }
+        }
+        if (x + n > x1) { n = x1 - x; }
+        x = x + n;
+    }
+}
+
+# give the world the boundary a pattern carries over the pattern's box, its
+# top-left at (ox, oy), as one change (sim.set_bound): the cells of the box
+# inside it are the world's, and those outside it are not
+# ---
+# s:   simulation
+# p:   pattern
+# ox:  world column of the pattern's left edge
+# oy:  world row of the pattern's top edge
+# ret: why the world could not take it, the world then as it was
+pub fun place_bound(s: *sim.Sim, p: *Pattern, ox: i64, oy: i64) opt[str] {
+    if (!bounded(p) || p.w == 0 || p.h == 0) { ret opt[str].none{}; }
+    val no:   opt[str]        = opt[str].some{"the boundary could not be held"};
+    var mine: boundary.Region = boundary.init(p.a);
+    fin { boundary.dnit(?mine); }
+    var xs: Vector[i64] = vector.init[i64](p.a);
+    fin { vector.dnit[i64](?xs); }
+    var y: usize = 0;
+    for (y < p.h) {
+        vector.clear[i64](?xs);
+        var x: usize = 0;
+        for (x < p.w) {
+            if (!inside(p, x, y)) {
+                x = x + 1;
+                cnt;
+            }
+            var e: usize = x;
+            for (e < p.w && inside(p, e, y)) { e = e + 1; }
+            val a: res[usize, allo.Error] = vector.push[i64](?xs, ox + x::i64);
+            val b: res[usize, allo.Error] = vector.push[i64](?xs, ox + e::i64);
+            if (sel a.err || sel b.err) { ret no; }
+            x = e;
+        }
+        if (xs.len > 0) {
+            val took: res[bool, allo.Error] = boundary.append(?mine, oy + y::i64, oy + y::i64 + 1, xs.data, xs.len / 2);
+            if (sel took.err) { ret no; }
+        }
+        y = y + 1;
+    }
+    val cur: *boundary.Region = sim.bound(s);
+    # a box wholly inside changes nothing on a world without a boundary
+    if (cur == nil && boundary.area(?mine) == (p.w * p.h)::u64) { ret opt[str].none{}; }
+    var next: boundary.Region = boundary.init(p.a);
+    fin { boundary.dnit(?next); }
+    var box: boundary.Region = boundary.init(p.a);
+    fin { boundary.dnit(?box); }
+    var made: err[allo.Error] = err[allo.Error].ok{};
+    if (cur != nil)   { made = boundary.copy(?next, cur); }
+    or                { made = boundary.rect(?next, 0 - boundary.FAR, 0 - boundary.FAR, boundary.FAR, boundary.FAR); }
+    if (sel made.err) { ret no; }
+    val boxed: err[allo.Error] = boundary.rect(?box, ox, oy, ox + p.w::i64, oy + p.h::i64);
+    if (sel boxed.err) { ret no; }
+    val cut: err[allo.Error] = boundary.combine(?next, ?box, boundary.SUBTRACT);
+    if (sel cut.err) { ret no; }
+    val joined: err[allo.Error] = boundary.combine(?next, ?mine, boundary.ADD);
+    if (sel joined.err)                          { ret no; }
+    if (cur != nil && boundary.same(?next, cur)) { ret opt[str].none{}; }
+    ret sim.set_bound(s, ?next);
 }
 
 # read the cells of [x0, x1) by [y0, y1) into a pattern, the reverse of place
@@ -432,13 +640,57 @@ pub fun capture(p: *Pattern, s: *sim.Sim, x0: i64, y0: i64, x1: i64, y1: i64) er
         val held: err[allo.Error] = hold_words(p, sim.word_len(s));
         if (sel held.err) { ret held; }
     }
-    var y: usize = 0;
+    if (sim.walls(s)) {
+        val held: err[allo.Error] = hold_walls(p);
+        if (sel held.err) { ret held; }
+    }
+    var any: bool  = false;
+    var y:   usize = 0;
     for (y < h) {
         var ok: bool = sim.read_run(s, x0, y0 + y::i64, w, ?p.cells[y * w]);
-        if (ok && words) { ok = sim.read_words(s, x0, y0 + y::i64, w, word(p, 0, y)); }
+        if (ok && words)     { ok = sim.read_words(s, x0, y0 + y::i64, w, word(p, 0, y)); }
+        if (ok && walled(p)) { ok = sim.read_walls(s, x0, y0 + y::i64, w, ?p.walls[y * w]); }
         if (!ok) {
             resize(p, 0, 0);
             ret err[allo.Error].err{allo.Error.invalid{}};
+        }
+        var i: usize = 0;
+        for (walled(p) && !any && i < w) {
+            if (p.walls[y * w + i] != 0) { any = true; }
+            i = i + 1;
+        }
+        y = y + 1;
+    }
+    # a world's walls the area holds none of are not the pattern's
+    if (!any) { drop_walls(p); }
+    ret err[allo.Error].ok{};
+}
+
+# give a pattern captured from the world (capture) the part of the world's
+# boundary its box holds, or no boundary where the world has none
+# ---
+# p:   pattern, its box where capture read it
+# s:   simulation
+# ret: ok, or the allocator's refusal, leaving p without a boundary
+pub fun capture_bound(p: *Pattern, s: *sim.Sim) err[allo.Error] {
+    drop_domain(p);
+    val r: *boundary.Region = sim.bound(s);
+    if (r == nil) { ret err[allo.Error].ok{}; }
+    val held: err[allo.Error] = hold_domain(p);
+    if (sel held.err) { ret held; }
+    val x1: i64   = p.x + p.w::i64;
+    var y:  usize = 0;
+    for (y < p.h) {
+        var n:  usize = 0;
+        val xs: *i64  = boundary.row(r, p.y + y::i64, ?n);
+        var k:  usize = 0;
+        for (k < n) {
+            var a: i64 = xs[k * 2];
+            var b: i64 = xs[k * 2 + 1];
+            if (a < p.x) { a = p.x; }
+            if (b > x1)  { b = x1; }
+            if (a < b)   { mem.fill[u8](?p.domain[y * p.w + (a - p.x)::usize], 1, (b - a)::usize); }
+            k = k + 1;
         }
         y = y + 1;
     }
@@ -533,13 +785,22 @@ pub fun orient(dst: *Pattern, a: *allo.Allocator, p: *Pattern, o: u8) err[allo.E
             ret held;
         }
     }
+    var layered: err[allo.Error] = err[allo.Error].ok{};
+    if (p.walls != nil)                    { layered = hold_walls(dst); }
+    if (sel layered.ok && p.domain != nil) { layered = hold_domain(dst); }
+    if (sel layered.err) {
+        dnit(dst);
+        ret layered;
+    }
     var y: usize = 0;
     for (y < h) {
         var x: usize = 0;
         for (x < w) {
             val i: usize = oriented(p, o, x, y);
             dst.cells[y * w + x] = p.cells[i];
-            if (p.words != nil) { mem.copy[u32](word(dst, x, y), ?p.words[i * p.values], p.values); }
+            if (p.words != nil)  { mem.copy[u32](word(dst, x, y), ?p.words[i * p.values], p.values); }
+            if (p.walls != nil)  { dst.walls[y * w + x] = p.walls[i]; }
+            if (p.domain != nil) { dst.domain[y * w + x] = p.domain[i]; }
             x = x + 1;
         }
         y = y + 1;
@@ -558,14 +819,26 @@ pub fun corner(c: i64, n: usize) i64 {
 # overlay a pattern onto the world, centered on cell (cx, cy)
 #
 # the pattern's top-left lands at (cx - w/2, cy - h/2). dead pattern cells leave
-# the world untouched, so a stamp overlays rather than erases.
+# the world untouched, so a stamp overlays rather than erases, but for its
+# walls, which are written dead or alive. a pattern carrying a boundary gives
+# the world that boundary over its box first (place_bound).
 # ---
-# s:  simulation to stamp onto
-# p:  pattern to place
-# cx: target column the pattern is centered on
-# cy: target row the pattern is centered on
-pub fun stamp(s: *sim.Sim, p: *Pattern, cx: i64, cy: i64) {
-    place(s, p, corner(cx, p.w), corner(cy, p.h), false);
+# s:   simulation to stamp onto
+# p:   pattern to place
+# cx:  target column the pattern is centered on
+# cy:  target row the pattern is centered on
+# ret: why the boundary or the walls were not taken, the world then as it was
+pub fun stamp(s: *sim.Sim, p: *Pattern, cx: i64, cy: i64) opt[str] {
+    val ox:  i64      = corner(cx, p.w);
+    val oy:  i64      = corner(cy, p.h);
+    val why: opt[str] = place_bound(s, p, ox, oy);
+    if (sel why.some) { ret why; }
+    if (walled(p)) {
+        val held: opt[str] = sim.hold_walls(s);
+        if (sel held.some) { ret held; }
+    }
+    place(s, p, ox, oy, false);
+    ret opt[str].none{};
 }
 
 test stamp__places_a_glider_centered {
@@ -791,7 +1064,7 @@ test orient__keys_act_on_the_shape_on_screen {
     ret 0;
 }
 
-test words__a_pattern_keeps_words_of_several_values_through_clone_and_orient {
+test words__a_pattern_keeps_words_walls_and_its_boundary_through_clone_and_orient {
     var a: allo.Allocator;
     page.make(?a);
     var p:    Pattern;
@@ -805,18 +1078,67 @@ test words__a_pattern_keeps_words_of_several_values_through_clone_and_orient {
     set_word(?p, 1, 0, ?c[0], 1);
     c[1] = 0;
     set_word(?p, 2, 1, ?c[0], 1);
+    # a wall at (1, 0), and a boundary of its top row
+    val hw: err[allo.Error] = hold_walls(?p);
+    val hd: err[allo.Error] = hold_domain(?p);
+    if (sel hw.err || sel hd.err) { ret 1; }
+    set_wall(?p, 1, 0, true);
+    p.domain[0] = 1;
+    p.domain[1] = 1;
+    p.domain[2] = 1;
     var n:   usize = 0;
     val run: *u32  = run_word(?p, 0, 0, ?n);
     if (n != 2 || run[1] != 0xffff || !blank(?p, 0, 1) || blank(?p, 2, 1)) { ret 2; }
     var q:    Pattern;
     val copy: err[allo.Error] = clone(?q, ?a, ?p);
     if (sel copy.err || q.values != 3 || word(?q, 1, 0)[1] != 0xffff || word(?q, 2, 1)[2] != 7) { ret 3; }
+    if (!wall(?q, 1, 0) || wall(?q, 0, 0) || !inside(?q, 2, 0) || inside(?q, 2, 1))             { ret 5; }
     # turned a quarter clockwise, (x, y) lies at (h - 1 - y, x)
     var t:    Pattern;
     val turn: err[allo.Error] = orient(?t, ?a, ?p, 1);
     if (sel turn.err || t.values != 3 || word(?t, 1, 1)[1] != 0xffff || word(?t, 0, 2)[0] != 1 || !blank(?t, 0, 0)) { ret 4; }
+    if (!wall(?t, 1, 1) || wall(?t, 1, 0) || !inside(?t, 1, 2) || inside(?t, 0, 2))                                 { ret 6; }
+    # a clear leaves neither
+    clear(?t);
+    if (walled(?t) || bounded(?t)) { ret 7; }
     dnit(?t);
     dnit(?q);
     dnit(?p);
+    ret 0;
+}
+
+test frame__a_stamp_lands_its_walls_on_the_gpu_as_on_the_cpu {
+    val strings: [2]str = [2]str{"B3/S23", "R=13,T=10,b=[1],m=0.15,s=0.015,kn=1,gn=1"};
+    var k:       usize  = 0;
+    for (k < 2) {
+        val r: res[rules.Rule, str] = rules.parse(strings[k]);
+        if (sel r.err) { ret 1; }
+        var t:    sim.Rig;
+        val code: i32 = sim.rig_open(?t, r.ok, sim.seed_walls);
+        if (code != 0) { ret code; }
+        # the walls whole, and a strip small enough to go up a cell at a time
+        var big:   Pattern;
+        var small: Pattern;
+        init(?big, ?t.a, 0, 0, "big");
+        init(?small, ?t.a, 0, 0, "small");
+        if (!sim.read_begin(?t.cpu, -42, -42, 42, 42)) { ret 2; }
+        val gb: err[allo.Error] = capture(?big, ?t.cpu, -42, -42, 42, 42);
+        val gs: err[allo.Error] = capture(?small, ?t.cpu, -30, -1, 30, 2);
+        sim.read_end(?t.cpu);
+        if (sel gb.err || sel gs.err || !walled(?big) || !walled(?small)) { ret 3; }
+        sim.rig_step(?t, 3);
+        if (!sim.rig_settle(?t))                                                                       { ret 4; }
+        if (!place(?t.cpu, ?big, 100, -42, false) || !place(?t.cpu, ?small, -30, 60, false))           { ret 5; }
+        if (t.on && (!place(?t.gpu, ?big, 100, -42, false) || !place(?t.gpu, ?small, -30, 60, false))) { ret 6; }
+        sim.rig_step(?t, 3);
+        if (!sim.rig_same(?t)) {
+            print.eprintlnf("{}'s stamped walls differ between the engines", strings[k]);
+            ret 10 + k::i32;
+        }
+        dnit(?big);
+        dnit(?small);
+        sim.rig_close(?t);
+        k = k + 1;
+    }
     ret 0;
 }

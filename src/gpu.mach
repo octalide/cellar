@@ -89,10 +89,14 @@
 # that stops every pass and step after it (mark_comp, gate_comp), and the host,
 # seeing it in a census, takes the pool, rewinds its count of the generations
 # to where the gate closed, makes room and reopens it. a bounded grid's seams
-# are the host's to link, so there the host allocates, as below, unless the
-# grid fits the pool whole: then every chunk of it was allocated when it was
-# set (cellar.space.cover), nothing is allocated or freed as it steps, and no
-# budget bounds the generations a frame records.
+# are the host's to link, and a boundary's chunks the host's to judge, so
+# there the host allocates, as below, unless the world fits the pool whole:
+# then every chunk of it was allocated when it was set (cellar.space.cover),
+# nothing is allocated or freed as it steps, and no budget bounds the
+# generations a frame records. a world with a boundary keeps its domain in a
+# buffer of its own, which the stages reach by the address the head holds
+# (layout.Domain) and the host keeps level with its own (sync_domain); a
+# world without one makes no such buffer, and its head says so.
 #
 # a chunk allocated empty is cleared on the GPU by a stage of its own rather
 # than uploaded, and each step stamps which chunks it left alive or warm, so the
@@ -204,10 +208,14 @@ val FRAG_SPV:   [_]u8;
 # words of the meta buffer ahead of the page table: the shared words and the rule
 pub val HEAD: usize = layout.HEAD::usize;
 # words of the view buffer ahead of the palettes: the look, then the heat, age
-# and rule palettes of SHADES entries of four floats each
+# and rule palettes of SHADES entries of four floats each, then the wall
+# colours (WALLS_AT)
 pub val LOOK: usize = 24;
 # the words of the view buffer where the rule palette starts
 val INK_AT: usize = LOOK + SHADES * 8;
+# the words of the view buffer where the wall colours start, past the rule
+# palette: a wall cell holding no live state, then one holding a live one
+val WALLS_AT: usize = INK_AT + SHADES * 4;
 # words of a slot's coverage pyramid
 pub val MIP: usize = layout.MIP::usize;
 # entries in each palette
@@ -391,11 +399,13 @@ rec Op {
 # slot: its slot
 # i:    the cell
 # v:    its value in the layer
+# kept: a cell edit, which a wall there keeps out (layout.EDIT_GUARD)
 rec Write {
     k:    u32;
     slot: u32;
     i:    u32;
     v:    u32;
+    kept: bool;
 }
 
 # the shards a pool's cells and pyramids lie in (cellar.layout): each
@@ -521,8 +531,16 @@ fun store_reach(g: *Gpu, st: *Store, cap: usize, framed: bool) err[gfx.Error] {
     ret err[gfx.Error].ok{};
 }
 
+# whether buffer i of a shard, in make_shard's order, is the one before it
+# again: the second cells of a static layer, whose cells are one
+# (cellar.layer WALL)
+fun aliased(st: *Store, i: usize) bool {
+    ret i < st.set.n * 2 && i % 2 == 1 && space.static_layer(?st.set, i / 2);
+}
+
 # make shard j of every layer's two cells and of the pyramids, slots long,
-# noting their addresses, each made undone if one is refused
+# noting their addresses, each made undone if one is refused. a static
+# layer's second cells name its first's buffer
 fun make_shard(g: *Gpu, st: *Store, j: usize, slots: usize, framed: bool) err[gfx.Error] {
     var made: usize = 0;
     val n:    usize = st.set.n * 2 + 1;
@@ -530,6 +548,15 @@ fun make_shard(g: *Gpu, st: *Store, j: usize, slots: usize, framed: bool) err[gf
         var b:   *gfx.StorageBuffer = ?st.mip[j];
         var len: usize              = slots * MIP * 4;
         var e:   usize              = layout.mip_entry(j::u32)::usize;
+        if (aliased(st, made)) {
+            val k:  usize = made / 2;
+            val e0: usize = layout.cells_entry(k::u32, 0, j::u32)::usize;
+            e           = layout.cells_entry(k::u32, 1, j::u32)::usize;
+            st.cells[e] = st.cells[e0];
+            st.addrs[e] = st.addrs[e0];
+            made        = made + 1;
+            cnt;
+        }
         if (made < st.set.n * 2) {
             val k: usize = made / 2;
             b   = ?st.cells[layout.cells_entry(k::u32, (made % 2)::u32, j::u32)::usize];
@@ -557,7 +584,8 @@ fun make_shard(g: *Gpu, st: *Store, j: usize, slots: usize, framed: bool) err[gf
 fun drop_shard(g: *Gpu, st: *Store, j: usize, n: usize) {
     var i: usize = 0;
     for (i < n) {
-        if (i < st.set.n * 2) { gfx.storage_buffer_delete(g.d, ?st.cells[layout.cells_entry((i / 2)::u32, (i % 2)::u32, j::u32)::usize]); }
+        if (aliased(st, i))   {}
+        or (i < st.set.n * 2) { gfx.storage_buffer_delete(g.d, ?st.cells[layout.cells_entry((i / 2)::u32, (i % 2)::u32, j::u32)::usize]); }
         or                    { gfx.storage_buffer_delete(g.d, ?st.mip[j]); }
         i = i + 1;
     }
@@ -567,7 +595,7 @@ fun drop_shard(g: *Gpu, st: *Store, j: usize, n: usize) {
 # are where the other's begin, so a store of either takes the other's by
 # making or deleting the shards of the layers past them (store_views)
 fun views_nest(a: *plane.Set, b: *plane.Set) bool {
-    if (!plane.same_words(a, b) || plane.exact(a) != plane.exact(b)) { ret false; }
+    if (!plane.same_words(a, b) || plane.exact(a) != plane.exact(b) || plane.walled(a) != plane.walled(b)) { ret false; }
     var k: usize = plane.exact(a);
     for (k < a.n && k < b.n) {
         if (a.at[k].width != b.at[k].width || !string.str_equals(a.at[k].name, b.at[k].name)) { ret false; }
@@ -711,13 +739,15 @@ fun in_shard(st: *Store, s: usize, run: usize) usize {
     ret run;
 }
 
-# bytes a slot takes in a store for a set: every layer's two cells and its
-# pyramid
+# bytes a slot takes in a store for a set: every layer's two cells, one for
+# a static layer, and its pyramid
 fun slot_bytes(set: *plane.Set) usize {
     var n: usize = MIP * 4;
     var k: usize = 0;
     for (k < set.n) {
-        n = n + plane.span_words(set.at[k].width) * 8;
+        var b: usize = plane.span_words(set.at[k].width) * 8;
+        if (space.static_layer(set, k)) { b = b / 2; }
+        n = n + b;
         k = k + 1;
     }
     ret n;
@@ -959,6 +989,15 @@ fun pool_bytes(cap: usize) usize {
 # nops:     how many
 # ctl:      the status head's first words, as take read them
 # untaken:  why the last take that failed left the pool the GPU's
+# read:     slots whose cells were read back, ever, which a test watches
+# dom:      the world's boundary as the stages read it (layout.Domain), once
+#           a world had one
+# dom_room: words dom holds, 0 before it is made
+# dom_at:   its address
+# dom_on:   dom holds the boundary of the world the frame steps
+# dom_cap:  the slots dom's words a slot were laid out for
+# dom_most: the masks dom has room for
+# dom_set:  the host's count of boundaries set (space bound_at) dom holds
 pub rec Gpu {
     a:        *allo.Allocator;
     r:        *gfx.Renderer;
@@ -1103,6 +1142,14 @@ pub rec Gpu {
     nops:     usize;
     ctl:      [16]u32;
     untaken:  str;
+    read:     usize;
+    dom:      gfx.StorageBuffer;
+    dom_room: usize;
+    dom_at:   u64;
+    dom_on:   bool;
+    dom_cap:  usize;
+    dom_most: usize;
+    dom_set:  u32;
 }
 
 # how long frames may take against the display's refresh interval
@@ -1374,6 +1421,12 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     g.pyrs     = vector.init[u32](a);
     g.edit_at  = vector.init[u32](a);
     g.room     = 0;
+    g.dom_room = 0;
+    g.dom_at   = 0;
+    g.dom_on   = false;
+    g.dom_cap  = 0;
+    g.dom_most = 0;
+    g.dom_set  = 0;
     g.cut      = false;
     g.span     = FIRST_SPAN;
     g.fixed    = false;
@@ -1418,6 +1471,7 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     g.trim_seq = 0;
     g.trimmed  = false;
     g.untaken  = "";
+    g.read     = 0;
     g.listed   = false;
     g.gathered = 0;
     g.est      = UNKNOWN;
@@ -1443,12 +1497,17 @@ pub fun init(g: *Gpu, a: *allo.Allocator, r: *gfx.Renderer, cap: usize, heat: *f
     }
     if (g.stepping) { hold_clocks(g); }
 
-    val e7: err[gfx.Error] = make(g.d, (INK_AT + SHADES * 4) * 4, ?g.view);
+    val e7: err[gfx.Error] = make(g.d, (WALLS_AT + 8) * 4, ?g.view);
     if (sel e7.err) { ret e7; }
     val e8: err[gfx.Error] = gfx.storage_buffer_upload(g.d, ?g.view, LOOK * 4, heat::*u8, SHADES * 16);
     if (sel e8.err) { ret e8; }
     val e9: err[gfx.Error] = gfx.storage_buffer_upload(g.d, ?g.view, (LOOK + SHADES * 4) * 4, age::*u8, SHADES * 16);
     if (sel e9.err) { ret e9; }
+    var walls: [8]f32;
+    wall_colour(theme.WALL, g.srgb, ?walls[0]);
+    wall_colour(theme.WALL_ON, g.srgb, ?walls[4]);
+    val e10: err[gfx.Error] = gfx.storage_buffer_upload(g.d, ?g.view, WALLS_AT * 4, (?walls[0])::*u8, 32);
+    if (sel e10.err) { ret e10; }
     forget_censuses(g);
     # a 32-bit state layer until the host's pool names its own, which the
     # first flush takes up
@@ -1971,6 +2030,15 @@ fun sync_table(g: *Gpu, r: *rule.Rule) err[gfx.Error] {
     ret err[gfx.Error].ok{};
 }
 
+# a wall colour, sRGB hex, as the target stores it, opaque, into out's four
+# floats
+fun wall_colour(hex: u32, srgb: bool, out: *f32) {
+    out[0] = channel(theme.red(hex), srgb);
+    out[1] = channel(theme.green(hex), srgb);
+    out[2] = channel(theme.blue(hex), srgb);
+    out[3] = 1.0;
+}
+
 # a colour channel as the target stores it
 fun channel(byte: u8, srgb: bool) f32 {
     val c: f32 = byte::f32 / 255.0;
@@ -2158,7 +2226,8 @@ pub fun dnit(g: *Gpu) {
     vector.dnit[u32](?g.pyrs);
     vector.dnit[u32](?g.edit_at);
     vector.dnit[u32](?g.shifts);
-    if (g.room != 0) { gfx.storage_buffer_delete(g.d, ?g.edited); }
+    if (g.room != 0)     { gfx.storage_buffer_delete(g.d, ?g.edited); }
+    if (g.dom_room != 0) { gfx.storage_buffer_delete(g.d, ?g.dom); }
 }
 
 # note an edit, which a census recorded before it cannot free chunks around
@@ -2184,18 +2253,25 @@ pub fun note_bulk(g: *Gpu) {
 }
 
 # queue a painted cell, already written to the host's staging cells: its
-# value in each layer an edit writes, the state and rule layers, and the shown
-# layer it starts over (cellar.layer)
-pub fun note_write(g: *Gpu, sp: *space.Space, s: usize, i: usize) {
+# value in each layer an edit writes, the state and rule layers, the wall
+# layer where the pool holds one, and the shown layer it starts over
+# (cellar.layer). a cell edit (kept) writes no wall and is kept out of a wall
+# the GPU holds there, which the host's staging may not know of: the edit
+# stage drops it (layout.EDIT_GUARD), and a pull replays it only where the
+# cell read back is no wall
+pub fun note_write(g: *Gpu, sp: *space.Space, s: usize, i: usize, kept: bool) {
     if ((sp.dirty[s] & space.DIRTY_CELLS) != 0) { ret; }
     val set: *plane.Set = space.layers(sp);
     val sh:  opt[usize] = plane.shown(set);
     var n:   usize      = plane.exact(set);
-    if (sel sh.some) { n = sh.some + 1; }
+    if (plane.walled(set)) { n = n + 1; }
+    if (sel sh.some)       { n = sh.some + 1; }
     var k: usize = 0;
     for (k < n) {
-        val v: u32 = plane.get(space.plane_of(sp, k, s), i);
-        vector.push[Write](?g.writes, Write{k: k::u32, slot: s::u32, i: i::u32, v: v});
+        if (!(kept && space.static_layer(set, k))) {
+            val v: u32 = plane.get(space.plane_of(sp, k, s), i);
+            vector.push[Write](?g.writes, Write{k: k::u32, slot: s::u32, i: i::u32, v: v, kept: kept});
+        }
         k = k + 1;
     }
     vector.push[u32](?g.stamped, s::u32);
@@ -2656,13 +2732,15 @@ pub fun pull(g: *Gpu, sp: *space.Space) err[gfx.Error] {
         if (sel e.err) { ret e; }
         s = s + run;
     }
-    # a painted cell not yet uploaded is newer than what was just read
+    # a painted cell not yet uploaded is newer than what was just read, but
+    # where a wall read back keeps a cell edit out
     var i: usize = 0;
     for (i < g.writes.len) {
         val w: Write = g.writes.data[i];
-        plane.put(space.plane_of(sp, w.k::usize, w.slot::usize), w.i::usize, w.v);
+        if (!(w.kept && space.wall_at(sp, w.slot::usize, w.i::usize))) { plane.put(space.plane_of(sp, w.k::usize, w.slot::usize), w.i::usize, w.v); }
         i = i + 1;
     }
+    space.mark_all_walls(sp);
     ret err[gfx.Error].ok{};
 }
 
@@ -2703,7 +2781,12 @@ pub fun pull_chunks(g: *Gpu, sp: *space.Space, lo: usize, n: usize) err[gfx.Erro
     for (i < g.writes.len) {
         val w:    Write = g.writes.data[i];
         val slot: usize = w.slot::usize;
-        if (slot >= lo && slot < lo + n) { plane.put(space.plane_of(sp, w.k::usize, slot), w.i::usize, w.v); }
+        if (slot >= lo && slot < lo + n && !(w.kept && space.wall_at(sp, slot, w.i::usize))) { plane.put(space.plane_of(sp, w.k::usize, slot), w.i::usize, w.v); }
+        i = i + 1;
+    }
+    i = lo;
+    for (i < lo + n && i < sp.hi) {
+        if (space.used(sp, i)) { space.mark_walls(sp, i); }
         i = i + 1;
     }
     ret err[gfx.Error].ok{};
@@ -2736,6 +2819,7 @@ pub fun forget_writes(g: *Gpu, lo: usize, n: usize) {
 # yet made are read as that flush starts them: the layers both hold are read,
 # and a shown layer the GPU lacks starts from the state layer just read
 fun read_run(g: *Gpu, sp: *space.Space, s: usize, run: usize) err[gfx.Error] {
+    g.read = g.read + run;
     val set:  *plane.Set = space.layers(sp);
     val nest: bool       = views_nest(?g.p.set, set);
     # layers changed otherwise since the last flush leave every slot's
@@ -2815,8 +2899,10 @@ fun paint_keys(g: *Gpu, sp: *space.Space, filled: bool, l: usize, word: bool) er
 fun upload_layer(g: *Gpu, sp: *space.Space, filled: bool, chunks: usize, top: usize, l: usize) err[gfx.Error] {
     val st:    *Store = store_of(g, ?g.p);
     val width: u32    = g.p.set.at[l].width;
-    val wide:  bool   = width >= layer.WIDTH_MAX;
-    var keyed: usize  = 0;
+    # where the pool holds walls a word-wide cell goes through the edit stage
+    # too, which keeps a cell edit out of a wall (edits_of)
+    val wide:  bool  = width >= layer.WIDTH_MAX && !plane.walled(?g.p.set);
+    var keyed: usize = 0;
     if (wide) {
         val ek: err[gfx.Error] = paint_keys(g, sp, filled, l, true);
         if (sel ek.err) { ret ek; }
@@ -2865,14 +2951,15 @@ fun upload_layer(g: *Gpu, sp: *space.Space, filled: bool, chunks: usize, top: us
     ret err[gfx.Error].ok{};
 }
 
-# add the painted cells of a layer l narrower than a word to the frame's
-# edits, none in a chunk going up whole (filled): each cell's last edit as the
+# add the painted cells of a layer l narrower than a word, or of any width
+# where the pool holds walls, to the frame's edits, none in a chunk going up
+# whole (filled): each cell's last edit as the
 # bits it takes in its word and its value in them, which the edit stage
 # writes into the front with atomics, so the word's other cells stay as the
 # GPU holds them and the host need not pull them first (cellar.sim edit_begin)
 fun edits_of(g: *Gpu, sp: *space.Space, filled: bool, l: usize) err[gfx.Error] {
     val width: u32 = g.p.set.at[l].width;
-    if (width >= layer.WIDTH_MAX || !g.stepping) { ret err[gfx.Error].ok{}; }
+    if ((width >= layer.WIDTH_MAX && !plane.walled(?g.p.set)) || !g.stepping) { ret err[gfx.Error].ok{}; }
     val ek: err[gfx.Error] = paint_keys(g, sp, filled, l, false);
     if (sel ek.err)      { ret ek; }
     if (g.keys.len == 0) { ret err[gfx.Error].ok{}; }
@@ -2887,8 +2974,10 @@ fun edits_of(g: *Gpu, sp: *space.Space, filled: bool, l: usize) err[gfx.Error] {
         val w:  *Write = ?g.writes.data[(k & 0xfffffff)::usize];
         val sh: u32    = layer.cell_shift(width, w.i);
         val at: usize  = g.edit_at.len;
-        g.edit_at.data[at]     = w.slot;
-        g.edit_at.data[at + 1] = (l::u32 << layout.EDIT_LAYER) | layer.cell_word(width, w.i);
+        g.edit_at.data[at] = w.slot;
+        var kw: u32 = (l::u32 << layout.EDIT_LAYER) | layer.cell_word(width, w.i);
+        if (w.kept) { kw = kw | layout.EDIT_GUARD; }
+        g.edit_at.data[at + 1] = kw;
         g.edit_at.data[at + 2] = layer.mask(width) << sh;
         g.edit_at.data[at + 3] = (w.v & layer.mask(width)) << sh;
         g.edit_at.len          = at + 4;
@@ -3141,6 +3230,8 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
     }
     val e11: err[gfx.Error] = send(g, ?g.p.meta);
     if (sel e11.err) { ret e11; }
+    val ed: err[gfx.Error] = sync_domain(g, sp);
+    if (sel ed.err) { ret ed; }
 
     if (g.stepping) {
         # chunks allocated empty are cleared on the GPU, in both pools, the
@@ -3235,6 +3326,66 @@ fun flush(g: *Gpu, sp: *space.Space, whole: bool, owns: bool) err[gfx.Error] {
         }
     }
     ret err[gfx.Error].ok{};
+}
+
+# bring the stages' copy of the world's boundary level with the host's
+# (layout.Domain), where the GPU steps a world with one: whole when the host
+# set another boundary, its capacity changed or it made more masks than the
+# copy has room for, else the words and the mask of every slot whose entry
+# changed, which the host marks whenever it binds a slot. the copy is made
+# larger inside the frame, the old one freed once the frames reading it ran
+fun sync_domain(g: *Gpu, sp: *space.Space) err[gfx.Error] {
+    if (sp.bound == nil || !g.stepping) {
+        g.dom_on = false;
+        ret err[gfx.Error].ok{};
+    }
+    val masks: usize = sp.masks.len / space.MASK;
+    val slots: usize = sp.cap * space.DOM_WORDS;
+    val head:  usize = layout.DOM_HEAD::usize;
+    if (g.dom_on && g.dom_set == sp.bound_at && g.dom_cap == sp.cap && masks <= g.dom_most) {
+        var s: usize = 0;
+        for (s < sp.hi) {
+            if ((sp.dirty[s] & space.DIRTY_ENTRY) != 0) {
+                val d: *u32           = ?sp.dom[s * space.DOM_WORDS];
+                val e: err[gfx.Error] = queue(g, (head + s * space.DOM_WORDS) * 4, d::*u8, space.DOM_WORDS * 4);
+                if (sel e.err) { ret e; }
+                if (d[1] != 0) {
+                    val at: usize          = layout.mask_at((head + slots)::u32, d[1])::usize;
+                    val em: err[gfx.Error] = queue(g, at * 4, (?sp.masks.data[(d[1]::usize - 1) * space.MASK])::*u8, space.MASK * 4);
+                    if (sel em.err) { ret em; }
+                }
+            }
+            s = s + 1;
+        }
+        ret send(g, ?g.dom);
+    }
+    var most: usize = masks * 2;
+    if (most < 16) { most = 16; }
+    val words: usize = head + slots + most * space.MASK;
+    if (words > g.dom_room) {
+        if (g.dom_room != 0) { gfx.storage_buffer_delete(g.d, ?g.dom); }
+        g.dom_room = 0;
+        g.dom_on   = false;
+        val made: err[gfx.Error] = make_framed(g, true, words * 4, ?g.dom);
+        if (sel made.err) { ret made; }
+        val at: res[u64, gfx.Error] = gfx.storage_buffer_address(g.d, ?g.dom);
+        if (sel at.err) {
+            gfx.storage_buffer_delete(g.d, ?g.dom);
+            ret err[gfx.Error].err{at.err};
+        }
+        g.dom_room = words;
+        g.dom_at   = at.ok;
+    }
+    g.dom_cap  = sp.cap;
+    g.dom_most = (g.dom_room - head - slots) / space.MASK;
+    g.dom_set  = sp.bound_at;
+    var first: u32            = (head + slots)::u32;
+    var e:     err[gfx.Error] = queue(g, 0, (?first)::*u8, 4);
+    if (sel e.ok && sp.hi != 0)        { e = queue(g, head * 4, sp.dom::*u8, sp.hi * space.DOM_WORDS * 4); }
+    if (sel e.ok && sp.masks.len != 0) { e = queue(g, (head + slots) * 4, sp.masks.data::*u8, sp.masks.len * 4); }
+    if (sel e.err)                     { ret e; }
+    g.dom_on = true;
+    ret send(g, ?g.dom);
 }
 
 # fit the pool to the host's capacity, which shrank to the world it holds
@@ -3606,15 +3757,17 @@ fun upload_view(g: *Gpu, sp: *space.Space, look: *Look) err[gfx.Error] {
     vector.clear[u32](?g.sent);
     val t0: time.InstantClock = time.instant();
     if (sel t0.err) { ret err[gfx.Error].ok{}; }
-    # the draw reads a chunk's state layer and its view layers
+    # the draw reads a chunk's state layer, its wall layer and its view
+    # layers, and below a pixel a cell its pyramid and its walls
     var drawn: usize = 0;
     var k:     usize = 0;
     for (k < g.p.set.n) {
-        if (k == 0 || g.p.set.at[k].role == layer.VIEW) { drawn = drawn + span_bytes(?g.p, k); }
+        if (drawn_layer(?g.p.set, k)) { drawn = drawn + span_bytes(?g.p, k); }
         k = k + 1;
     }
-    val budget: u64   = g.pace_us.quick_us * 1000 / VIEW_SHARE;
-    var s:      usize = g.cursor;
+    val wk:     opt[usize] = plane.wall(?g.p.set);
+    val budget: u64        = g.pace_us.quick_us * 1000 / VIEW_SHARE;
+    var s:      usize      = g.cursor;
     if (s >= sp.hi) { s = 0; }
     var bytes: usize = 0;
     var n:     usize = 0;
@@ -3653,6 +3806,11 @@ fun upload_view(g: *Gpu, sp: *space.Space, look: *Look) err[gfx.Error] {
                         e          = queue(g, s * MIP * 4, nil, MIP * 4);
                     }
                 }
+                # a wall's slot sends its walls with its pyramid
+                if ((sel e.ok) && want == SENT_MIP && (sel wk.some) && space.walled(sp, s)) {
+                    val pushed: res[usize, allo.Error] = vector.push[u32](?g.sent, s::u32);
+                    if (sel pushed.err) { e = err[gfx.Error].err{gfx.Error.alloc{pushed.err}}; }
+                }
                 if (sel e.err) {
                     vector.clear[gfx.BufferWrite](?g.batch);
                     vector.clear[u32](?g.sent);
@@ -3680,9 +3838,13 @@ fun upload_view(g: *Gpu, sp: *space.Space, look: *Look) err[gfx.Error] {
             i = i + 1;
         }
         e = send_mip(g);
+        if ((sel e.ok) && g.sent.len != 0) {
+            if (sel wk.some) { e = send_drawn(g, sp, wk.some); }
+        }
+        vector.clear[u32](?g.sent);
     }
     or {
-        e = send_drawn(g, sp);
+        e = send_drawn(g, sp, layer.LAYERS_MAX::usize);
         vector.clear[u32](?g.sent);
         if (sel e.err) { vector.clear[gfx.BufferWrite](?g.batch); }
     }
@@ -3730,13 +3892,22 @@ fun send_mip(g: *Gpu) err[gfx.Error] {
     ret err[gfx.Error].ok{};
 }
 
-# send the layers the draw reads of the slots in sent, a batch a layer's shard
-fun send_drawn(g: *Gpu, sp: *space.Space) err[gfx.Error] {
+# whether the draw reads layer k of a set: the state layer, the wall layer
+# and the view layers
+fun drawn_layer(set: *plane.Set, k: usize) bool {
+    ret k == 0 || set.at[k].role == layer.VIEW || set.at[k].role == layer.WALL;
+}
+
+# send the layers the draw reads of the slots in sent, or layer only alone
+# where it names one below layer.LAYERS_MAX, a batch a layer's shard
+fun send_drawn(g: *Gpu, sp: *space.Space, only: usize) err[gfx.Error] {
     val st: *Store = store_of(g, ?g.p);
     var k:  usize  = 0;
     for (k < g.p.set.n) {
-        var j: usize = 0;
-        for ((k == 0 || g.p.set.at[k].role == layer.VIEW) && j < st.n) {
+        var j:    usize = 0;
+        var goes: bool  = drawn_layer(?g.p.set, k);
+        if (only < layer.LAYERS_MAX::usize) { goes = k == only; }
+        for (goes && j < st.n) {
             var i: usize = 0;
             for (i < g.sent.len) {
                 val sl: usize = g.sent.data[i]::usize;
@@ -3838,13 +4009,20 @@ fun fill_pool_words(g: *Gpu) {
     var shown: u32        = 0;
     val sk:    opt[usize] = plane.shown(?g.p.set);
     if (sel sk.some) { shown = sk.some::u32; }
+    var wall: u32        = 0;
+    val wk:   opt[usize] = plane.wall(?g.p.set);
+    if (sel wk.some) { wall = wk.some::u32; }
     g.head[layout.WIDTH_AT::usize]      = g.p.set.at[0].width;
-    g.head[layout.SET_AT::usize]        = layer.set_word(g.p.set.n::u32, shown, lives);
+    g.head[layout.SET_AT::usize]        = layer.set_word(g.p.set.n::u32, shown, lives, wall);
     g.head[layout.WIDTHS_AT::usize]     = widths;
     g.head[layout.CAP_AT::usize]        = g.p.cap::u32;
     g.head[layout.SHARD_AT::usize]      = st.m;
     g.head[layout.LIT_AT::usize]        = g.lit;
     g.head[layout.FOLD_AT::usize]       = g.fold;
+    g.head[layout.DOMAIN_ON_AT::usize]  = 0;
+    g.head[layout.DOMAIN_AT::usize]     = (g.dom_at & 0xffffffff)::u32;
+    g.head[layout.DOMAIN_AT::usize + 1] = (g.dom_at >> 32)::u32;
+    if (g.dom_on) { g.head[layout.DOMAIN_ON_AT::usize] = 1; }
     g.head[layout.SHARDS_AT::usize]     = (st.at & 0xffffffff)::u32;
     g.head[layout.SHARDS_AT::usize + 1] = (st.at >> 32)::u32;
 }
@@ -3888,15 +4066,16 @@ fun plan_pass(g: *Gpu, free: bool, span: u32) {
     g.moved   = true;
 }
 
-# plan a gather of the active list ahead of the next generation, under rule r
-fun plan_gather(g: *Gpu, r: *rule.Rule) {
+# plan a gather of the active list ahead of the next generation, every chunk
+# along the boundary's edge listed where rim says the rule reads it live
+fun plan_gather(g: *Gpu, rim: bool) {
     val op: *Op = ?g.ops[g.nops];
     op.pass   = false;
     op.gather = true;
     op.now    = g.serial + 1;
     op.bits   = 0;
-    if (g.owns)         { op.bits = op.bits | layout.GATHER_GATED; }
-    if (rule.rimmed(r)) { op.bits = op.bits | layout.GATHER_RIM; }
+    if (g.owns) { op.bits = op.bits | layout.GATHER_GATED; }
+    if (rim)    { op.bits = op.bits | layout.GATHER_RIM; }
     g.nops = g.nops + 1;
 }
 
@@ -4091,7 +4270,7 @@ fun timed_ops(g: *Gpu, step: *gfx.Compute, bound: usize, tab: u32) err[gfx.Error
 # look:  the camera and colours for the draw
 # ret:   the generations completed, or why recording failed
 pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, look: *Look) res[usize, gfx.Error] {
-    val e14: err[gfx.Error] = flush(g, sp, false, g.stepping && !topology.bounded(?sp.grid));
+    val e14: err[gfx.Error] = flush(g, sp, false, g.stepping && !space.bounded(sp));
     if (sel e14.err) { ret res[usize, gfx.Error].err{e14.err}; }
     val ei: err[gfx.Error] = sync_ink(g, r, look);
     if (sel ei.err) { ret res[usize, gfx.Error].err{ei.err}; }
@@ -4176,7 +4355,7 @@ pub fun frame(g: *Gpu, sp: *space.Space, r: *rule.Rule, gen: u64, steps: usize, 
                 g.passed  = space.ring(radius)::usize;
             }
             if (gather) {
-                plan_gather(g, r);
+                plan_gather(g, sp.rim);
                 g.listed   = true;
                 g.gathered = 0;
             }

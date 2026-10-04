@@ -20,6 +20,7 @@ use cellar.ceiling;
 use cellar.command;
 use cellar.device;
 use cellar.format;
+use cellar.gesture;
 use cellar.history;
 use cellar.identify.worker;
 use cellar.look;
@@ -46,6 +47,45 @@ use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 
+# what the wall tool draws with and what its walls hold: a gesture, the
+# brush's radius, and dead walls or ones holding the pen's state, a value
+# under a continuous rule and alive under any other. a choice here takes the
+# wall tool up
+fun walls_section(ui: *bctx.Context, l: look.Look, a: *app.App, s: *world.Shown) {
+    look.heading(ui, l, "Walls");
+    var kinds: [gesture.COUNT]str;
+    var k:     usize = 0;
+    for (k < gesture.COUNT) {
+        kinds[k] = gesture.name(k);
+        k        = k + 1;
+    }
+    var on: usize = gesture.COUNT;
+    if (a.tool == app.TOOL_WALL) { on = a.walls.kind; }
+    val hit: usize = bw.button_grid(ui, ?kinds[0], gesture.COUNT, 2, on);
+    if (hit < gesture.COUNT) {
+        gesture.cancel(?a.walls);
+        a.walls.kind = hit;
+        app.pick_tool(a, app.TOOL_WALL);
+    }
+    var holds: [2]str;
+    holds[0] = "Dead";
+    holds[1] = "Live";
+    if (rules.caps(world.rule(s)).continuous) { holds[1] = "Value"; }
+    var kind: usize = a.wall_kind;
+    if (bw.segmented(ui, ?holds[0], 2, ?kind)) {
+        a.wall_kind = kind;
+        app.pick_tool(a, app.TOOL_WALL);
+    }
+    if (a.walls.kind == gesture.FREEHAND) {
+        var rd: [24]u8;
+        val o:  usize = text.buf_u64(?rd[0], 0, (a.walls.radius + 0.5)::u64);
+        rd[o] = 0;
+        bw.slider(ui, "Wall radius", ?rd[0], ?a.walls.radius, 0.0, gesture.RADIUS_MAX);
+    }
+    if (a.walls.kind == gesture.POLYGON) { look.note(ui, l, "Click each corner, then the first or enter to close it; the eraser takes walls away"); }
+    or                                   { look.note(ui, l, "Drag in the world to draw walls; the eraser takes them away"); }
+}
+
 # unscaled height of the population graph
 val GRAPH: f32 = 48.0;
 # unscaled height of a file's row
@@ -53,8 +93,8 @@ val ROW_H: f32 = 24.0;
 # the version the settings show
 val VERSION: str = $mach.project.version;
 
-# the world panel: the world's bounds, the randomize area and the world's
-# clearing, and the operations on a selection
+# the world panel: the world's bounds, its walls, the randomize area and the
+# world's clearing, and the operations on a selection
 # ---
 # ui: the interface
 # l:  cellar's look
@@ -62,6 +102,7 @@ val VERSION: str = $mach.project.version;
 # s:  the world as shown, whose rule gives the grid
 pub fun world_page(ui: *bctx.Context, l: look.Look, a: *app.App, s: *world.Shown) {
     bounds.section(ui, l, a, s);
+    walls_section(ui, l, a, s);
     look.heading(ui, l, "Randomize");
     var areas: [8]str;
     areas[0] = "32";
@@ -72,18 +113,50 @@ pub fun world_page(ui: *bctx.Context, l: look.Look, a: *app.App, s: *world.Shown
     areas[5] = "1k";
     areas[6] = "2k";
     areas[7] = "4k";
-    val area: usize = bw.button_grid(ui, ?areas[0], app.BOUNDS_COUNT, 4, a.bounds_idx);
-    if (area < app.BOUNDS_COUNT) { a.bounds_idx = area; }
-    look.note(ui, l, "Randomize fills a square this wide");
+    var targets: [app.FILL_COUNT]str;
+    targets[app.FILL_SQUARE]    = "Square";
+    targets[app.FILL_CIRCLE]    = "Circle";
+    targets[app.FILL_GRID]      = "Grid";
+    targets[app.FILL_REGION]    = "Region";
+    targets[app.FILL_SELECTION] = "Selection";
+    val shape: usize = bw.button_grid(ui, ?targets[0], app.FILL_COUNT, 2, a.fill_target);
+    if (shape < app.FILL_COUNT) { a.fill_target = shape; }
+    var pct: f32   = a.fill_density * 100.0;
+    var rd:  [16]u8;
+    val o:   usize = text.buf_u64(?rd[0], 0, (pct + 0.5)::u64);
+    rd[o]     = '%';
+    rd[o + 1] = 0;
+    if (bw.slider(ui, "Density", ?rd[0], ?pct, 1.0, 100.0)) { a.fill_density = pct / 100.0; }
     var more: [2]str;
     more[0] = "Randomize";
     more[1] = "Clear";
     val act: usize = bw.buttons(ui, ?more[0], 2);
-    if (act == 0) { app.submit(a, command.Command.randomize{app.bounds_size(a.bounds_idx)}); }
+    if (act == 0) { app.randomize(a); }
     if (act == 1) { app.submit(a, command.Command.clear{}); }
+    if (a.fill_target == app.FILL_SQUARE || a.fill_target == app.FILL_CIRCLE) {
+        val area: usize = bw.button_grid(ui, ?areas[0], app.BOUNDS_COUNT, 4, a.bounds_idx);
+        if (area < app.BOUNDS_COUNT) { a.bounds_idx = area; }
+        look.note(ui, l, "Fills this wide around the centre of the view");
+    }
+    if (a.fill_target == app.FILL_GRID)      { look.note(ui, l, "Fills the whole of a bounded grid, or every region of the boundary"); }
+    if (a.fill_target == app.FILL_REGION)    { region_picker(ui, l, a, s); }
+    if (a.fill_target == app.FILL_SELECTION) { look.note(ui, l, "Fills the selection and leaves the rest"); }
 
     look.heading(ui, l, "Selection");
     arrange.selection(ui, l, a);
+}
+
+# choosing the boundary region a fill fills: a click on it in the world
+fun region_picker(ui: *bctx.Context, l: look.Look, a: *app.App, s: *world.Shown) {
+    if (s.regions.n == 0) {
+        look.note(ui, l, "The world has no boundary to hold a region");
+        ret;
+    }
+    var label: str = "Choose a region";
+    if (a.picking)                 { label = "Click a region in the world"; }
+    if (bw.button(ui, label))      { a.picking = !a.picking; }
+    if (sel s.regions.chosen.some) { look.note(ui, l, "Fills the region chosen, which F frames"); }
+    or                             { look.note(ui, l, "No region is chosen"); }
 }
 
 # the solid colours as swatches across the column, the chosen one framed
@@ -131,7 +204,7 @@ pub fun view_page(ui: *bctx.Context, l: look.Look, a: *app.App, s: *world.Shown)
     or         { look.note(ui, l, "HashLife keeps no heat or age, so draws solid"); }
     if (solid) { swatches(ui, a); }
     bw.toggle(ui, "Grid lines", ?a.gutter);
-    if (bw.button(ui, "Frame the randomize area")) { app.frame_area(a); }
+    if (bw.button(ui, "Frame the fill")) { app.frame_area(a, ?s.rule.grid, s.regions.whole, s.regions.chosen); }
 }
 
 # the population over the recent samples, each held until the generation of
@@ -387,7 +460,7 @@ fun save(a: *app.App, p: *paths.Paths, kind: u8) {
     }
     var fname: [80]u8;
     var path:  [1152]u8;
-    val words: bool = kind == saves.KIND_PATTERN && pattern.exact(?a.custom);
+    val words: bool = kind == saves.KIND_PATTERN && (pattern.exact(?a.custom) || pattern.walled(?a.custom));
     paths.file(p, saves.file_name(name, kind, words, ?fname[0]), ?path[0]);
     val f: opt[command.File] = app.file(a, ?path[0]);
     if (sel f.none)               { ret; }

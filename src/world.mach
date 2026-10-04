@@ -9,7 +9,10 @@
 # cellar.render and cellar.gpu, and the world has no edge, so nothing here
 # names one.
 
+use cellar.boundary;
 use cellar.ceiling;
+use cellar.command;
+use cellar.fill;
 use cellar.history;
 use cellar.pattern;
 use rules: cellar.rule;
@@ -31,6 +34,7 @@ use std.types.string.str;
 # population: live cells in the world
 # history:    recent populations by generation
 # bounds:     the smallest box holding every live cell, or none
+# regions:    the world's boundary's regions, and the boxes to frame
 # running:    the simulation is stepping on its own
 # full:       the world outgrew its pool or the tree's table, and stepping
 #             stopped until it is cleared
@@ -56,6 +60,7 @@ pub rec Shown {
     population: usize;
     history:    history.History;
     bounds:     opt[space.Box];
+    regions:    sim.Regions;
     running:    bool;
     full:       bool;
     reason:     str;
@@ -83,6 +88,7 @@ pub fun observe(s: *sim.Sim, out: *Shown) {
     out.population = sim.population(s);
     out.history    = s.history;
     out.bounds     = sim.bounds(s);
+    out.regions    = sim.region_view(s);
     out.running    = s.running != 0;
     out.full       = s.full;
     out.reason     = sim.full_reason(s);
@@ -226,18 +232,49 @@ pub fun clear(s: *sim.Sim) {
     sim.clear(s);
 }
 
-# replace the world with a random square side cells across, centred on the origin
-pub fun randomize(s: *sim.Sim, side: usize) {
-    sim.randomize(s, sim.DEFAULT_DENSITY, side);
+# replace the world with a random fill
+# ---
+# ret: false when the fill is the grid of a world without one
+pub fun randomize(s: *sim.Sim, f: *fill.Fill) bool {
+    ret sim.randomize_shape(s, f);
 }
 
-# set the cell at world (x, y) live (v = 1) or dead (v = 0)
+# choose the boundary region holding a cell, which a region fill fills
+pub fun choose_region(s: *sim.Sim, x: i64, y: i64) {
+    sim.choose_region(s, x, y);
+}
+
+# the mode the pen paints a state in: a dead cell is the eraser's, which takes
+# a wall away with the cell, and any other is drawn past the walls
+fun pen_mode(v: u8) u8 {
+    if (v == 0) { ret sim.EDIT_ERASE; }
+    ret sim.EDIT_CELLS;
+}
+
+# set the cell at world (x, y) to a state, live (v = 1) or dead (v = 0), a
+# dead one erasing a wall there too
 pub fun paint(s: *sim.Sim, x: i64, y: i64, v: u8) {
-    sim.paint(s, x, y, v);
+    sim.paint_as(s, x, y, v, pen_mode(v));
 }
 
-# set every cell on the line from (x0, y0) to (x1, y1), ends included
+# set every cell on the line from (x0, y0) to (x1, y1), ends included, as
+# paint sets one
 pub fun line(s: *sim.Sim, x0: i64, y0: i64, x1: i64, y1: i64, v: u8) {
+    line_as(s, x0, y0, x1, y1, v, pen_mode(v));
+}
+
+# draw walls with the wall tool: every cell of the shape a gesture drew made a
+# wall holding the command's state, as one change
+# ---
+# s:   simulation
+# c:   the walls
+# ret: why they were not drawn, the world then as it was
+pub fun walls(s: *sim.Sim, c: *command.Walls) opt[str] {
+    ret sim.paint_region(s, ?c.shape, c.v, sim.EDIT_WALLS);
+}
+
+# set every cell on a line as paint does, each write doing mode to walls
+fun line_as(s: *sim.Sim, x0: i64, y0: i64, x1: i64, y1: i64, v: u8, mode: u8) {
     var dx: i64 = x1 - x0;
     var dy: i64 = y1 - y0;
     var sx: i64 = 1;
@@ -254,7 +291,7 @@ pub fun line(s: *sim.Sim, x0: i64, y0: i64, x1: i64, y1: i64, v: u8) {
     var x: i64 = x0;
     var y: i64 = y0;
     for {
-        sim.paint(s, x, y, v);
+        sim.paint_as(s, x, y, v, mode);
         if (x == x1 && y == y1) { brk; }
         val e2: i64 = e * 2;
         if (e2 > 0 - dy) {
@@ -268,9 +305,12 @@ pub fun line(s: *sim.Sim, x0: i64, y0: i64, x1: i64, y1: i64, v: u8) {
     }
 }
 
-# overlay a pattern's live cells centred on world (x, y)
-pub fun stamp(s: *sim.Sim, p: *pattern.Pattern, x: i64, y: i64) {
-    pattern.stamp(s, p, x, y);
+# overlay a pattern's live cells and its walls centred on world (x, y), and
+# give the world the boundary it carries over its box
+# ---
+# ret: why its boundary or walls were not taken, nothing then written
+pub fun stamp(s: *sim.Sim, p: *pattern.Pattern, x: i64, y: i64) opt[str] {
+    ret pattern.stamp(s, p, x, y);
 }
 
 test rule_string__writes_life_and_wide_rules {

@@ -3,10 +3,10 @@
 #
 # a cell is a bit in the family's state layer (word.WIDTH, cellar.layer), a
 # row of 32 to a word, and its display channels, age << 8 | heat, lie in the
-# view layer the family keeps beside it (word.SHOWN), layer 1 of its set,
-# where the pool holds it while the view's colour mode reads them. the stage
-# reaches both by address, and steps the channels only where the meta head's
-# set word names a shown layer.
+# view layer the family keeps beside it (word.SHOWN), the shown layer the
+# meta head's set word names, past the wall layer where the pool holds one,
+# while the view's colour mode reads them. the stage reaches both by address,
+# and steps the channels only where the set word names a shown layer.
 #
 # an invocation is a run of 8 cells in a row, and 8 workgroups of 64 cover a
 # chunk, a band of 8 rows each; the workgroup's row (cellar.layout row) names
@@ -104,12 +104,8 @@ var runs: Runs;
 #[shared]
 var full: u32;
 
-# the shown layer's place in the family's set
-val SHOWN_LAYER: u32 = 1;
-
 # the cell at (x, y) of a slot's frame, taken through the links where it lies
-# outside the window (cellar.layout), its slot NONE where no chunk holds it,
-# or PAST past a plane's dead edge
+# outside the window (cellar.layout), its slot NONE where no chunk holds it
 fun reach(slot: u32, x: i32, y: i32) pool.Spot {
     var sl: u32       = slot;
     var px: i32       = x;
@@ -125,10 +121,7 @@ fun reach(slot: u32, x: i32, y: i32) pool.Spot {
             at = pool.Spot{slot: sl, i: (py * layout.SIDE::i32 + px)::u32};
             h  = layout.HOPS;
         }
-        or (n == layout.NONE) {
-            if ((t & layout.LINK_EDGE) != 0) { at = pool.Spot{slot: layout.PAST, i: 0}; }
-            h = layout.HOPS;
-        }
+        or (n == layout.NONE) { h = layout.HOPS; }
         or {
             val nx: i32 = layout.hop_x(t, px, py);
             py = layout.hop_y(t, px, py);
@@ -226,6 +219,11 @@ fun comp_main() {
     # off the grid at zero
     val edge:   u32 = meta.table[base + layout.EDGE_AT];
     val seamed: u32 = layout.seamed(edge);
+    # a chunk whose block reaches the world's boundary reads a cell outside it
+    # as the form holds the edge, and holds its own cells outside it at zero
+    val dom_on: u32            = meta.base[layout.DOMAIN_ON_AT - layout.BASE_AT];
+    val dom:    *layout.Domain = meta.domain;
+    val dm:     pool.Dom       = pool.dom_of(dom, dom_on, slot);
 
     # the serial that produced the source. a stamp this step already wrote
     # may have replaced it, so a stamp of either serial counts as set then; a
@@ -240,11 +238,13 @@ fun comp_main() {
     val src:   u32            = last & 1;
     val place: layout.Where   = layout.where(slot, m);
     val dst:   layout.Span    = layer.span(sh, 0, now & 1, place, word.WIDTH);
-    val hsrc:  layout.Span    = layer.span(sh, SHOWN_LAYER, src, place, word.SHOWN);
-    val hdst:  layout.Span    = layer.span(sh, SHOWN_LAYER, now & 1, place, word.SHOWN);
-    val sw:    u32            = dst.at + ly::u32 * 2 + x0 / 32;
-    val hw:    u32            = (ly::u32 * layout.SIDE + x0) / 2;
-    val shows: u32            = layer.set_shown(meta.base[layout.SET_AT - layout.BASE_AT]);
+    # the shown layer is the set word's, past a wall layer where the pool
+    # holds one (cellar.layer)
+    val shows: u32         = layer.set_shown(meta.base[layout.SET_AT - layout.BASE_AT]);
+    val hsrc:  layout.Span = layer.span(sh, shows, src, place, word.SHOWN);
+    val hdst:  layout.Span = layer.span(sh, shows, now & 1, place, word.SHOWN);
+    val sw:    u32         = dst.at + ly::u32 * 2 + x0 / 32;
+    val hw:    u32         = (ly::u32 * layout.SIDE + x0) / 2;
     if (lid == 0) {
         var busy: u32 = 0;
         var k:    u32 = 0;
@@ -256,7 +256,10 @@ fun comp_main() {
             }
             k = k + 1;
         }
-        if (seamed != 0) { busy = 1; }
+        if (seamed != 0)                       { busy = 1; }
+        if (dm.block != 0 && meta.strobe != 0) { busy = 1; }
+        # a wall held as a flipping background's complement changes every step
+        if (layout.walled(edge) != 0 && meta.strobe != 0) { busy = 1; }
         full = busy;
     }
     sy.workgroup_barrier();
@@ -322,8 +325,7 @@ fun comp_main() {
             for (c < hi) {
                 val a:  pool.Spot = reach(slot, c, y);
                 var on: u32       = 0;
-                if (a.slot == layout.PAST) { on = past; }
-                or (a.slot != layout.NONE) { on = pool.cell(sh, m, 0, src, a.slot, word.WIDTH, a.i); }
+                if (a.slot != layout.NONE) { on = pool.cell(sh, m, 0, src, a.slot, word.WIDTH, a.i); }
                 bits = bits | (on << (c - c0)::u32);
                 c    = c + 1;
             }
@@ -343,11 +345,16 @@ fun comp_main() {
             # the chunk, and each is one word of that chunk's row
             val cx: u32 = (k + 1) / 2;
             val n:  u32 = meta.table[base + cy * 3 + cx];
+            var w:  u32 = 0;
             if (n != layout.NONE) {
                 val ns: layout.Span = layer.span(sh, 0, src, layout.where(n, m), word.WIDTH);
-                val w:  u32         = ns.p.v[ns.at + yy::u32 * 2 + (k + 1) % 2];
-                bits = w & span((lo - c0)::u32, (hi - c0)::u32);
+                w = ns.p.v[ns.at + yy::u32 * 2 + (k + 1) % 2];
             }
+            if (past != 0 && dm.block != 0) {
+                val inside: u32 = pool.dom_bits(dom, dom_on, dm.block, cy * 3 + cx, n, yy::u32 * 2 + (k + 1) % 2);
+                w = (w & inside) | ~inside;
+            }
+            bits = w & span((lo - c0)::u32, (hi - c0)::u32);
         }
         tile.v[i] = bits;
         i         = i + 64;
@@ -460,13 +467,24 @@ fun comp_main() {
             c    = c + 1;
         }
     }
-    # cells off the grid are held at zero
+    # cells off the grid are held at zero, and outside the boundary, a word
+    # operation a run
     if (seamed != 0) {
         var c: u32 = 0;
         for (c < 8) {
             if (layout.edge_side(edge, (x0 + c)::i32, ly) != 4) { next = next & ~(1 << c); }
             c = c + 1;
         }
+    }
+    if (dm.mask != 0) { next = next & ((pool.dom_word(dom, dm.mask, ly::u32 * 2 + x0 / 32) >> (x0 % 32)) & 0xff); }
+    # a wall cell keeps its state, held as its complement anew each step where
+    # the background flips (cellar.layer WALL)
+    val wl: u32 = (pool.walls(sh, meta.base[layout.SET_AT - layout.BASE_AT], edge, place, ly::u32 * 2 + x0 / 32) >> (x0 % 32)) & 0xff;
+    if (wl != 0) {
+        val ws:  layout.Span = layer.span(sh, 0, src, place, word.WIDTH);
+        var was: u32         = (ws.p.v[ws.at + ly::u32 * 2 + x0 / 32] >> (x0 % 32)) & 0xff;
+        if (meta.strobe != 0) { was = ~was & 0xff; }
+        next = (next & ~wl) | (was & wl);
     }
 
     # the run's display channels follow its cells, and where the pool holds
@@ -476,6 +494,9 @@ fun comp_main() {
         for (j < 4) {
             val h: u32 = hsrc.p.v[hsrc.at + hw + j];
             var v: u32 = word.become(h & 0xffff, (next >> (j * 2)) & 1) | (word.become(h >> 16, (next >> (j * 2 + 1)) & 1) << 16);
+            # a wall's display channels stay as they stand, as its state does
+            if (((wl >> (j * 2)) & 1) != 0)     { v = (v & 0xffff0000) | (h & 0xffff); }
+            if (((wl >> (j * 2 + 1)) & 1) != 0) { v = (v & 0xffff) | (h & 0xffff0000); }
             if (seamed != 0) {
                 if (layout.edge_side(edge, (x0 + j * 2)::i32, ly) != 4)     { v = v & 0xffff0000; }
                 if (layout.edge_side(edge, (x0 + j * 2 + 1)::i32, ly) != 4) { v = v & 0xffff; }

@@ -73,12 +73,15 @@ pub val LIT_AT: u32 = 19;
 # the word of the rows a dispatch folds along y (row): the device's most
 # workgroups along y, which every stage finds its row by
 pub val FOLD_AT: u32 = 20;
-# the words of the shard table's address, past the base words (Meta)
+# the word of the domain flag: 1 while the world has a boundary, whose domain
+# the address past it names (Domain), else 0 and the address is never read
+pub val DOMAIN_ON_AT: u32 = 21;
+# the words of the domain's address, past the base words (Meta)
+pub val DOMAIN_AT: u32 = 22;
+# the words of the shard table's address, past the domain's (Meta)
 pub val SHARDS_AT: u32 = 24;
 # a neighbour that does not exist
 pub val NONE: u32 = 0xffffffff;
-# a position past a plane's dead edge, as a step stage's reach finds it
-pub val PAST: u32 = 0xfffffffe;
 
 # the row of workgroups a stage's workgroup lies in, where its dispatch folds
 # rows past fold along y onto z, fold rows a step along z (cellar.gpu rows). a
@@ -382,17 +385,16 @@ pub fun mip_span(sh: *Shards, at: Where) Span {
 #
 # a chunk's frame is its own 64 by 64 cells, and a step reads cells up to a
 # rule's radius outside it. the edge word gives the window of the frame that
-# lies in the world, the whole frame unless a bounded grid's edge cuts through
-# it. a position outside the window lies to one of the eight sides of it,
-# edge_side, and the entry's neighbour slot and link word for that side say
-# where it is: the slot, and the transform taking the position into that
+# lies in the world, the whole frame unless the edge of a grid that wraps cuts
+# through it. a position outside the window lies to one of the eight sides of
+# it, edge_side, and the entry's neighbour slot and link word for that side
+# say where it is: the slot, and the transform taking the position into that
 # slot's frame. on the unbounded plane a link only moves a position by a
-# chunk; across a bounded grid's seam it wraps, and on a twisted seam it also
+# chunk; across a grid's seam it wraps, and on a twisted seam it also
 # mirrors. a position the transform leaves outside the new frame's window is
 # taken on the same way, at most HOPS times, and a missing slot on the way
-# reads as zeros. a side past a plane's dead edge has no slot and its link word
-# says so (LINK_EDGE), so a step can read the edge as its rule holds it, which
-# is not always zero (see cellar.rule.outside).
+# reads as zeros. a plane has no seams: it is a boundary (Domain), whose
+# chunks are linked as the unbounded plane's are.
 #
 # a chunk whose 3 by 3 block lies whole in the world is not seamed: its links
 # only move by a chunk and every window is whole, so a step may read it the
@@ -409,8 +411,6 @@ pub val LINK_FLIP_Y: u32 = 2;
 pub val LINK_SWAP:   u32 = 4;
 # the link crosses a bounded grid's seam, so it does not move by a chunk alone
 pub val LINK_SEAM: u32 = 8;
-# the side lies past a plane's dead edge, and its neighbour slot is NONE
-pub val LINK_EDGE: u32 = 16;
 pub val LINK_BIAS: i32 = 2048;
 val     LINK_OX:   u32 = 8;
 val     LINK_OY:   u32 = 20;
@@ -453,6 +453,11 @@ pub fun beside(n: u32, t: u32) u32 {
 
 # the edge word's seamed bit, above the window's four bounds of seven bits
 pub val EDGE_SEAMED: u32 = 0x80000000;
+# the edge word's walled bit: the chunk holds a wall in the wall layer
+# (cellar.layer WALL). it rides in the entry so it moves, is uploaded and is
+# freed with the chunk, and a stage or the host reads a chunk's walls only
+# where it is set. a chunk that holds a wall is never freed
+pub val WALLED: u32 = 0x40000000;
 # the edge word of a whole, unseamed chunk
 pub val EDGE_WHOLE: u32 = 0x8002000;
 
@@ -466,6 +471,11 @@ pub fun edge(x0: u32, x1: u32, y0: u32, y1: u32, seamed: u32) u32 {
 # 1 when an edge word's chunk is seamed, else 0
 pub fun seamed(e: u32) u32 {
     ret e >> 31;
+}
+
+# 1 when an edge word's chunk holds a wall, else 0
+pub fun walled(e: u32) u32 {
+    ret (e >> 30) & 1;
 }
 
 # the side of an edge word's window the position (x, y) of the frame lies to,
@@ -486,9 +496,11 @@ pub fun edge_side(e: u32, x: i32, y: i32) u32 {
 # slot is free, a link word per neighbour slot, and the edge word. sense
 # holds the running rule's, and gen, strobe and base lie at GEN_AT, STROBE_AT
 # and BASE_AT. base's words are the first entry of a step's dispatch, then
-# the words at WIDTH_AT, SET_AT, WIDTHS_AT, CAP_AT, SHARD_AT, LIT_AT and FOLD_AT, and shards,
-# at SHARDS_AT, is the address of the shard table. a stage's storage block
-# has at most 16 fields, so these are gathered rather than one each
+# the words at WIDTH_AT, SET_AT, WIDTHS_AT, CAP_AT, SHARD_AT, LIT_AT, FOLD_AT
+# and DOMAIN_ON_AT. domain, at DOMAIN_AT, is the address of the world's
+# boundary where it has one, and shards, at SHARDS_AT, the address of the
+# shard table. a stage's storage block has at most 16 fields, so these are
+# gathered rather than one each
 pub rec Meta {
     census: u32;
     hi:     u32;
@@ -496,10 +508,57 @@ pub rec Meta {
     sense:  Sense;
     gen:    u32;
     strobe: u32;
-    base:   [SHARDS_AT - BASE_AT]u32;
+    base:   [DOMAIN_AT - BASE_AT]u32;
+    domain: *Domain;
     shards: *Shards;
     rule:   [RULE]u32;
     table:  [WORDS]u32;
+}
+
+# a world's boundary as the stages read it (cellar.boundary)
+#
+# a world with a boundary keeps two words a slot, from dom_at: the block word,
+# which says which chunks of its 3 by 3 block, in the page table's neighbour
+# order, lie wholly outside the boundary (DOM_OUT) and which cross its edge
+# (DOM_EDGE), and the mask word, which names the chunk's mask where it
+# crosses the edge itself, 0 where it lies wholly inside. a slot of a chunk
+# wholly outside never exists. a mask is the chunk's cells the boundary
+# holds, a bit a cell as a 1-bit layer holds them (cellar.layer), MASK words
+# from mask_at. only a chunk across the edge has one, so the boundary costs
+# the masks of the chunks along its edge and two words a slot, and a world
+# without one costs nothing: its head's domain flag is 0 and no stage reads
+# past it. a chunk that does not exist reads as zeros either way, and one of
+# the block outside reads as the rule's open edge (cellar.space Block).
+pub rec Domain {
+    v: [WORDS]u32;
+}
+
+# the domain's head: the word its masks start at
+pub val DOM_HEAD: u32 = 1;
+# the domain's words a slot
+pub val DOM_WORDS: u32 = 2;
+# the block word's bits: block chunk q lies wholly outside at bit q, and
+# crosses the edge at bit DOM_EDGE + q
+pub val DOM_EDGE: u32 = 9;
+# words of a chunk's mask
+pub val MASK: u32 = CELLS / 32;
+
+# the word of the domain holding slot s's block word, its mask word past it
+#[inline]
+pub fun dom_at(s: u32) u32 {
+    ret DOM_HEAD + s * DOM_WORDS;
+}
+
+# the first word of mask m, from 1, in a domain whose masks start at first
+#[inline]
+pub fun mask_at(first: u32, m: u32) u32 {
+    ret first + (m - 1) * MASK;
+}
+
+# 1 when a block word's chunk q lies wholly outside, else 0
+#[inline]
+pub fun dom_out(w: u32, q: u32) u32 {
+    ret (w >> q) & 1;
 }
 
 # the slots the clear stage empties, n of them, named by the host or listed by
@@ -554,8 +613,9 @@ pub fun flags_words(cap: u32) u32 {
 }
 
 # the gather's header bits: the GPU owns the pool, so a closed gate (Status)
-# leaves the list empty, and the rule reads a plane's dead edge live on some
-# generation, so every seamed chunk steps (cellar.rule.rimmed)
+# leaves the list empty, and the rule reads the edge of the world's boundary
+# live on some generation, so every chunk whose block reaches it steps
+# (cellar.space keep_rim)
 pub val GATHER_GATED: u32 = 1;
 pub val GATHER_RIM:   u32 = 2;
 # cells of spread a list holds: every slot within this many cells of a live
@@ -582,8 +642,11 @@ pub rec Edits {
     v:     [EDITS_MAX * 4]u32;
 }
 
-# where an edit's second word holds its layer
+# where an edit's second word holds its layer, a byte, and its guard bit: a
+# guarded edit is a cell edit (cellar.sim EDIT_CELLS), which the edit stage
+# drops where the cell is a wall (cellar.layer WALL)
 pub val EDIT_LAYER: u32 = 16;
+pub val EDIT_GUARD: u32 = 0x80000000;
 
 # the most edits a stage's record declares
 pub val EDITS_MAX: u32 = 8388608;
@@ -711,6 +774,8 @@ test link__takes_a_position_through_every_transform_and_back {
     if (beside(3, t) != NONE || beside(3, plain_link(1)) != 3) { ret 3; }
     val e: u32 = edge(14, 64, 0, 50, 1);
     if (seamed(e) != 1 || seamed(EDGE_WHOLE) != 0)                                          { ret 4; }
+    if (walled(e | WALLED) != 1 || walled(e) != 0 || seamed(e | WALLED) != 1)               { ret 8; }
+    if (edge_side(e | WALLED, 14, 49) != 4)                                                 { ret 9; }
     if (edge(0, 64, 0, 64, 0) != EDGE_WHOLE)                                                { ret 5; }
     if (edge_side(e, 13, 0) != 3 || edge_side(e, 14, 49) != 4 || edge_side(e, 20, 50) != 7) { ret 6; }
     if (edge_side(e, 64, -1) != 2)                                                          { ret 7; }

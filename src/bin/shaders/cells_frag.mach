@@ -25,6 +25,12 @@
 # fainter than a lone cell, in the solid colour or the mean age's; trails show
 # the hottest cell's colour.
 #
+# a wall cell (cellar.layer WALL) shows the wall colour, lighter where it holds
+# a live state, in every mode and whatever the parity, and below a pixel per
+# cell the walls a pixel covers show over what else it holds by their share
+# of it, as live cells show by their density. a chunk's walls are read only
+# where its entry says it holds one.
+#
 # a generation whose cells hold the world's complement (cellar.layout's strobe
 # flag, on an odd generation) is drawn inverted in every mode: a held dead cell
 # and every cell of a chunk that does not exist show the solid colour, and a
@@ -32,7 +38,7 @@
 # the complement holds.
 
 # the look, then the palettes: the trail ramp over heat at 0, the age palette
-# at 256 and the rule palette over heat at 512. port holds the port's left and
+# at 256 and the rule palette over heat at 512, then the wall colours (WALL). port holds the port's left and
 # top in the window, and the window's width and height
 rec View {
     base_cx: u32;
@@ -50,7 +56,7 @@ rec View {
     port:    f32x4;
     solid:   f32x4;
     back:    f32x4;
-    pal:     [768]f32x4;
+    pal:     [770]f32x4;
 }
 
 use cellar.bin.shaders.pool;
@@ -73,6 +79,11 @@ var in_slot:  u32;
 
 #[output(0)]
 var out_colour: f32x4;
+
+# the wall colours' places past the palettes: a wall holding no live state,
+# and one holding a live one
+val WALL:    u32 = 768;
+val WALL_ON: u32 = 769;
 
 # the least share of the live colour a pixel with any live cell shows
 val FLOOR: f32 = 0.45;
@@ -106,6 +117,35 @@ fun cell(slot: u32, i: u32) u32 {
     val s:     layout.Span  = layer.span(meta.shards, 0, front, at, w);
     val v:     u32          = layer.read(s.p.v[s.at + layer.cell_word(w, i)], w, i);
     ret pool.sensed(meta.shards, meta.base[layout.SET_AT - layout.BASE_AT], meta.base[layout.WIDTHS_AT - layout.BASE_AT], front, at, v, w, i);
+}
+
+# 1 when cell i of a slot is a wall
+fun walled(slot: u32, i: u32) u32 {
+    ret pool.wall(meta.shards, meta.base[layout.SET_AT - layout.BASE_AT], meta.table[slot * layout.ENTRY + layout.EDGE_AT], place(slot), i);
+}
+
+# the walls among the s by s cells of a slot from column x and row y, s at
+# most 32 and x a multiple of it
+fun walls_in(slot: u32, x: u32, y: u32, s: u32) u32 {
+    val edge: u32 = meta.table[slot * layout.ENTRY + layout.EDGE_AT];
+    var n:    u32 = 0;
+    if (layout.walled(edge) != 0) {
+        val set:  u32          = meta.base[layout.SET_AT - layout.BASE_AT];
+        val at:   layout.Where = place(slot);
+        var mask: u32          = 0xffffffff;
+        if (s < 32) { mask = (1 << s) - 1; }
+        var r: u32 = 0;
+        for (r < s) {
+            val i: u32 = (y + r) * layout.SIDE + x;
+            var b: u32 = (pool.walls(meta.shards, set, edge, at, i / 32) >> (i % 32)) & mask;
+            for (b != 0) {
+                b = b & (b - 1);
+                n = n + 1;
+            }
+            r = r + 1;
+        }
+    }
+    ret n;
 }
 
 # the share of the live colour for cells this dense
@@ -165,6 +205,12 @@ fun sample() f32x4 {
         # the palette runs over the first 255 generations and holds after
         if (view.mode == 2) { col = view.pal[256 + layout.texel_age(c, meta.sense.age_shift, meta.sense.age_mask)]; }
     }
+    if (walled(in_slot, ly * layout.SIDE + lx) != 0) {
+        var on: u32 = layout.live(c, meta.sense.live_mask, meta.sense.live_lo, meta.sense.live_hi);
+        if (flipped() != 0) { on = 1 - on; }
+        col = view.pal[WALL];
+        if (on != 0) { col = view.pal[WALL_ON]; }
+    }
     if (view.gutter != 0 && view.ppc >= 4.0) {
         val fx: f32 = (in_local[0] - lx::f32) * view.ppc;
         val fy: f32 = (in_local[1] - ly::f32) * view.ppc;
@@ -198,15 +244,16 @@ fun coverage() f32x4 {
     val tx0: i32 = floor_i(x0 / s::f32);
     val ty0: i32 = floor_i(y0 / s::f32);
 
-    val base: u32 = in_slot * layout.ENTRY;
-    val cx:   i32 = meta.table[base + 9]::i32 - view.base_cx::i32;
-    val cy:   i32 = meta.table[base + 10]::i32 - view.base_cy::i32;
-    val half: f32 = s::f32 * 0.5;
-    var live: u32 = 0;
-    var heat: u32 = 0;
-    var ages: u32 = 0;
-    var seen: u32 = 0;
-    var ty:   i32 = ty0;
+    val base:  u32 = in_slot * layout.ENTRY;
+    val cx:    i32 = meta.table[base + 9]::i32 - view.base_cx::i32;
+    val cy:    i32 = meta.table[base + 10]::i32 - view.base_cy::i32;
+    val half:  f32 = s::f32 * 0.5;
+    var live:  u32 = 0;
+    var heat:  u32 = 0;
+    var ages:  u32 = 0;
+    var seen:  u32 = 0;
+    var walls: u32 = 0;
+    var ty:    i32 = ty0;
     for ((ty * s)::f32 + half < y1) {
         val my: f32 = (ty * s)::f32 + half;
         if (my >= y0) {
@@ -240,6 +287,7 @@ fun coverage() f32x4 {
                             val m: layout.Span = layout.mip_span(meta.shards, place(n));
                             t = m.p.v[m.at + at + (ly * side + lx)::u32];
                         }
+                        walls = walls + walls_in(n, (lx * s)::u32, (ly * s)::u32, s::u32);
                         val tl: u32 = t & layout.TEXEL_LIVE;
                         val th: u32 = (t >> layout.TEXEL_HEAT) & layout.HEAT_CAP;
                         live = live + tl;
@@ -253,19 +301,29 @@ fun coverage() f32x4 {
         ty = ty + 1;
     }
 
+    var col: f32x4 = view.back;
     if (flipped() != 0) {
         # every cell the pixel covers that is not held live is live, those of
         # chunks that do not exist included
-        if (seen == 0)    { ret view.solid; }
-        if (live >= seen) { ret view.back; }
-        val on: f32 = cover((seen - live)::f32 / seen::f32);
-        ret view.back + (view.solid - view.back) * f32x4{on, on, on, 1.0};
+        if (seen == 0) { col = view.solid; }
+        or (live < seen) {
+            val on: f32 = cover((seen - live)::f32 / seen::f32);
+            col = view.back + (view.solid - view.back) * f32x4{on, on, on, 1.0};
+        }
     }
-    var share: f32 = 0.0;
-    var age:   u32 = 0;
-    if (seen != 0) { share = live::f32 / seen::f32; }
-    if (live != 0) { age = ages / live; }
-    ret summed(share, heat, age);
+    or {
+        var share: f32 = 0.0;
+        var age:   u32 = 0;
+        if (seen != 0) { share = live::f32 / seen::f32; }
+        if (live != 0) { age = ages / live; }
+        col = summed(share, heat, age);
+    }
+    # the walls the pixel covers show over the rest by their share of it
+    if (walls != 0 && seen != 0) {
+        val w: f32 = cover(walls::f32 / seen::f32);
+        col = col + (view.pal[WALL] - col) * f32x4{w, w, w, 1.0};
+    }
+    ret col;
 }
 
 #[stage("fragment")]

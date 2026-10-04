@@ -52,6 +52,7 @@ use cellar.device;
 use cellar.exec;
 use cellar.format;
 use cellar.formats;
+use cellar.gesture;
 use cellar.gpu;
 use cellar.gui;
 use cellar.hud;
@@ -339,7 +340,7 @@ pub fun on_init(ctx: *Context) {
 pub fun pick_engine(a: *app.App, s: *sim.Sim, cli: u8, software: bool) u8 {
     if (cli != args.ENGINE_ANY) { ret cli; }
     if (a.engine_tree) {
-        if (rule.caps(?s.rule).no_tree == nil) { ret args.ENGINE_HASHLIFE; }
+        if (sim.no_tree(s) == nil) { ret args.ENGINE_HASHLIFE; }
         var rb: [rule.DISPLAY_MAX + 1]u8;
         app.say_why(a, "HashLife cannot run the saved rule", rule.display(?s.rule, ?rb[0]));
         app.say_also(a, "using the chunk engine");
@@ -366,7 +367,7 @@ fun say_software(a: *app.App, engine: u8) {
 # have it, saying why
 fun refuse_tree(ctx: *Context, g: *Game) {
     var rb: [rule.DISPLAY_MAX + 1]u8;
-    if (rule.caps(?g.sim.rule).no_tree != nil) {
+    if (sim.no_tree(?g.sim) != nil) {
         print.eprintlnf("cellar: --engine hashlife: HashLife cannot run {}; it runs radius 1 rules without B0 on the unbounded plane", rule.display(?g.sim.rule, ?rb[0]));
     }
     or { print.eprintln("cellar: --engine hashlife: HashLife could not take the world"); }
@@ -393,10 +394,10 @@ pub fun start_world(a: *app.App, s: *sim.Sim, open: str, capture: bool, engine: 
     val tree: bool = engine == args.ENGINE_HASHLIFE;
     if (open != nil) {
         val f: opt[command.File] = app.file(a, open);
-        if (sel f.some && tree && rule.caps(?s.rule).no_tree == nil) { app.submit(a, command.Command.engine{true}); }
-        if (sel f.some)                                              { app.submit(a, command.Command.open{f.some}); }
+        if (sel f.some && tree && sim.no_tree(s) == nil) { app.submit(a, command.Command.engine{true}); }
+        if (sel f.some)                                  { app.submit(a, command.Command.open{f.some}); }
     }
-    or           { world.randomize(s, app.bounds_size(a.bounds_idx)); }
+    or           { sim.randomize(s, sim.DEFAULT_DENSITY, app.bounds_size(a.bounds_idx)); }
     if (capture) { world.toggle(s); }
     if (!tree)   { ret false; }
     app.submit(a, command.Command.engine{true});
@@ -418,10 +419,12 @@ fun keys(ctx: *Context, g: *Game) {
     val in: *inp.Input = ?ctx.input;
     val a:  *app.App   = ?g.app;
     if (inp.key_pressed(in, inp.KEY_ESCAPE)) {
-        if (a.help != 0) { a.help = 0; }
-        or (a.sizing)    { bounds.cancel(a); }
-        or (a.selected)  { app.deselect(a); }
-        or               { context_stop(ctx); }
+        if (a.help != 0)    { a.help = 0; }
+        or (bounds.busy(a)) { bounds.cancel(a); }
+        or (a.walls.active) { gesture.cancel(?a.walls); }
+        or (a.picking)      { a.picking = false; }
+        or (a.selected)     { app.deselect(a); }
+        or                  { context_stop(ctx); }
         ret;
     }
     # a chord with ctrl acts on the selection, and never also as the bare key
@@ -430,20 +433,25 @@ fun keys(ctx: *Context, g: *Game) {
     val del:   bool = inp.key_pressed(in, inp.KEY_DELETE);
     val z:     bool = inp.key_pressed(in, inp.KEY_Z);
     val redo:  bool = ctrl && ((z && shift) || inp.key_pressed(in, inp.KEY_Y));
-    if (inp.key_pressed(in, inp.KEY_SPACE))                                { app.submit(a, command.Command.toggle{}); }
-    if (inp.key_pressed(in, inp.KEY_S))                                    { app.submit(a, command.Command.step{}); }
-    if (inp.key_pressed(in, inp.KEY_BACKSPACE))                            { app.submit(a, command.Command.reset{}); }
-    if (inp.key_pressed(in, inp.KEY_C) && !ctrl)                           { app.submit(a, command.Command.clear{}); }
-    if (inp.key_pressed(in, inp.KEY_R) && !ctrl)                           { app.submit(a, command.Command.randomize{app.bounds_size(a.bounds_idx)}); }
-    if (inp.key_pressed(in, inp.KEY_M))                                    { a.mode = (a.mode + 1) % app.MODE_COUNT; }
-    if (inp.key_pressed(in, inp.KEY_G))                                    { a.gutter = 1 - a.gutter; }
-    if (inp.key_pressed(in, inp.KEY_F))                                    { app.frame_area(a); }
-    if (inp.key_pressed(in, inp.KEY_D))                                    { a.tool = app.TOOL_DRAW; }
-    if (inp.key_pressed(in, inp.KEY_E))                                    { a.tool = app.TOOL_ERASE; }
-    if (inp.key_pressed(in, inp.KEY_T))                                    { a.tool = app.TOOL_STAMP; }
-    if (inp.key_pressed(in, inp.KEY_Q))                                    { app.step_ink(a, rule.states(?g.shown.rule), shift); }
-    if (inp.key_pressed(in, inp.KEY_V) && !ctrl)                           { a.tool = app.TOOL_SELECT; }
-    if (inp.key_pressed(in, inp.KEY_W))                                    { a.tool = app.TOOL_BOUNDS; }
+    if (inp.key_pressed(in, inp.KEY_SPACE))                              { app.submit(a, command.Command.toggle{}); }
+    if (inp.key_pressed(in, inp.KEY_S))                                  { app.submit(a, command.Command.step{}); }
+    if (inp.key_pressed(in, inp.KEY_BACKSPACE))                          { app.submit(a, command.Command.reset{}); }
+    if (inp.key_pressed(in, inp.KEY_C) && !ctrl)                         { app.submit(a, command.Command.clear{}); }
+    if (inp.key_pressed(in, inp.KEY_R) && !ctrl)                         { app.randomize(a); }
+    if (inp.key_pressed(in, inp.KEY_M))                                  { a.mode = (a.mode + 1) % app.MODE_COUNT; }
+    if (inp.key_pressed(in, inp.KEY_G))                                  { a.gutter = 1 - a.gutter; }
+    if (inp.key_pressed(in, inp.KEY_F))                                  { app.frame_area(a, ?g.shown.rule.grid, g.shown.regions.whole, g.shown.regions.chosen); }
+    if (inp.key_pressed(in, inp.KEY_D))                                  { a.tool = app.TOOL_DRAW; }
+    if (inp.key_pressed(in, inp.KEY_E))                                  { a.tool = app.TOOL_ERASE; }
+    if (inp.key_pressed(in, inp.KEY_T))                                  { a.tool = app.TOOL_STAMP; }
+    if (inp.key_pressed(in, inp.KEY_Q))                                  { app.step_ink(a, rule.states(?g.shown.rule), shift); }
+    if (inp.key_pressed(in, inp.KEY_V) && !ctrl)                         { a.tool = app.TOOL_SELECT; }
+    if (inp.key_pressed(in, inp.KEY_W))                                  { app.pick_tool(a, app.TOOL_BOUNDS); }
+    if (inp.key_pressed(in, inp.KEY_ENTER) && a.tool == app.TOOL_BOUNDS) { bounds.close(a); }
+    if (inp.key_pressed(in, inp.KEY_ENTER) && a.tool == app.TOOL_WALL) {
+        if (gesture.close(?a.walls)) { app.draw_walls(a); }
+    }
+    if (inp.key_pressed(in, inp.KEY_L))                                    { app.pick_tool(a, app.TOOL_WALL); }
     if (inp.key_pressed(in, inp.KEY_V) && ctrl)                            { paste(ctx, a, shift); }
     if (z && !ctrl)                                                        { a.orient = pattern.orient_turn(a.orient); }
     if (z && ctrl && !shift)                                               { app.submit(a, command.Command.undo{}); }
@@ -582,10 +590,17 @@ fun edit_world(g: *Game, cam: render.Camera) {
     val h: *bint.Hit = ?g.world;
     val a: *app.App  = ?g.app;
     # a drag of the bounds goes on wherever the pointer goes until released
-    if (a.tool == app.TOOL_BOUNDS || a.sizing) {
+    if (a.tool == app.TOOL_BOUNDS || bounds.busy(a)) {
         var gr: topology.Grid = g.shown.rule.grid;
         bounds.tool(a, ?gr, cam, app.scale(a.scale_idx), h.mx, h.my, h.pressed && over_world(g), h.held);
         ret;
+    }
+    # the wall tool draws any gesture's shape, which goes on wherever the
+    # pointer goes until it is finished
+    if (a.tool == app.TOOL_WALL || a.walls.active) {
+        val pressed: bool = h.pressed && over_world(g) && !a.picking;
+        if (gesture.track(?a.walls, cam, app.scale(a.scale_idx), h.mx, h.my, pressed, h.held)) { app.draw_walls(a); }
+        if (a.tool == app.TOOL_WALL || a.walls.active)                                         { ret; }
     }
     if (!over_world(g)) {
         a.stroke = false;
@@ -594,6 +609,14 @@ fun edit_world(g: *Game, cam: render.Camera) {
     var cx: i64 = 0;
     var cy: i64 = 0;
     render.cell_at(cam, h.mx, h.my, ?cx, ?cy);
+    # a click names the region to fill, and is not an edit
+    if (a.picking) {
+        if (h.pressed) {
+            app.submit(a, command.Command.region{command.Cell{x: cx, y: cy}});
+            a.picking = false;
+        }
+        ret;
+    }
     if (a.tool == app.TOOL_STAMP) {
         if (h.pressed) { arrange.stamp_active(a, cx, cy); }
         ret;
@@ -620,11 +643,12 @@ fun edit_world(g: *Game, cam: render.Camera) {
     a.last_y = cy;
 }
 
-# a bounded grid's edge as a thin line, and the space off it as the plain
-# backdrop: off the grid is dead, on a frame drawn inverted too
+# a wrapping grid's edge as a thin line, and the space off it as the plain
+# backdrop: off the grid is dead, on a frame drawn inverted too. a plane is a
+# boundary, drawn as the world's domain is (bounds.domain)
 fun grid_edge(g: *Game, d: *paint.Paint, cam: render.Camera) {
     var gr: topology.Grid = g.shown.rule.grid;
-    if (!topology.bounded(?gr)) { ret; }
+    if (!topology.bounded(?gr) || gr.shape == topology.PLANE) { ret; }
     # an unbounded axis runs past the port
     var x0: f32 = cam.x0 - 2.0;
     var x1: f32 = cam.x0 + cam.sw + 2.0;
@@ -880,11 +904,13 @@ pub fun on_draw(ctx: *Context) {
     # the world's overlays, then the interface over everything
     var d: paint.Paint = paint.Paint{pass: ?pass, srgb: g.srgb};
     grid_edge(g, ?d, cam);
+    bounds.domain(?d, a, cam);
     outline(g, ?d, cam);
     hud.selection(?d, a, cam, sc);
     bounds.overlay(?d, a, cam);
     hover(g, ?d, cam);
     ghost(g, ?d, pt, cam);
+    gesture.overlay(?d, ?a.walls, cam, ?a.shade_tmp);
     val drew: err[gfx.Error] = gui.draw(?g.gui, ?pass);
     if (sel drew.err) { print.eprintlnf("could not draw the interface: {}", gfx.error_message(drew.err)); }
 

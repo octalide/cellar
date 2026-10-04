@@ -28,6 +28,13 @@
 # keeps its exact values however the family's layers change. a source that
 # offers no words is written as the words of its states under the rule the
 # Info names, which must be one cellar reads.
+#
+# a pattern's walls follow its body, in a section of their own: the line
+# "[walls]", then a body of run-counted tokens ended by '!', placed as the
+# cells' body is: 'o' a wall, 'b' a cell that is not one, '$' the end of a
+# row. a wall holds the word its cell has in the body, or 0 where the body has
+# none, so a dead wall costs one bit. a file without walls has no section, and
+# a reader that knows none stops at the body's '!', taking the cells alone.
 
 use cellar.format;
 use cellar.formats.rle;
@@ -48,6 +55,8 @@ use std.types.string.str;
 # the first line of a file of one value a word, and the start of one of more
 val MAGIC:  str = "[RLW 1]";
 val MAGIC2: str = "[RLW 2 ";
+# the line the walls' section opens with
+val WALLS: str = "[walls]";
 # the base a word is written in
 val BASE: u64 = 26;
 # the words a decoder gathers into one run before handing it on
@@ -265,6 +274,66 @@ fun read_body(p: *u8, n: usize, i: usize, e: *format.Emit, rd: *Reading, m: usiz
     ret err[format.Error].ok{};
 }
 
+# the offset of the '!' that ends the body starting at i, or n when none does
+fun body_end(p: *u8, n: usize, i: usize) usize {
+    var k: usize = i;
+    for (k < n && p[k] != '!') { k = k + 1; }
+    ret k;
+}
+
+# stream the walls' section at i, if the file has one, to the emit
+# ---
+# p, n:   the bytes
+# i: the byte past the body's '!'
+# e: where the walls go
+# ox, oy: the world position of the pattern's top-left corner
+# w, h:   the declared size, which the walls must stay inside
+fun read_walls(p: *u8, n: usize, i: usize, e: *format.Emit, ox: i64, oy: i64, w: i64, h: i64) err[format.Error] {
+    var at: usize = skip_blank(p, n, i);
+    if (!begins(p, n, at, WALLS)) { ret err[format.Error].ok{}; }
+    at = at + string.str_len(WALLS);
+    var x:     i64  = 0;
+    var y:     i64  = 0;
+    var count: i64  = 0;
+    var has:   bool = false;
+    for (true) {
+        e.info.at = at;
+        if (at >= n) { ret err[format.Error].err{format.Error.truncated{}}; }
+        val ch: u8 = p[at];
+        at = at + 1;
+        if (is_blank(ch)) { cnt; }
+        if (is_digit(ch)) {
+            count = count * 10 + (ch - '0')::i64;
+            has   = true;
+            if (count > format.LIMIT) { ret err[format.Error].err{format.Error.range{}}; }
+            cnt;
+        }
+        if (ch == '!') {
+            if (has) { ret err[format.Error].err{format.Error.malformed{}}; }
+            ret err[format.Error].ok{};
+        }
+        var k: i64 = 1;
+        if (has) { k = count; }
+        count = 0;
+        has   = false;
+        if (ch == '$') {
+            y = y + k;
+            x = 0;
+            if (y > format.LIMIT) { ret err[format.Error].err{format.Error.range{}}; }
+            cnt;
+        }
+        if (ch == 'b') {
+            x = x + k;
+            if (x > format.LIMIT) { ret err[format.Error].err{format.Error.range{}}; }
+            cnt;
+        }
+        if (ch != 'o' || x + k > w || y >= h)                { ret err[format.Error].err{format.Error.malformed{}}; }
+        if (!format.emit_walls(e, ox + x, oy + y, k::usize)) { ret err[format.Error].err{format.Error.sink{}}; }
+        x = x + k;
+    }
+    ret err[format.Error].ok{};
+}
+
 # decode an RLW file
 fun decode(a: *allo.Allocator, p: *u8, n: usize, e: *format.Emit) err[format.Error] {
     var at: usize = skip_blank(p, n, 0);
@@ -314,6 +383,12 @@ fun decode(a: *allo.Allocator, p: *u8, n: usize, e: *format.Emit) err[format.Err
             e.info.values = rule.word_len(?rd.r);
         }
         rd.whole = rd.adopt || m == rule.word_len(?rd.r);
+    }
+    # the walls come first, so a sink knows them before the cells they hold
+    val end: usize = body_end(p, n, at);
+    if (end < n) {
+        val wr: err[format.Error] = read_walls(p, n, end + 1, e, ox, oy, w, h);
+        if (sel wr.err) { ret wr; }
     }
     ret read_body(p, n, at, e, ?rd, m, ox, oy, w, h);
 }
@@ -492,7 +567,47 @@ fun encode(a: *allo.Allocator, src: *format.Source, info: *format.Info, out: *Ve
     }
     val bang: err[format.Error] = rle.put(?w, '!');
     if (sel bang.err) { ret bang; }
-    ret rle.put(?w, '\n');
+    val end: err[format.Error] = rle.put(?w, '\n');
+    if (sel end.err)      { ret end; }
+    if (src.walls == nil) { ret end; }
+    ret write_walls(?w, src);
+}
+
+# write a source's walls as the walls' section, when it holds any
+fun write_walls(w: *rle.Out, src: *format.Source) err[format.Error] {
+    var curx: i64  = src.x0;
+    var cury: i64  = src.y0;
+    var any:  bool = false;
+    var r:    format.Run;
+    for (src.walls(src.ctx, ?r)) {
+        if (r.n == 0 || r.y < cury || r.y >= src.y1 || r.x < src.x0 || r.x + r.n::i64 > src.x1) { ret err[format.Error].err{format.Error.range{}}; }
+        if (!any) {
+            val head: err[format.Error] = rle.put_str(w, WALLS);
+            if (sel head.err) { ret head; }
+            val nl: err[format.Error] = rle.put(w, '\n');
+            if (sel nl.err) { ret nl; }
+            w.col = 0;
+            any   = true;
+        }
+        if (r.y > cury) {
+            val down: err[format.Error] = rle.token(w, r.y - cury, "$", 1);
+            if (sel down.err) { ret down; }
+            cury = r.y;
+            curx = src.x0;
+        }
+        if (r.x < curx) { ret err[format.Error].err{format.Error.range{}}; }
+        if (r.x > curx) {
+            val gap: err[format.Error] = rle.token(w, r.x - curx, "b", 1);
+            if (sel gap.err) { ret gap; }
+        }
+        val on: err[format.Error] = rle.token(w, r.n::i64, "o", 1);
+        if (sel on.err) { ret on; }
+        curx = r.x + r.n::i64;
+    }
+    if (!any) { ret err[format.Error].ok{}; }
+    val bang: err[format.Error] = rle.put(w, '!');
+    if (sel bang.err) { ret bang; }
+    ret rle.put(w, '\n');
 }
 
 # the RLW format's registry record
@@ -505,6 +620,7 @@ pub fun make() format.Format {
     f.builds = false;
     f.states = 256;
     f.words  = true;
+    f.walls  = true;
     f.encode = encode;
     ret f;
 }
