@@ -44,6 +44,7 @@ use win: boom.window;
 use cellar.app;
 use cellar.args;
 use cellar.arrange;
+use cellar.boundary;
 use cellar.bounds;
 use cellar.command;
 use cellar.config;
@@ -56,6 +57,7 @@ use cellar.gesture;
 use cellar.gpu;
 use cellar.gui;
 use cellar.hud;
+use cellar.pace;
 use cellar.paint;
 use cellar.panel;
 use cellar.paths;
@@ -414,17 +416,55 @@ fun toggle_fullscreen(ctx: *Context) {
     }
 }
 
+# escape cancels the innermost thing in progress, one at a time, and otherwise
+# does nothing: quitting is the window's close
+# ---
+# a:   application state
+# ret: whether it cancelled something
+pub fun escape(a: *app.App) bool {
+    if (a.help != 0) {
+        a.help = 0;
+        ret true;
+    }
+    if (a.inks_open || a.engine_open) {
+        a.inks_open   = false;
+        a.engine_open = false;
+        ret true;
+    }
+    if (bounds.busy(a)) {
+        bounds.cancel(a);
+        ret true;
+    }
+    if (a.walls.active) {
+        gesture.cancel(?a.walls);
+        ret true;
+    }
+    if (a.picking) {
+        a.picking = false;
+        ret true;
+    }
+    if (a.part_on) {
+        a.part_on = false;
+        boundary.clear(?a.part);
+        ret true;
+    }
+    if (a.selected) {
+        app.deselect(a);
+        ret true;
+    }
+    if (a.tool == app.TOOL_STAMP) {
+        a.tool = app.TOOL_DRAW;
+        ret true;
+    }
+    ret false;
+}
+
 # the keys, one edge each
 fun keys(ctx: *Context, g: *Game) {
     val in: *inp.Input = ?ctx.input;
     val a:  *app.App   = ?g.app;
     if (inp.key_pressed(in, inp.KEY_ESCAPE)) {
-        if (a.help != 0)    { a.help = 0; }
-        or (bounds.busy(a)) { bounds.cancel(a); }
-        or (a.walls.active) { gesture.cancel(?a.walls); }
-        or (a.picking)      { a.picking = false; }
-        or (a.selected)     { app.deselect(a); }
-        or                  { context_stop(ctx); }
+        escape(a);
         ret;
     }
     # a chord with ctrl acts on the selection, and never also as the bare key
@@ -817,6 +857,8 @@ pub fun on_draw(ctx: *Context) {
         world.observe(?g.sim, ?g.shown);
     }
     app.fit_engine(a, world.hashlife(?g.shown));
+    val clk: time.InstantClock = time.instant();
+    if (sel clk.ok) { pace.feed(?a.rate, world.generation(?g.shown), world.running(?g.shown) && !world.full(?g.shown), time.instant_sub(clk.ok, g.started)::f64 / SECOND::f64); }
     if (a.clip_ready) {
         win.window_clipboard_set(?ctx.window, a.clip.data::str);
         a.clip_ready = false;
@@ -978,7 +1020,7 @@ pub fun on_dnit(ctx: *Context) {
     if (g.sim_ok && g.paths.ok && g.bench == args.BENCH_NONE && g.capture == nil) {
         if (g.gui_ok) { panel.keep(?g.gui.ui, ?g.app); }
         var sp:    [1088]u8;
-        val saved: err[persist.Error] = config.save(?g.a, ?g.app, ?g.sim, settings(g, ?sp[0]));
+        val saved: err[persist.Error] = config.save(?g.a, ?g.app, ?g.sim, config.Frame{mode: win.window_mode(?ctx.window), placement: win.window_bounds(?ctx.window)}, settings(g, ?sp[0]));
         if (sel saved.err) {
             print.eprintlnf("settings not saved: {}", persist.error_message(saved.err));
         }
@@ -1379,5 +1421,36 @@ test pick_engine__the_command_line_overrides_the_saved_engine_and_a_rule_hashlif
 
     app.dnit(?a);
     sim.dnit(?s);
+    ret 0;
+}
+
+test escape__cancels_the_innermost_thing_in_progress_and_otherwise_does_nothing {
+    var al: allo.Allocator;
+    page.make(?al);
+    var a: app.App;
+    app.init(?a);
+    val shown: err[format.Error] = app.attach(?a, ?al);
+    if (sel shown.err) { ret 1; }
+    a.tool      = app.TOOL_STAMP;
+    a.help      = 1;
+    a.inks_open = true;
+    a.sizing    = true;
+    a.picking   = true;
+    a.part_on   = true;
+    a.selected  = true;
+    if (!escape(?a) || a.help != 0 || !a.inks_open) { ret 2; }
+    if (!escape(?a) || a.inks_open || !a.sizing)    { ret 3; }
+    if (!escape(?a) || a.sizing || !a.picking)      { ret 4; }
+    if (!escape(?a) || a.picking || !a.part_on)     { ret 5; }
+    if (!escape(?a) || a.part_on || !a.selected)    { ret 6; }
+    if (!escape(?a) || a.selected)                  { ret 7; }
+    if (a.tool != app.TOOL_STAMP)                   { ret 8; }
+    if (!escape(?a) || a.tool != app.TOOL_DRAW)     { ret 9; }
+    if (escape(?a))                                 { ret 10; }
+    a.walls.active = true;
+    if (!escape(?a) || a.walls.active) { ret 11; }
+    a.engine_open = true;
+    if (!escape(?a) || a.engine_open) { ret 12; }
+    app.dnit(?a);
     ret 0;
 }

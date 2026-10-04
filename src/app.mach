@@ -16,6 +16,7 @@ use cellar.identify;
 use cellar.identify.worker;
 use cellar.journal;
 use cellar.library;
+use cellar.pace;
 use cellar.pattern;
 use cellar.render;
 use cellar.rule;
@@ -91,6 +92,22 @@ pub val TOOL_COUNT: usize = 6;
 pub val TOOL_BUTTONS: usize = 5;
 # the button the shape tools share
 pub val SHAPES_BUTTON: usize = 4;
+
+# the world panel's sections (cellar.pages): the world's shape, its walls,
+# and selecting and filling
+pub val SECTION_SHAPE:  usize = 0;
+pub val SECTION_WALLS:  usize = 1;
+pub val SECTION_FILL:   usize = 2;
+pub val WORLD_SECTIONS: usize = 3;
+
+# the world panel's section holding a tool's controls, WORLD_SECTIONS for a
+# tool whose controls are elsewhere
+pub fun section_of(t: usize) usize {
+    if (t == TOOL_BOUNDS) { ret SECTION_SHAPE; }
+    if (t == TOOL_WALL)   { ret SECTION_WALLS; }
+    if (t == TOOL_SELECT) { ret SECTION_FILL; }
+    ret WORLD_SECTIONS;
+}
 
 # a wall drawn holds no live state
 pub val WALL_DEAD: usize = 0;
@@ -168,12 +185,15 @@ pub val ZOOM_TREE_MIN: f32 = 0.000000000001;
 # mode:         colour mode (render.MODE_*)
 # gutter:       1 to draw grid lines when zoomed in
 # uncapped:     1 to step as fast as the machine allows
+# rate:         the rate the world measures at (cellar.pace)
 # tool:         what a left press does to the world (TOOL_*)
 # ink:          the state the draw tool paints, below the rule's states
 # bounds_idx:   index into the power-of-two randomize-area table, the size of a
 #               shape fill
 # fill_target:  what randomize fills (FILL_*), which the randomize key repeats
 # picking:      the next click in the world chooses the region to fill
+# inks_open:    the pen's states popup is open (cellar.toolbar)
+# engine_open:  the engine's popup is open (cellar.toolbar)
 # fill_density: the live-cell probability of a fill, in [0, 1]
 # pattern_sel:  the selected library pattern's index, or CUSTOM
 # library:      the bundled patterns, once attach has run
@@ -206,6 +226,10 @@ pub val ZOOM_TREE_MIN: f32 = 0.000000000001;
 # relayout:     the panels are to return to the default layout on the next frame
 # files_seen:   the files panel was drawn last frame
 # help:         1 while the key reference is shown
+# world_open:   each section of the world panel open (1) or folded (0)
+# reveal:       the world panel's section to bring into view as it next
+#               draws, WORLD_SECTIONS for none
+# tool_seen:    the tool the panels last drew under
 # full_said:    the full pool was reported, until the world is cleared
 # ceil_said:    the ceiling the run paused at was reported, until it resumes
 # kept_said:    the pool the GPU kept was reported, until the host takes it
@@ -281,11 +305,14 @@ pub rec App {
     mode:         usize;
     gutter:       u8;
     uncapped:     u8;
+    rate:         pace.Rate;
     tool:         usize;
     ink:          u8;
     bounds_idx:   usize;
     fill_target:  usize;
     picking:      bool;
+    inks_open:    bool;
+    engine_open:  bool;
     fill_density: f32;
     pattern_sel:  usize;
     library:      library.Library;
@@ -317,6 +344,9 @@ pub rec App {
     relayout:     bool;
     files_seen:   bool;
     help:         u8;
+    world_open:   [WORLD_SECTIONS]u8;
+    reveal:       usize;
+    tool_seen:    usize;
     full_said:    bool;
     ceil_said:    bool;
     kept_said:    bool;
@@ -947,15 +977,18 @@ pub fun step_ink(a: *App, n: u32, back: bool) {
 
 # seed the application state
 pub fun init(a: *App) {
-    a.speed        = 12.0;
-    a.mode         = render.MODE_SOLID::usize;
-    a.gutter       = 0;
-    a.uncapped     = 0;
+    a.speed    = 12.0;
+    a.mode     = render.MODE_SOLID::usize;
+    a.gutter   = 0;
+    a.uncapped = 0;
+    pace.init(?a.rate);
     a.tool         = TOOL_DRAW;
     a.ink          = 1;
     a.bounds_idx   = DEFAULT_BOUNDS;
     a.fill_target  = FILL_SQUARE;
     a.picking      = false;
+    a.inks_open    = false;
+    a.engine_open  = false;
     a.fill_density = fill.DENSITY;
     a.pattern_sel  = 0;
     library.empty(?a.library);
@@ -982,13 +1015,20 @@ pub fun init(a: *App) {
     a.relayout    = true;
     a.files_seen  = false;
     a.help        = 0;
-    a.full_said   = false;
-    a.kept_said   = false;
-    a.ceil_said   = false;
-    a.toast       = "";
-    a.toast_held  = false;
-    a.told        = 0;
-    a.said[0]     = 0;
+    var k: usize = 0;
+    for (k < WORLD_SECTIONS) {
+        a.world_open[k] = 1;
+        k               = k + 1;
+    }
+    a.reveal     = WORLD_SECTIONS;
+    a.tool_seen  = TOOL_DRAW;
+    a.full_said  = false;
+    a.kept_said  = false;
+    a.ceil_said  = false;
+    a.toast      = "";
+    a.toast_held = false;
+    a.told       = 0;
+    a.said[0]    = 0;
     device.none(?a.device);
     blit.field.init(?a.name, ?a.name_buf[0], saves.NAME_MAX + 1, 0, saves.name_char);
     blit.field.init(?a.go_to, ?a.go_to_buf[0], GO_TO_MAX + 1, 0, digit);
