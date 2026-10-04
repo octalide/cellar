@@ -22,7 +22,18 @@
 # cell is that many values of 8 hexadecimal digits each, run together. its words are read as
 # the rule it names; where that rule is not taken, each cell becomes the state
 # the named rule reads in it, or live under a rule of a family this cellar
-# does not know. a "cellar 3" file is read the same, its rule B/S notation and its kernel key
+# does not know. a "cellar 7" file, what save_world writes, is a "cellar 6"
+# file whose header's cells key says whether its cells are states or words,
+# where the version said so before, and whose body may hold two more kinds of
+# record beside its chunks. a line "bound <n>" and n lines after it are the
+# world's drawn boundary (cellar.boundary), a band a line: its first row, the
+# row past its last, then its spans, two columns each, the first and the one
+# past the last, an unbounded side at boundary.FAR. a line "wall <cx> <cy>"
+# and 64 lines after it are the walls of a chunk holding any, a row a line of
+# 16 hexadecimal digits, the cell at column x of the row its bit x. a wall
+# holds the state or word its cell does, so a chunk of dead walls alone has
+# no chunk record. a file without either is a world without a boundary or
+# walls, as every older file is. a "cellar 3" file is read the same, its rule B/S notation and its kernel key
 # the whole weighted kernel, preferred to the rule beside it. a "cellar 2" file
 # is the same without the header, and a file in the custom pattern format, what
 # every world was saved as before the world became unbounded, loads centred on
@@ -31,10 +42,12 @@
 # first.
 
 use gfx: boom.graphics;
+use cellar.boundary;
 use cellar.format;
 use cellar.formats;
 use cellar.formats.adapt;
 use cellar.layer;
+use cellar.layer.plane;
 use cellar.paths;
 use cellar.pattern;
 use cellar.render;
@@ -55,6 +68,7 @@ use std.collections.vector.Vector;
 use fs:       std.filesystem;
 use io_error: std.io.error;
 use mem:      std.memory;
+use std.print;
 use std.text.parse;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -76,11 +90,14 @@ pub val DIR_MODE: i32 = 0o755;
 pub val FILE_MODE: i32 = 0o644;
 # the first line of a world file, less its version digit
 val MAGIC: str = "cellar ";
-# the version save_world writes, and the version it writes for a rule whose
-# cells are words, the newest load_world reads
-val VERSION: u8 = '4';
+# the versions earlier cellars wrote for cells of words and of
+# words of several values, and the version save_world writes, the newest
+# load_world reads
 val WORDS:   u8 = '5';
 val VALUES:  u8 = '6';
+val VERSION: u8 = '7';
+# hexadecimal digits a row of walls takes
+val WALL_DIGITS: usize = 16;
 # hexadecimal digits a word takes
 val WORD_DIGITS: usize = 8;
 # the oldest sparse version load_world reads
@@ -114,19 +131,25 @@ pub rec View {
 # box:     the cells a stamped pattern covers, none for a world, an empty pattern or a rule
 # stray:   it was a .rule file whose copy into the data directory failed, so
 #          its name resolves only for the rest of the session
+# dropped: why the world could not take a world file's boundary or walls, nil
+#          when it took them (Loaded)
 pub rec Opened {
     world:   bool;
     foreign: bool;
     box:     opt[space.Box];
     stray:   bool;
+    dropped: str;
 }
 
 # what a world load did beyond replacing the cells
 # ---
 # foreign: the file names a rule this cellar cannot run, so the rule was left
 #          as it was and a state it lacks loaded as state 1
+# dropped: why the world could not take the file's boundary or walls, which it
+#          loaded without, or nil when it took them
 pub rec Loaded {
     foreign: bool;
+    dropped: str;
 }
 
 # why a save or load did not complete
@@ -317,8 +340,6 @@ fun write_header(buf: *u8, s: *sim.Sim, v: *View) usize {
     var off: usize = text.buf_str(buf, 0, MAGIC);
     val m:   usize = sim.word_len(s);
     buf[off] = VERSION;
-    if (rule.keeps_words(?s.rule)) { buf[off] = WORDS; }
-    if (m > 1)                     { buf[off] = VALUES; }
     off      = off + 1;
     buf[off] = '\n';
     off      = off + 1;
@@ -329,10 +350,15 @@ fun write_header(buf: *u8, s: *sim.Sim, v: *View) usize {
     off = text.buf_str(buf, off, rule.format(?s.rule, ?rb[0]));
     off = text.buf_str(buf, off, "\nstates ");
     off = text.buf_u64(buf, off, rule.states(?s.rule)::u64);
-    if (m > 1) {
-        off = text.buf_str(buf, off, "\nvalues ");
-        off = text.buf_u64(buf, off, m::u64);
+    off = text.buf_str(buf, off, "\ncells ");
+    if (rule.keeps_words(?s.rule)) {
+        off = text.buf_str(buf, off, "words");
+        if (m > 1) {
+            off = text.buf_str(buf, off, "\nvalues ");
+            off = text.buf_u64(buf, off, m::u64);
+        }
     }
+    or { off = text.buf_str(buf, off, "states"); }
     off = text.buf_str(buf, off, "\ngeneration ");
     off = text.buf_u64(buf, off, s.generation);
     off = text.buf_str(buf, off, "\npan_x ");
@@ -378,8 +404,10 @@ pub fun save_world(a: *allo.Allocator, s: *sim.Sim, v: *View, path: str) err[Err
         put(?out, head[i]);
         i = i + 1;
     }
-    if (out.ok && words) { sim.chunks_in(s, space.Box{x0: 0 - space.BIAS, y0: 0 - space.BIAS, x1: space.BIAS, y1: space.BIAS}, write_words, (?out)::*u8); }
-    or (out.ok)          { sim.chunks(s, write_chunk, (?out)::*u8); }
+    if (out.ok && sim.drawn(s)) { write_bound(?out, sim.bound(s)); }
+    if (out.ok && words)        { sim.chunks_in(s, space.Box{x0: 0 - space.BIAS, y0: 0 - space.BIAS, x1: space.BIAS, y1: space.BIAS}, write_words, (?out)::*u8); }
+    or (out.ok)                 { sim.chunks(s, write_chunk, (?out)::*u8); }
+    if (out.ok)                 { sim.walled_chunks(s, write_walls, (?out)::*u8); }
     if (!out.ok) {
         vector.dnit[u8](?out.buf);
         ret err[Error].err{Error.alloc{allo.Error.exhausted{}}};
@@ -407,6 +435,79 @@ fun put(o: *Out, b: u8) {
     if (!o.ok) { ret; }
     val r: res[usize, allo.Error] = vector.push[u8](?o.buf, b);
     if (sel r.err) { o.ok = false; }
+}
+
+# append the bytes of a string
+fun put_str(o: *Out, t: str) {
+    var i: usize = 0;
+    for (t[i] != 0) {
+        put(o, t[i]);
+        i = i + 1;
+    }
+}
+
+# append a signed decimal
+fun put_i64(o: *Out, v: i64) {
+    var num: [24]u8;
+    val n:   usize = buf_i64(?num[0], 0, v);
+    var i:   usize = 0;
+    for (i < n) {
+        put(o, num[i]);
+        i = i + 1;
+    }
+}
+
+# write the world's drawn boundary as a bound record, a band a line
+fun write_bound(o: *Out, r: *boundary.Region) {
+    put_str(o, "bound ");
+    put_i64(o, r.bands.len::i64);
+    put(o, '\n');
+    var i: usize = 0;
+    for (i < r.bands.len && o.ok) {
+        val b: *boundary.Band = ?r.bands.data[i];
+        put_i64(o, b.y0);
+        put(o, ' ');
+        put_i64(o, b.y1);
+        var k: usize = 0;
+        for (k < b.n * 2) {
+            put(o, ' ');
+            put_i64(o, r.xs.data[b.at * 2 + k]);
+            k = k + 1;
+        }
+        put(o, '\n');
+        i = i + 1;
+    }
+}
+
+# write a wall record: the chunk's line and its 64 rows of walls, unless it
+# holds no wall
+fun write_walls(ctx: *u8, cx: i64, cy: i64, wl: *u32) {
+    val o:  *Out        = ctx::*Out;
+    val pl: plane.Plane = plane.at(wl, layer.WALL_WIDTH);
+    if (!plane.any(pl)) { ret; }
+    put_str(o, "wall ");
+    put_i64(o, cx);
+    put(o, ' ');
+    put_i64(o, cy);
+    put(o, '\n');
+    var y: usize = 0;
+    for (y < space.SIDE::usize && o.ok) {
+        var row: u64   = 0;
+        var x:   usize = 0;
+        for (x < space.SIDE::usize) {
+            if (plane.get(pl, y * 64 + x) != 0) { row = row | (1::u64 << x::u64); }
+            x = x + 1;
+        }
+        var d: usize = WALL_DIGITS;
+        for (d > 0) {
+            val h: u64 = (row >> ((d - 1) * 4)::u64) & 15;
+            if (h < 10) { put(o, '0' + h::u8); }
+            or          { put(o, 'a' + (h - 10)::u8); }
+            d = d - 1;
+        }
+        put(o, '\n');
+        y = y + 1;
+    }
 }
 
 # write a chunk's line and its 64 rows of states
@@ -540,6 +641,7 @@ fun world_version(b: *Vector[u8]) u8 {
 # shape:      that kernel's structure
 # states:     how many states its cells hold
 # values:     values a word holds, 1 when the file names none
+# words:      the cells key names words rather than states
 # generation: the generation, 0 when the file names none
 # view:       the view, starting as the reader's own
 rec Head {
@@ -550,6 +652,7 @@ rec Head {
     shape:      [rule.FORMAT_MAX + 1]u8;
     states:     u32;
     values:     usize;
+    words:      bool;
     generation: u64;
     view:       View;
 }
@@ -627,6 +730,14 @@ fun field(key: str, v: str, h: *Head) bool {
         h.values = r.ok::usize;
         ret true;
     }
+    if (string.str_equals(key, "cells")) {
+        if (string.str_equals(v, "words")) {
+            h.words = true;
+            ret true;
+        }
+        h.words = false;
+        ret string.str_equals(v, "states");
+    }
     if (string.str_equals(key, "generation")) {
         val r: res[u64, parse.ParseError] = parse.parse_u64_exact(v, 10);
         if (sel r.err) { ret false; }
@@ -701,25 +812,175 @@ fun read_header(b: *Vector[u8], p: usize, out: *usize, h: *Head) err[Error] {
     ret err[Error].ok{};
 }
 
-# the chunk records of a sparse world, as coordinates and states
+# what a sparse world's body holds beside its chunk records
 # ---
-# b:      the file contents
-# start:  the offset of the first record
-# states: how many states a cell may hold
-# at:     receives each chunk's coordinates, two per chunk
-# words:  the cells are words
-# m:      values a word holds
-# cells:  receives each chunk's space.CELLS states, or words of m values
-# max:    the most chunks the pool can hold
-# ret:    ok, or why the file was refused
-fun parse_sparse(b: *Vector[u8], start: usize, states: u32, words: bool, m: usize, at: *Vector[i64], cells: *Vector[u32], max: usize) err[Error] {
-    var per: usize = space.CELLS;
+# bounded: the file holds a drawn boundary
+# bound:   that boundary
+# wall_at: each walled chunk's coordinates, two per chunk
+# walls:   each walled chunk's walls, space.MASK words, as the wall layer holds them
+rec Body {
+    bounded: bool;
+    bound:   boundary.Region;
+    wall_at: Vector[i64];
+    walls:   Vector[u32];
+}
+
+fun body_init(y: *Body, a: *allo.Allocator) {
+    y.bounded = false;
+    y.bound   = boundary.init(a);
+    y.wall_at = vector.init[i64](a);
+    y.walls   = vector.init[u32](a);
+}
+
+fun body_dnit(y: *Body) {
+    boundary.dnit(?y.bound);
+    vector.dnit[i64](?y.wall_at);
+    vector.dnit[u32](?y.walls);
+}
+
+# the offset just past a lowercase word at p, which receives it NUL-terminated
+fun parse_word(b: *Vector[u8], p: usize, out: *u8, max: usize) usize {
+    var o: usize = p;
+    var n: usize = 0;
+    for (text.byte_at(b.data, b.len, o) >= 'a' && text.byte_at(b.data, b.len, o) <= 'z') {
+        if (n < max) { out[n] = b.data[o]; }
+        n = n + 1;
+        o = o + 1;
+    }
+    if (n >= max) { n = 0; }
+    out[n] = 0;
+    ret o;
+}
+
+# read a bound record's bands, from the line after its own, into y.bound
+# ---
+# b:   the file contents
+# p:   the offset of the first band's line
+# n:   how many bands
+# y:   the body, whose boundary they make
+# end: receives the offset past the last band's line
+# ret: ok, or why the file was refused
+fun parse_bound(b: *Vector[u8], p: usize, n: usize, y: *Body, end: *usize) err[Error] {
+    val bad: err[Error] = err[Error].err{Error.format{format.Error.malformed{}}};
+    if (y.bounded) { ret bad; }
+    y.bounded = true;
+    var xs: Vector[i64] = vector.init[i64](y.bound.xs.a);
+    fin { vector.dnit[i64](?xs); }
+    var o: usize = p;
+    var k: usize = 0;
+    for (k < n) {
+        vector.clear[i64](?xs);
+        if (o >= b.len) { ret err[Error].err{Error.truncated{}}; }
+        val stop: usize = next_line(b, o);
+        for (true) {
+            for (o < stop && (b.data[o] == ' ' || b.data[o] == '\t' || b.data[o] == '\r')) { o = o + 1; }
+            if (o >= stop || b.data[o] == '\n')                           { brk; }
+            if ((b.data[o] < '0' || b.data[o] > '9') && b.data[o] != '-') { ret bad; }
+            var v: i64 = 0;
+            o = parse_i64(b, o, ?v);
+            if (o > stop) { ret bad; }
+            val put: res[usize, allo.Error] = vector.push[i64](?xs, v);
+            if (sel put.err) { ret err[Error].err{Error.alloc{put.err}}; }
+        }
+        if (xs.len < 4 || xs.len % 2 != 0) { ret bad; }
+        val took: res[bool, allo.Error] = boundary.append(?y.bound, xs.data[0], xs.data[1], ?xs.data[2], (xs.len - 2) / 2);
+        if (sel took.err) { ret err[Error].err{Error.alloc{took.err}}; }
+        if (!took.ok)     { ret bad; }
+        o = stop;
+        k = k + 1;
+    }
+    @end = o;
+    ret err[Error].ok{};
+}
+
+# read a wall record's 64 rows, skipping line ends, into y's walls
+# ---
+# b:   the file contents
+# p:   where the rows start
+# y:   the body, which takes the chunk's walls
+# end: receives the offset past the last row
+# ret: ok, or truncated when the body runs out first
+fun parse_walls(b: *Vector[u8], p: usize, y: *Body, end: *usize) err[Error] {
+    val base: usize                  = y.walls.len;
+    val grow: res[usize, allo.Error] = vector.reserve[u32](?y.walls, space.MASK);
+    if (sel grow.err) { ret err[Error].err{Error.alloc{grow.err}}; }
+    y.walls.len = base + space.MASK;
+    mem.zero[u32](?y.walls.data[base], space.MASK);
+    val pl: plane.Plane = plane.at(?y.walls.data[base], layer.WALL_WIDTH);
+    var o:  usize       = p;
+    var r:  usize       = 0;
+    for (r < space.SIDE::usize) {
+        for (o < b.len && hex_digit(b.data[o]) == 16) { o = o + 1; }
+        var row: u64   = 0;
+        var d:   usize = 0;
+        for (d < WALL_DIGITS) {
+            val h: u32 = hex_digit(text.byte_at(b.data, b.len, o));
+            if (h == 16) { ret err[Error].err{Error.truncated{}}; }
+            row = (row << 4) | h::u64;
+            o   = o + 1;
+            d   = d + 1;
+        }
+        var x: usize = 0;
+        for (x < space.SIDE::usize) {
+            if (((row >> x::u64) & 1) != 0) { plane.put(pl, r * 64 + x, 1); }
+            x = x + 1;
+        }
+        r = r + 1;
+    }
+    @end = o;
+    ret err[Error].ok{};
+}
+
+# the records of a sparse world: its chunks as coordinates and states, and in
+# a layered file (VERSION) its boundary and walls
+# ---
+# b:       the file contents
+# start:   the offset of the first record
+# states:  how many states a cell may hold
+# at:      receives each chunk's coordinates, two per chunk
+# words:   the cells are words
+# m:       values a word holds
+# cells:   receives each chunk's space.CELLS states, or words of m values
+# max:     the most chunks the pool can hold
+# layered: the file may hold bound and wall records
+# body:    receives them
+# ret:     ok, or why the file was refused
+fun parse_sparse(b: *Vector[u8], start: usize, states: u32, words: bool, m: usize, at: *Vector[i64], cells: *Vector[u32], max: usize, layered: bool, body: *Body) err[Error] {
+    val bad: err[Error] = err[Error].err{Error.format{format.Error.malformed{}}};
+    var per: usize      = space.CELLS;
     if (words) { per = space.CELLS * m; }
     val w: usize = digits(states);
     var p: usize = start;
     for (true) {
         for (p < b.len && (b.data[p] == '\n' || b.data[p] == '\r' || b.data[p] == ' ')) { p = p + 1; }
         if (p >= b.len) { brk; }
+        if (layered && b.data[p] >= 'a' && b.data[p] <= 'z') {
+            var kind: [8]u8;
+            p = parse_word(b, p, ?kind[0], 7);
+            if (string.str_equals(?kind[0], "bound")) {
+                var n: i64 = 0;
+                p = parse_i64(b, p, ?n);
+                if (p >= b.len || n < 0) { ret bad; }
+                val got: err[Error] = parse_bound(b, next_line(b, p), n::usize, body, ?p);
+                if (sel got.err) { ret got; }
+                cnt;
+            }
+            if (!string.str_equals(?kind[0], "wall")) { ret bad; }
+            var wx: i64 = 0;
+            var wy: i64 = 0;
+            p = parse_i64(b, p, ?wx);
+            if (p >= b.len) { ret err[Error].err{Error.truncated{}}; }
+            p = parse_i64(b, p, ?wy);
+            if (p >= b.len) { ret err[Error].err{Error.truncated{}}; }
+            if (body.wall_at.len / 2 >= max || wx < 0 - space.BIAS || wx >= space.BIAS
+                || wy < 0 - space.BIAS || wy >= space.BIAS) { ret err[Error].err{Error.dimensions{}}; }
+            val pa: res[usize, allo.Error] = vector.push[i64](?body.wall_at, wx);
+            val pb: res[usize, allo.Error] = vector.push[i64](?body.wall_at, wy);
+            if (sel pa.err || sel pb.err) { ret err[Error].err{Error.alloc{allo.Error.exhausted{}}}; }
+            val got: err[Error] = parse_walls(b, p, body, ?p);
+            if (sel got.err) { ret got; }
+            cnt;
+        }
         var cx: i64 = 0;
         var cy: i64 = 0;
         p = parse_i64(b, p, ?cx);
@@ -829,9 +1090,8 @@ fun world_from(a: *allo.Allocator, s: *sim.Sim, v: *View, data: *Vector[u8]) res
     val ver: u8 = world_version(data);
     if (ver != 0) {
         var start: usize = next_line(data, 0);
-        if (ver < OLDEST || ver > VALUES) { ret res[Loaded, Error].err{Error.version{}}; }
-        val words: bool = ver >= WORDS;
-        var h:     Head;
+        if (ver < OLDEST || ver > VERSION) { ret res[Loaded, Error].err{Error.version{}}; }
+        var h: Head;
         h.family[0]  = 0;
         h.ruled      = false;
         h.rule[0]    = 0;
@@ -839,29 +1099,55 @@ fun world_from(a: *allo.Allocator, s: *sim.Sim, v: *View, data: *Vector[u8]) res
         h.shape[0]   = 0;
         h.states     = 2;
         h.values     = 1;
+        h.words      = false;
         h.generation = 0;
         h.view       = @v;
         if (ver >= '3') {
             val head: err[Error] = read_header(data, start, ?start, ?h);
             if (sel head.err) { ret res[Loaded, Error].err{head.err}; }
         }
+        # a version 7 file says whether its cells are words, which an
+        # older one's version said
+        var words: bool = h.words;
+        if (ver < VERSION) { words = ver >= WORDS; }
         # the world runs no rule of a family the GPU stepping it cannot step
         var refused: bool        = false;
+        var dropped: str         = nil;
         var at:      Vector[i64] = vector.init[i64](a);
         var cells:   Vector[u32] = vector.init[u32](a);
+        var body:    Body;
+        body_init(?body, a);
         # a version 5 file's words are one value, and a version 6 file names its own
         if (ver < VALUES) { h.values = 1; }
         val m:      usize      = h.values;
-        val parsed: err[Error] = parse_sparse(data, start, h.states, words, m, ?at, ?cells, sim.load_chunks(s));
+        val parsed: err[Error] = parse_sparse(data, start, h.states, words, m, ?at, ?cells, sim.load_chunks(s), ver >= VERSION, ?body);
         if (sel parsed.ok) {
             # the world empties first, so a rule the quadtree cannot run moves
             # nothing out of it, and the rule comes before the cells are written
-            # as its words
+            # as its words. a drawn boundary the file lacks goes before the
+            # rule is judged against it, and the file's comes after, as a
+            # restore does it (sim.restore)
             sim.fill_begin(s);
+            if (sim.drawn(s) && !body.bounded) {
+                val off: opt[str] = sim.set_bound(s, nil);
+                if (sel off.some) { dropped = off.some; }
+            }
             val named: opt[rule.Rule] = head_rule(?h);
             if (sel named.some) {
                 val taken: opt[str] = sim.set_rule(s, named.some);
                 refused = sel taken.some;
+            }
+            if (body.bounded) {
+                val on: opt[str] = sim.set_bound(s, ?body.bound);
+                if (sel on.some) { dropped = on.some; }
+            }
+            var walled: bool = body.wall_at.len > 0;
+            if (walled) {
+                val held: opt[str] = sim.fill_walled(s);
+                if (sel held.some) {
+                    dropped = held.some;
+                    walled  = false;
+                }
             }
             # words are the named rule's, and go in whole where it was taken
             # and holds words of as many values, or as an older version of
@@ -905,14 +1191,21 @@ fun world_from(a: *allo.Allocator, s: *sim.Sim, v: *View, data: *Vector[u8]) res
                 k = k + 1;
             }
             if (now != nil) { allo.deallocate[u32](a, now, space.CELLS * mw); }
+            # the walls go in after the cells, each holding its cell's word
+            k = 0;
+            for (walled && k < body.wall_at.len / 2) {
+                sim.fill_walls(s, body.wall_at.data[k * 2], body.wall_at.data[k * 2 + 1], ?body.walls.data[k * space.MASK]);
+                k = k + 1;
+            }
             sim.fill_end(s);
             s.generation = h.generation;
             @v           = h.view;
         }
         vector.dnit[i64](?at);
         vector.dnit[u32](?cells);
+        body_dnit(?body);
         if (sel parsed.err) { ret res[Loaded, Error].err{parsed.err}; }
-        ret res[Loaded, Error].ok{Loaded{foreign: refused || foreign(?h)}};
+        ret res[Loaded, Error].ok{Loaded{foreign: refused || foreign(?h), dropped: dropped}};
     }
 
     # an old dense world is a custom pattern, centred on the origin
@@ -929,6 +1222,11 @@ fun world_from(a: *allo.Allocator, s: *sim.Sim, v: *View, data: *Vector[u8]) res
     val ox: i64 = 0 - (tmp.w / 2)::i64;
     val oy: i64 = 0 - (tmp.h / 2)::i64;
     sim.fill_begin(s);
+    var dropped: str = nil;
+    if (sim.drawn(s)) {
+        val off: opt[str] = sim.set_bound(s, nil);
+        if (sel off.some) { dropped = off.some; }
+    }
     var y: usize = 0;
     for (y < tmp.h) {
         var x: usize = 0;
@@ -940,7 +1238,7 @@ fun world_from(a: *allo.Allocator, s: *sim.Sim, v: *View, data: *Vector[u8]) res
     }
     sim.fill_end(s);
     pattern.dnit(?tmp);
-    ret res[Loaded, Error].ok{Loaded{foreign: false}};
+    ret res[Loaded, Error].ok{Loaded{foreign: false, dropped: dropped}};
 }
 
 # stamp a pattern file's bytes onto the world centred on the origin, in the
@@ -975,7 +1273,7 @@ fun stamp_from(a: *allo.Allocator, s: *sim.Sim, data: *Vector[u8]) res[Opened, E
     if (ws.refused) { foreign = true; }
     format.info_dnit(?info);
     if (sel r.err) { ret res[Opened, Error].err{from_format(r.err)}; }
-    ret res[Opened, Error].ok{Opened{world: false, foreign: foreign, box: box, stray: false}};
+    ret res[Opened, Error].ok{Opened{world: false, foreign: foreign, box: box, stray: false, dropped: nil}};
 }
 
 # open a file of any kind cellar reads, dispatching on its bytes
@@ -1037,13 +1335,13 @@ fun rule_from(s: *sim.Sim, data: *Vector[u8]) res[Opened, Error] {
     val stray:  bool     = !store.install(kept.ok, data.data, data.len);
     val taken:  opt[str] = sim.set_rule(s, r);
     val closed: bool     = sel taken.some;
-    ret res[Opened, Error].ok{Opened{world: false, foreign: closed, box: opt[space.Box].none{}, stray: stray}};
+    ret res[Opened, Error].ok{Opened{world: false, foreign: closed, box: opt[space.Box].none{}, stray: stray, dropped: nil}};
 }
 
 # a world load's outcome as an open's
 fun opened_world(w: res[Loaded, Error]) res[Opened, Error] {
     if (sel w.err) { ret res[Opened, Error].err{w.err}; }
-    ret res[Opened, Error].ok{Opened{world: true, foreign: w.ok.foreign, box: opt[space.Box].none{}, stray: false}};
+    ret res[Opened, Error].ok{Opened{world: true, foreign: w.ok.foreign, box: opt[space.Box].none{}, stray: false, dropped: w.ok.dropped}};
 }
 
 # copy a pattern's name, rule and comments into an Info
@@ -1651,7 +1949,7 @@ test load_world__reads_cellar_2_and_every_cellar_3_header {
 
     # a version from the future, a header that never ends, and a value that
     # cannot be read, are refused untouched
-    val six: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v7.cellar", "cellar 7\n\n");
+    val six: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v8.cellar", "cellar 8\n\n");
     if (!sel six.err)         { ret 8; }
     if (!sel six.err.version) { ret 8; }
     val open: res[Loaded, Error] = load_versioned(?a, ?s, ?v, "out/test/test_v3_open.cellar", "cellar 3\nrule B3/S23\n");
@@ -1967,5 +2265,374 @@ test load__a_reaction_world_and_pattern_0_8_0_wrote_load_both_fields_exactly {
     pattern.dnit(?p);
     sim.dnit(?want);
     sim.dnit(?got);
+    ret 0;
+}
+
+# the rules boundaries and walls are kept under: two states, a rule whose
+# background flips, generations, lenia and reaction-diffusion
+#[testing]
+val LAYERED: [5]str = [5]str{"B3/S23", "B0123/S123", "345/2/4", "R=13,T=10,b=[1],m=0.15,s=0.015,kn=1,gn=1", "F=0.029,k=0.057"};
+
+# a boundary of two regions apart, the walls sim.seed_walls draws inside the
+# first, and a block inside the second
+#[testing]
+fun seed_layered(s: *sim.Sim, r: str, bound: bool, walls: bool) bool {
+    val k: res[rule.Rule, str] = rule.parse(r);
+    if (sel k.err)                         { ret false; }
+    if (!sim.taken(sim.set_rule(s, k.ok))) { ret false; }
+    if (bound) {
+        var b:     boundary.Region = boundary.init(s.space.a);
+        var other: boundary.Region = boundary.init(s.space.a);
+        fin {
+            boundary.dnit(?b);
+            boundary.dnit(?other);
+        }
+        boundary.rect(?b, -45, -45, 45, 45);
+        boundary.ellipse(?other, 60, -10, 100, 20);
+        boundary.combine(?b, ?other, boundary.ADD);
+        if (!sim.taken(sim.set_bound(s, ?b))) { ret false; }
+    }
+    if (walls) { sim.seed_walls(s); }
+    var y: i64 = 0;
+    for (y < 6) {
+        sim.paint(s, 76 + y, y, rule.ink(?s.rule)::u8);
+        y = y + 1;
+    }
+    sim.step(s);
+    sim.step(s);
+    sim.step(s);
+    ret true;
+}
+
+# whether two worlds hold the same boundary, walls and words over a box
+#[testing]
+fun same_in(s: *sim.Sim, t: *sim.Sim, x0: i64, y0: i64, x1: i64, y1: i64) bool {
+    if (sim.drawn(s) != sim.drawn(t) || sim.walls(s) != sim.walls(t))       { ret false; }
+    if (sim.drawn(s) && !boundary.same(sim.bound(s), sim.bound(t)))         { ret false; }
+    if (s.generation != t.generation || sim.word_len(s) != sim.word_len(t)) { ret false; }
+    var ws: [layer.LAYERS_MAX]u32;
+    var wt: [layer.LAYERS_MAX]u32;
+    var y:  i64 = y0;
+    for (y < y1) {
+        var x: i64 = x0;
+        for (x < x1) {
+            if (sim.wall_at(s, x, y) != sim.wall_at(t, x, y)) { ret false; }
+            sim.word_at(s, x, y, ?ws[0]);
+            sim.word_at(t, x, y, ?wt[0]);
+            if (!mem.equal[u32](?ws[0], ?wt[0], sim.word_len(s))) { ret false; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    ret true;
+}
+
+# whether two worlds hold the same boundary, walls and words over the box
+# (-50, -50) to (110, 50), which every cell seed_layered makes lies in
+#[testing]
+fun same_layers(s: *sim.Sim, t: *sim.Sim) bool {
+    ret same_in(s, t, -50, -50, 110, 50);
+}
+
+test load_world__round_trips_boundaries_of_several_regions_and_walls_of_every_kind {
+    var a: allo.Allocator;
+    page.make(?a);
+    var v: View = View{pan_x: 0.0, pan_y: 0.0, zoom: 1.0, mode: render.MODE_SOLID};
+    # each rule with both, and two states with each alone
+    var k: usize = 0;
+    for (k < 7) {
+        var r:     str  = LAYERED[k % 5];
+        var bound: bool = true;
+        var walls: bool = true;
+        if (k == 5) { bound = false; }
+        if (k == 6) { walls = false; }
+        var s:    sim.Sim;
+        val made: err[allo.Error] = sim.init(?s, ?a);
+        if (sel made.err)                                     { ret 1; }
+        if (!seed_layered(?s, r, bound, walls))               { ret 2; }
+        if (sim.walls(?s) != walls || sim.drawn(?s) != bound) { ret 3; }
+        val path:  str        = "out/test/test_layered.cellar";
+        val saved: err[Error] = save_world(?a, ?s, ?v, path);
+        if (sel saved.err) { ret 4; }
+        # loaded over a world with a boundary and walls of its own
+        var t:     sim.Sim;
+        val made2: err[allo.Error] = sim.init(?t, ?a);
+        if (sel made2.err)                                { ret 5; }
+        if (!seed_layered(?t, "B36/S23", !bound, !walls)) { ret 6; }
+        sim.paint_as(?t, 30, 30, 1, sim.EDIT_WALLS);
+        val loaded: res[Loaded, Error] = load_world(?a, ?t, ?v, path);
+        fs.remove_file(path);
+        if (sel loaded.err)                                                                { ret 7; }
+        if (loaded.ok.foreign || loaded.ok.dropped != nil || !rule.same(?t.rule, ?s.rule)) { ret 8; }
+        if (bound) {
+            val parts: res[usize, allo.Error] = boundary.count(sim.bound(?t));
+            if (!(sel parts.ok && parts.ok == 2)) { ret 9; }
+        }
+        if (!same_layers(?s, ?t)) {
+            print.eprintlnf("{} case {} did not load as saved", r, k::u64);
+            ret 10;
+        }
+        # and it runs on as the world it was, its walls holding
+        sim.step(?s);
+        sim.step(?t);
+        if (!same_layers(?s, ?t)) { ret 11; }
+        sim.dnit(?s);
+        sim.dnit(?t);
+        k = k + 1;
+    }
+    ret 0;
+}
+
+test load_world__an_older_file_is_a_world_without_a_boundary_or_walls {
+    var a: allo.Allocator;
+    page.make(?a);
+    var v:     View   = View{pan_x: 0.0, pan_y: 0.0, zoom: 1.0, mode: render.MODE_SOLID};
+    val heads: [5]str = [5]str{"cellar 2\n", "cellar 3\nrule B3/S23\n\n", "cellar 4\nfamily weighted\nrule B3/S23\nstates 2\n\n",
+        "cellar 5\nfamily weighted\nrule B3/S23\nstates 2\n\n", "cellar 6\nfamily weighted\nrule B3/S23\nstates 2\nvalues 1\n\n"};
+    var k: usize = 0;
+    for (k < 6) {
+        var s:    sim.Sim;
+        val made: err[allo.Error] = sim.init(?s, ?a);
+        if (sel made.err)                            { ret 1; }
+        if (!seed_layered(?s, "B3/S23", true, true)) { ret 2; }
+        # a chunk at (-1, 2) whose first row starts with two live cells apart,
+        # as states or as words, or the dense file of 0.3.0 and before
+        var body: Vector[u8] = vector.init[u8](?a);
+        var i:    usize      = 0;
+        if (k < 5) {
+            for (heads[k][i] != 0) {
+                vector.push[u8](?body, heads[k][i]);
+                i = i + 1;
+            }
+        }
+        if (k < 3) { chunk_text(?body, "-1 2\n", "101"); }
+        or (k < 5) {
+            val line: str = "-1 2\n";
+            i = 0;
+            for (line[i] != 0) {
+                vector.push[u8](?body, line[i]);
+                i = i + 1;
+            }
+            i = 0;
+            for (i < space.CELLS) {
+                var d: usize = 0;
+                for (d < 7) {
+                    vector.push[u8](?body, '0');
+                    d = d + 1;
+                }
+                if (i == 0 || i == 2) { vector.push[u8](?body, '1'); }
+                or                    { vector.push[u8](?body, '0'); }
+                vector.push[u8](?body, ' ');
+                i = i + 1;
+            }
+        }
+        or {
+            val dense: str = "3 1\n101\n";
+            for (dense[i] != 0) {
+                vector.push[u8](?body, dense[i]);
+                i = i + 1;
+            }
+        }
+        val got: res[Loaded, Error] = world_from(?a, ?s, ?v, ?body);
+        vector.dnit[u8](?body);
+        if (!(sel got.ok && got.ok.dropped == nil)) {
+            print.eprintlnf("older world {} was refused", k::u64);
+            ret 3;
+        }
+        if (sim.drawn(?s) || sim.bound(?s) != nil || sim.walls(?s)) { ret 4; }
+        if (sim.population(?s) != 2)                                { ret 5; }
+        sim.dnit(?s);
+        k = k + 1;
+    }
+    ret 0;
+}
+
+test load_world__a_bound_or_wall_record_that_is_not_one_is_refused_untouched {
+    var a: allo.Allocator;
+    page.make(?a);
+    var v:    View            = View{pan_x: 0.0, pan_y: 0.0, zoom: 1.0, mode: render.MODE_SOLID};
+    var s:    sim.Sim;
+    val made: err[allo.Error] = sim.init(?s, ?a);
+    if (sel made.err) { ret 1; }
+    block(?s, 0, 0);
+    val head: str = "cellar 7\nfamily weighted\nrule B3/S23\nstates 2\ncells states\n\n";
+    # bands out of order, spans that overlap, a short wall and a record of no kind
+    val bad: [4]str = [4]str{"bound 2\n0 4 0 8\n-2 0 0 8\n", "bound 1\n0 4 0 8 6 9\n", "wall 0 0\n0000000000000001\n", "walls 0 0\n"};
+    var k:   usize  = 0;
+    for (k < 4) {
+        var body: Vector[u8] = vector.init[u8](?a);
+        var i:    usize      = 0;
+        for (head[i] != 0) {
+            vector.push[u8](?body, head[i]);
+            i = i + 1;
+        }
+        i = 0;
+        for (bad[k][i] != 0) {
+            vector.push[u8](?body, bad[k][i]);
+            i = i + 1;
+        }
+        val r: res[Loaded, Error] = world_from(?a, ?s, ?v, ?body);
+        vector.dnit[u8](?body);
+        if (!sel r.err)                               { ret 2 + k::i32; }
+        if (sim.population(?s) != 4 || sim.walls(?s)) { ret 10; }
+        k = k + 1;
+    }
+    sim.dnit(?s);
+    ret 0;
+}
+
+test rlw__a_patterns_walls_round_trip_and_land_with_its_cells {
+    var a: allo.Allocator;
+    page.make(?a);
+    var v: View  = View{pan_x: 0.0, pan_y: 0.0, zoom: 1.0, mode: render.MODE_SOLID};
+    var k: usize = 0;
+    for (k < 5) {
+        var s:    sim.Sim;
+        val made: err[allo.Error] = sim.init(?s, ?a);
+        if (sel made.err)                               { ret 1; }
+        if (!seed_layered(?s, LAYERED[k], false, true)) { ret 2; }
+        # the walls' box, read as a pattern, its words with it where the rule keeps them
+        var p:    pattern.Pattern;
+        val init: err[allo.Error] = pattern.init(?p, ?a, 0, 0, "walls");
+        if (sel init.err)                          { ret 3; }
+        if (!sim.read_begin(?s, -42, -42, 42, 42)) { ret 3; }
+        val got: err[allo.Error] = pattern.capture(?p, ?s, -42, -42, 42, 42);
+        sim.read_end(?s);
+        if (sel got.err || !pattern.walled(?p)) { ret 4; }
+        var text: [rule.FORMAT_MAX + 1]u8;
+        pattern.set_rule(?p, rule.format(?s.rule, ?text[0]));
+
+        # written as RLW, its walls in a section of their own, and read back
+        var f: format.Format;
+        if (!formats.by_id("rlw", ?f)) { ret 5; }
+        var out: Vector[u8] = vector.init[u8](?a);
+        val enc: err[Error] = encode_pattern(?a, ?f, ?p, ?out);
+        if (sel enc.err) { ret 6; }
+        var q:     pattern.Pattern;
+        val qinit: err[allo.Error] = pattern.init(?q, ?a, 0, 0, "");
+        if (sel qinit.err) { ret 7; }
+        val read: err[Error] = pattern_from(?a, ?q, out.data, out.len);
+        if (sel read.err) {
+            print.eprintlnf("{}'s pattern did not read back", LAYERED[k]);
+            ret 8;
+        }
+        if (!pattern.walled(?q) || q.w != p.w || q.h != p.h || q.x != p.x || q.y != p.y) { ret 9; }
+        var i: usize = 0;
+        for (i < p.w * p.h) {
+            if (p.walls[i] != q.walls[i] || p.cells[i] != q.cells[i])                                           { ret 10; }
+            if (pattern.exact(?p) && !mem.equal[u32](?p.words[i * p.values], ?q.words[i * q.values], p.values)) { ret 11; }
+            i = i + 1;
+        }
+
+        # placed, and opened as a file centred on the origin, its walls land
+        # with its cells as they stood
+        var t:     sim.Sim;
+        val made2: err[allo.Error] = sim.init(?t, ?a);
+        if (sel made2.err)                        { ret 12; }
+        if (!sim.taken(sim.set_rule(?t, s.rule))) { ret 12; }
+        t.generation = s.generation;
+        if (!pattern.place(?t, ?q, q.x, q.y, true)) { ret 13; }
+        if (!same_in(?s, ?t, -42, -42, 42, 42)) {
+            print.eprintlnf("{}'s pattern did not place as copied", LAYERED[k]);
+            ret 14;
+        }
+        var u:     sim.Sim;
+        val made3: err[allo.Error] = sim.init(?u, ?a);
+        if (sel made3.err)                        { ret 15; }
+        if (!sim.taken(sim.set_rule(?u, s.rule))) { ret 15; }
+        u.generation = s.generation;
+        val opened: res[Opened, Error] = open_bytes(?a, ?u, ?v, ?out);
+        if (!(sel opened.ok && !opened.ok.world)) { ret 16; }
+        # a file overlays a flipped world, whose dead cells it leaves as the
+        # background holds them, where the copy's were the complement's
+        if (!sim.flipped(?s) && !same_in(?s, ?u, -42, -42, 42, 42)) {
+            print.eprintlnf("{}'s pattern file did not open as copied", LAYERED[k]);
+            ret 17;
+        }
+
+        # written as RLE it is its cells alone
+        var g: format.Format;
+        if (!formats.by_id("rle", ?g)) { ret 18; }
+        vector.clear[u8](?out);
+        val plain: err[Error] = encode_pattern(?a, ?g, ?p, ?out);
+        if (sel plain.ok) {
+            val back: err[Error] = pattern_from(?a, ?q, out.data, out.len);
+            if (sel back.err || pattern.walled(?q)) { ret 19; }
+        }
+
+        vector.dnit[u8](?out);
+        pattern.dnit(?p);
+        pattern.dnit(?q);
+        sim.dnit(?s);
+        sim.dnit(?t);
+        sim.dnit(?u);
+        k = k + 1;
+    }
+    ret 0;
+}
+
+test export__a_walled_world_written_as_rlw_loads_back_exactly {
+    var a: allo.Allocator;
+    page.make(?a);
+    var f: format.Format;
+    if (!formats.by_id("rlw", ?f)) { ret 1; }
+    var k: usize = 0;
+    for (k < 5) {
+        var s:    sim.Sim;
+        val made: err[allo.Error] = sim.init(?s, ?a);
+        if (sel made.err)                               { ret 2; }
+        if (!seed_layered(?s, LAYERED[k], false, true)) { ret 2; }
+        # the whole world written out, as cellar run --out writes it
+        var info: format.Info;
+        format.info_init(?info, ?a);
+        var text: [rule.FORMAT_MAX + 1]u8;
+        format.set_str(?a, ?info.rule, rule.format(?s.rule, ?text[0]));
+        var ws:  adapt.WorldSource;
+        var out: Vector[u8]                        = vector.init[u8](?a);
+        var enc: err[format.Error]                 = err[format.Error].ok{};
+        val src: res[*format.Source, format.Error] = adapt.world_source(?ws, ?s, ?a, f.words);
+        if (sel src.err) { enc = err[format.Error].err{src.err}; }
+        if (sel src.ok)  { enc = formats.save(?a, ?f, src.ok, ?info, ?out); }
+        adapt.world_source_dnit(?ws);
+        format.info_dnit(?info);
+        if (sel enc.err) { ret 3; }
+
+        # and read back into an empty world of its rule, where it was
+        var t:     sim.Sim;
+        val made2: err[allo.Error] = sim.init(?t, ?a);
+        if (sel made2.err)                        { ret 4; }
+        if (!sim.taken(sim.set_rule(?t, s.rule))) { ret 4; }
+        t.generation = s.generation;
+        var wk:   adapt.WorldSink;
+        var back: format.Info;
+        format.info_init(?back, ?a);
+        val got: err[format.Error] = formats.load(?a, ?f, out.data, out.len, adapt.world_sink(?wk, ?t, 0, 0), ?back);
+        format.info_dnit(?back);
+        if (sel got.err || back.walls == 0) {
+            print.eprintlnf("{}'s world did not read back", LAYERED[k]);
+            ret 5;
+        }
+        # a file overlays a flipped world, whose dead cells it leaves as the
+        # background holds them, so there the walls alone are compared
+        if (sim.flipped(?s)) {
+            var y: i64 = -50;
+            for (y < 50) {
+                var x: i64 = -50;
+                for (x < 110) {
+                    if (sim.wall_at(?s, x, y) != sim.wall_at(?t, x, y)) { ret 6; }
+                    x = x + 1;
+                }
+                y = y + 1;
+            }
+        }
+        or (!same_layers(?s, ?t)) {
+            print.eprintlnf("{}'s world did not load back as written", LAYERED[k]);
+            ret 7;
+        }
+        vector.dnit[u8](?out);
+        sim.dnit(?s);
+        sim.dnit(?t);
+        k = k + 1;
+    }
     ret 0;
 }
