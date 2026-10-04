@@ -6,6 +6,26 @@ All notable changes to cellar are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-04
+
+### Added
+
+- The top readout shows the measured rate against the set speed (`speed 41 of 60/s`, or `41/s max` uncapped), and Stats shows the measured rate and the time a step takes, from GPU timestamps on the GPU and wall time otherwise (#310).
+- Fullscreen and the window's size and position are saved on close and restored at start, straight into fullscreen without a windowed frame. Position is restored where the platform allows it, which Wayland does not (#309).
+
+### Changed
+
+- The World tab is grouped by task in three folding sections: Shape (topology, boundary, size), Walls, and Select and fill. Every exclusive choice is one button group, toggles are toggles, and each tool's heading shows its key and lights while the tool is in use. Picking the boundary, wall or select tool brings its section to the front (#311).
+- The toolbar fits 1280 px with HashLife on. The engine choice, HashLife's step and going to a generation moved into one popup (#311).
+- The help screen lists keys by area, and every control with a key shows it in its tooltip (#311).
+- Stats takes more of the right side by default, so every row shows at 1280x800 (#311).
+- Built on boom 0.50.
+
+### Fixed
+
+- Esc closed the application. It now cancels what is in progress, innermost first, and otherwise does nothing (#308).
+- Shape choices for boundaries and walls lit each other and could not be told apart, and the selection's Clear shared the world's Clear (#307).
+
 ## [0.12.0] - 2026-10-03
 
 ### Added
