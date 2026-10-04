@@ -56,6 +56,16 @@
 # have a state but 0 is kept too. the words are those of the rule the Info
 # names. a format that records states alone carries a cell's state, read from
 # its state layer.
+#
+# a pattern's walls (cellar.sim EDIT_WALLS) are cells too: a wall holds the
+# state or word its cell does, and a wall no live run covers is dead. a format
+# whose files can record which cells are walls says so (Format.walls). its
+# decoder emits them with emit_walls, every wall run before any cell run, row
+# by row from the top and left to right within a row, apart, so a sink knows
+# which of the cells that follow are walls before it writes them. a source
+# that holds walls offers them as runs of their own (Source.walls), the cells
+# under them among its runs as any cell, so a format that records no walls
+# writes a pattern's cells and leaves its walls out.
 
 use allo: std.allocator;
 use std.collections.vector.Vector;
@@ -127,6 +137,7 @@ pub fun error_message(e: Error) str {
 # x1:       right edge of the box, exclusive
 # y1:       bottom edge of the box, exclusive
 # live:     live cells emitted
+# walls:    wall cells emitted
 # notes:    NOTE_* flags, set once the decode is validated
 # values:   in word mode, the values a word holds, as the file records it
 # at:       byte offset a failed decode stopped at
@@ -142,6 +153,7 @@ pub rec Info {
     x1:       i64;
     y1:       i64;
     live:     u64;
+    walls:    u64;
     notes:    u32;
     values:   usize;
     at:       usize;
@@ -163,6 +175,7 @@ pub fun info_init(i: *Info, a: *allo.Allocator) {
     i.x1       = 0;
     i.y1       = 0;
     i.live     = 0;
+    i.walls    = 0;
     i.notes    = 0;
     i.values   = 1;
     i.at       = 0;
@@ -263,6 +276,9 @@ fun lower(c: u8) u8 {
 # words: in word mode, in place of run, n cells of state v from (x, y)
 #        rightward with their words, the Info's values each; false when they
 #        cannot be kept. nil for a sink that takes states alone
+# walls: n cells from (x, y) rightward are walls, holding the state or word
+#        the cell runs give them, or dead where none does; false when they
+#        cannot be kept. nil for a sink that takes cells alone
 # close: the load ended; false when the destination lost anything
 pub rec Sink {
     ctx:   *u8;
@@ -272,6 +288,7 @@ pub rec Sink {
     open:  fun(*u8, *Info) bool;
     run:   fun(*u8, i64, i64, usize, u8) bool;
     words: fun(*u8, i64, i64, usize, u8, *u32) bool;
+    walls: fun(*u8, i64, i64, usize) bool;
     close: fun(*u8) bool;
 }
 
@@ -362,6 +379,27 @@ pub fun emit_words(e: *Emit, x: i64, y: i64, n: usize, v: u8, w: *u32) bool {
     ret e.sink.words(e.sink.ctx, x, y, n, v, w);
 }
 
+# report n cells from (x, y) rightward as walls, ahead of every cell run
+#
+# a decoder calls this for every wall run and stops with Error.sink when it is
+# false. a sink that takes no walls is not told of them, and gets their cells
+# as any other.
+# ---
+# e:   the decode's emit
+# x:   first column
+# y:   row
+# n:   cells
+# ret: false when the sink refused the run
+pub fun emit_walls(e: *Emit, x: i64, y: i64, n: usize) bool {
+    if (n == 0) { ret true; }
+    cover(e.info, x, y, x + n::i64, y + 1);
+    e.info.walls = e.info.walls + n::u64;
+    if (e.sink == nil)       { ret true; }
+    if (e.fits)              { ret e.sink.fit(e.sink.ctx, x, y, n, 0); }
+    if (e.sink.walls == nil) { ret true; }
+    ret e.sink.walls(e.sink.ctx, x, y, n);
+}
+
 # fold live cells into an Info as emitting them would, for a decoder that
 # knows their extent, count and highest state without listing them
 # ---
@@ -386,7 +424,7 @@ pub fun gather(i: *Info, x0: i64, y0: i64, x1: i64, y1: i64, live: u64, top: u8)
 # n: cells, at least 1
 # v: state, nonzero, or in word mode any
 # w: in word mode the run's n words, the Source's values each, none all 0,
-#    until the next run is read; nil otherwise
+#    until the next run is read; nil otherwise and in a wall run
 pub rec Run {
     x: i64;
     y: i64;
@@ -443,6 +481,9 @@ pub rec Quadtree {
 # next:       the next run, false when none remain
 # words:      in place of next, the next run in word mode, false when none
 #             remain. nil for a source that has states alone
+# walls:      the next run of walls, row by row as the cells' runs come, its
+#             state 0 and its words nil, false when none remain; rewind starts
+#             them again too. nil for a source that holds no walls
 pub rec Source {
     ctx:        *u8;
     x0:         i64;
@@ -456,6 +497,7 @@ pub rec Source {
     rewind:     fun(*u8) err[Error];
     next:       fun(*u8, *Run) bool;
     words:      fun(*u8, *Run) bool;
+    walls:      fun(*u8, *Run) bool;
 }
 
 # a pattern file format
@@ -470,6 +512,8 @@ pub rec Source {
 # words:  its files can record a rule's cells exactly, as words:
 #         decode emits them with emit_words in word mode, and encode reads a
 #         source's words when it offers them
+# walls:  its files can record which cells are walls: decode emits them with
+#         emit_walls, and encode reads a source's walls when it offers them
 # encode: write the source's cells to out, describing them with the Info's text.
 #         nil when the format is read only
 pub rec Format {
@@ -480,6 +524,7 @@ pub rec Format {
     builds: bool;
     states: u32;
     words:  bool;
+    walls:  bool;
     encode: fun(*allo.Allocator, *Source, *Info, *Vector[u8]) err[Error];
 }
 

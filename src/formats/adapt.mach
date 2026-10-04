@@ -7,6 +7,7 @@
 # records a continuous rule's words carries its values exactly between them.
 
 use gfx: boom.graphics;
+use cellar.boundary;
 use cellar.format;
 use cellar.hashlife;
 use cellar.layer;
@@ -34,7 +35,7 @@ use std.types.string.str;
 # ---
 # p:      the pattern to fill; on open it is resized and takes the file's rule
 #         and comments, and its name when the file has one, and in word mode it
-#         holds the words
+#         holds the words, and the walls when the file has any
 # words:  the words are kept, as they are unless the file names a rule whose
 #         words are its states, whose patterns hold states (see cellar.pattern)
 # values: values a word holds, as the file records them
@@ -110,6 +111,18 @@ fun pattern_words(ctx: *u8, x: i64, y: i64, n: usize, v: u8, w: *u32) bool {
     ret true;
 }
 
+fun pattern_walls(ctx: *u8, x: i64, y: i64, n: usize) bool {
+    val s:    *PatternSink    = ctx::*PatternSink;
+    val held: err[allo.Error] = pattern.hold_walls(s.p);
+    if (sel held.err) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        pattern.set_wall(s.p, (x - s.p.x)::usize + i, (y - s.p.y)::usize, true);
+        i = i + 1;
+    }
+    ret true;
+}
+
 fun pattern_close(ctx: *u8) bool {
     ret true;
 }
@@ -129,6 +142,7 @@ pub fun pattern_sink(s: *PatternSink, p: *pattern.Pattern) *format.Sink {
     s.sink.open  = pattern_open;
     s.sink.run   = pattern_run;
     s.sink.words = pattern_words;
+    s.sink.walls = pattern_walls;
     s.sink.close = pattern_close;
     ret ?s.sink;
 }
@@ -146,6 +160,9 @@ pub fun pattern_sink(s: *PatternSink, p: *pattern.Pattern) *format.Sink {
 # the world whole rather than the box. only open begins the edit, and a rule
 # the sink was given to take is set there, once the pattern is known to fit and
 # before any cell is written, so the cells are written as that rule's states.
+# a file's walls are written as walls as they come, dead, ahead of its cells,
+# which the world takes up the wall layer for as the sink opens, and its cells
+# that are walls are written into them.
 # ---
 # s:       simulation to write onto
 # dx:      columns to shift every cell by
@@ -163,6 +180,11 @@ pub fun pattern_sink(s: *PatternSink, p: *pattern.Pattern) *format.Sink {
 #          older version of its family recorded (cellar.rule adopt), so word
 #          runs are written as their words rather than their states
 # from:    the values the file's words hold
+# walled:  the file has walls, which the world holds from open on
+# walls:   the file's walls written so far, shifted, from the first wall run
+#          to close
+# row:     the spans of the wall row being gathered, not yet in walls
+# row_y:   that row
 # tree:    the tree the sink offers while the quadtree holds the world
 # sink:    the sink to hand to formats.load
 pub rec WorldSink {
@@ -178,6 +200,10 @@ pub rec WorldSink {
     refused: bool;
     exact:   bool;
     from:    usize;
+    walled:  bool;
+    walls:   boundary.Region;
+    row:     Vector[i64];
+    row_y:   i64;
     tree:    format.TreeSink;
     sink:    format.Sink;
 }
@@ -218,32 +244,104 @@ fun world_open(ctx: *u8, info: *format.Info) bool {
     w.from = info.values;
     if (sel named.ok)  { w.exact = !sim.flipped(w.s) && rule.alike(?named.ok, ?w.s.rule) && rule.adopts(?w.s.rule, info.values); }
     if (!info.bounded) { ret true; }
+    if (info.walls > 0) {
+        val held: opt[str] = sim.hold_walls(w.s);
+        if (sel held.some) { ret false; }
+        w.walled = true;
+    }
     w.opened = sim.edit_begin(w.s, info.x0 + w.dx, info.y0 + w.dy, info.x1 + w.dx, info.y1 + w.dy);
     ret w.opened;
 }
 
-fun world_run(ctx: *u8, x: i64, y: i64, n: usize, v: u8) bool {
-    val w: *WorldSink = ctx::*WorldSink;
-    ret sim.edit_run(w.s, x + w.dx, y + w.dy, n, v);
-}
-
-fun world_words(ctx: *u8, x: i64, y: i64, n: usize, v: u8, c: *u32) bool {
-    val w: *WorldSink = ctx::*WorldSink;
-    if (w.exact && w.from == sim.word_len(w.s)) { ret sim.edit_words(w.s, x + w.dx, y + w.dy, n, c); }
+# write n cells of state v, or their words c in word mode, from world (x, y)
+# rightward, all of them walls or none
+fun world_write(w: *WorldSink, x: i64, y: i64, n: usize, v: u8, c: *u32) bool {
+    if (c == nil)                               { ret sim.edit_run(w.s, x, y, n, v); }
+    if (w.exact && w.from == sim.word_len(w.s)) { ret sim.edit_words(w.s, x, y, n, c); }
     if (w.exact) {
         # words an older version of the family recorded, each as its word now
         var i: usize = 0;
         for (i < n) {
             var now: [layer.LAYERS_MAX]u32;
-            if (!rule.adopt(?w.s.rule, ?c[i * w.from], w.from, ?now[0]))       { ret false; }
-            if (!sim.edit_words(w.s, x + w.dx + i::i64, y + w.dy, 1, ?now[0])) { ret false; }
+            if (!rule.adopt(?w.s.rule, ?c[i * w.from], w.from, ?now[0])) { ret false; }
+            if (!sim.edit_words(w.s, x + i::i64, y, 1, ?now[0]))         { ret false; }
             i = i + 1;
         }
         ret true;
     }
     # a cell whose state is 0 is dead to a rule that reads the states alone
     if (v == 0) { ret true; }
-    ret sim.edit_run(w.s, x + w.dx, y + w.dy, n, v);
+    ret sim.edit_run(w.s, x, y, n, v);
+}
+
+# write cells as world_write does, those the file's walls cover as walls
+fun world_cells(w: *WorldSink, x: i64, y: i64, n: usize, v: u8, c: *u32) bool {
+    if (!w.walled)      { ret world_write(w, x, y, n, v, c); }
+    if (!walls_done(w)) { ret false; }
+    var ns:  usize = 0;
+    val xs:  *i64  = boundary.row(?w.walls, y, ?ns);
+    val end: i64   = x + n::i64;
+    var at:  i64   = x;
+    var k:   usize = 0;
+    for (at < end) {
+        for (k < ns && xs[k * 2 + 1] <= at) { k = k + 1; }
+        var stop: i64  = end;
+        var on:   bool = false;
+        if (k < ns && xs[k * 2] <= at) {
+            on = true;
+            if (xs[k * 2 + 1] < stop) { stop = xs[k * 2 + 1]; }
+        }
+        or (k < ns && xs[k * 2] < stop) { stop = xs[k * 2]; }
+        var mode: u8 = sim.EDIT_CELLS;
+        if (on) { mode = sim.EDIT_WALLS; }
+        sim.edit_as(w.s, mode);
+        var part: *u32 = nil;
+        if (c != nil) { part = ?c[(at - x)::usize * w.from]; }
+        val ok: bool = world_write(w, at, y, (stop - at)::usize, v, part);
+        sim.edit_as(w.s, sim.EDIT_CELLS);
+        if (!ok) { ret false; }
+        at = stop;
+    }
+    ret true;
+}
+
+# put the wall row being gathered into the walls, false when they could not take it
+fun walls_done(w: *WorldSink) bool {
+    if (w.row.len == 0) { ret true; }
+    val took: res[bool, allo.Error] = boundary.append(?w.walls, w.row_y, w.row_y + 1, w.row.data, w.row.len / 2);
+    vector.clear[i64](?w.row);
+    ret sel took.ok && took.ok;
+}
+
+fun world_run(ctx: *u8, x: i64, y: i64, n: usize, v: u8) bool {
+    val w: *WorldSink = ctx::*WorldSink;
+    ret world_cells(w, x + w.dx, y + w.dy, n, v, nil);
+}
+
+fun world_words(ctx: *u8, x: i64, y: i64, n: usize, v: u8, c: *u32) bool {
+    val w: *WorldSink = ctx::*WorldSink;
+    ret world_cells(w, x + w.dx, y + w.dy, n, v, c);
+}
+
+# make n cells from (x, y) rightward dead walls, which the cells that follow
+# write into, and gather them, row by row, into the walls
+fun world_walls(ctx: *u8, x: i64, y: i64, n: usize) bool {
+    val w:  *WorldSink = ctx::*WorldSink;
+    val wx: i64        = x + w.dx;
+    val wy: i64        = y + w.dy;
+    if (!w.walled)                                        { ret false; }
+    if (w.row.len > 0 && wy != w.row_y && !walls_done(w)) { ret false; }
+    w.row_y = wy;
+    if (w.row.len > 0 && w.row.data[w.row.len - 1] == wx) { w.row.data[w.row.len - 1] = wx + n::i64; }
+    or {
+        val a: res[usize, allo.Error] = vector.push[i64](?w.row, wx);
+        val b: res[usize, allo.Error] = vector.push[i64](?w.row, wx + n::i64);
+        if (sel a.err || sel b.err) { ret false; }
+    }
+    if (!sim.edit_as(w.s, sim.EDIT_WALLS)) { ret false; }
+    val ok: bool = sim.edit_run(w.s, wx, wy, n, 0);
+    sim.edit_as(w.s, sim.EDIT_CELLS);
+    ret ok;
 }
 
 fun world_tree_open(ctx: *u8, info: *format.Info) bool {
@@ -270,6 +368,11 @@ fun world_close(ctx: *u8) bool {
     val w: *WorldSink = ctx::*WorldSink;
     if (w.planned) { sim.need_dnit(?w.need); }
     w.planned = false;
+    boundary.dnit(?w.walls);
+    vector.dnit[i64](?w.row);
+    w.walls  = boundary.init(w.s.space.a);
+    w.row    = vector.init[i64](w.s.space.a);
+    w.walled = false;
     if (!w.opened) { ret true; }
     w.opened = false;
     ret sim.edit_end(w.s);
@@ -292,6 +395,10 @@ pub fun world_sink(w: *WorldSink, s: *sim.Sim, dx: i64, dy: i64) *format.Sink {
     w.refused   = false;
     w.exact     = false;
     w.from      = 1;
+    w.walled    = false;
+    w.walls     = boundary.init(s.space.a);
+    w.row       = vector.init[i64](s.space.a);
+    w.row_y     = 0;
     w.tree.ctx  = w::*u8;
     w.tree.x0   = 0 - dx;
     w.tree.y0   = 0 - dy;
@@ -306,6 +413,7 @@ pub fun world_sink(w: *WorldSink, s: *sim.Sim, dx: i64, dy: i64) *format.Sink {
     w.sink.open  = world_open;
     w.sink.run   = world_run;
     w.sink.words = world_words;
+    w.sink.walls = world_walls;
     w.sink.close = world_close;
     ret ?w.sink;
 }
@@ -329,24 +437,54 @@ pub fun sink_rule(w: *WorldSink, r: rule.Rule) {
     if (rule.caps(?w.rule).no_tree != nil) { w.sink.tree = nil; }
 }
 
-# a source that reads a heap pattern, its live cells in rows
+# a source that reads a heap pattern, its live cells in rows, and its walls
 # ---
 # p:      pattern to read
 # x:      cursor column, relative to the pattern
 # y:      cursor row
+# wx:     the walls' cursor column
+# wy:     the walls' cursor row
 # source: the source to hand to formats.save
 pub rec PatternSource {
     p:      *pattern.Pattern;
     x:      usize;
     y:      usize;
+    wx:     usize;
+    wy:     usize;
     source: format.Source;
 }
 
 fun pattern_rewind(ctx: *u8) err[format.Error] {
     val s: *PatternSource = ctx::*PatternSource;
-    s.x = 0;
-    s.y = 0;
+    s.x  = 0;
+    s.y  = 0;
+    s.wx = 0;
+    s.wy = 0;
     ret err[format.Error].ok{};
+}
+
+# the next run of walls
+fun pattern_next_walls(ctx: *u8, r: *format.Run) bool {
+    val s: *PatternSource = ctx::*PatternSource;
+    for (s.wy < s.p.h) {
+        for (s.wx < s.p.w) {
+            var n:  usize = 0;
+            val on: bool  = pattern.wall_run(s.p, s.wx, s.wy, ?n);
+            val at: usize = s.wx;
+            s.wx = s.wx + n;
+            if (on) {
+                r.x = s.p.x + at::i64;
+                r.y = s.p.y + s.wy::i64;
+                r.n = n;
+                r.v = 0;
+                r.w = nil;
+                ret true;
+            }
+        }
+        s.wx = 0;
+        s.wy = s.wy + 1;
+    }
+    ret false;
 }
 
 fun pattern_next(ctx: *u8, r: *format.Run) bool {
@@ -405,6 +543,8 @@ pub fun pattern_source(s: *PatternSource, p: *pattern.Pattern) *format.Source {
     s.p             = p;
     s.x             = 0;
     s.y             = 0;
+    s.wx            = 0;
+    s.wy            = 0;
     s.source.ctx    = s::*u8;
     s.source.x0     = p.x;
     s.source.y0     = p.y;
@@ -431,6 +571,8 @@ pub fun pattern_source(s: *PatternSource, p: *pattern.Pattern) *format.Source {
     s.source.next   = pattern_next;
     s.source.words  = nil;
     if (pattern.exact(p)) { s.source.words = pattern_next_words; }
+    s.source.walls = nil;
+    if (pattern.walled(p)) { s.source.walls = pattern_next_walls; }
     ret ?s.source;
 }
 
@@ -788,6 +930,7 @@ pub fun world_source(w: *WorldSource, s: *sim.Sim, a: *allo.Allocator, words: bo
     w.source.rewind     = world_rewind;
     w.source.next       = world_next;
     w.source.words      = nil;
+    w.source.walls      = nil;
     if (w.exact) { w.source.words = world_next_words; }
     w.band = 0;
     w.end  = 0;
