@@ -87,7 +87,7 @@ cd cellar
 mach dep pull .   # realize the pinned std, boom, image and their dependencies
 mach build .
 mach run .
-mach test .
+mach test . --timeout 5m
 ```
 
 ## License
