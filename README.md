@@ -77,7 +77,7 @@ formats, headless runs and the bench in full.
 
 ## Build
 
-Requires [Mach](https://github.com/briar-systems/mach) 6.10.1 or newer and a C
+Requires [Mach](https://github.com/briar-systems/mach) 7.1.1 or newer and a C
 compiler for GLFW, which mach-glfw builds from source (on linux, the X11 and
 Wayland development headers and `wayland-scanner`).
 
@@ -87,10 +87,8 @@ cd cellar
 mach dep pull .   # realize the pinned std, boom, image and their dependencies
 mach build .
 mach run .
-mach test .
+mach test . --timeout 5m
 ```
-
-On macOS, pass `--pie` to `mach build` and `mach run`.
 
 ## License
 
