@@ -77,7 +77,7 @@ formats, headless runs and the bench in full.
 
 ## Build
 
-Requires [Mach](https://github.com/briar-systems/mach) 7.1.1 or newer and a C
+Requires [Mach](https://github.com/briar-systems/mach) 7.2.0 or newer and a C
 compiler for GLFW, which mach-glfw builds from source (on linux, the X11 and
 Wayland development headers and `wayland-scanner`).
 
